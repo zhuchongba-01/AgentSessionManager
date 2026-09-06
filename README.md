@@ -20,3 +20,11 @@ pnpm typecheck
 pnpm test:unit
 cargo test --manifest-path src-tauri/Cargo.toml session_manager
 ```
+
+## 致谢
+
+特别感谢 [LINUX DO](https://linux.do) 社区！！更多信息请参阅 [ACKNOWLEDGMENTS.md](./ACKNOWLEDGMENTS.md)。
+
+## 开源许可
+
+本项目采用 [MIT License](./LICENSE) 开源。
