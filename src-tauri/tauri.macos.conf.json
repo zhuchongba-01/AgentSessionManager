@@ -1,0 +1,10 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "titleBarStyle": "Overlay"
+      }
+    ]
+  }
+}
