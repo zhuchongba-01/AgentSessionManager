@@ -597,7 +597,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           sessionId: target.sessionId,
           sourcePath: target.sourcePath!,
           includeProject: false,
-          sharedConfirmed: false,
         });
         setDeleteTargets(null);
         setSelectedSessionKeys((current) => {

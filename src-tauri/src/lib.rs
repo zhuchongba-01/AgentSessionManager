@@ -30,7 +30,6 @@ async fn delete_session(
     #[allow(non_snake_case)] sessionId: String,
     #[allow(non_snake_case)] sourcePath: String,
     #[allow(non_snake_case)] includeProject: Option<bool>,
-    #[allow(non_snake_case)] sharedConfirmed: Option<bool>,
 ) -> Result<session_manager::DeleteSessionReply, String> {
     tauri::async_runtime::spawn_blocking(move || {
         session_manager::delete_session_checked(
@@ -38,7 +37,6 @@ async fn delete_session(
             &sessionId,
             &sourcePath,
             includeProject.unwrap_or(false),
-            sharedConfirmed.unwrap_or(false),
         )
     })
     .await

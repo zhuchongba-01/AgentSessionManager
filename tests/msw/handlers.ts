@@ -13,7 +13,7 @@ const readJson = async <T>(request: Request): Promise<T> => {
 
 export const handlers = [
   http.get(GITHUB_RELEASE_ENDPOINT, () =>
-    success({ tag_name: "v1.3.8", draft: false, prerelease: false }),
+    success({ tag_name: "v1.3.9", draft: false, prerelease: false }),
   ),
   http.post(`${TAURI_ENDPOINT}/list_sessions`, () =>
     success({ sessions: listSessions(), warnings: [] }),

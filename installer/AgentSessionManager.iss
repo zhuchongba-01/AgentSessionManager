@@ -1,5 +1,5 @@
 #define MyAppName "Agent会话管理器"
-#define MyAppVersion "1.3.8"
+#define MyAppVersion "1.3.9"
 #define MyAppExeName "Agent会话管理器.exe"
 
 [Setup]
@@ -10,7 +10,7 @@ DefaultDirName={autopf}\Agent会话管理器
 DefaultGroupName={#MyAppName}
 UninstallDisplayName={#MyAppName}
 OutputDir=Output
-OutputBaseFilename=Agent会话管理器安装程序
+OutputBaseFilename=AgentSessionManager-Setup-v{#MyAppVersion}
 SetupIconFile=..\src-tauri\icons\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max

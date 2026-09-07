@@ -209,7 +209,7 @@ describe("SessionManagerPage", () => {
     server.use(
       http.get(GITHUB_LATEST_RELEASE_API, () =>
         HttpResponse.json({
-          tag_name: "v1.3.9",
+          tag_name: "v1.3.10",
           draft: false,
           prerelease: false,
         }),
@@ -218,7 +218,7 @@ describe("SessionManagerPage", () => {
     renderPage();
 
     const updateButton = await screen.findByRole("button", {
-      name: "发现新版本 v1.3.9",
+      name: "发现新版本 v1.3.10",
     });
     await userEvent.click(updateButton);
 

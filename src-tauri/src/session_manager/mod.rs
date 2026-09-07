@@ -52,8 +52,6 @@ pub struct DeleteSessionRequest {
     pub source_path: String,
     #[serde(default)]
     pub include_project: bool,
-    #[serde(default)]
-    pub shared_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,13 +81,6 @@ pub enum DeleteSessionReply {
     },
     /// 记录本就不存在（可能已被同批其他项的级联清理删掉），目标状态已达成。
     NotFound,
-    /// 真实工作目录被多个会话共享；携带后端 canonicalize 比对出的权威
-    /// 共享信息，由前端弹窗要求用户二次确认。
-    NeedsSharedConfirmation {
-        #[serde(rename = "sharedCount")]
-        shared_count: u32,
-        providers: Vec<String>,
-    },
 }
 
 #[derive(Serialize)]
@@ -265,7 +256,6 @@ pub fn delete_session_checked(
     session_id: &str,
     source_path: &str,
     include_project: bool,
-    shared_confirmed: bool,
 ) -> Result<DeleteSessionReply, String> {
     if include_project {
         return Err("会话清理不再删除项目目录；请使用文件管理器单独处理项目文件".into());
@@ -285,14 +275,7 @@ pub fn delete_session_checked(
         })
         .ok_or("会话已变化或不存在，请重新扫描")?;
     deletion::run(target, &sessions, |plan| {
-        delete_session_in_snapshot(
-            provider_id,
-            session_id,
-            source_path,
-            include_project,
-            shared_confirmed,
-            plan,
-        )
+        delete_session_in_snapshot(provider_id, session_id, source_path, include_project, plan)
     })
 }
 
@@ -303,7 +286,6 @@ fn delete_session_in_snapshot(
     session_id: &str,
     source_path: &str,
     include_project: bool,
-    _shared_confirmed: bool,
     sessions: &[SessionMeta],
 ) -> Result<DeleteSessionReply, String> {
     let selected = sessions.iter().find(|item| {
@@ -457,7 +439,6 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
                 &request.session_id,
                 &request.source_path,
                 false,
-                false,
                 plan,
             )
         })
@@ -585,10 +566,6 @@ where
                 Ok(DeleteSessionReply::CleanupPending { warnings }) => {
                     outcome.error = Some("清理未完成，请退出 Agent 后重试".into());
                     outcome.warnings = warnings;
-                }
-                Ok(DeleteSessionReply::NeedsSharedConfirmation { .. }) => {
-                    outcome.error =
-                        Some("Shared directory deletion needs explicit confirmation".to_string());
                 }
                 Err(error) => {
                     outcome.error = Some(error);
@@ -743,28 +720,24 @@ mod tests {
                 session_id: "s1".to_string(),
                 source_path: "/tmp/s1".to_string(),
                 include_project: false,
-                shared_confirmed: false,
             },
             DeleteSessionRequest {
                 provider_id: "claude".to_string(),
                 session_id: "s2".to_string(),
                 source_path: "/tmp/s2".to_string(),
                 include_project: false,
-                shared_confirmed: false,
             },
             DeleteSessionRequest {
                 provider_id: "gemini".to_string(),
                 session_id: "s3".to_string(),
                 source_path: "/tmp/s3".to_string(),
                 include_project: false,
-                shared_confirmed: false,
             },
             DeleteSessionRequest {
                 provider_id: "codex".to_string(),
                 session_id: "s4".to_string(),
                 source_path: "/tmp/s4".to_string(),
                 include_project: false,
-                shared_confirmed: false,
             },
         ];
 
@@ -775,9 +748,8 @@ mod tests {
                 }),
                 "s2" => Err("boom".to_string()),
                 "s3" => Ok(DeleteSessionReply::NotFound),
-                _ => Ok(DeleteSessionReply::NeedsSharedConfirmation {
-                    shared_count: 2,
-                    providers: vec!["codex".to_string(), "claude".to_string()],
+                _ => Ok(DeleteSessionReply::CleanupPending {
+                    warnings: vec!["index locked".to_string()],
                 }),
             }
         });
@@ -792,12 +764,13 @@ mod tests {
         // 记录本就不存在：目标状态已达成，不算失败
         assert!(outcomes[2].success);
         assert_eq!(outcomes[2].error, None);
-        // 需要共享目录二次确认：批量通道没有确认入口，按失败返回
+        // 未完成清理：失败结果保留警告，供前端提示重试
         assert!(!outcomes[3].success);
+        assert_eq!(outcomes[3].warnings, vec!["index locked".to_string()]);
         assert!(outcomes[3]
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("confirmation")));
+            .is_some_and(|error| error.contains("清理未完成")));
     }
 
     #[test]
@@ -807,19 +780,11 @@ mod tests {
         std::fs::write(&sentinel, "keep").unwrap();
         let mut target = session_meta("codex", "thread-1", "missing.jsonl", false);
         target.project_dir = Some(project.path().to_string_lossy().into_owned());
-        for confirmed in [false, true] {
-            let error = delete_session_in_snapshot(
-                "codex",
-                "thread-1",
-                "missing.jsonl",
-                true,
-                confirmed,
-                &[target.clone()],
-            )
-            .expect_err("legacy directory deletion must be rejected");
-            assert!(error.contains("不再删除项目目录"));
-            assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
-        }
+        let error =
+            delete_session_in_snapshot("codex", "thread-1", "missing.jsonl", true, &[target])
+                .expect_err("legacy directory deletion must be rejected");
+        assert!(error.contains("不再删除项目目录"));
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
     }
 
     #[test]
@@ -831,9 +796,8 @@ mod tests {
         // 快照里仍在、磁盘上已消失的文件型残留（同批前项级联清理过）
         assert!(!source.exists());
 
-        let reply =
-            delete_session_in_snapshot("codex", "thread-1", "gone.jsonl", false, false, &[stale])
-                .expect("stale residual short-circuits to NotFound");
+        let reply = delete_session_in_snapshot("codex", "thread-1", "gone.jsonl", false, &[stale])
+            .expect("stale residual short-circuits to NotFound");
 
         assert!(matches!(reply, DeleteSessionReply::NotFound));
     }

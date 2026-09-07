@@ -6,19 +6,13 @@ export interface DeleteSessionOptions {
   sessionId: string;
   sourcePath: string;
   includeProject?: boolean;
-  sharedConfirmed?: boolean;
 }
 
 /** 后端 delete_session 的结构化结果（tag + snake_case 变体名）。 */
 export type DeleteSessionReply =
   | { status: "deleted"; warnings?: string[] }
   | { status: "not_found" }
-  | { status: "cleanup_pending"; warnings: string[] }
-  | {
-      status: "needs_shared_confirmation";
-      sharedCount: number;
-      providers: string[];
-    };
+  | { status: "cleanup_pending"; warnings: string[] };
 
 export interface DeleteSessionResult extends DeleteSessionOptions {
   success: boolean;
@@ -54,14 +48,12 @@ export const sessionsApi = {
       sessionId,
       sourcePath,
       includeProject = false,
-      sharedConfirmed = false,
     } = options;
     return await invoke("delete_session", {
       providerId,
       sessionId,
       sourcePath,
       includeProject,
-      sharedConfirmed,
     });
   },
 
