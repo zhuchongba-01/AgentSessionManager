@@ -164,6 +164,7 @@ fn collect_summary_files(root: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn read_summary(path: &Path) -> Result<GrokSessionSummary, String> {
+    ensure_readable_size(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read Grok Build session summary: {e}"))?;
     serde_json::from_str(&text)
@@ -171,7 +172,12 @@ fn read_summary(path: &Path) -> Result<GrokSessionSummary, String> {
 }
 
 fn parse_summary(path: &Path) -> Option<SessionMeta> {
-    let summary = read_summary(path).ok()?;
+    let summary = read_summary(path)
+        .map_err(|error| {
+            super::utils::scan_warning(error.clone());
+            error
+        })
+        .ok()?;
     let session_id = summary.info.id;
     let title = summary
         .generated_title
@@ -200,6 +206,8 @@ fn parse_summary(path: &Path) -> Option<SessionMeta> {
         provider_id: "grokbuild".to_string(),
         session_id: session_id.clone(),
         residual: false,
+        archived: false,
+        cleanup_pending: false,
         title,
         summary: session_summary,
         project_dir: summary.info.cwd,

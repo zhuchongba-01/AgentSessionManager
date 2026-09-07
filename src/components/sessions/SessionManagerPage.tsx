@@ -26,6 +26,7 @@ import {
   X,
   Download,
   Github,
+  Terminal,
 } from "lucide-react";
 import appIcon from "@/icons/app-icon.png";
 import {
@@ -38,7 +39,6 @@ import { piApi } from "@/lib/api/pi";
 import { sessionsApi } from "@/lib/api/sessions";
 import type { SessionMeta } from "@/types";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
@@ -70,6 +70,8 @@ import {
 import { useTheme } from "@/components/theme-provider";
 import { AgentIcon } from "./AgentIcon";
 import { SessionItem } from "./SessionItem";
+import { SessionRows } from "./SessionRows";
+import { SessionStatusBadges } from "./SessionStatusBadges";
 import { SessionMessageItem } from "./SessionMessageItem";
 import { SessionMinimap } from "./SessionMinimap";
 import {
@@ -219,8 +221,15 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const { t } = useTranslation();
   const { resolvedTheme, setTheme } = useTheme();
   const queryClient = useQueryClient();
-  const { data, isLoading, isFetching, refetch, dataUpdatedAt } =
-    useSessionsQuery();
+  const {
+    data,
+    isLoading,
+    isFetching,
+    refetch,
+    dataUpdatedAt,
+    error: sessionsError,
+    warnings: scanWarnings,
+  } = useSessionsQuery();
   const sessions = data ?? [];
   const includesPiSessions = appId === "all" || appId === "pi";
   const piSessionDiscovery = useQuery({
@@ -242,16 +251,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const [deleteTargets, setDeleteTargets] = useState<SessionMeta[] | null>(
     null,
   );
-  // 后端判定共享目录后回传的权威共享信息；非空表示当前确认对话框处于
-  // "二次确认"阶段，再次点击删除才会带 sharedConfirmed 真正执行。
-  const [sharedConfirmation, setSharedConfirmation] = useState<{
-    sharedCount: number;
-    providers: string[];
-  } | null>(null);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<Set<string>>(
     () => new Set(),
   );
   const [isBatchDeleting, setIsBatchDeleting] = useState(false);
+  const [isResuming, setIsResuming] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [availableUpdate, setAvailableUpdate] =
     useState<AvailableUpdate | null>(null);
@@ -404,11 +408,15 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       ? t("sessionManager.providerFilterAll", { defaultValue: "全部 Agent" })
       : getProviderLabel(providerFilter, t);
 
-  const { data: messages = [], isLoading: isLoadingMessages } =
-    useSessionMessagesQuery(
-      selectedSession?.providerId,
-      selectedSession?.sourcePath,
-    );
+  const {
+    data: messages = [],
+    isLoading: isLoadingMessages,
+    error: messagesError,
+    refetch: refetchMessages,
+  } = useSessionMessagesQuery(
+    selectedSession?.providerId,
+    selectedSession?.sourcePath,
+  );
   const visibleMessages = useMemo(
     () => getVisibleSessionMessages(messages, isCodexSession),
     [isCodexSession, messages],
@@ -532,6 +540,28 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [t],
   );
 
+  const handleResume = async () => {
+    if (!selectedSession?.sourcePath || isResuming || isDeleting) return;
+    setIsResuming(true);
+    try {
+      const command = await sessionsApi.resume(
+        selectedSession.providerId,
+        selectedSession.sourcePath,
+        isMac(),
+      );
+      if (isMac()) toast.success("已打开恢复终端");
+      else
+        await handleCopy(
+          command,
+          "恢复命令已复制，请粘贴到 PowerShell 或对应终端执行",
+        );
+    } catch (error) {
+      toast.error("无法恢复会话", { description: extractErrorMessage(error) });
+    } finally {
+      setIsResuming(false);
+    }
+  };
+
   const handleOpenUrl = useCallback(
     async (url: string) => {
       try {
@@ -548,7 +578,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [t],
   );
 
-  const handleDeleteConfirm = async (includeProject = false) => {
+  const handleDeleteConfirm = async (_includeProject = false) => {
     if (!deleteTargets || deleteTargets.length === 0 || isDeleting) {
       return;
     }
@@ -556,32 +586,20 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     const targets = deleteTargets.filter((session) => session.sourcePath);
     if (targets.length === 0) {
       setDeleteTargets(null);
-      setSharedConfirmation(null);
       return;
     }
 
     if (targets.length === 1) {
       const [target] = targets;
       try {
-        const reply = await deleteSessionMutation.mutateAsync({
+        await deleteSessionMutation.mutateAsync({
           providerId: target.providerId,
           sessionId: target.sessionId,
           sourcePath: target.sourcePath!,
-          includeProject,
-          // 共享目录的判定以后端 canonicalize 比对为准：首次确认不带
-          // sharedConfirmed，后端返回 needs_shared_confirmation 后由本
-          // 对话框展示权威警告，用户再次点击删除才真正执行。
-          sharedConfirmed: sharedConfirmation !== null,
+          includeProject: false,
+          sharedConfirmed: false,
         });
-        if (reply.status === "needs_shared_confirmation") {
-          setSharedConfirmation({
-            sharedCount: reply.sharedCount,
-            providers: reply.providers,
-          });
-          return;
-        }
         setDeleteTargets(null);
-        setSharedConfirmation(null);
         setSelectedSessionKeys((current) => {
           const next = new Set(current);
           next.delete(getSessionKey(target));
@@ -590,13 +608,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       } catch {
         // 错误已由 mutation 的 onError 提示；关闭对话框避免停留在删除中状态
         setDeleteTargets(null);
-        setSharedConfirmation(null);
       }
       return;
     }
 
     setDeleteTargets(null);
-    setSharedConfirmation(null);
     setIsBatchDeleting(true);
     try {
       const results = await sessionsApi.deleteMany(
@@ -616,7 +632,12 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
       const failedErrors = results
         .filter((result) => !result.success)
-        .map((result) => result.error || t("common.unknown"));
+        .map((result) =>
+          [
+            result.error || t("common.unknown"),
+            ...(result.warnings ?? []),
+          ].join("；"),
+        );
 
       const deleteWarnings = results
         .filter((result) => result.success)
@@ -644,8 +665,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         deletedKeys.forEach((key) => next.delete(key));
         return next;
       });
-
-      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
 
       if (deletedKeys.length > 0) {
         toast.success(
@@ -679,6 +698,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           }),
       );
     } finally {
+      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: ["sessionMessages"] });
       setIsBatchDeleting(false);
     }
   };
@@ -953,6 +974,10 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           throw result.error;
         }
         const nextSessions = result.data ?? [];
+        await queryClient.invalidateQueries({ queryKey: ["sessionMessages"] });
+        await queryClient.invalidateQueries({
+          queryKey: piKeys.sessionDiscovery,
+        });
         const after = new Set(nextSessions.map(getSessionKey));
         const added = [...after].filter((key) => !before.has(key)).length;
         const removed = [...before].filter((key) => !after.has(key)).length;
@@ -1129,8 +1154,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       ) : (
                         <AgentIcon
                           icon={getProviderIconName(providerFilter)}
-                          name={providerFilter}
-                          size={14}
+                          name={providerFilterLabel}
+                          size={16}
                         />
                       )}
                       <span className="truncate">
@@ -1144,7 +1169,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     <SelectContent className="asm-select-content asm-agent-filter-content">
                       <SelectItem value="all">
                         <div className="asm-agent-option">
-                          <Boxes className="size-3.5" />
+                          <Boxes className="size-4" />
                           <span>
                             {t("sessionManager.providerFilterAll", {
                               defaultValue: "全部 Agent",
@@ -1157,22 +1182,22 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       </SelectItem>
                       {(
                         [
-                          ["codex", "Codex"],
-                          ["grokbuild", "Grok Build"],
-                          ["claude", "Claude Code"],
-                          ["opencode", "OpenCode"],
-                          ["zcode", "ZCode"],
-                          ["pi", "Pi"],
+                          "codex",
+                          "grokbuild",
+                          "claude",
+                          "opencode",
+                          "zcode",
+                          "pi",
                         ] as const
-                      ).map(([providerId, label]) => (
+                      ).map((providerId) => (
                         <SelectItem key={providerId} value={providerId}>
                           <div className="asm-agent-option">
                             <AgentIcon
                               icon={getProviderIconName(providerId)}
-                              name={providerId}
-                              size={14}
+                              name={getProviderLabel(providerId, t)}
+                              size={16}
                             />
-                            <span>{label}</span>
+                            <span>{getProviderLabel(providerId, t)}</span>
                             <span className="asm-agent-option-count">
                               {providerSessionCounts[providerId] ?? 0}
                             </span>
@@ -1321,7 +1346,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                               defaultValue: "取消全选",
                             })
                           : t("sessionManager.selectAllFiltered", {
-                              defaultValue: "全选当前",
+                              defaultValue: "全选筛选结果（含其他分页）",
                             })}
                       </Button>
                     )}
@@ -1364,6 +1389,21 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     <div className="flex items-center justify-center py-12">
                       <RefreshCw className="size-5 animate-spin text-muted-foreground" />
                     </div>
+                  ) : sessionsError ? (
+                    <div role="alert" className="p-4 text-sm text-destructive">
+                      无法读取会话列表：{extractErrorMessage(sessionsError)}
+                      <Button
+                        variant="outline"
+                        onClick={() => void handleRescan()}
+                      >
+                        重试扫描
+                      </Button>
+                    </div>
+                  ) : scanWarnings.length > 0 &&
+                    filteredSessions.length === 0 ? (
+                    <div role="alert" className="p-3 text-sm text-amber-700">
+                      扫描未完整完成：{scanWarnings.join("；")}
+                    </div>
                   ) : filteredSessions.length === 0 ? (
                     <div className="flex flex-col items-center justify-center py-12 text-center">
                       <MessageSquare className="size-8 text-muted-foreground/50 mb-2" />
@@ -1373,6 +1413,14 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     </div>
                   ) : listViewMode === "grouped" ? (
                     <div>
+                      {scanWarnings.length > 0 && (
+                        <div
+                          role="alert"
+                          className="p-3 text-sm text-amber-700"
+                        >
+                          扫描未完整完成：{scanWarnings.join("；")}
+                        </div>
+                      )}
                       {groupedSessions.map((providerGroup) => {
                         const providerOpen = expandedProviderGroups.has(
                           providerGroup.providerId,
@@ -1422,7 +1470,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                     icon={getProviderIconName(
                                       providerGroup.providerId,
                                     )}
-                                    name={providerGroup.providerId}
+                                    name={providerLabel}
                                     size={16}
                                   />
                                   <span className="asm-group-name">
@@ -1510,10 +1558,10 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                         </CollapsibleTrigger>
                                       </div>
                                       <CollapsibleContent className="asm-dir-items">
-                                        {directoryGroup.sessions.map(
-                                          (session) =>
-                                            renderSessionItem(session),
-                                        )}
+                                        <SessionRows
+                                          sessions={directoryGroup.sessions}
+                                          renderItem={renderSessionItem}
+                                        />
                                       </CollapsibleContent>
                                     </Collapsible>
                                   );
@@ -1526,9 +1574,18 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     </div>
                   ) : (
                     <div>
-                      {filteredSessions.map((session) =>
-                        renderSessionItem(session),
+                      {scanWarnings.length > 0 && (
+                        <div
+                          role="alert"
+                          className="p-3 text-sm text-amber-700"
+                        >
+                          扫描未完整完成：{scanWarnings.join("；")}
+                        </div>
                       )}
+                      <SessionRows
+                        sessions={filteredSessions}
+                        renderItem={renderSessionItem}
+                      />
                     </div>
                   )}
                 </div>
@@ -1566,8 +1623,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     <>
                       <AgentIcon
                         icon={getProviderIconName(selectedSession.providerId)}
-                        name={selectedSession.providerId}
-                        size={14}
+                        name={getProviderLabel(selectedSession.providerId, t)}
+                        size={16}
                       />
                       <span className="asm-detail-provider">
                         {getProviderLabel(selectedSession.providerId, t)}
@@ -1654,19 +1711,30 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         <h2 className="asm-detail-title">
                           {formatSessionTitle(selectedSession)}
                         </h2>
-                        {selectedSession.residual && (
-                          <Badge
-                            variant="outline"
-                            className="shrink-0 border-amber-500/50 text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300"
-                          >
-                            {t("sessionManager.residual", {
-                              defaultValue: "残留",
-                            })}
-                          </Badge>
-                        )}
+                        <SessionStatusBadges session={selectedSession} />
 
                         {/* 操作按钮组 */}
                         <div className="asm-detail-actions">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={
+                              isDeleting ||
+                              isResuming ||
+                              !selectedSession.resumeCommand ||
+                              selectedSession.cleanupPending ||
+                              selectedSession.archived ||
+                              selectedSession.residual
+                            }
+                            onClick={() => void handleResume()}
+                          >
+                            <Terminal className="mr-1 size-3.5" />
+                            {isResuming
+                              ? "恢复中…"
+                              : isMac()
+                                ? "恢复会话"
+                                : "复制恢复命令"}
+                          </Button>
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <Button
@@ -1686,9 +1754,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                     ? t("sessionManager.deleting", {
                                         defaultValue: "删除中...",
                                       })
-                                    : t("sessionManager.delete", {
-                                        defaultValue: "删除会话",
-                                      })}
+                                    : selectedSession.cleanupPending
+                                      ? "继续清理"
+                                      : t("sessionManager.delete", {
+                                          defaultValue: "删除会话",
+                                        })}
                                 </span>
                               </Button>
                             </TooltipTrigger>
@@ -1791,6 +1861,23 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                           <div className="flex items-center justify-center py-12">
                             <RefreshCw className="size-5 animate-spin text-muted-foreground" />
                           </div>
+                        ) : messagesError ? (
+                          <div
+                            role="alert"
+                            className="p-6 text-sm text-destructive"
+                          >
+                            <p>会话读取失败，不能据此判断会话为空。</p>
+                            <p className="mt-2 break-all">
+                              {extractErrorMessage(messagesError)}
+                            </p>
+                            <Button
+                              variant="outline"
+                              className="mt-3"
+                              onClick={() => void refetchMessages()}
+                            >
+                              重试读取
+                            </Button>
+                          </div>
                         ) : visibleMessages.length === 0 ? (
                           <div className="flex flex-col items-center justify-center py-12 text-center">
                             <MessageSquare className="size-8 text-muted-foreground/50 mb-2" />
@@ -1810,7 +1897,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                 .getVirtualItems()
                                 .map((virtualRow) => (
                                   <div
-                                    key={virtualRow.key}
+                                    key={`${selectedKey}:${virtualRow.key}`}
                                     data-index={virtualRow.index}
                                     ref={virtualizer.measureElement}
                                     style={{
@@ -1881,36 +1968,12 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           }
           cancelText={t("common.cancel", { defaultValue: "取消" })}
           variant="destructive"
-          checkboxLabel={
-            deleteTargets?.length === 1 && deleteTargets[0].projectDir
-              ? t("sessionManager.deleteProjectCheckbox", {
-                  defaultValue: "同时将真实工作目录移入回收站",
-                })
-              : undefined
-          }
-          checkboxWarning={
-            deleteTargets?.length === 1 && deleteTargets[0].projectDir
-              ? sharedConfirmation
-                ? // 二次确认阶段：展示后端 canonicalize 比对出的权威共享信息
-                  t("sessionManager.sharedDirNeedsConfirmation", {
-                    defaultValue:
-                      "同一目录还被 {{providers}} 的 {{count}} 个会话使用；确认后才会将真实工作目录移入回收站。",
-                    providers: sharedConfirmation.providers.join("、"),
-                    count: sharedConfirmation.sharedCount,
-                  })
-                : t("sessionManager.projectDirRecycleHint", {
-                    defaultValue:
-                      "真实工作目录会进入系统回收站；对应 Agent 的项目残留索引也会同步清理。",
-                  })
-              : undefined
-          }
           onConfirm={(includeProject) =>
             void handleDeleteConfirm(includeProject)
           }
           onCancel={() => {
             if (!isDeleting) {
               setDeleteTargets(null);
-              setSharedConfirmation(null);
             }
           }}
         />

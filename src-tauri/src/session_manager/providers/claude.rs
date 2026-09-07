@@ -86,7 +86,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     Ok(messages)
 }
 
-pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
     let meta = parse_session(path).ok_or_else(|| {
         format!(
             "Failed to parse Claude session metadata: {}",
@@ -103,6 +103,7 @@ pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<boo
 
     if let Some(stem) = path.file_stem() {
         let sibling = path.parent().unwrap_or_else(|| Path::new("")).join(stem);
+        let sibling = super::utils::checked_storage_child(root, &sibling)?;
         remove_path_if_exists(&sibling).map_err(|e| {
             format!(
                 "Failed to delete Claude session sidecar {}: {e}",
@@ -126,7 +127,12 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
         return None;
     }
 
-    let (head, tail) = read_head_tail_lines(path, 10, 30).ok()?;
+    let (head, tail) = read_head_tail_lines(path, 10, 30)
+        .map_err(|error| {
+            super::utils::scan_warning(format!("无法读取 {}：{error}", path.display()));
+            error
+        })
+        .ok()?;
 
     let mut session_id: Option<String> = None;
     let mut project_dir: Option<String> = None;
@@ -244,6 +250,8 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: false,
+        archived: false,
+        cleanup_pending: false,
         title,
         summary,
         project_dir,

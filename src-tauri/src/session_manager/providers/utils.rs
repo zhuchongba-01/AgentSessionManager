@@ -1,9 +1,38 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
+
+thread_local! {
+    static SCAN_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn scan_warning(message: impl Into<String>) {
+    SCAN_WARNINGS.with(|warnings| {
+        let mut warnings = warnings.borrow_mut();
+        if warnings.len() < 20 {
+            warnings.push(message.into());
+        }
+    });
+}
+
+pub fn scan_with_diagnostics(
+    provider: &str,
+    scan: fn() -> Vec<crate::session_manager::SessionMeta>,
+) -> (Vec<crate::session_manager::SessionMeta>, Vec<String>) {
+    SCAN_WARNINGS.with(|warnings| warnings.borrow_mut().clear());
+    let sessions = scan();
+    let warnings = SCAN_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()));
+    (
+        sessions,
+        warnings
+            .into_iter()
+            .map(|warning| format!("{provider}: {warning}"))
+            .collect(),
+    )
+}
 
 /// Maximum number of characters for session titles (shared across providers).
 pub const TITLE_MAX_CHARS: usize = 80;
@@ -12,6 +41,63 @@ pub const TITLE_MAX_CHARS: usize = 80;
 /// 超限常见于携带 base64 截图或大段日志的会话：整读会把数倍内存拉进进程，
 /// 再一次性序列化过 IPC。
 pub const MAX_MESSAGES_FILE_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_QUERY_BYTES: i64 = 32 * 1024 * 1024;
+pub const MAX_QUERY_ROWS: i64 = 20_000;
+const MAX_SCAN_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Validate every derived path, including symlinked ancestors of missing targets.
+pub fn checked_storage_child(root: &Path, child: &Path) -> Result<PathBuf, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    if child
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("Storage path contains a parent-directory component".into());
+    }
+    let mut existing = child;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                suffix.push(
+                    existing
+                        .file_name()
+                        .ok_or("Invalid storage path")?
+                        .to_os_string(),
+                );
+                existing = existing.parent().ok_or("Invalid storage ancestor")?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let mut resolved = existing.canonicalize().map_err(|e| e.to_string())?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    if resolved == root || !resolved.starts_with(&root) {
+        return Err("Derived storage path escapes its root".into());
+    }
+    Ok(resolved)
+}
+
+pub fn check_sqlite_message_budget(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<(), String> {
+    for table in ["message", "part"] {
+        let sql = format!("SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0) FROM {table} WHERE session_id=?1");
+        let (rows, bytes): (i64, i64) = conn
+            .query_row(&sql, [session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| format!("无法检查会话读取大小：{e}"))?;
+        if rows > MAX_QUERY_ROWS || bytes > MAX_QUERY_BYTES {
+            return Err(
+                "会话超过单次读取限制（每表 20000 条 / 32 MB），请使用原 Agent 分段查看".into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 /// 会话 ID 会被拼进 `claude --resume {id}` 这类 resume 命令，并在 macOS 上
 /// 经 shell 执行（Windows 上也会被复制进剪贴板供用户粘贴）。因此只接受
@@ -56,12 +142,28 @@ where
     where
         F: Fn(&Path) -> bool + ?Sized,
     {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return;
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                scan_warning(format!("无法扫描 {}：{error}", root.display()));
+                return;
+            }
         };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan_warning(format!("无法枚举 {}：{error}", root.display()));
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    scan_warning(format!("无法读取 {}：{error}", entry.path().display()));
+                    continue;
+                }
             };
             let path = entry.path();
             if file_type.is_dir() {
@@ -87,7 +189,7 @@ pub fn read_head_tail_lines(
     // For small files, read all lines once and split
     if file_len < 16_384 {
         let reader = BufReader::new(file);
-        let all: Vec<String> = reader.lines().map_while(Result::ok).collect();
+        let all: Vec<String> = reader.lines().collect::<io::Result<_>>()?;
         let head = all.iter().take(head_n).cloned().collect();
         let skip = all.len().saturating_sub(tail_n);
         let tail = all.into_iter().skip(skip).collect();
@@ -95,19 +197,37 @@ pub fn read_head_tail_lines(
     }
 
     // Read head lines from the beginning
-    let reader = BufReader::new(file);
-    let head: Vec<String> = reader.lines().take(head_n).map_while(Result::ok).collect();
+    let mut reader = BufReader::new(file);
+    let mut head = Vec::new();
+    for _ in 0..head_n {
+        let mut line = String::new();
+        let count = reader
+            .by_ref()
+            .take(MAX_SCAN_LINE_BYTES + 1)
+            .read_line(&mut line)?;
+        if count == 0 {
+            break;
+        }
+        if count as u64 > MAX_SCAN_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Session metadata line exceeds scan limit",
+            ));
+        }
+        head.push(line);
+    }
 
     // Seek to last ~16 KB for tail lines
     let seek_pos = file_len.saturating_sub(16_384);
     let mut file2 = File::open(path)?;
     file2.seek(SeekFrom::Start(seek_pos))?;
-    let tail_reader = BufReader::new(file2);
-    let all_tail: Vec<String> = tail_reader.lines().map_while(Result::ok).collect();
-
-    // Skip first partial line if we seeked into the middle of a line
-    let skip_first = if seek_pos > 0 { 1 } else { 0 };
-    let usable: Vec<String> = all_tail.into_iter().skip(skip_first).collect();
+    let mut tail_reader = BufReader::new(file2);
+    // Discard the partial line as bytes, BEFORE attempting UTF-8 decoding.
+    if seek_pos > 0 {
+        let mut partial = Vec::new();
+        tail_reader.read_until(b'\n', &mut partial)?;
+    }
+    let usable: Vec<String> = tail_reader.lines().collect::<io::Result<_>>()?;
     let skip = usable.len().saturating_sub(tail_n);
     let tail = usable.into_iter().skip(skip).collect();
 
@@ -224,6 +344,53 @@ pub fn path_basename(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn derived_paths_cannot_escape_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        std::fs::create_dir_all(root.join("part")).unwrap();
+        assert!(checked_storage_child(&root, &root.join("part").join("msg_1")).is_ok());
+        assert!(checked_storage_child(
+            &root,
+            &root.join("part").join("..").join("..").join("victim")
+        )
+        .is_err());
+        assert!(checked_storage_child(&root, temp.path()).is_err());
+        assert!(checked_storage_child(&root, &root).is_err());
+    }
+
+    #[test]
+    fn tail_discards_partial_utf8_before_decoding() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unicode.jsonl");
+        let text = format!(
+            "{{\"text\":\"{}\"}}\n{{\"last\":true}}\n",
+            "中".repeat(6000)
+        );
+        assert_eq!(text.as_bytes()[text.len() - 16_384] & 0xc0, 0x80);
+        std::fs::write(&path, text).unwrap();
+        let (_, tail) = read_head_tail_lines(&path, 1, 30).unwrap();
+        assert_eq!(tail, vec!["{\"last\":true}"]);
+    }
+
+    #[test]
+    fn scan_rejects_unbounded_metadata_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.jsonl");
+        std::fs::write(&path, "x".repeat(MAX_SCAN_LINE_BYTES as usize + 2)).unwrap();
+        assert!(read_head_tail_lines(&path, 1, 1).is_err());
+    }
+
+    #[test]
+    fn sqlite_read_budget_bounds_record_count() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE message(session_id TEXT, data TEXT); CREATE TABLE part(session_id TEXT, data TEXT);
+            WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<20001)
+            INSERT INTO message SELECT 'ses_1', '{}' FROM n;").unwrap();
+        assert!(check_sqlite_message_budget(&conn, "ses_1").is_err());
+        assert!(check_sqlite_message_budget(&conn, "other").is_ok());
+    }
 
     #[test]
     fn parse_timestamp_to_ms_supports_integers_and_rfc3339() {

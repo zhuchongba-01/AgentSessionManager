@@ -45,7 +45,10 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(connection) => connection,
-        Err(_) => return Vec::new(),
+        Err(error) => {
+            super::utils::scan_warning(error.to_string());
+            return Vec::new();
+        }
     };
     let mut statement = match connection.prepare(
         "SELECT id, COALESCE(title, ''), COALESCE(directory, ''), \
@@ -53,7 +56,10 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
          FROM session ORDER BY time_updated DESC",
     ) {
         Ok(statement) => statement,
-        Err(_) => return Vec::new(),
+        Err(error) => {
+            super::utils::scan_warning(error.to_string());
+            return Vec::new();
+        }
     };
     let rows = match statement.query_map([], |row| {
         Ok((
@@ -65,40 +71,54 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
         ))
     }) {
         Ok(rows) => rows,
-        Err(_) => return Vec::new(),
+        Err(error) => {
+            super::utils::scan_warning(error.to_string());
+            return Vec::new();
+        }
     };
 
     let native_task_ids = load_native_task_ids(&tasks_index_path());
-    rows.flatten()
-        .map(|(session_id, title, directory, created, updated)| {
-            let display_title = if title.trim().is_empty() {
-                directory
-                    .trim_end_matches(['/', '\\'])
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            } else {
-                Some(title)
-            };
-            let residual = native_task_ids
-                .as_ref()
-                .is_some_and(|task_ids| !task_ids.contains(&session_id));
-            SessionMeta {
-                provider_id: PROVIDER_ID.to_string(),
-                session_id: session_id.clone(),
-                residual,
-                title: display_title.clone(),
-                summary: display_title,
-                project_dir: (!directory.is_empty()).then_some(directory),
-                project_name: None,
-                created_at: (created > 0).then_some(created),
-                last_active_at: (updated > 0).then_some(updated),
-                source_path: Some(source_reference(&path, &session_id)),
-                resume_command: (!residual).then(|| format!("zcode -s {session_id}")),
-            }
-        })
-        .collect()
+    if tasks_index_path().exists() && native_task_ids.is_none() {
+        super::utils::scan_warning("任务侧边栏索引无法读取，残留分类暂不可用");
+    }
+    rows.filter_map(|row| match row {
+        Ok(row) => Some(row),
+        Err(error) => {
+            super::utils::scan_warning(error.to_string());
+            None
+        }
+    })
+    .map(|(session_id, title, directory, created, updated)| {
+        let display_title = if title.trim().is_empty() {
+            directory
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        } else {
+            Some(title)
+        };
+        let residual = native_task_ids
+            .as_ref()
+            .is_some_and(|task_ids| !task_ids.contains(&session_id));
+        SessionMeta {
+            provider_id: PROVIDER_ID.to_string(),
+            session_id: session_id.clone(),
+            residual,
+            archived: false,
+            cleanup_pending: false,
+            title: display_title.clone(),
+            summary: display_title,
+            project_dir: (!directory.is_empty()).then_some(directory),
+            project_name: None,
+            created_at: (created > 0).then_some(created),
+            last_active_at: (updated > 0).then_some(updated),
+            source_path: Some(source_reference(&path, &session_id)),
+            resume_command: (!residual).then(|| format!("zcode -s {session_id}")),
+        }
+    })
+    .collect()
 }
 
 /// ZCode's desktop task list is backed by a separate index database. Session
@@ -125,11 +145,24 @@ fn load_native_task_ids(path: &Path) -> Option<BTreeSet<String>> {
 pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
     let (path, session_id) = parse_source(source)
         .ok_or_else(|| format!("Invalid ZCode SQLite source reference: {source}"))?;
+    if path.canonicalize().map_err(|e| e.to_string())?
+        != database_path().canonicalize().map_err(|e| e.to_string())?
+    {
+        return Err("ZCode database is outside configured storage".into());
+    }
     let connection = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| format!("Failed to open ZCode database: {error}"))?;
+
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+    super::utils::check_sqlite_message_budget(&connection, &session_id)?;
 
     let mut message_statement = connection
         .prepare(
@@ -157,7 +190,8 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
 
     let mut part_texts: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for (message_id, raw) in parts.flatten() {
+    for row in parts {
+        let (message_id, raw) = row.map_err(|e| e.to_string())?;
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
@@ -174,7 +208,8 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
     }
 
     let mut output = Vec::new();
-    for (message_id, raw, timestamp) in messages.flatten() {
+    for row in messages {
+        let (message_id, raw, timestamp) = row.map_err(|e| e.to_string())?;
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
@@ -226,6 +261,9 @@ pub fn delete_session(
     project_dir: Option<&str>,
     project_was_deleted: bool,
 ) -> Result<bool, String> {
+    if project_was_deleted {
+        return Err("项目级会话级联删除已禁用；请逐项选择会话".into());
+    }
     let (path, referenced_id) = parse_source(source)
         .ok_or_else(|| format!("Invalid ZCode SQLite source reference: {source}"))?;
     if referenced_id != session_id {
@@ -243,6 +281,13 @@ pub fn delete_session(
 
     validate_session_id(session_id)?;
 
+    let configured_database = database_path();
+    let cli_root = configured_database
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Invalid ZCode CLI directory")?;
+    session_sidecar_targets(cli_root, session_id)?;
+
     let initial_ids = BTreeSet::from([session_id.to_string()]);
     // The task index is ZCode's native sidebar. Clean it first so a later
     // primary-database failure leaves a recoverable residual session instead
@@ -258,11 +303,9 @@ pub fn delete_session(
     session_ids.extend(discovered_ids);
 
     let mut errors = Vec::new();
-    if let Some(cli_root) = actual.parent().and_then(Path::parent) {
-        for id in &session_ids {
-            if let Err(error) = cleanup_session_sidecars(cli_root, id) {
-                errors.push(error);
-            }
+    for id in &session_ids {
+        if let Err(error) = cleanup_session_sidecars(cli_root, id) {
+            errors.push(error);
         }
     }
 
@@ -538,6 +581,18 @@ fn task_order_session_id(node_key: &str) -> Option<String> {
 }
 
 fn cleanup_session_sidecars(cli_root: &Path, session_id: &str) -> Result<(), String> {
+    for target in session_sidecar_targets(cli_root, session_id)? {
+        remove_path_if_exists(&target).map_err(|error| {
+            format!(
+                "Failed to delete ZCode session sidecar {}: {error}",
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn session_sidecar_targets(cli_root: &Path, session_id: &str) -> Result<Vec<PathBuf>, String> {
     validate_session_id(session_id)?;
     let targets = [
         cli_root
@@ -548,15 +603,10 @@ fn cleanup_session_sidecars(cli_root: &Path, session_id: &str) -> Result<(), Str
         cli_root.join("agents").join(session_id),
         cli_root.join("exec").join("bash-startup").join(session_id),
     ];
-    for target in targets {
-        remove_path_if_exists(&target).map_err(|error| {
-            format!(
-                "Failed to delete ZCode session sidecar {}: {error}",
-                target.display()
-            )
-        })?;
-    }
-    Ok(())
+    targets
+        .iter()
+        .map(|target| super::utils::checked_storage_child(cli_root, target))
+        .collect()
 }
 
 fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {

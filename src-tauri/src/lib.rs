@@ -6,10 +6,10 @@ use tauri::tray::TrayIconBuilder;
 use tauri::Theme;
 
 #[tauri::command]
-async fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, String> {
-    tauri::async_runtime::spawn_blocking(session_manager::scan_sessions)
+async fn list_sessions() -> Result<session_manager::SessionScanReport, String> {
+    tauri::async_runtime::spawn_blocking(session_manager::checked_list_sessions)
         .await
-        .map_err(|error| format!("扫描会话失败：{error}"))
+        .map_err(|error| format!("扫描会话失败：{error}"))?
 }
 
 #[tauri::command]
@@ -55,22 +55,20 @@ async fn delete_sessions(
 }
 
 #[tauri::command]
-async fn launch_session_terminal(
-    command: String,
-    cwd: Option<String>,
-    #[allow(non_snake_case)] customConfig: Option<String>,
-) -> Result<bool, String> {
+async fn session_resume(
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] sourcePath: String,
+    launch: bool,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        session_manager::terminal::launch_terminal(
-            "terminal",
-            &command,
-            cwd.as_deref(),
-            customConfig.as_deref(),
-        )
+        let command = session_manager::resume_command(&providerId, &sourcePath)?;
+        if launch {
+            session_manager::terminal::launch_terminal("terminal", &command, None, None)?;
+        }
+        Ok(command)
     })
     .await
-    .map_err(|error| format!("启动终端失败：{error}"))??;
-    Ok(true)
+    .map_err(|error| format!("恢复会话失败：{error}"))?
 }
 
 #[tauri::command]
@@ -143,7 +141,7 @@ pub fn run() {
             get_session_messages,
             delete_session,
             delete_sessions,
-            launch_session_terminal,
+            session_resume,
             get_pi_session_discovery,
             set_window_theme,
         ])

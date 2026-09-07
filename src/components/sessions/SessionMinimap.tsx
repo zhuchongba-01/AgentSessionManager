@@ -61,8 +61,9 @@ export function SessionMinimap({
         const reply = messages
           .slice(messageIndex + 1, nextMessageIndex)
           .filter((item) => item.role.toLowerCase() === "assistant")
-          .map((item) => item.content)
-          .join("\n");
+          .map((item) => item.content.slice(0, 220))
+          .join("\n")
+          .slice(0, 220);
         return [{ messageIndex, user: message.content, reply }];
       }),
     [messageIndexes, messages],

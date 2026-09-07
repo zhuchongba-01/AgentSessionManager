@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   extractCodexPromptPreview,
   formatSessionMessagePreview,
+  getProviderIconName,
+  getProviderLabel,
   getVisibleSessionMessages,
   groupSessionsByProviderAndDirectory,
   shouldHideCodexMessageFromToc,
@@ -9,6 +11,18 @@ import {
 import type { SessionMessage, SessionMeta } from "@/types";
 
 describe("session utils", () => {
+  it("uses canonical Agent brand names and normalized icon keys", () => {
+    const untranslated = (key: string) => key;
+    expect(getProviderLabel("codex", untranslated)).toBe("Codex");
+    expect(getProviderLabel("claude", untranslated)).toBe("Claude Code");
+    expect(getProviderLabel("opencode", untranslated)).toBe("OpenCode");
+    expect(getProviderLabel("zcode", untranslated)).toBe("ZCode");
+    expect(getProviderLabel("grokbuild", untranslated)).toBe("Grok Build");
+    expect(getProviderLabel("pi", untranslated)).toBe("Pi");
+    expect(getProviderIconName("Codex")).toBe("openai");
+    expect(getProviderIconName("GROKBUILD")).toBe("grok");
+  });
+
   it("hides Codex internal context from the readable transcript", () => {
     const messages: SessionMessage[] = [
       { role: "developer", content: "INTERNAL_DEVELOPER_PROMPT" },

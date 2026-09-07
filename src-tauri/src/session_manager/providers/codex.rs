@@ -54,12 +54,121 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
     let thread_titles = load_thread_titles();
     let project_context = load_project_context();
     let native_rollouts = load_native_active_rollouts();
-    scan_sessions_in_roots_with_context(
+    let mut sessions = scan_sessions_in_roots_with_context(
         &roots,
         &thread_titles,
         &project_context,
         native_rollouts.as_ref(),
-    )
+    );
+    let indexed = match load_indexed_rollouts() {
+        Ok(indexed) => indexed,
+        Err(error) => {
+            super::utils::scan_warning(error);
+            None
+        }
+    };
+    let indexed_ids = indexed
+        .as_ref()
+        .map(|items| items.keys().cloned().collect::<HashSet<_>>());
+    if let Some(indexed) = indexed {
+        for (id, source) in indexed {
+            if let Some(item) = sessions.iter_mut().find(|item| {
+                item.session_id == id
+                    && item.source_path.as_deref().is_some_and(|path| {
+                        normalized_rollout_path(path) == normalized_rollout_path(&source)
+                    })
+            }) {
+                if native_rollouts
+                    .as_ref()
+                    .is_some_and(|active| !active.contains_key(&id))
+                {
+                    item.archived = true;
+                    item.residual = false;
+                    item.resume_command = None;
+                }
+            } else if !Path::new(&source).exists() {
+                sessions.push(SessionMeta {
+                    provider_id: PROVIDER_ID.into(),
+                    session_id: id.clone(),
+                    residual: false,
+                    archived: native_rollouts
+                        .as_ref()
+                        .is_some_and(|active| !active.contains_key(&id)),
+                    cleanup_pending: true,
+                    title: thread_titles
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| Some(format!("缺少日志的任务 {id}"))),
+                    summary: Some("索引仍存在，但日志文件已消失；可继续清理索引".into()),
+                    project_dir: None,
+                    project_name: None,
+                    created_at: None,
+                    last_active_at: None,
+                    source_path: Some(source),
+                    resume_command: None,
+                });
+            }
+        }
+    }
+    match desktop_catalog_ids() {
+        Ok(ids) => {
+            for id in ids {
+                // Do not classify unreadable/unscanned live records as index ghosts.
+                if indexed_ids
+                    .as_ref()
+                    .is_none_or(|indexed| indexed.contains(&id))
+                {
+                    continue;
+                }
+                if sessions.iter().any(|session| session.session_id == id) {
+                    continue;
+                }
+                sessions.push(SessionMeta {
+                    provider_id: PROVIDER_ID.into(),
+                    session_id: id.clone(),
+                    residual: false,
+                    archived: false,
+                    cleanup_pending: true,
+                    title: Some(format!("仅剩侧边栏索引的任务 {id}")),
+                    summary: Some(
+                        "侧边栏索引存在，但没有找到对应日志；请退出 Codex 后继续清理".into(),
+                    ),
+                    project_dir: None,
+                    project_name: None,
+                    created_at: None,
+                    last_active_at: None,
+                    source_path: Some(format!("codex-index:{id}")),
+                    resume_command: None,
+                });
+            }
+        }
+        Err(error) => super::utils::scan_warning(error),
+    }
+    sessions
+}
+
+fn desktop_catalog_ids() -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    for path in codex_desktop_db_paths(&codex_config_dir())? {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+        conn.busy_timeout(Duration::from_secs(2))
+            .map_err(|e| e.to_string())?;
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_thread_catalog')", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if !exists {
+            continue;
+        }
+        let mut statement = conn
+            .prepare("SELECT thread_id FROM local_thread_catalog")
+            .map_err(|e| e.to_string())?;
+        for row in statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+        {
+            ids.insert(row.map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(ids)
 }
 
 pub fn session_roots() -> Vec<PathBuf> {
@@ -72,12 +181,55 @@ pub fn session_roots() -> Vec<PathBuf> {
 
 /// A historical rollout may share its thread id with the current Codex task.
 /// Deleting that old file must not remove the live thread from Codex's index.
-pub fn should_cleanup_index_after_delete(session_id: &str, source_path: &str) -> bool {
-    load_native_active_rollouts().is_none_or(|rollouts| {
-        rollouts
-            .get(session_id)
-            .is_none_or(|current_path| current_path == &normalized_rollout_path(source_path))
-    })
+pub fn should_cleanup_index_after_delete(
+    session_id: &str,
+    source_path: &str,
+) -> Result<bool, String> {
+    Ok(load_indexed_rollouts()?.is_none_or(|rollouts| {
+        rollouts.get(session_id).is_none_or(|path| {
+            normalized_rollout_path(path) == normalized_rollout_path(source_path)
+        })
+    }))
+}
+
+fn load_indexed_rollouts() -> Result<Option<HashMap<String, String>>, String> {
+    let config_dir = codex_config_dir();
+    let config = read_codex_config_text()?;
+    load_indexed_rollouts_from_paths(codex_state_db_paths(&config_dir, &config))
+}
+
+fn load_indexed_rollouts_from_paths(
+    paths: Vec<PathBuf>,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let mut rollouts = HashMap::new();
+    let mut loaded = false;
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("无法读取 Codex 任务索引，已停止清理：{e}"))?;
+        conn.busy_timeout(Duration::from_secs(2))
+            .map_err(|e| e.to_string())?;
+        let mut statement = conn
+            .prepare("SELECT id, rollout_path FROM threads")
+            .map_err(|e| format!("Codex 索引结构不兼容，已停止清理：{e}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, source) = row.map_err(|e| e.to_string())?;
+            if let Some(previous) = rollouts.insert(id, source.clone()) {
+                if normalized_rollout_path(&previous) != normalized_rollout_path(&source) {
+                    return Err("多个 Codex 索引对同一任务指向不同日志，已停止清理".into());
+                }
+            }
+        }
+        loaded = true;
+    }
+    Ok(loaded.then_some(rollouts))
 }
 
 /// Remove the exact Codex desktop indexes that survive after a rollout file or
@@ -270,6 +422,7 @@ fn rewrite_session_index(path: &Path, session_id: &str) -> Result<(), String> {
         } else {
             kept + "\n"
         },
+        &text,
     )
 }
 
@@ -399,10 +552,10 @@ fn cleanup_global_state(
     if !path.is_file() {
         return Ok(());
     }
-    let mut value: Value = serde_json::from_str(
-        &std::fs::read_to_string(path).map_err(|e| format!("无法读取 Codex 全局状态：{e}"))?,
-    )
-    .map_err(|e| format!("Codex 全局状态格式无效：{e}"))?;
+    let original =
+        std::fs::read_to_string(path).map_err(|e| format!("无法读取 Codex 全局状态：{e}"))?;
+    let mut value: Value =
+        serde_json::from_str(&original).map_err(|e| format!("Codex 全局状态格式无效：{e}"))?;
     if !value.is_object() {
         return Ok(());
     }
@@ -433,7 +586,7 @@ fn cleanup_global_state(
         }
     }
     let text = serde_json::to_string(&value).map_err(|e| e.to_string())? + "\n";
-    atomic_write(path, text)
+    atomic_write(path, text, &original)
 }
 
 /// Remove exact references to one Codex thread from the desktop state tree.
@@ -516,7 +669,7 @@ fn normalized_path(value: &str) -> String {
         .to_lowercase()
 }
 
-fn atomic_write(path: &Path, text: String) -> Result<(), String> {
+fn atomic_write(path: &Path, text: String, expected: &str) -> Result<(), String> {
     let mut temp = tempfile::NamedTempFile::new_in(
         path.parent()
             .ok_or_else(|| "索引文件没有父目录".to_string())?,
@@ -524,6 +677,10 @@ fn atomic_write(path: &Path, text: String) -> Result<(), String> {
     .map_err(|e| format!("无法创建临时索引文件：{e}"))?;
     temp.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     temp.flush().map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    if std::fs::read_to_string(path).map_err(|e| e.to_string())? != expected {
+        return Err("Codex 索引在清理期间发生变化，已停止覆盖；请退出 Agent 后重试".into());
+    }
     temp.persist(path)
         .map(|_| ())
         .map_err(|e| format!("无法替换 Codex 索引：{}", e.error))
@@ -611,7 +768,16 @@ fn mark_residual_rollouts(
     }
     for (index, session) in sessions.iter_mut().enumerate() {
         session.residual = current_by_id.get(&session.session_id).copied() != Some(index);
-        if session.residual {
+        if !current_by_id.contains_key(&session.session_id)
+            && session
+                .source_path
+                .as_deref()
+                .is_some_and(is_archived_rollout)
+        {
+            session.archived = true;
+            session.residual = false;
+        }
+        if session.residual || session.archived {
             session.resume_command = None;
         }
     }
@@ -637,11 +803,18 @@ fn is_archived_rollout(path: &str) -> bool {
 }
 
 fn normalized_rollout_path(path: &str) -> String {
-    let path = path.replace('/', "\\");
-    path.strip_prefix("\\\\?\\")
-        .unwrap_or(&path)
-        .trim_end_matches('\\')
-        .to_lowercase()
+    #[cfg(not(target_os = "windows"))]
+    {
+        return path.trim_end_matches('/').to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path = path.replace('/', "\\");
+        path.strip_prefix("\\\\?\\")
+            .unwrap_or(&path)
+            .trim_end_matches('\\')
+            .to_lowercase()
+    }
 }
 
 /// Read the same project assignments used by the Codex desktop sidebar.  A
@@ -1000,11 +1173,22 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_with_titles(path, &HashMap::new())
 }
 
+pub fn working_directory(path: &Path) -> Result<Option<String>, String> {
+    parse_session(path)
+        .map(|meta| meta.project_dir)
+        .ok_or_else(|| "无法读取会话的原始工作目录".into())
+}
+
 fn parse_session_with_titles(
     path: &Path,
     thread_titles: &HashMap<String, String>,
 ) -> Option<SessionMeta> {
-    let (head, tail) = read_head_tail_lines(path, 10, 300).ok()?;
+    let (head, tail) = read_head_tail_lines(path, 10, 300)
+        .map_err(|error| {
+            super::utils::scan_warning(format!("无法读取 {}：{error}", path.display()));
+            error
+        })
+        .ok()?;
 
     let mut session_id: Option<String> = None;
     let mut project_dir: Option<String> = None;
@@ -1123,6 +1307,8 @@ fn parse_session_with_titles(
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: false,
+        archived: false,
+        cleanup_pending: false,
         title,
         summary,
         project_dir,
@@ -1232,6 +1418,36 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_lookup_includes_archived_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE threads(id TEXT, rollout_path TEXT, archived INTEGER);
+            INSERT INTO threads VALUES('archived-1','archived.jsonl',1),('active-1','active.jsonl',0);").unwrap();
+        drop(conn);
+        let indexed = load_indexed_rollouts_from_paths(vec![path])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            indexed.get("archived-1").map(String::as_str),
+            Some("archived.jsonl")
+        );
+        assert!(indexed.contains_key("active-1"));
+    }
+
+    #[test]
+    fn index_replacement_rejects_a_changed_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.json");
+        std::fs::write(&path, "new state from agent").unwrap();
+        assert!(atomic_write(&path, "manager edit".into(), "old snapshot").is_err());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "new state from agent"
+        );
+    }
     use crate::session_paths::CODEX_STATE_DB_FILENAME;
     use tempfile::tempdir;
 
@@ -1497,10 +1713,8 @@ mod tests {
         let rollouts = load_native_active_rollouts_from_db(&db_path).expect("load rollouts");
 
         assert_eq!(rollouts.len(), 1);
-        assert_eq!(
-            rollouts.get("active-thread").map(String::as_str),
-            Some(r"c:\users\test\.codex\sessions\active.jsonl")
-        );
+        let expected = normalized_rollout_path(r"\\?\C:\Users\test\.codex\sessions\active.jsonl");
+        assert_eq!(rollouts.get("active-thread"), Some(&expected));
         assert!(!rollouts.contains_key("archived-thread"));
     }
 

@@ -1,6 +1,5 @@
 import { useTranslation } from "react-i18next";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Badge } from "@/components/ui/badge";
 import {
   Tooltip,
   TooltipContent,
@@ -9,6 +8,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { SessionMeta } from "@/types";
 import { AgentIcon } from "./AgentIcon";
+import { SessionStatusBadges } from "./SessionStatusBadges";
 import {
   formatRelativeTime,
   formatSessionTitle,
@@ -40,6 +40,7 @@ export function SessionItem({
   const title = formatSessionTitle(session);
   const lastActive = session.lastActiveAt || session.createdAt || undefined;
   const sessionKey = getSessionKey(session);
+  const providerLabel = getProviderLabel(session.providerId, t);
 
   return (
     <div className={cn("asm-session-item group", isSelected && "is-selected")}>
@@ -64,7 +65,7 @@ export function SessionItem({
             <span className="asm-provider-icon">
               <AgentIcon
                 icon={getProviderIconName(session.providerId)}
-                name={session.providerId}
+                name={providerLabel}
                 size={16}
               />
             </span>
@@ -74,18 +75,7 @@ export function SessionItem({
           </TooltipContent>
         </Tooltip>
         <span className="asm-session-title">{title}</span>
-        {session.residual && (
-          <Badge
-            variant="outline"
-            title={t("sessionManager.residualDescription", {
-              defaultValue:
-                "本地文件仍存在，但该记录未显示在 Agent 的当前会话列表中",
-            })}
-            className="shrink-0 border-amber-500/50 px-1.5 py-0 text-[10px] font-medium text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300"
-          >
-            {t("sessionManager.residual", { defaultValue: "残留" })}
-          </Badge>
-        )}
+        <SessionStatusBadges session={session} />
         <span className="asm-session-time">
           {lastActive ? formatRelativeTime(lastActive, t) : t("common.unknown")}
         </span>

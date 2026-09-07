@@ -3,5 +3,5 @@ pub mod codex;
 pub mod grokbuild;
 pub mod opencode;
 pub mod pi;
-mod utils;
+pub(crate) mod utils;
 pub mod zcode;

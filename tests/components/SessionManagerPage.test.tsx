@@ -43,37 +43,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: openUrlMock,
 }));
 
-vi.mock("@/components/ConfirmDialog", () => ({
-  ConfirmDialog: ({
-    isOpen,
-    title,
-    message,
-    confirmText,
-    cancelText,
-    onConfirm,
-    onCancel,
-  }: {
-    isOpen: boolean;
-    title: string;
-    message: string;
-    confirmText: string;
-    cancelText: string;
-    onConfirm: (checkboxChecked: boolean) => void;
-    onCancel: () => void;
-  }) =>
-    isOpen ? (
-      <div data-testid="confirm-dialog">
-        <div>{title}</div>
-        <div>{message}</div>
-        {/* 真实组件通过 onConfirm(checkboxChecked) 回传布尔值；若直接把
-            onConfirm 挂到 onClick，事件对象会被当成 includeProject 一路
-            传进 invoke 的 JSON.stringify，触发循环引用错误。 */}
-        <button onClick={() => onConfirm(false)}>{confirmText}</button>
-        <button onClick={onCancel}>{cancelText}</button>
-      </div>
-    ) : null,
-}));
-
 const renderPage = (appId = "codex") => {
   const client = new QueryClient({
     defaultOptions: {
@@ -313,15 +282,15 @@ describe("SessionManagerPage", () => {
     await userEvent.click(filter);
 
     const codexOption = await screen.findByRole("option", { name: /Codex/ });
-    expect(within(codexOption).getByTitle("codex")).toBeInTheDocument();
+    expect(within(codexOption).getByTitle("Codex")).toBeInTheDocument();
     expect(codexOption).toHaveTextContent("3");
 
     const claudeOption = screen.getByRole("option", { name: /Claude Code/ });
-    expect(within(claudeOption).getByTitle("claude")).toBeInTheDocument();
+    expect(within(claudeOption).getByTitle("Claude Code")).toBeInTheDocument();
     expect(claudeOption).toHaveTextContent("1");
 
     const zcodeOption = screen.getByRole("option", { name: /ZCode/ });
-    expect(within(zcodeOption).getByTitle("zcode")).toBeInTheDocument();
+    expect(within(zcodeOption).getByTitle("ZCode")).toBeInTheDocument();
     expect(zcodeOption).toHaveTextContent("0");
   });
 
@@ -397,7 +366,7 @@ describe("SessionManagerPage", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
 
     expect(screen.getByText("已选 3 项")).toBeInTheDocument();
 
@@ -413,45 +382,21 @@ describe("SessionManagerPage", () => {
     );
   });
 
-  it("requires a second confirmation when the backend reports a shared directory", async () => {
+  it("never offers project-directory deletion in the real confirmation dialog", async () => {
     const deleteSpy = vi
       .spyOn(sessionsApi, "delete")
-      .mockResolvedValueOnce({
-        status: "needs_shared_confirmation",
-        sharedCount: 2,
-        providers: ["codex、claude"],
-      })
       .mockResolvedValueOnce({ status: "deleted" });
-
     renderPage();
-
-    await waitFor(() =>
-      expect(
-        screen.getByRole("heading", { name: "Alpha Session" }),
-      ).toBeInTheDocument(),
-    );
-
+    await screen.findByRole("heading", { name: "Alpha Session" });
     fireEvent.click(screen.getByRole("button", { name: /删除会话/i }));
-    const dialog = screen.getByTestId("confirm-dialog");
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
-
-    // 第一次点击只向后端询问；共享判定返回后对话框保持打开等待二次确认
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(1));
-    expect(deleteSpy.mock.calls[0][0].sharedConfirmed).toBe(false);
-    expect(screen.getByTestId("confirm-dialog")).toBeInTheDocument();
-
-    fireEvent.click(
-      within(screen.getByTestId("confirm-dialog")).getByRole("button", {
-        name: /删除会话/i,
-      }),
-    );
-
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(2));
-    expect(deleteSpy.mock.calls[1][0].sharedConfirmed).toBe(true);
     await waitFor(() =>
-      expect(screen.queryByTestId("confirm-dialog")).not.toBeInTheDocument(),
+      expect(deleteSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ includeProject: false }),
+      ),
     );
-    expect(toastSuccessMock).toHaveBeenCalled();
     deleteSpy.mockRestore();
   });
 
@@ -497,7 +442,7 @@ describe("SessionManagerPage", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
@@ -537,7 +482,7 @@ describe("SessionManagerPage", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
@@ -569,12 +514,12 @@ describe("SessionManagerPage", () => {
 
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 codex 供应商分组/,
+        name: /展开或折叠 Codex 供应商分组/,
       }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 claude 供应商分组/,
+        name: /展开或折叠 Claude Code 供应商分组/,
       }),
     ).toBeInTheDocument();
     expect(
@@ -650,7 +595,7 @@ describe("SessionManagerPage", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 claude 供应商分组/,
+        name: /展开或折叠 Claude Code 供应商分组/,
       }),
     ).toBeInTheDocument();
     expect(
@@ -673,7 +618,7 @@ describe("SessionManagerPage", () => {
 
     await switchToGroupedView();
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
@@ -703,10 +648,10 @@ describe("SessionManagerPage", () => {
     await enterGroupedBatchMode();
 
     const codexProviderCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 供应商分组内会话/,
+      name: /选择 Codex 供应商分组内会话/,
     });
     const claudeProviderCheckbox = screen.getByRole("checkbox", {
-      name: /选择 claude 供应商分组内会话/,
+      name: /选择 Claude Code 供应商分组内会话/,
     });
 
     fireEvent.click(codexProviderCheckbox);
@@ -734,7 +679,7 @@ describe("SessionManagerPage", () => {
     expandDirectoryGroup("codex", "codex");
 
     const providerCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 供应商分组内会话/,
+      name: /选择 Codex 供应商分组内会话/,
     });
     const codexDirectoryCheckbox = screen.getByRole("checkbox", {
       name: /选择 codex 目录分组内会话/,
@@ -763,7 +708,7 @@ describe("SessionManagerPage", () => {
 
     expect(
       screen.getByRole("checkbox", {
-        name: /选择 codex 供应商分组内会话/,
+        name: /选择 Codex 供应商分组内会话/,
       }),
     ).toHaveAttribute("aria-checked", "mixed");
     expect(
@@ -808,5 +753,170 @@ describe("SessionManagerPage", () => {
     ).toBeInTheDocument();
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
+  });
+
+  it("shows message read failures rather than an empty conversation", async () => {
+    const spy = vi
+      .spyOn(sessionsApi, "getMessages")
+      .mockRejectedValue(new Error("database is locked"));
+    renderPage();
+    expect(
+      await screen.findByText("会话读取失败，不能据此判断会话为空。"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("database is locked")).toBeInTheDocument();
+    expect(
+      screen.queryByText("sessionManager.emptySession"),
+    ).not.toBeInTheDocument();
+    spy.mockRestore();
+  });
+
+  it("shows scan failures rather than no sessions", async () => {
+    const spy = vi
+      .spyOn(sessionsApi, "list")
+      .mockRejectedValue(new Error("access denied"));
+    renderPage();
+    expect(await screen.findByRole("alert")).toHaveTextContent("access denied");
+    expect(
+      screen.queryByText("sessionManager.noSessions"),
+    ).not.toBeInTheDocument();
+    spy.mockRestore();
+  });
+
+  it("surfaces partial scan diagnostics alongside readable sessions", async () => {
+    const original = sessionsApi.list;
+    const spy = vi
+      .spyOn(sessionsApi, "list")
+      .mockImplementation(async (onWarnings) => {
+        const sessions = await original();
+        onWarnings?.(["zcode: database is locked"]);
+        return sessions;
+      });
+    renderPage();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "zcode: database is locked",
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Alpha Session" }),
+    ).toBeInTheDocument();
+    spy.mockRestore();
+  });
+
+  it("keeps a pending deletion visible and offers a retry", async () => {
+    const target: SessionMeta = {
+      providerId: "codex",
+      sessionId: "pending-1",
+      title: "Pending Session",
+      sourcePath: "/mock/pending.jsonl",
+      cleanupPending: true,
+    };
+    setSessionFixtures([target], {});
+    const spy = vi.spyOn(sessionsApi, "delete").mockResolvedValue({
+      status: "cleanup_pending",
+      warnings: ["index locked"],
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "继续清理" }));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: /删除会话/,
+      }),
+    );
+    await waitFor(() =>
+      expect(toastWarningMock).toHaveBeenCalledWith(
+        "清理尚未完成，可在列表中继续清理",
+        expect.objectContaining({ description: "index locked" }),
+      ),
+    );
+    expect(
+      await screen.findByRole("button", { name: "继续清理" }),
+    ).toBeInTheDocument();
+    expect(toastSuccessMock).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("invalidates selected messages when rescanning unchanged session paths", async () => {
+    const spy = vi
+      .spyOn(sessionsApi, "getMessages")
+      .mockResolvedValue([{ role: "user", content: "before rescan" }]);
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    const before = spy.mock.calls.length;
+    spy.mockResolvedValue([{ role: "user", content: "after rescan" }]);
+    fireEvent.click(screen.getByRole("button", { name: /重新扫描/ }));
+    await waitFor(() => expect(spy.mock.calls.length).toBeGreaterThan(before));
+    spy.mockRestore();
+  });
+
+  it("refreshes the list after a deletion request fails", async () => {
+    const listSpy = vi.spyOn(sessionsApi, "list");
+    const deleteSpy = vi
+      .spyOn(sessionsApi, "delete")
+      .mockRejectedValue(new Error("partial cleanup"));
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+    const before = listSpy.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /删除会话/ }));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: /删除会话/,
+      }),
+    );
+    await waitFor(() =>
+      expect(listSpy.mock.calls.length).toBeGreaterThan(before),
+    );
+    deleteSpy.mockRestore();
+    listSpy.mockRestore();
+  });
+
+  it("copies a backend-validated resume command for a current session", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "resume-1",
+          title: "Resume Session",
+          sourcePath: "/mock/resume.jsonl",
+          resumeCommand: "codex resume resume-1",
+        },
+      ],
+      {},
+    );
+    const spy = vi
+      .spyOn(sessionsApi, "resume")
+      .mockResolvedValue("codex resume resume-1");
+    const copy = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: copy },
+    });
+    renderPage();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "复制恢复命令" }),
+    );
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith("codex", "/mock/resume.jsonl", false),
+    );
+    expect(copy).toHaveBeenCalledWith("codex resume resume-1");
+    spy.mockRestore();
+  });
+
+  it("labels archived sessions and disables direct resume", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "archive-1",
+          title: "Archived Session",
+          sourcePath: "/mock/archive.jsonl",
+          archived: true,
+          resumeCommand: "codex resume archive-1",
+        },
+      ],
+      {},
+    );
+    renderPage();
+    await screen.findByRole("heading", { name: "Archived Session" });
+    expect(screen.getAllByText("已归档").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "复制恢复命令" })).toBeDisabled();
   });
 });

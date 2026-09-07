@@ -254,7 +254,7 @@ body {
   background: transparent !important;
   box-shadow: none !important;
   color: hsl(var(--muted-foreground));
-  font-size: 12px !important;
+  font-size: 13px !important;
   font-weight: 400 !important;
 }
 
@@ -407,16 +407,16 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* 工具栏下拉菜单：内容尺寸与触发器（12px）保持一致，避免展开后突变 */
+/* 工具栏下拉菜单：内容尺寸与触发器保持一致，避免展开后突变 */
 .asm-select-content {
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .asm-select-content [role="option"] {
   min-height: 0;
   padding-top: 5px;
   padding-bottom: 5px;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .asm-select-content [role="option"] svg {
@@ -504,7 +504,8 @@ body {
 
 .asm-detail-provider {
   color: hsl(var(--muted-foreground));
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .asm-detail-tool,

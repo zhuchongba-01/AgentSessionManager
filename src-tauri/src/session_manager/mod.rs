@@ -1,3 +1,4 @@
+mod deletion;
 pub mod providers;
 pub mod terminal;
 
@@ -6,12 +7,16 @@ use std::path::{Path, PathBuf};
 
 use providers::{claude, codex, grokbuild, opencode, pi, zcode};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMeta {
     pub provider_id: String,
     pub session_id: String,
     pub residual: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub cleanup_pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,15 +69,16 @@ pub struct DeleteSessionOutcome {
     pub warnings: Vec<String>,
 }
 
-/// 删除请求的结构化结果：让前端能区分"已删除""记录本就不存在"和
-/// "需要就共享目录二次确认"，而不是靠解析错误字符串。
+/// 删除请求的结构化结果；任何未完成的清理都必须保留可重试记录。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeleteSessionReply {
-    /// 记录已删除。warnings 携带非致命的后续清理失败（如 Codex 正在运行
-    /// 时状态库被锁住），不应向用户报告为删除失败。
+    /// 记录已删除。内部清理警告由持久化协调器转换为 CleanupPending。
     Deleted {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    CleanupPending {
         warnings: Vec<String>,
     },
     /// 记录本就不存在（可能已被同批其他项的级联清理删掉），目标状态已达成。
@@ -86,14 +92,28 @@ pub enum DeleteSessionReply {
     },
 }
 
+#[derive(Serialize)]
+pub struct SessionScanReport {
+    pub sessions: Vec<SessionMeta>,
+    pub warnings: Vec<String>,
+}
+
 pub fn scan_sessions() -> Vec<SessionMeta> {
+    scan_report().sessions
+}
+
+fn scan_report() -> SessionScanReport {
     let (r1, r2, r3, r4, r5, r6) = std::thread::scope(|s| {
-        let h1 = s.spawn(codex::scan_sessions);
-        let h2 = s.spawn(claude::scan_sessions);
-        let h3 = s.spawn(opencode::scan_sessions);
-        let h4 = s.spawn(grokbuild::scan_sessions);
-        let h5 = s.spawn(pi::scan_sessions);
-        let h6 = s.spawn(zcode::scan_sessions);
+        let h1 = s.spawn(|| providers::utils::scan_with_diagnostics("codex", codex::scan_sessions));
+        let h2 =
+            s.spawn(|| providers::utils::scan_with_diagnostics("claude", claude::scan_sessions));
+        let h3 = s
+            .spawn(|| providers::utils::scan_with_diagnostics("opencode", opencode::scan_sessions));
+        let h4 = s.spawn(|| {
+            providers::utils::scan_with_diagnostics("grokbuild", grokbuild::scan_sessions)
+        });
+        let h5 = s.spawn(|| providers::utils::scan_with_diagnostics("pi", pi::scan_sessions));
+        let h6 = s.spawn(|| providers::utils::scan_with_diagnostics("zcode", zcode::scan_sessions));
         (
             join_scan_results(h1),
             join_scan_results(h2),
@@ -105,27 +125,43 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
     });
 
     let mut sessions = Vec::new();
-    sessions.extend(r1);
-    sessions.extend(r2);
-    sessions.extend(r3);
-    sessions.extend(r4);
-    sessions.extend(r5);
-    sessions.extend(r6);
+    let mut warnings = Vec::new();
+    for (items, issues) in [r1, r2, r3, r4, r5, r6] {
+        sessions.extend(items);
+        warnings.extend(issues);
+    }
 
+    if let Ok(pending) = deletion::pending_sessions() {
+        for item in pending {
+            if let Some(existing) = sessions.iter_mut().find(|s| {
+                s.provider_id == item.provider_id
+                    && s.session_id == item.session_id
+                    && s.source_path == item.source_path
+            }) {
+                existing.cleanup_pending = true;
+                existing.resume_command = None;
+                existing.residual = item.residual;
+                existing.archived = item.archived;
+                existing.summary = item.summary;
+            } else {
+                sessions.push(item);
+            }
+        }
+    }
     sessions.sort_by(|a, b| {
         let a_ts = a.last_active_at.or(a.created_at).unwrap_or(0);
         let b_ts = b.last_active_at.or(b.created_at).unwrap_or(0);
         b_ts.cmp(&a_ts)
     });
 
-    sessions
+    SessionScanReport { sessions, warnings }
 }
 
 /// 单个 provider 的扫描线程 panic 时不允许无声吞掉：至少留下日志，否则
 /// 用户看到的是"该 Agent 没有会话"，与真的没有会话无法区分。
 fn join_scan_results(
-    handle: std::thread::ScopedJoinHandle<'_, Vec<SessionMeta>>,
-) -> Vec<SessionMeta> {
+    handle: std::thread::ScopedJoinHandle<'_, (Vec<SessionMeta>, Vec<String>)>,
+) -> (Vec<SessionMeta>, Vec<String>) {
     match handle.join() {
         Ok(items) => items,
         Err(payload) => {
@@ -135,7 +171,7 @@ fn join_scan_results(
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic payload".to_string());
             log::warn!("provider scan thread panicked: {message}");
-            Vec::new()
+            (Vec::new(), vec![format!("Agent 扫描线程失败：{message}")])
         }
     }
 }
@@ -149,7 +185,15 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
         return zcode::load_messages(source_path);
     }
 
+    let roots = provider_roots(provider_id)?;
     let path = Path::new(source_path);
+    let canonical = canonicalize_existing_path(path, "session source")?;
+    if !roots.iter().any(|root| {
+        root.canonicalize()
+            .is_ok_and(|root| canonical.starts_with(root))
+    }) {
+        return Err("Session source is outside configured storage".into());
+    }
     match provider_id {
         "codex" => codex::load_messages(path),
         "claude" => claude::load_messages(path),
@@ -160,6 +204,62 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
     }
 }
 
+pub fn checked_list_sessions() -> Result<SessionScanReport, String> {
+    deletion::pending_sessions()?;
+    Ok(scan_report())
+}
+
+pub fn resume_command(provider: &str, source: &str) -> Result<String, String> {
+    let session = scan_sessions()
+        .into_iter()
+        .find(|session| {
+            session.provider_id == provider && session.source_path.as_deref() == Some(source)
+        })
+        .ok_or("会话已不存在，请重新扫描")?;
+    if session.cleanup_pending || session.archived || session.residual {
+        return Err("该记录正在清理、已归档或属于历史副本，请先在原 Agent 中处理".into());
+    }
+    if !providers::utils::is_safe_session_id(&session.session_id) {
+        return Err("会话 ID 无法安全用于恢复命令".into());
+    }
+    let quote = |value: &str| {
+        if cfg!(target_os = "windows") {
+            format!("'{}'", value.replace('\'', "''"))
+        } else {
+            terminal::shell_escape(value)
+        }
+    };
+    let id = &session.session_id;
+    let command = match provider {
+        "codex" => format!("codex resume {id}"),
+        "claude" => format!("claude --resume {id}"),
+        "opencode" => format!("opencode -s {id}"),
+        "zcode" => format!("zcode -s {id}"),
+        "grokbuild" => format!("grok --resume {id}"),
+        "pi" => format!("pi --session {}", quote(source)),
+        _ => return Err("不支持此 Agent".into()),
+    };
+    let cwd = if provider == "codex" {
+        codex::working_directory(Path::new(source))?
+    } else {
+        session.project_dir
+    };
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        if !Path::new(&cwd).is_dir() {
+            return Err("会话工作目录已不存在，请先恢复目录或使用原 Agent 选择新的目录".into());
+        }
+        return Ok(if cfg!(target_os = "windows") {
+            format!(
+                "& {{ Set-Location -LiteralPath {} -ErrorAction Stop; {command} }}",
+                quote(&cwd)
+            )
+        } else {
+            format!("cd {} && {command}", quote(&cwd))
+        });
+    }
+    Ok(command)
+}
+
 pub fn delete_session_checked(
     provider_id: &str,
     session_id: &str,
@@ -167,15 +267,33 @@ pub fn delete_session_checked(
     include_project: bool,
     shared_confirmed: bool,
 ) -> Result<DeleteSessionReply, String> {
+    if include_project {
+        return Err("会话清理不再删除项目目录；请使用文件管理器单独处理项目文件".into());
+    }
+    let _guard = deletion::DELETE_LOCK
+        .lock()
+        .map_err(|_| "清理锁不可用，请重启管理器")?;
+    deletion::ensure_agent_stopped(provider_id)?;
+    deletion::pending_sessions()?;
     let sessions = scan_sessions();
-    delete_session_in_snapshot(
-        provider_id,
-        session_id,
-        source_path,
-        include_project,
-        shared_confirmed,
-        &sessions,
-    )
+    let target = sessions
+        .iter()
+        .find(|item| {
+            item.provider_id == provider_id
+                && item.session_id == session_id
+                && item.source_path.as_deref() == Some(source_path)
+        })
+        .ok_or("会话已变化或不存在，请重新扫描")?;
+    deletion::run(target, &sessions, |plan| {
+        delete_session_in_snapshot(
+            provider_id,
+            session_id,
+            source_path,
+            include_project,
+            shared_confirmed,
+            plan,
+        )
+    })
 }
 
 /// 在预扫描的会话快照上执行删除。批量删除共用一次扫描，避免 N 项删除
@@ -185,7 +303,7 @@ fn delete_session_in_snapshot(
     session_id: &str,
     source_path: &str,
     include_project: bool,
-    shared_confirmed: bool,
+    _shared_confirmed: bool,
     sessions: &[SessionMeta],
 ) -> Result<DeleteSessionReply, String> {
     let selected = sessions.iter().find(|item| {
@@ -194,20 +312,16 @@ fn delete_session_in_snapshot(
             && item.source_path.as_deref() == Some(source_path)
     });
 
-    // 同批前一项的级联清理可能已经把本项的残留副本一并删除。对这类
-    // "快照仍在、文件已消失"的文件型残留直接视为已达成目标。opencode
-    // 的残留元数据本就允许 source 缺失（有专门通道），zcode 等虚拟
-    // sqlite 引用不做存在性判断，均不适用此短路。
-    if matches!(provider_id, "codex" | "claude" | "grokbuild")
-        && selected.is_some_and(|item| item.residual)
+    if include_project {
+        return Err("会话清理不再删除项目目录；请使用文件管理器单独处理项目文件".into());
+    }
+    if selected.is_some_and(|item| item.residual && !item.cleanup_pending)
+        && matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
         && !Path::new(source_path).exists()
     {
         return Ok(DeleteSessionReply::NotFound);
     }
-
     let project_dir = selected.and_then(|item| item.project_dir.clone());
-    let deleting_current_codex_session =
-        selected.is_none_or(|item| item.provider_id != "codex" || !item.residual);
     let related_residual_sources = selected
         .map(|item| {
             collect_related_residual_sources(
@@ -219,75 +333,43 @@ fn delete_session_in_snapshot(
             )
         })
         .unwrap_or_default();
-    if include_project {
-        let project = project_dir
-            .as_deref()
-            .ok_or_else(|| "该会话没有可靠的真实工作目录映射，已拒绝删除目录".to_string())?;
-        let project_path = canonicalize_existing_path(Path::new(project), "project directory")?;
-        validate_project_delete_target(&project_path)?;
 
-        let shared: Vec<&SessionMeta> = sessions
-            .iter()
-            .filter(|item| {
-                item.project_dir
-                    .as_deref()
-                    .and_then(|value| Path::new(value).canonicalize().ok())
-                    .is_some_and(|value| value == project_path)
-            })
-            .collect();
-        if shared.len() > 1 && !shared_confirmed {
-            // 这里是共享目录判定的唯一权威：以 canonicalize 结果为准返回
-            // 需要确认，前端据此弹出警告并要求二次确认，而不是自行比较
-            // 路径字符串。
-            let providers = shared
-                .iter()
-                .map(|item| item.provider_id.to_string())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            return Ok(DeleteSessionReply::NeedsSharedConfirmation {
-                shared_count: shared.len() as u32,
-                providers,
-            });
-        }
-
-        trash::delete(&project_path).map_err(|e| format!("无法将真实工作目录移入回收站：{e}"))?;
-    }
-
-    let deleted = delete_session_record(
-        provider_id,
-        session_id,
-        source_path,
-        project_dir.as_deref(),
-        include_project,
-    )?;
-
-    let mut warnings = Vec::new();
-    if deleted
-        && provider_id == "codex"
-        && (include_project
-            || (deleting_current_codex_session
-                && codex::should_cleanup_index_after_delete(session_id, source_path)))
+    // Clear referenced indexes BEFORE removing the transcript. Archived threads
+    // are included in the authoritative lookup; historical copies are not.
+    if provider_id == "codex" && codex::should_cleanup_index_after_delete(session_id, source_path)?
     {
-        // 主记录删除成功后的索引清理是尽力而为：Codex 正在运行时状态库
-        // 可能持有写锁，清理失败不应把整体报告为删除失败。
-        if let Err(error) =
-            codex::cleanup_after_delete(session_id, project_dir.as_deref(), include_project)
-        {
-            warnings.push(format!("会话已删除，但 Codex 索引清理失败：{error}"));
-        } else {
-            warnings.push(
-                "Codex 正在运行时可能暂时保留已删除的侧栏项；重新启动 Codex 后会刷新".to_string(),
-            );
-        }
+        codex::cleanup_after_delete(session_id, None, false)?;
     }
+    let missing_file = matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
+        && !Path::new(source_path).exists();
+    let deleted = if missing_file {
+        if selected.is_some_and(|item| item.cleanup_pending || item.residual) {
+            true
+        } else {
+            return Err("会话文件已消失，请重新扫描".into());
+        }
+    } else {
+        delete_session_record(
+            provider_id,
+            session_id,
+            source_path,
+            project_dir.as_deref(),
+            false,
+        )?
+    };
+    let mut warnings = Vec::new();
 
     // Deleting a current conversation means deleting that conversation as a
     // whole. Historical rollouts and legacy-format copies with the same native
     // ID must not surface as new leftovers afterward. Selecting a residual
     // entry itself remains deliberately scoped to that one entry.
-    if deleted {
+    if deleted || selected.is_some_and(|item| item.cleanup_pending) {
         for residual_source in related_residual_sources {
+            if matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
+                && !Path::new(&residual_source).exists()
+            {
+                continue;
+            }
             if let Err(error) = delete_session_record(
                 provider_id,
                 session_id,
@@ -300,11 +382,13 @@ fn delete_session_in_snapshot(
         }
     }
 
-    Ok(if deleted {
-        DeleteSessionReply::Deleted { warnings }
-    } else {
-        DeleteSessionReply::NotFound
-    })
+    Ok(
+        if deleted || selected.is_some_and(|item| item.cleanup_pending) {
+            DeleteSessionReply::Deleted { warnings }
+        } else {
+            DeleteSessionReply::NotFound
+        },
+    )
 }
 
 fn collect_related_residual_sources(
@@ -349,98 +433,35 @@ fn delete_session_record(
 }
 
 pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOutcome> {
-    // 全批只扫描一次磁盘；批内前项级联清理掉的同 ID 残留副本由
-    // delete_session_in_snapshot 的容错短路处理。
+    let guard = deletion::DELETE_LOCK.lock();
     let sessions = scan_sessions();
     collect_delete_session_outcomes(requests, |request| {
-        delete_session_in_snapshot(
-            &request.provider_id,
-            &request.session_id,
-            &request.source_path,
-            request.include_project,
-            request.shared_confirmed,
-            &sessions,
-        )
+        if guard.is_err() {
+            return Err("清理锁不可用，请重启管理器".into());
+        }
+        if request.include_project {
+            return Err("批量清理不删除项目目录".into());
+        }
+        deletion::ensure_agent_stopped(&request.provider_id)?;
+        deletion::pending_sessions()?;
+        let Some(target) = sessions.iter().find(|item| {
+            item.provider_id == request.provider_id
+                && item.session_id == request.session_id
+                && item.source_path.as_deref() == Some(request.source_path.as_str())
+        }) else {
+            return Err("会话已变化或不存在，请重新扫描".into());
+        };
+        deletion::run(target, &sessions, |plan| {
+            delete_session_in_snapshot(
+                &request.provider_id,
+                &request.session_id,
+                &request.source_path,
+                false,
+                false,
+                plan,
+            )
+        })
     })
-}
-
-#[cfg(target_os = "windows")]
-const PROTECTED_TOP_LEVEL_DIRS: &[&str] = &[
-    "windows",
-    "program files",
-    "program files (x86)",
-    "programdata",
-    "users",
-];
-
-#[cfg(not(target_os = "windows"))]
-const PROTECTED_TOP_LEVEL_DIRS: &[&str] = &[
-    "usr", "etc", "var", "bin", "sbin", "lib", "lib64", "opt", "boot", "dev", "proc", "sys", "run",
-    "home", "system", "library", "private",
-];
-
-/// 会话 cwd 指向系统位置时拒绝把"真实工作目录"移入回收站。只保护根目录
-/// 下的第一级目录（`C:\Windows`、`C:\Users\Public` 等）；用户主目录内部
-/// 是项目常态位置，不在此列（home 本身由调用方先行拒绝）。
-fn is_protected_system_location(path: &Path, home: &Path) -> bool {
-    if path.starts_with(home) {
-        return false;
-    }
-    let mut first: Option<String> = None;
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => continue,
-            std::path::Component::Normal(name) => {
-                first = Some(name.to_string_lossy().to_lowercase());
-                break;
-            }
-            _ => break,
-        }
-    }
-    first.is_some_and(|name| PROTECTED_TOP_LEVEL_DIRS.contains(&name.as_str()))
-}
-
-fn validate_project_delete_target(path: &Path) -> Result<(), String> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| "无法确定用户主目录，已拒绝删除".to_string())?
-        .canonicalize()
-        .map_err(|e| format!("无法解析用户主目录：{e}"))?;
-    if path == home || path.parent().is_none() {
-        return Err("目标是受保护的宽泛根目录，已拒绝删除".to_string());
-    }
-    if path.join("AgentSessionManager").exists()
-        || path.join("ClaudeCodexHistoryManager").exists()
-        || is_session_manager_source(path)
-        || std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.canonicalize().ok())
-            .is_some_and(|exe| exe.starts_with(path))
-    {
-        return Err("目标包含 Agent 会话管理器自身工作区，已强制禁止删除".to_string());
-    }
-    if is_protected_system_location(path, &home) {
-        return Err("目标是系统目录，已拒绝删除".to_string());
-    }
-    for provider in ["codex", "claude", "opencode", "grokbuild", "pi"] {
-        if let Ok(roots) = provider_roots(provider) {
-            for root in roots {
-                if root.exists() && root.canonicalize().ok().as_deref() == Some(path) {
-                    return Err("目标是 Agent 数据根目录，已拒绝删除".to_string());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_session_manager_source(path: &Path) -> bool {
-    let package = path.join("package.json");
-    if let Ok(text) = std::fs::read_to_string(package) {
-        if text.contains("\"name\": \"agent-session-manager\"") {
-            return true;
-        }
-    }
-    path.join("ClaudeCodexHistoryManager.spec").is_file() || path.join("GCHistory.spec").is_file()
 }
 
 fn delete_session_with_roots(
@@ -515,6 +536,10 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
         "opencode" => vec![opencode::get_opencode_data_dir()],
         "grokbuild" => grokbuild::session_roots(),
         "pi" => pi::session_roots(),
+        "zcode" => vec![zcode::database_path()
+            .parent()
+            .ok_or("Invalid ZCode database path")?
+            .to_path_buf()],
         _ => return Err(format!("Unsupported provider: {provider_id}")),
     };
 
@@ -557,6 +582,10 @@ where
                 Ok(DeleteSessionReply::NotFound) => {
                     outcome.success = true;
                 }
+                Ok(DeleteSessionReply::CleanupPending { warnings }) => {
+                    outcome.error = Some("清理未完成，请退出 Agent 后重试".into());
+                    outcome.warnings = warnings;
+                }
                 Ok(DeleteSessionReply::NeedsSharedConfirmation { .. }) => {
                     outcome.error =
                         Some("Shared directory deletion needs explicit confirmation".to_string());
@@ -596,6 +625,8 @@ mod tests {
             provider_id: provider_id.to_string(),
             session_id: session_id.to_string(),
             residual,
+            archived: false,
+            cleanup_pending: false,
             title: None,
             summary: None,
             project_dir: None,
@@ -654,32 +685,6 @@ mod tests {
 
         assert!(deleted);
         assert!(!session_file.exists());
-    }
-
-    #[test]
-    fn refuses_to_delete_a_directory_containing_the_manager_workspace() {
-        let root = tempdir().expect("tempdir");
-        std::fs::create_dir(root.path().join("AgentSessionManager")).expect("manager marker");
-
-        let error = validate_project_delete_target(root.path())
-            .expect_err("manager parent must always be protected");
-
-        assert!(error.contains("会话管理器自身工作区"));
-    }
-
-    #[test]
-    fn refuses_to_delete_the_manager_source_directory_itself() {
-        let root = tempdir().expect("tempdir");
-        std::fs::write(
-            root.path().join("package.json"),
-            r#"{"name": "agent-session-manager"}"#,
-        )
-        .expect("package marker");
-
-        let error = validate_project_delete_target(root.path())
-            .expect_err("manager source must always be protected");
-
-        assert!(error.contains("会话管理器自身工作区"));
     }
 
     #[test]
@@ -796,38 +801,25 @@ mod tests {
     }
 
     #[test]
-    fn shared_project_delete_requires_explicit_confirmation_before_any_deletion() {
+    fn legacy_project_delete_is_rejected_before_touching_any_file() {
         let project = tempdir().expect("tempdir");
-        let project_dir = project.path().to_string_lossy().to_string();
-        let mut first = session_meta("codex", "thread-1", "current.jsonl", false);
-        first.project_dir = Some(project_dir.clone());
-        let mut second = session_meta("claude", "thread-2", "other.jsonl", false);
-        second.project_dir = Some(project_dir);
-
-        let reply = delete_session_in_snapshot(
-            "codex",
-            "thread-1",
-            "current.jsonl",
-            true,
-            false,
-            &[first, second],
-        )
-        .expect("needs-confirmation reply");
-
-        // 后端以 canonicalize 比对结果为准返回权威共享信息，且在任何
-        // 删除动作发生之前就返回。
-        match reply {
-            DeleteSessionReply::NeedsSharedConfirmation {
-                shared_count,
-                providers,
-            } => {
-                assert_eq!(shared_count, 2);
-                // BTreeSet 去重排序后依次列出涉及的所有 provider
-                assert_eq!(providers, vec!["claude".to_string(), "codex".to_string()]);
-            }
-            other => panic!("expected NeedsSharedConfirmation, got {other:?}"),
+        let sentinel = project.path().join("valuable.txt");
+        std::fs::write(&sentinel, "keep").unwrap();
+        let mut target = session_meta("codex", "thread-1", "missing.jsonl", false);
+        target.project_dir = Some(project.path().to_string_lossy().into_owned());
+        for confirmed in [false, true] {
+            let error = delete_session_in_snapshot(
+                "codex",
+                "thread-1",
+                "missing.jsonl",
+                true,
+                confirmed,
+                &[target.clone()],
+            )
+            .expect_err("legacy directory deletion must be rejected");
+            assert!(error.contains("不再删除项目目录"));
+            assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
         }
-        assert!(project.path().exists(), "确认前不得触碰共享目录");
     }
 
     #[test]
@@ -844,31 +836,5 @@ mod tests {
                 .expect("stale residual short-circuits to NotFound");
 
         assert!(matches!(reply, DeleteSessionReply::NotFound));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn system_locations_are_protected_from_project_deletion() {
-        let home = Path::new(r"C:\Users\me");
-
-        assert!(is_protected_system_location(Path::new(r"C:\Windows"), home));
-        assert!(is_protected_system_location(
-            Path::new(r"C:\Program Files\App"),
-            home
-        ));
-        // 主目录之外的其他用户目录同样受 C:\Users 这层保护
-        assert!(is_protected_system_location(
-            Path::new(r"C:\Users\Public\shared"),
-            home
-        ));
-        // 主目录内部是项目常态位置；其他盘符的普通目录不受影响
-        assert!(!is_protected_system_location(
-            Path::new(r"C:\Users\me\Desktop\Cat"),
-            home
-        ));
-        assert!(!is_protected_system_location(
-            Path::new(r"E:\projects\Cat"),
-            home
-        ));
     }
 }

@@ -13,6 +13,7 @@ export interface DeleteSessionOptions {
 export type DeleteSessionReply =
   | { status: "deleted"; warnings?: string[] }
   | { status: "not_found" }
+  | { status: "cleanup_pending"; warnings: string[] }
   | {
       status: "needs_shared_confirmation";
       sharedCount: number;
@@ -26,8 +27,18 @@ export interface DeleteSessionResult extends DeleteSessionOptions {
 }
 
 export const sessionsApi = {
-  async list(): Promise<SessionMeta[]> {
-    return await invoke("list_sessions");
+  async list(
+    onWarnings?: (warnings: string[]) => void,
+  ): Promise<SessionMeta[]> {
+    const report = await invoke<
+      { sessions: SessionMeta[]; warnings: string[] } | SessionMeta[]
+    >("list_sessions");
+    if (Array.isArray(report)) {
+      onWarnings?.([]);
+      return report;
+    }
+    onWarnings?.(report.warnings);
+    return report.sessions;
   },
 
   async getMessages(
@@ -60,16 +71,11 @@ export const sessionsApi = {
     return await invoke("delete_sessions", { items });
   },
 
-  async launchTerminal(options: {
-    command: string;
-    cwd?: string | null;
-    customConfig?: string | null;
-  }): Promise<boolean> {
-    const { command, cwd, customConfig } = options;
-    return await invoke("launch_session_terminal", {
-      command,
-      cwd,
-      customConfig,
-    });
+  async resume(
+    providerId: string,
+    sourcePath: string,
+    launch: boolean,
+  ): Promise<string> {
+    return await invoke("session_resume", { providerId, sourcePath, launch });
   },
 };

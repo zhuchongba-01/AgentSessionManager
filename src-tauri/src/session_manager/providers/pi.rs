@@ -209,12 +209,16 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
         SessionRootResolution::RequiresProjectContext {
             configured_path, ..
         } => {
+            super::utils::scan_warning(format!(
+                "会话目录 {configured_path} 需要项目上下文，未进行全局扫描"
+            ));
             log::warn!(
                 "Pi sessionDir '{configured_path}' requires a project cwd and cannot be globally enumerated"
             );
             Vec::new()
         }
         SessionRootResolution::Unavailable { reason } => {
+            super::utils::scan_warning(reason.clone());
             log::warn!("Pi session discovery unavailable: {reason}");
             Vec::new()
         }
@@ -229,6 +233,7 @@ fn scan_sessions_in_root(root: &Path, layout: SessionLayout) -> Vec<SessionMeta>
         .filter_map(|path| match parse_session(&path) {
             Ok(session) => Some(session),
             Err(error) => {
+                super::utils::scan_warning(error.clone());
                 log::debug!("Skipping invalid Pi session {}: {error}", path.display());
                 None
             }
@@ -339,6 +344,8 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         provider_id: PROVIDER_ID.to_string(),
         session_id: header.id,
         residual: false,
+        archived: false,
+        cleanup_pending: false,
         title,
         summary: summary_text,
         project_dir: (!header.cwd.trim().is_empty()).then(|| header.cwd.clone()),

@@ -68,7 +68,11 @@ export function ConfirmDialog({
         }
       }}
     >
-      <DialogContent className="max-w-sm" zIndex={zIndex}>
+      <DialogContent
+        data-testid="confirm-dialog"
+        className="max-w-sm"
+        zIndex={zIndex}
+      >
         <DialogHeader className="space-y-3 border-b-0 bg-transparent pb-0">
           <DialogTitle className="flex items-center gap-2 text-lg font-semibold">
             <IconComponent className={iconClass} />

@@ -51,17 +51,25 @@ export function AgentIcon({
   if (source) {
     const scale = opticalScale[key] ?? 1;
     return (
-      <img
-        src={source}
-        alt=""
+      <span
+        aria-hidden="true"
         title={name}
         className={cn(
-          "inline-block shrink-0 object-contain",
-          monoIcons.has(source) && "asm-icon-mono",
+          "inline-flex shrink-0 items-center justify-center",
           className,
         )}
-        style={{ width: size, height: size, transform: `scale(${scale})` }}
-      />
+        style={{ width: size, height: size }}
+      >
+        <img
+          src={source}
+          alt=""
+          className={cn(
+            "max-w-none object-contain",
+            monoIcons.has(source) && "asm-icon-mono",
+          )}
+          style={{ width: size * scale, height: size * scale }}
+        />
+      </span>
     );
   }
 

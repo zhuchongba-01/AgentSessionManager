@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::session_manager::{SessionMessage, SessionMeta};
 
 use super::utils::{
-    collect_files_where, is_safe_session_id, parse_timestamp_to_ms, path_basename, truncate_summary,
+    check_sqlite_message_budget, checked_storage_child, collect_files_where, is_safe_session_id,
+    parse_timestamp_to_ms, path_basename, truncate_summary,
 };
 
 const PROVIDER_ID: &str = "opencode";
@@ -41,6 +42,9 @@ fn get_opencode_db_path() -> PathBuf {
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let mut json_sessions = scan_sessions_json();
     let Some(sqlite_sessions) = try_scan_sessions_sqlite() else {
+        if get_opencode_db_path().is_file() {
+            super::utils::scan_warning("SQLite 会话索引读取失败，当前列表可能不完整");
+        }
         return json_sessions;
     };
 
@@ -71,6 +75,8 @@ fn scan_sessions_json() -> Vec<SessionMeta> {
     for path in json_files {
         if let Some(meta) = parse_session(&storage, &path) {
             sessions.push(meta);
+        } else {
+            super::utils::scan_warning(format!("无法读取会话元数据 {}", path.display()));
         }
     }
     sessions
@@ -106,6 +112,7 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
     )
     .ok()?;
 
+    conn.busy_timeout(Duration::from_secs(2)).ok()?;
     let mut stmt = conn
         .prepare(
             "SELECT id, title, directory, time_created, time_updated FROM session ORDER BY time_updated DESC",
@@ -126,7 +133,14 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
         .ok()?;
 
     let mut sessions = Vec::new();
-    for row in iter.flatten() {
+    for row in iter {
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => {
+                super::utils::scan_warning(error.to_string());
+                continue;
+            }
+        };
         let (session_id, title, directory, created, updated) = row;
         let display_title = if title.is_empty() {
             path_basename(&directory)
@@ -137,6 +151,8 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
             provider_id: PROVIDER_ID.to_string(),
             session_id: session_id.clone(),
             residual: false,
+            archived: false,
+            cleanup_pending: false,
             title: display_title.clone(),
             summary: display_title,
             project_dir: if directory.is_empty() {
@@ -165,6 +181,8 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         .parent()
         .and_then(|p| p.parent())
         .ok_or_else(|| "Cannot determine storage root from message path".to_string())?;
+    checked_storage_child(storage, path)?;
+    let mut remaining_bytes = super::utils::MAX_QUERY_BYTES as u64;
 
     let mut msg_files = Vec::new();
     collect_json_files(path, &mut msg_files);
@@ -173,18 +191,11 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     let mut entries: Vec<(i64, String, String, String)> = Vec::new();
 
     for msg_path in &msg_files {
-        let data = match std::fs::read_to_string(msg_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let value = read_json_bounded(msg_path, &mut remaining_bytes)?;
 
         let msg_id = match value.get("id").and_then(Value::as_str) {
-            Some(id) => id.to_string(),
-            None => continue,
+            Some(id) if is_safe_session_id(id) => id.to_string(),
+            _ => return Err("Invalid OpenCode message ID".into()),
         };
 
         let role = value
@@ -200,8 +211,8 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             .unwrap_or(0);
 
         // Collect text parts from storage/part/{messageID}/
-        let part_dir = storage.join("part").join(&msg_id);
-        let text = collect_parts_text(&part_dir);
+        let part_dir = checked_storage_child(storage, &storage.join("part").join(&msg_id))?;
+        let text = collect_parts_text(&part_dir, &mut remaining_bytes)?;
         if text.trim().is_empty() {
             continue;
         }
@@ -229,12 +240,25 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
 pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String> {
     let (db_path, session_id) = parse_sqlite_source(source)
         .ok_or_else(|| format!("Invalid SQLite source reference: {source}"))?;
+    if db_path.canonicalize().map_err(|e| e.to_string())?
+        != get_opencode_db_path()
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+    {
+        return Err("OpenCode database is outside configured storage".into());
+    }
 
     let conn = Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("Failed to open OpenCode database: {e}"))?;
+
+    conn.busy_timeout(Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+    check_sqlite_message_budget(&conn, &session_id)?;
 
     let mut msg_stmt = conn
         .prepare(
@@ -267,14 +291,14 @@ pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String>
 
     let mut parts_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for part in part_rows.flatten() {
-        let (message_id, data) = part;
+    for part in part_rows {
+        let (message_id, data) = part.map_err(|e| e.to_string())?;
         parts_map.entry(message_id).or_default().push(data);
     }
 
     let mut messages = Vec::new();
-    for row in msg_rows.flatten() {
-        let (msg_id, ts, data) = row;
+    for row in msg_rows {
+        let (msg_id, ts, data) = row.map_err(|e| e.to_string())?;
         let msg_value: Value = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(_) => continue,
@@ -314,6 +338,14 @@ pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String>
 }
 
 pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    if !is_safe_session_id(session_id) {
+        return Err("Invalid OpenCode session ID".into());
+    }
+    let expected = checked_storage_child(storage, &storage.join("message").join(session_id))?;
+    let actual = checked_storage_child(storage, path)?;
+    if actual != expected {
+        return Err("OpenCode source is not the selected session message directory".into());
+    }
     if path.file_name().and_then(|name| name.to_str()) != Some(session_id) {
         return Err(format!(
             "OpenCode session path does not match session ID: expected {session_id}, found {}",
@@ -326,21 +358,31 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
 
     let mut message_ids = Vec::new();
     for message_path in &message_files {
-        let data = match std::fs::read_to_string(message_path) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+        let data = std::fs::read_to_string(message_path).map_err(|e| e.to_string())?;
+        let value: Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
         if let Some(message_id) = value.get("id").and_then(Value::as_str) {
+            if !is_safe_session_id(message_id) {
+                return Err("Invalid OpenCode message ID; no files deleted".into());
+            }
             message_ids.push(message_id.to_string());
         }
     }
 
-    for message_id in &message_ids {
-        let part_dir = storage.join("part").join(message_id);
+    let part_dirs = message_ids
+        .iter()
+        .map(|id| checked_storage_child(storage, &storage.join("part").join(id)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let session_diff_path = checked_storage_child(
+        storage,
+        &storage
+            .join("session_diff")
+            .join(format!("{session_id}.json")),
+    )?;
+    let session_file = find_session_file(storage, session_id)
+        .map(|path| checked_storage_child(storage, &path))
+        .transpose()?;
+    // Complete validation before the first destructive operation.
+    for part_dir in &part_dirs {
         remove_dir_all_if_exists(&part_dir).map_err(|e| {
             format!(
                 "Failed to delete OpenCode part directory {}: {e}",
@@ -349,9 +391,6 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
         })?;
     }
 
-    let session_diff_path = storage
-        .join("session_diff")
-        .join(format!("{session_id}.json"));
     remove_file_if_exists(&session_diff_path).map_err(|e| {
         format!(
             "Failed to delete OpenCode session diff {}: {e}",
@@ -366,7 +405,7 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
         )
     })?;
 
-    if let Some(session_file) = find_session_file(storage, session_id) {
+    if let Some(session_file) = session_file {
         remove_file_if_exists(&session_file).map_err(|e| {
             format!(
                 "Failed to delete OpenCode session file {}: {e}",
@@ -471,10 +510,12 @@ fn quote_sqlite_identifier(value: &str) -> String {
 }
 
 fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
-    let data = std::fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&data).ok()?;
+    let value = read_json_bounded(path, &mut (super::utils::MAX_QUERY_BYTES as u64)).ok()?;
 
     let session_id = value.get("id").and_then(Value::as_str)?.to_string();
+    if !is_safe_session_id(&session_id) {
+        return None;
+    }
     let title = value
         .get("title")
         .and_then(Value::as_str)
@@ -505,6 +546,7 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
 
     // Build source_path = message directory for this session
     let msg_dir = storage.join("message").join(&session_id);
+    checked_storage_child(storage, &msg_dir).ok()?;
     let source_path = msg_dir.to_string_lossy().to_string();
 
     // Skip expensive I/O if title already available from session JSON
@@ -518,6 +560,8 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: false,
+        archived: false,
+        cleanup_pending: false,
         title: display_title,
         summary,
         project_dir: directory,
@@ -532,7 +576,10 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
 
 /// Read the first user message's first text part to use as summary.
 fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
-    let msg_dir = storage.join("message").join(session_id);
+    if !is_safe_session_id(session_id) {
+        return None;
+    }
+    let msg_dir = checked_storage_child(storage, &storage.join("message").join(session_id)).ok()?;
     if !msg_dir.is_dir() {
         return None;
     }
@@ -542,23 +589,17 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
 
     // Collect user messages with timestamps for ordering
     let mut user_msgs: Vec<(i64, String)> = Vec::new();
+    let mut remaining_bytes = super::utils::MAX_QUERY_BYTES as u64;
     for msg_path in &msg_files {
-        let data = match std::fs::read_to_string(msg_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let value = read_json_bounded(msg_path, &mut remaining_bytes).ok()?;
 
         if value.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
 
         let msg_id = match value.get("id").and_then(Value::as_str) {
-            Some(id) => id.to_string(),
-            None => continue,
+            Some(id) if is_safe_session_id(id) => id.to_string(),
+            _ => return None,
         };
 
         let ts = value
@@ -574,8 +615,8 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
 
     // Take first user message and get its parts
     let (_, first_id) = user_msgs.first()?;
-    let part_dir = storage.join("part").join(first_id);
-    let text = collect_parts_text(&part_dir);
+    let part_dir = checked_storage_child(storage, &storage.join("part").join(first_id)).ok()?;
+    let text = collect_parts_text(&part_dir, &mut remaining_bytes).ok()?;
     if text.trim().is_empty() {
         return None;
     }
@@ -601,9 +642,9 @@ fn extract_part_text(part_value: &Value) -> Option<String> {
     }
 }
 
-fn collect_parts_text(part_dir: &Path) -> String {
+fn collect_parts_text(part_dir: &Path, remaining_bytes: &mut u64) -> Result<String, String> {
     if !part_dir.is_dir() {
-        return String::new();
+        return Ok(String::new());
     }
 
     let mut parts = Vec::new();
@@ -611,21 +652,28 @@ fn collect_parts_text(part_dir: &Path) -> String {
 
     let mut texts = Vec::new();
     for part_path in &parts {
-        let data = match std::fs::read_to_string(part_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let value = read_json_bounded(part_path, remaining_bytes)?;
 
         if let Some(text) = extract_part_text(&value) {
             texts.push(text);
         }
     }
 
-    texts.join("\n")
+    Ok(texts.join("\n"))
+}
+
+fn read_json_bounded(path: &Path, remaining_bytes: &mut u64) -> Result<Value, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut text = String::new();
+    file.take(*remaining_bytes + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if text.len() as u64 > *remaining_bytes {
+        return Err("OpenCode JSON 会话超过 32 MiB 读取限制，请使用原 Agent 查看".into());
+    }
+    *remaining_bytes -= text.len() as u64;
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn collect_json_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -666,6 +714,36 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_message_id_is_rejected_before_any_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let source = storage.join("message").join("ses_1");
+        std::fs::create_dir_all(&source).unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let sentinel = victim.join("keep.txt");
+        std::fs::write(&sentinel, "valuable").unwrap();
+        std::fs::write(source.join("msg_1.json"), r#"{"id":"../../../victim"}"#).unwrap();
+        assert!(load_messages(&source).is_err());
+        assert!(delete_session(&storage, &source, "ses_1").is_err());
+        assert!(source.join("msg_1.json").exists());
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "valuable");
+    }
+
+    #[test]
+    fn json_reads_share_a_finite_byte_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("part.json");
+        std::fs::write(&path, r#"{"text":"hello"}"#).unwrap();
+        let mut small_budget = 4;
+        assert!(read_json_bounded(&path, &mut small_budget).is_err());
+        let mut budget = 20;
+        assert!(read_json_bounded(&path, &mut budget).is_ok());
+        assert!(budget < 20);
+        assert!(read_json_bounded(&path, &mut budget).is_err());
+    }
     use rusqlite::Connection;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -919,8 +997,12 @@ mod tests {
 
     #[test]
     fn load_messages_sqlite_reads_messages_and_parts() {
+        let _env_guard = opencode_env_lock().lock().expect("env lock");
         let temp = tempdir().expect("tempdir");
-        let db_path = temp.path().join("opencode.db");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+        std::fs::create_dir(temp.path().join("opencode")).unwrap();
+        let db_path = get_opencode_db_path();
         let conn = Connection::open(&db_path).expect("open sqlite db");
         create_sqlite_schema(&conn);
 
@@ -978,6 +1060,11 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "[Tool: bash]\nDone");
         assert_eq!(messages[1].ts, Some(2000));
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 
     #[test]

@@ -136,16 +136,26 @@ export const getProviderLabel = (
   providerId: string,
   t: (key: string) => string,
 ) => {
-  const key = `apps.${providerId}`;
+  const normalized = providerId.toLocaleLowerCase();
+  const labels: Record<string, string> = {
+    codex: "Codex",
+    claude: "Claude Code",
+    opencode: "OpenCode",
+    zcode: "ZCode",
+    grokbuild: "Grok Build",
+    pi: "Pi",
+  };
+  const key = `apps.${normalized}`;
   const translated = t(key);
-  return translated === key ? providerId : translated;
+  return translated === key ? (labels[normalized] ?? providerId) : translated;
 };
 
 // 根据 providerId 获取对应的图标名称
 export const getProviderIconName = (providerId: string) => {
-  if (providerId === "codex") return "openai";
-  if (providerId === "grokbuild") return "grok";
-  return providerId;
+  const normalized = providerId.toLocaleLowerCase();
+  if (normalized === "codex") return "openai";
+  if (normalized === "grokbuild") return "grok";
+  return normalized;
 };
 
 export const getRoleTone = (role: string) => {

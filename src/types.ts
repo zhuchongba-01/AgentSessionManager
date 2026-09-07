@@ -2,6 +2,8 @@ export interface SessionMeta {
   providerId: string;
   sessionId: string;
   residual?: boolean;
+  archived?: boolean;
+  cleanupPending?: boolean;
   title?: string;
   summary?: string;
   projectDir?: string | null;
