@@ -9,12 +9,39 @@ export const GITHUB_LATEST_RELEASE_API =
 
 export type AvailableUpdate = {
   version: string;
+  notes: string | null;
 };
 
 type GitHubReleaseResponse = {
   tag_name?: unknown;
+  body?: unknown;
   draft?: unknown;
   prerelease?: unknown;
+};
+
+const summarizeReleaseNotes = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+
+  const lines = value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => ({
+      isHeading: /^\s{0,3}#{1,6}\s+/.test(line),
+      text: line
+        .replace(/^\s{0,3}#{1,6}\s+/, "")
+        .replace(/^\s*(?:[-*+] |\d+[.)]\s+)/, "")
+        .replace(/\[([^\]]+)]\([^\s)]+(?:\s+"[^"]*")?\)/g, "$1")
+        .replace(/[`*_~]/g, "")
+        .replace(/<[^>]+>/g, "")
+        .trim(),
+    }))
+    .filter(({ isHeading, text }) => !isHeading && Boolean(text))
+    .map(({ text }) => text)
+    .slice(0, 2);
+
+  if (lines.length === 0) return null;
+  const summary = lines.join("\n");
+  return summary.length > 420 ? `${summary.slice(0, 417).trimEnd()}…` : summary;
 };
 
 const parseVersion = (value: string): number[] | null => {
@@ -64,7 +91,9 @@ export const checkForAvailableUpdate = async (
     }
 
     const version = release.tag_name.replace(/^v/i, "");
-    return isVersionNewer(version, currentVersion) ? { version } : null;
+    return isVersionNewer(version, currentVersion)
+      ? { version, notes: summarizeReleaseNotes(release.body) }
+      : null;
   } catch {
     // 更新检查不应影响本地会话管理；离线、限流或仓库尚无 Release 时静默隐藏。
     return null;

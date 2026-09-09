@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -18,7 +18,8 @@ use crate::session_paths::{
 
 use super::utils::{
     collect_files_where, ensure_readable_size, extract_text, is_safe_session_id,
-    parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary, TITLE_MAX_CHARS,
+    parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary,
+    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "codex";
@@ -47,6 +48,28 @@ struct CodexProjectBinding {
 struct CodexProjectContext {
     thread_projects: HashMap<String, CodexProjectBinding>,
     projectless_threads: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryBaseRef {
+    thread_id: String,
+    end_byte_offset: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RolloutDescriptor {
+    path: PathBuf,
+    session_id: String,
+    rollout_id: String,
+    created_at: Option<i64>,
+    file_len: u64,
+    history_base: Option<HistoryBaseRef>,
+}
+
+#[derive(Clone, Debug)]
+struct HistorySegment {
+    path: PathBuf,
+    end_byte_offset: Option<u64>,
 }
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
@@ -704,9 +727,14 @@ fn scan_sessions_in_roots_with_context(
         collect_jsonl_files(root, &mut files);
     }
 
+    let descriptors = files
+        .iter()
+        .filter_map(|path| read_rollout_descriptor(path).ok())
+        .collect::<Vec<_>>();
+
     let mut sessions = Vec::new();
-    for path in files {
-        if let Some(mut meta) = parse_session_with_titles(&path, thread_titles) {
+    for path in &files {
+        if let Some(mut meta) = parse_session_with_titles(path, thread_titles) {
             if let Some(binding) = project_context.thread_projects.get(&meta.session_id) {
                 meta.project_dir = binding.root_path.clone();
                 meta.project_name = (!binding.name.trim().is_empty()).then(|| binding.name.clone());
@@ -721,8 +749,287 @@ fn scan_sessions_in_roots_with_context(
         }
     }
 
+    collapse_paginated_history(&mut sessions, &descriptors, native_rollouts);
     mark_residual_rollouts(&mut sessions, native_rollouts);
     sessions
+}
+
+fn collapse_paginated_history(
+    sessions: &mut Vec<SessionMeta>,
+    descriptors: &[RolloutDescriptor],
+    native_rollouts: Option<&HashMap<String, String>>,
+) {
+    let continuations = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.history_base.is_some())
+        .collect::<Vec<_>>();
+    if continuations.is_empty() {
+        return;
+    }
+
+    let mut hidden_paths = HashSet::new();
+    let mut chain_created_at = HashMap::<String, i64>::new();
+
+    for continuation in continuations {
+        match resolve_paginated_chain_from_descriptors(&continuation.path, descriptors) {
+            Ok(chain) => {
+                let leaf_path = normalized_rollout_path(&continuation.path.to_string_lossy());
+                let earliest = chain
+                    .iter()
+                    .filter_map(|segment| {
+                        descriptors
+                            .iter()
+                            .find(|descriptor| same_rollout_path(&descriptor.path, &segment.path))
+                            .and_then(|descriptor| descriptor.created_at)
+                    })
+                    .min();
+                if let Some(earliest) = earliest {
+                    chain_created_at
+                        .entry(leaf_path)
+                        .and_modify(|existing| *existing = (*existing).min(earliest))
+                        .or_insert(earliest);
+                }
+                for segment in chain.iter().take(chain.len().saturating_sub(1)) {
+                    hidden_paths.insert(normalized_rollout_path(&segment.path.to_string_lossy()));
+                }
+            }
+            Err(error) => {
+                // A paginated base is never a safe deletion candidate. If the
+                // chain cannot be resolved, keep only Codex's authoritative
+                // current path (or the continuation itself without a DB) and
+                // fail closed in load/delete rather than exposing bases as
+                // disposable residual files.
+                super::utils::scan_warning(error);
+                let keep = native_rollouts
+                    .and_then(|rollouts| rollouts.get(&continuation.session_id))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        normalized_rollout_path(&continuation.path.to_string_lossy())
+                    });
+                for descriptor in descriptors
+                    .iter()
+                    .filter(|item| item.session_id == continuation.session_id)
+                {
+                    let path = normalized_rollout_path(&descriptor.path.to_string_lossy());
+                    if path != keep {
+                        hidden_paths.insert(path);
+                    }
+                }
+            }
+        }
+    }
+
+    sessions.retain(|session| {
+        session
+            .source_path
+            .as_deref()
+            .is_none_or(|path| !hidden_paths.contains(&normalized_rollout_path(path)))
+    });
+    for session in sessions {
+        let Some(path) = session.source_path.as_deref() else {
+            continue;
+        };
+        if let Some(created_at) = chain_created_at.get(&normalized_rollout_path(path)) {
+            session.created_at = Some(session.created_at.unwrap_or(*created_at).min(*created_at));
+        }
+    }
+}
+
+fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("无法读取 Codex 会话元数据 {}：{error}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().take(10) {
+        let line = line.map_err(|error| error.to_string())?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let payload = value
+            .get("payload")
+            .ok_or_else(|| format!("Codex 会话缺少元数据：{}", path.display()))?;
+        let session_id = payload
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| format!("Codex 会话缺少 ID：{}", path.display()))?
+            .to_string();
+        let created_at = payload
+            .get("timestamp")
+            .and_then(parse_timestamp_to_ms)
+            .or_else(|| value.get("timestamp").and_then(parse_timestamp_to_ms));
+        let history_base = payload.get("history_base").and_then(|base| {
+            let thread_id = base.get("thread_id")?.as_str()?.trim();
+            let end_byte_offset = base.get("end_byte_offset")?.as_u64()?;
+            (!thread_id.is_empty() && end_byte_offset > 0).then(|| HistoryBaseRef {
+                thread_id: thread_id.to_string(),
+                end_byte_offset,
+            })
+        });
+        let file_len = path
+            .metadata()
+            .map_err(|error| format!("无法读取 Codex 会话大小 {}：{error}", path.display()))?
+            .len();
+        let rollout_id = rollout_instance_id(path, &session_id);
+        return Ok(RolloutDescriptor {
+            path: path.to_path_buf(),
+            session_id,
+            rollout_id,
+            created_at,
+            file_len,
+            history_base,
+        });
+    }
+
+    Err(format!("无法识别 Codex 会话元数据：{}", path.display()))
+}
+
+fn rollout_instance_id(path: &Path, session_id: &str) -> String {
+    let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+        return session_id.to_string();
+    };
+    let Some((_, suffix)) = stem.rsplit_once('_') else {
+        return session_id.to_string();
+    };
+
+    let bytes = suffix.as_bytes();
+    let uuid_like = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    if uuid_like {
+        suffix.to_string()
+    } else {
+        session_id.to_string()
+    }
+}
+
+fn same_rollout_path(left: &Path, right: &Path) -> bool {
+    normalized_rollout_path(&left.to_string_lossy())
+        == normalized_rollout_path(&right.to_string_lossy())
+}
+
+fn resolve_paginated_chain_from_descriptors(
+    current_path: &Path,
+    descriptors: &[RolloutDescriptor],
+) -> Result<Vec<HistorySegment>, String> {
+    let mut current = descriptors
+        .iter()
+        .find(|descriptor| same_rollout_path(&descriptor.path, current_path))
+        .ok_or_else(|| format!("未找到 Codex 分页会话元数据：{}", current_path.display()))?;
+    let mut visited = HashSet::new();
+    let mut reversed = vec![HistorySegment {
+        path: current.path.clone(),
+        end_byte_offset: None,
+    }];
+    visited.insert(normalized_rollout_path(&current.path.to_string_lossy()));
+
+    while let Some(history_base) = &current.history_base {
+        if reversed.len() >= 64 {
+            return Err(format!(
+                "Codex 分页历史链过长，已停止处理：{}",
+                current_path.display()
+            ));
+        }
+        let referenced_by_other_session = descriptors.iter().any(|candidate| {
+            candidate.rollout_id == history_base.thread_id
+                && candidate.session_id != current.session_id
+        });
+        let referenced_by_same_session = descriptors.iter().any(|candidate| {
+            candidate.rollout_id == history_base.thread_id
+                && candidate.session_id == current.session_id
+        });
+        if referenced_by_other_session && !referenced_by_same_session {
+            return Err(format!(
+                "Codex 分页历史引用了不同会话，已停止处理：{}",
+                current_path.display()
+            ));
+        }
+
+        let mut candidates = descriptors
+            .iter()
+            .filter(|candidate| candidate.session_id == current.session_id)
+            .filter(|candidate| candidate.rollout_id == history_base.thread_id)
+            .filter(|candidate| !same_rollout_path(&candidate.path, &current.path))
+            .filter(|candidate| {
+                !visited.contains(&normalized_rollout_path(&candidate.path.to_string_lossy()))
+            })
+            .filter(|candidate| candidate.file_len >= history_base.end_byte_offset)
+            .filter(
+                |candidate| match (candidate.created_at, current.created_at) {
+                    (Some(candidate_time), Some(current_time)) => candidate_time <= current_time,
+                    _ => true,
+                },
+            )
+            .map(|candidate| (candidate.file_len - history_base.end_byte_offset, candidate))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|(left_delta, left), (right_delta, right)| {
+            left_delta
+                .cmp(right_delta)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        let Some((best_delta, base)) = candidates.first().copied() else {
+            return Err(format!(
+                "Codex 分页历史基座缺失，已禁止危险操作：{}",
+                current_path.display()
+            ));
+        };
+        if candidates.get(1).is_some_and(|(delta, candidate)| {
+            *delta == best_delta && candidate.created_at == base.created_at
+        }) {
+            return Err(format!(
+                "Codex 分页历史基座不唯一，已禁止危险操作：{}",
+                current_path.display()
+            ));
+        }
+
+        let normalized = normalized_rollout_path(&base.path.to_string_lossy());
+        if !visited.insert(normalized) {
+            return Err(format!(
+                "Codex 分页历史形成循环，已停止处理：{}",
+                current_path.display()
+            ));
+        }
+        reversed.push(HistorySegment {
+            path: base.path.clone(),
+            end_byte_offset: Some(history_base.end_byte_offset),
+        });
+        current = base;
+    }
+
+    reversed.reverse();
+    Ok(reversed)
+}
+
+fn rollout_descriptors_for_path(path: &Path) -> Vec<RolloutDescriptor> {
+    let mut roots = session_roots();
+    if !roots.iter().any(|root| path.starts_with(root)) {
+        if let Some(parent) = path.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    let mut files = Vec::new();
+    for root in roots {
+        collect_jsonl_files(&root, &mut files);
+    }
+    files
+        .iter()
+        .filter_map(|candidate| read_rollout_descriptor(candidate).ok())
+        .collect()
+}
+
+fn resolve_paginated_chain(path: &Path) -> Result<Vec<HistorySegment>, String> {
+    let descriptors = rollout_descriptors_for_path(path);
+    resolve_paginated_chain_from_descriptors(path, &descriptors)
 }
 
 fn mark_residual_rollouts(
@@ -1081,9 +1388,49 @@ fn load_thread_titles_from_db(db_path: &Path) -> HashMap<String, String> {
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+    let mut messages = Vec::new();
+    let mut remaining_bytes = MAX_MESSAGES_FILE_BYTES;
+
+    for segment in resolve_paginated_chain(path)? {
+        let file_len = segment
+            .path
+            .metadata()
+            .map_err(|e| format!("Failed to inspect session file: {e}"))?
+            .len();
+        let segment_len = segment.end_byte_offset.unwrap_or(file_len);
+        if segment_len > remaining_bytes {
+            return Err(format!(
+                "Codex 分页历史合计超过 {} MB 加载上限",
+                MAX_MESSAGES_FILE_BYTES / 1024 / 1024
+            ));
+        }
+        remaining_bytes -= segment_len;
+        messages.extend(load_segment_messages(
+            &segment.path,
+            segment.end_byte_offset,
+        )?);
+    }
+
+    Ok(messages)
+}
+
+fn load_segment_messages(
+    path: &Path,
+    end_byte_offset: Option<u64>,
+) -> Result<Vec<SessionMessage>, String> {
     ensure_readable_size(path)?;
+    let file_len = path
+        .metadata()
+        .map_err(|e| format!("Failed to inspect session file: {e}"))?
+        .len();
+    if end_byte_offset.is_some_and(|offset| offset > file_len) {
+        return Err(format!(
+            "Codex 分页历史超出基座文件范围，已停止读取：{}",
+            path.display()
+        ));
+    }
     let file = File::open(path).map_err(|e| format!("Failed to open session file: {e}"))?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(file.take(end_byte_offset.unwrap_or(u64::MAX)));
     let mut messages = Vec::new();
 
     for line in reader.lines() {
@@ -1113,10 +1460,14 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                 let role = payload
                     .get("role")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
+                    .unwrap_or("unknown");
                 let content = payload.get("content").map(extract_text).unwrap_or_default();
-                (role, content)
+                if !matches!(role, "user" | "assistant")
+                    || (role == "user" && is_internal_user_context(payload, &content))
+                {
+                    continue;
+                }
+                (role.to_string(), content)
             }
             "function_call" => {
                 let name = payload
@@ -1148,7 +1499,11 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     Ok(messages)
 }
 
-pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+pub fn validate_delete(path: &Path, session_id: &str) -> Result<(), String> {
+    deletion_paths(path, session_id).map(|_| ())
+}
+
+fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String> {
     let meta = parse_session(path)
         .ok_or_else(|| format!("Failed to parse Codex session metadata: {}", path.display()))?;
 
@@ -1159,24 +1514,85 @@ pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<boo
         ));
     }
 
-    std::fs::remove_file(path).map_err(|e| {
-        format!(
-            "Failed to delete Codex session file {}: {e}",
-            path.display()
-        )
-    })?;
+    let descriptors = rollout_descriptors_for_path(path);
+    let target = descriptors
+        .iter()
+        .find(|descriptor| same_rollout_path(&descriptor.path, path))
+        .ok_or_else(|| format!("无法读取 Codex 会话元数据：{}", path.display()))?;
+
+    if target.history_base.is_some() {
+        return resolve_paginated_chain_from_descriptors(path, &descriptors)
+            .map(|chain| chain.into_iter().map(|segment| segment.path).collect());
+    }
+
+    for continuation in descriptors
+        .iter()
+        .filter(|descriptor| descriptor.session_id == session_id)
+        .filter(|descriptor| descriptor.history_base.is_some())
+    {
+        match resolve_paginated_chain_from_descriptors(&continuation.path, &descriptors) {
+            Ok(chain)
+                if chain
+                    .iter()
+                    .any(|segment| same_rollout_path(&segment.path, path)) =>
+            {
+                return Err("该记录是当前会话依赖的分页历史，不能单独删除".into());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "同 ID 的 Codex 分页历史无法确认，已禁止删除以保护会话：{error}"
+                ));
+            }
+        }
+    }
+
+    Ok(vec![path.to_path_buf()])
+}
+
+pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    let paths = deletion_paths(path, session_id)?;
+    let mut allowed_roots = session_roots();
+    if !allowed_roots.iter().any(|candidate| candidate == root) {
+        allowed_roots.push(root.to_path_buf());
+    }
+    let allowed_roots = allowed_roots
+        .iter()
+        .filter_map(|candidate| candidate.canonicalize().ok())
+        .collect::<Vec<_>>();
+    let mut validated_paths = Vec::new();
+    for candidate in paths {
+        let validated = candidate.canonicalize().map_err(|error| {
+            format!(
+                "无法确认 Codex 分页历史文件 {}：{error}",
+                candidate.display()
+            )
+        })?;
+        if !allowed_roots.iter().any(|root| validated.starts_with(root)) {
+            return Err(format!(
+                "Codex 分页历史文件位于允许目录之外：{}",
+                candidate.display()
+            ));
+        }
+        validated_paths.push(validated);
+    }
+
+    // Remove the active leaf first. If a later base removal fails, no surviving
+    // continuation is left pointing at a missing history file.
+    for candidate in validated_paths.into_iter().rev() {
+        std::fs::remove_file(&candidate).map_err(|e| {
+            format!(
+                "Failed to delete Codex session file {}: {e}",
+                candidate.display()
+            )
+        })?;
+    }
 
     Ok(true)
 }
 
 fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_with_titles(path, &HashMap::new())
-}
-
-pub fn working_directory(path: &Path) -> Result<Option<String>, String> {
-    parse_session(path)
-        .map(|meta| meta.project_dir)
-        .ok_or_else(|| "无法读取会话的原始工作目录".into())
 }
 
 fn parse_session_with_titles(
@@ -1235,8 +1651,10 @@ fn parse_session_with_titles(
                     && payload.get("role").and_then(Value::as_str) == Some("user")
                 {
                     let text = payload.get("content").map(extract_text).unwrap_or_default();
-                    if let Some(title) = title_candidate_from_user_message(&text) {
-                        first_user_message = Some(title);
+                    if !is_internal_user_context(payload, &text) {
+                        if let Some(title) = title_candidate_from_user_message(&text) {
+                            first_user_message = Some(title);
+                        }
                     }
                 }
             }
@@ -1266,13 +1684,14 @@ fn parse_session_with_titles(
         if summary.is_none() && value.get("type").and_then(Value::as_str) == Some("response_item") {
             if let Some(payload) = value.get("payload") {
                 if payload.get("type").and_then(Value::as_str) == Some("message") {
+                    let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
                     let text = payload.get("content").map(extract_text).unwrap_or_default();
-                    if latest_user_message.is_none()
-                        && payload.get("role").and_then(Value::as_str) == Some("user")
-                    {
+                    let visible = matches!(role, "user" | "assistant")
+                        && !(role == "user" && is_internal_user_context(payload, &text));
+                    if visible && latest_user_message.is_none() && role == "user" {
                         latest_user_message = title_candidate_from_user_message(&text);
                     }
-                    if !text.trim().is_empty() {
+                    if visible && !text.trim().is_empty() {
                         summary = Some(text);
                     }
                 }
@@ -1328,12 +1747,31 @@ fn is_subagent_source(source: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+fn is_internal_user_context(payload: &Value, text: &str) -> bool {
+    let content_item_kinds = payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|metadata| metadata.get("content_item_kinds"))
+        .and_then(Value::as_array);
+    if let Some(kinds) = content_item_kinds.filter(|kinds| !kinds.is_empty()) {
+        return !kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|kind| kind.starts_with("user."));
+    }
+
+    is_known_internal_context_text(text)
+}
+
+fn is_known_internal_context_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("# AGENTS.md")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<recommended_plugins>")
+}
+
 fn title_candidate_from_user_message(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with("# AGENTS.md")
-        || trimmed.starts_with("<environment_context>")
-    {
+    if trimmed.is_empty() || is_known_internal_context_text(trimmed) {
         return None;
     }
 
@@ -1666,6 +2104,195 @@ mod tests {
             ),
         )
         .expect("write session");
+    }
+
+    fn write_paginated_session(path: &Path, session_id: &str, base_offset: u64, message: &str) {
+        write_paginated_session_with_base(path, session_id, session_id, base_offset, message);
+    }
+
+    fn write_paginated_session_with_base(
+        path: &Path,
+        session_id: &str,
+        base_thread_id: &str,
+        base_offset: u64,
+        message: &str,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                "{{\"timestamp\":\"2026-03-07T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/tmp/project\",\"history_mode\":\"paginated\",\"history_base\":{{\"thread_id\":\"{base_thread_id}\",\"end_ordinal_exclusive\":2,\"end_byte_offset\":{base_offset}}}}}}}\n\
+                 {{\"timestamp\":\"2026-03-07T21:50:13Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"{message}\"}}}}\n",
+            ),
+        )
+        .expect("write paginated session");
+    }
+
+    #[test]
+    fn scan_collapses_paginated_history_base_into_current_session() {
+        let temp = tempdir().expect("tempdir");
+        let active = temp.path().join("sessions");
+        std::fs::create_dir_all(&active).expect("active dir");
+        let base = active.join("base.jsonl");
+        let current = active.join("current.jsonl");
+        write_codex_session(&base, "thread-id", "Earlier message");
+        write_paginated_session(
+            &current,
+            "thread-id",
+            base.metadata().expect("base metadata").len(),
+            "Later message",
+        );
+
+        let native_rollouts = HashMap::from([(
+            "thread-id".to_string(),
+            normalized_rollout_path(&current.to_string_lossy()),
+        )]);
+        let sessions = scan_sessions_in_roots_with_context(
+            &[active],
+            &HashMap::new(),
+            &CodexProjectContext::default(),
+            Some(&native_rollouts),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_path.as_deref(), current.to_str());
+        assert!(!sessions[0].residual);
+        assert_eq!(sessions[0].title.as_deref(), Some("Later message"));
+    }
+
+    #[test]
+    fn load_messages_merges_paginated_history_at_recorded_offset() {
+        let temp = tempdir().expect("tempdir");
+        let base = temp.path().join("base.jsonl");
+        let current = temp.path().join("current.jsonl");
+        let base_prefix = concat!(
+            "{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-id\",\"cwd\":\"/tmp/project\"}}\n",
+            "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"Earlier message\"}}\n"
+        );
+        std::fs::write(
+            &base,
+            format!(
+                "{base_prefix}{{\"timestamp\":\"2026-03-06T21:50:14Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Discarded tail\"}}}}\n"
+            ),
+        )
+        .expect("write base");
+        write_paginated_session(
+            &current,
+            "thread-id",
+            base_prefix.len() as u64,
+            "Later message",
+        );
+
+        let messages = load_messages(&current).expect("load paginated messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "Earlier message");
+        assert_eq!(messages[1].content, "Later message");
+        assert!(messages
+            .iter()
+            .all(|message| message.content != "Discarded tail"));
+    }
+
+    #[test]
+    fn load_messages_follows_multi_page_rollout_instance_ids() {
+        let temp = tempdir().expect("tempdir");
+        let logical_id = "01a076ed-bae5-7a02-a191-d9a4b880afc5";
+        let middle_id = "01a0868f-2daa-7f72-a3a8-870536bf6629";
+        let current_id = "01a08757-bd33-7643-96cb-7d8f560cbbe3";
+        let base = temp
+            .path()
+            .join(format!("rollout-2026-09-06T22-34-46-{logical_id}.jsonl"));
+        let middle = temp.path().join(format!(
+            "rollout-2026-09-09T23-25-25-{logical_id}_{middle_id}.jsonl"
+        ));
+        let current = temp.path().join(format!(
+            "rollout-2026-09-10T03-04-29-{logical_id}_{current_id}.jsonl"
+        ));
+        write_codex_session(&base, logical_id, "Earlier message");
+        write_paginated_session_with_base(
+            &middle,
+            logical_id,
+            logical_id,
+            base.metadata().expect("base metadata").len(),
+            "Middle message",
+        );
+        write_paginated_session_with_base(
+            &current,
+            logical_id,
+            middle_id,
+            middle.metadata().expect("middle metadata").len(),
+            "Later message",
+        );
+
+        let messages = load_messages(&current).expect("load multi-page history");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "Earlier message");
+        assert_eq!(messages[1].content, "Middle message");
+        assert_eq!(messages[2].content, "Later message");
+
+        let native_rollouts = HashMap::from([(
+            logical_id.to_string(),
+            normalized_rollout_path(&current.to_string_lossy()),
+        )]);
+        let sessions = scan_sessions_in_roots_with_context(
+            &[temp.path().to_path_buf()],
+            &HashMap::new(),
+            &CodexProjectContext::default(),
+            Some(&native_rollouts),
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_path.as_deref(), current.to_str());
+        assert!(!sessions[0].residual);
+        assert_eq!(sessions[0].title.as_deref(), Some("Later message"));
+    }
+
+    #[test]
+    fn deleting_paginated_current_session_removes_the_whole_chain() {
+        let temp = tempdir().expect("tempdir");
+        let base = temp.path().join("base.jsonl");
+        let current = temp.path().join("current.jsonl");
+        write_codex_session(&base, "thread-id", "Earlier message");
+        write_paginated_session(
+            &current,
+            "thread-id",
+            base.metadata().expect("base metadata").len(),
+            "Later message",
+        );
+
+        delete_session(temp.path(), &current, "thread-id").expect("delete paginated session");
+
+        assert!(!current.exists());
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn deleting_paginated_history_base_is_rejected() {
+        let temp = tempdir().expect("tempdir");
+        let base = temp.path().join("base.jsonl");
+        let current = temp.path().join("current.jsonl");
+        write_codex_session(&base, "thread-id", "Earlier message");
+        write_paginated_session(
+            &current,
+            "thread-id",
+            base.metadata().expect("base metadata").len(),
+            "Later message",
+        );
+
+        let error = validate_delete(&base, "thread-id").expect_err("base must be protected");
+
+        assert!(error.contains("分页历史"));
+        assert!(base.exists());
+        assert!(current.exists());
+    }
+
+    #[test]
+    fn missing_paginated_history_base_blocks_deletion() {
+        let temp = tempdir().expect("tempdir");
+        let current = temp.path().join("current.jsonl");
+        write_paginated_session(&current, "thread-id", 4096, "Later message");
+
+        let error = validate_delete(&current, "thread-id").expect_err("missing base must block");
+
+        assert!(error.contains("基座缺失"));
+        assert!(current.exists());
     }
 
     #[test]
@@ -2273,5 +2900,34 @@ mod tests {
 
         assert_eq!(msgs[3].role, "assistant");
         assert_eq!(msgs[3].content, "Done.");
+    }
+
+    #[test]
+    fn load_messages_skips_codex_internal_context_messages() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"test-id\",\"cwd\":\"/tmp\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"<recommended_plugins>internal</recommended_plugins>\",\"internal_chat_message_metadata_passthrough\":{\"content_item_kinds\":[\"plugins.recommendations\",\"environments.environment_context\"]}}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:14Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"<environment_context>legacy internal</environment_context>\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:15Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"developer\",\"content\":\"internal instructions\",\"internal_chat_message_metadata_passthrough\":{\"content_item_kinds\":[\"generic.developer_instructions\"]}}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:16Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"真实问题\",\"internal_chat_message_metadata_passthrough\":{\"content_item_kinds\":[\"user.text\"]}}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:17Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"真实回答\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        let messages = load_messages(&path).expect("load");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "真实问题");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "真实回答");
+
+        let meta = parse_session(&path).expect("parse");
+        assert_eq!(meta.title.as_deref(), Some("真实问题"));
+        assert_eq!(meta.summary.as_deref(), Some("真实回答"));
     }
 }

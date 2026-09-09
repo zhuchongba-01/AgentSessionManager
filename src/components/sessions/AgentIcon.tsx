@@ -32,7 +32,7 @@ const opticalScale: Record<string, number> = {
   grok: 1.15,
   opencode: 1.0,
   zcode: 1.1,
-  pi: 1.7,
+  pi: 1.55,
 };
 
 export function AgentIcon({

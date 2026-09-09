@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Agent会话管理器  v1.3.9",
+        "title": "Agent会话管理器  v1.3.13",
         "visible": false,
         "minWidth": 900,
         "minHeight": 600,

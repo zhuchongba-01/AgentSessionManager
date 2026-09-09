@@ -62,12 +62,4 @@ export const sessionsApi = {
   ): Promise<DeleteSessionResult[]> {
     return await invoke("delete_sessions", { items });
   },
-
-  async resume(
-    providerId: string,
-    sourcePath: string,
-    launch: boolean,
-  ): Promise<string> {
-    return await invoke("session_resume", { providerId, sourcePath, launch });
-  },
 };

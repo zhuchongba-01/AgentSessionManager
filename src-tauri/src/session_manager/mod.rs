@@ -200,57 +200,6 @@ pub fn checked_list_sessions() -> Result<SessionScanReport, String> {
     Ok(scan_report())
 }
 
-pub fn resume_command(provider: &str, source: &str) -> Result<String, String> {
-    let session = scan_sessions()
-        .into_iter()
-        .find(|session| {
-            session.provider_id == provider && session.source_path.as_deref() == Some(source)
-        })
-        .ok_or("会话已不存在，请重新扫描")?;
-    if session.cleanup_pending || session.archived || session.residual {
-        return Err("该记录正在清理、已归档或属于历史副本，请先在原 Agent 中处理".into());
-    }
-    if !providers::utils::is_safe_session_id(&session.session_id) {
-        return Err("会话 ID 无法安全用于恢复命令".into());
-    }
-    let quote = |value: &str| {
-        if cfg!(target_os = "windows") {
-            format!("'{}'", value.replace('\'', "''"))
-        } else {
-            terminal::shell_escape(value)
-        }
-    };
-    let id = &session.session_id;
-    let command = match provider {
-        "codex" => format!("codex resume {id}"),
-        "claude" => format!("claude --resume {id}"),
-        "opencode" => format!("opencode -s {id}"),
-        "zcode" => format!("zcode -s {id}"),
-        "grokbuild" => format!("grok --resume {id}"),
-        "pi" => format!("pi --session {}", quote(source)),
-        _ => return Err("不支持此 Agent".into()),
-    };
-    let cwd = if provider == "codex" {
-        codex::working_directory(Path::new(source))?
-    } else {
-        session.project_dir
-    };
-    if let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) {
-        if !Path::new(&cwd).is_dir() {
-            return Err("会话工作目录已不存在，请先恢复目录或使用原 Agent 选择新的目录".into());
-        }
-        return Ok(if cfg!(target_os = "windows") {
-            format!(
-                "& {{ Set-Location -LiteralPath {} -ErrorAction Stop; {command} }}",
-                quote(&cwd)
-            )
-        } else {
-            format!("cd {} && {command}", quote(&cwd))
-        });
-    }
-    Ok(command)
-}
-
 pub fn delete_session_checked(
     provider_id: &str,
     session_id: &str,
@@ -315,6 +264,10 @@ fn delete_session_in_snapshot(
             )
         })
         .unwrap_or_default();
+
+    if provider_id == "codex" && Path::new(source_path).exists() {
+        codex::validate_delete(Path::new(source_path), session_id)?;
+    }
 
     // Clear referenced indexes BEFORE removing the transcript. Archived threads
     // are included in the authoritative lookup; historical copies are not.

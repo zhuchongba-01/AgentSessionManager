@@ -110,14 +110,14 @@ body {
 }
 
 .asm-app-icon {
-  width: 22px;
-  height: 22px;
+  width: 26px;
+  height: 26px;
   flex: none;
-  border-radius: 7px;
+  border-radius: 8px;
 }
 
 .asm-app-name {
-  font-size: 12.5px;
+  font-size: 14px;
   font-weight: 600;
   letter-spacing: -0.01em;
   white-space: nowrap;
@@ -130,27 +130,52 @@ body {
 }
 
 .asm-update-button {
-  display: grid;
-  width: 26px;
-  height: 26px;
+  display: inline-flex;
+  height: 22px;
   flex: none;
-  place-items: center;
-  border-radius: 50%;
-  background: #d57f5d;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 999px;
+  background: hsl(145 55% 40%);
   color: #fff;
   cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
   transition:
     background 120ms ease,
     transform 120ms ease;
 }
 
 .asm-update-button:hover {
-  background: #c86f4d;
+  background: hsl(145 58% 34%);
   transform: translateY(-1px);
 }
 
 .asm-update-button:active {
   transform: translateY(0);
+}
+
+.asm-update-tooltip {
+  display: flex;
+  width: min(320px, calc(100vw - 24px));
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 11px !important;
+  white-space: normal;
+}
+
+.asm-update-tooltip-title {
+  font-weight: 600;
+}
+
+.asm-update-tooltip-notes {
+  color: hsl(var(--primary-foreground) / 0.82);
+  line-height: 1.5;
+  white-space: pre-line;
 }
 
 .asm-topbar-actions {
@@ -237,12 +262,6 @@ body {
   padding: 0 12px;
 }
 
-.asm-list-title {
-  flex: none;
-  font-size: 13px;
-  font-weight: 600;
-}
-
 .asm-agent-filter-trigger {
   width: auto !important;
   max-width: 126px;
@@ -269,36 +288,59 @@ body {
 }
 
 .asm-agent-option {
-  display: flex;
+  display: grid;
   width: 100%;
+  grid-template-columns: 16px minmax(0, 1fr) 2ch;
   align-items: center;
   gap: 9px;
 }
 
 .asm-agent-option-count {
-  margin-left: auto;
-  padding-left: 20px;
+  min-width: 2ch;
   color: hsl(var(--muted-foreground) / 0.65);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
-.asm-list-view-trigger {
-  width: 28px !important;
+.asm-list-view-switch {
+  display: flex;
   height: 28px !important;
-  min-width: 28px !important;
-  padding: 0 !important;
-  border: 0 !important;
-  border-radius: 7px !important;
-  background: transparent !important;
-  box-shadow: none !important;
-  color: hsl(var(--muted-foreground));
+  flex: none;
+  align-items: center;
+  padding: 2px;
+  border-radius: 999px;
+  background: hsl(var(--muted));
 }
 
-.asm-list-view-trigger:hover,
-.asm-list-view-trigger[data-state="open"] {
-  background: hsl(var(--muted)) !important;
+.asm-list-view-option {
+  height: 24px;
+  min-width: 34px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1;
+}
+
+.asm-list-view-option:hover {
   color: hsl(var(--foreground));
+}
+
+.asm-list-view-option[aria-pressed="true"] {
+  background: hsl(var(--background));
+  box-shadow:
+    0 0 0 1px hsl(var(--border) / 0.72),
+    0 1px 2px hsl(var(--foreground) / 0.08);
+  color: hsl(var(--foreground));
+}
+
+.asm-list-view-option:focus-visible {
+  outline-offset: 1px;
 }
 
 .asm-list-tool-button {
@@ -639,8 +681,8 @@ button.asm-chip:hover {
   appearance: none;
   display: flex;
   width: 100%;
-  height: 14px;
-  min-height: 14px;
+  height: 12px;
+  min-height: 12px;
   flex: none;
   align-items: center;
   justify-content: flex-start;
@@ -657,17 +699,17 @@ button.asm-chip:hover {
 
 .asm-minimap-tick {
   display: block;
-  height: 3px;
+  height: 2px;
   border: none;
-  border-radius: 2px;
-  background: hsl(var(--muted-foreground) / 0.32);
+  border-radius: 0;
+  background: hsl(60 2% 82%);
   transition:
     width 150ms ease,
     background 150ms ease;
 }
 
 .asm-minimap-tick.is-current {
-  background: hsl(var(--foreground) / 0.72);
+  background: hsl(60 1% 50%);
 }
 
 .asm-minimap-tick.is-hover {
@@ -676,6 +718,14 @@ button.asm-chip:hover {
 
 .asm-minimap-slot:focus-visible .asm-minimap-tick {
   box-shadow: 0 0 0 2px hsl(var(--background));
+}
+
+.dark .asm-minimap-tick {
+  background: hsl(var(--muted-foreground) / 0.42);
+}
+
+.dark .asm-minimap-tick.is-current {
+  background: hsl(var(--foreground) / 0.68);
 }
 
 .asm-detail-scroll {

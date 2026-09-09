@@ -15,8 +15,6 @@ import {
   FileText,
   CheckSquare,
   Boxes,
-  ListTree,
-  List,
   ChevronDown,
   ChevronRight,
   Moon,
@@ -24,9 +22,7 @@ import {
   Minus,
   Square,
   X,
-  Download,
   Github,
-  Terminal,
 } from "lucide-react";
 import appIcon from "@/icons/app-icon.png";
 import {
@@ -255,7 +251,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     () => new Set(),
   );
   const [isBatchDeleting, setIsBatchDeleting] = useState(false);
-  const [isResuming, setIsResuming] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [availableUpdate, setAvailableUpdate] =
     useState<AvailableUpdate | null>(null);
@@ -395,14 +390,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   }, [filteredSessions, selectedKey]);
   const isCodexSession = selectedSession?.providerId === "codex";
 
-  const listViewModeLabel =
-    listViewMode === "grouped"
-      ? t("sessionManager.viewModeGrouped", {
-          defaultValue: "分类",
-        })
-      : t("sessionManager.viewModeFlat", {
-          defaultValue: "列表",
-        });
   const providerFilterLabel =
     providerFilter === "all"
       ? t("sessionManager.providerFilterAll", { defaultValue: "全部 Agent" })
@@ -539,28 +526,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     },
     [t],
   );
-
-  const handleResume = async () => {
-    if (!selectedSession?.sourcePath || isResuming || isDeleting) return;
-    setIsResuming(true);
-    try {
-      const command = await sessionsApi.resume(
-        selectedSession.providerId,
-        selectedSession.sourcePath,
-        isMac(),
-      );
-      if (isMac()) toast.success("已打开恢复终端");
-      else
-        await handleCopy(
-          command,
-          "恢复命令已复制，请粘贴到 PowerShell 或对应终端执行",
-        );
-    } catch (error) {
-      toast.error("无法恢复会话", { description: extractErrorMessage(error) });
-    } finally {
-      setIsResuming(false);
-    }
-  };
 
   const handleOpenUrl = useCallback(
     async (url: string) => {
@@ -1050,14 +1015,28 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         void handleOpenUrl(GITHUB_LATEST_RELEASE_URL)
                       }
                     >
-                      <Download className="size-4" />
+                      {t("sessionManager.updateButton", {
+                        defaultValue: "更新",
+                      })}
                     </button>
                   </TooltipTrigger>
-                  <TooltipContent>
-                    {t("sessionManager.updateTooltip", {
-                      defaultValue: "发现新版本 v{{version}}，前往下载",
-                      version: availableUpdate.version,
-                    })}
+                  <TooltipContent
+                    className="asm-update-tooltip"
+                    side="bottom"
+                    align="start"
+                  >
+                    <strong className="asm-update-tooltip-title">
+                      {t("sessionManager.updateTooltip", {
+                        defaultValue: "发现新版本 v{{version}}",
+                        version: availableUpdate.version,
+                      })}
+                    </strong>
+                    <span className="asm-update-tooltip-notes">
+                      {availableUpdate.notes ||
+                        t("sessionManager.updateNotesUnavailable", {
+                          defaultValue: "该版本暂未提供更新说明",
+                        })}
+                    </span>
                   </TooltipContent>
                 </Tooltip>
               )}
@@ -1133,9 +1112,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 onContextMenu={(event) => event.preventDefault()}
               >
                 <div className="asm-list-toolbar">
-                  <span className="asm-list-title">
-                    {t("sessionManager.sessions", { defaultValue: "会话" })}
-                  </span>
                   <Select
                     value={providerFilter}
                     onValueChange={(value) =>
@@ -1166,7 +1142,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       </span>
                     </SelectTrigger>
                     <SelectContent className="asm-select-content asm-agent-filter-content">
-                      <SelectItem value="all">
+                      <SelectItem value="all" className="asm-agent-filter-item">
                         <div className="asm-agent-option">
                           <Boxes className="size-4" />
                           <span>
@@ -1189,7 +1165,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                           "pi",
                         ] as const
                       ).map((providerId) => (
-                        <SelectItem key={providerId} value={providerId}>
+                        <SelectItem
+                          key={providerId}
+                          value={providerId}
+                          className="asm-agent-filter-item"
+                        >
                           <div className="asm-agent-option">
                             <AgentIcon
                               icon={getProviderIconName(providerId)}
@@ -1248,48 +1228,40 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       </TooltipContent>
                     </Tooltip>
                   )}
-                  <Select
-                    value={listViewMode}
-                    onValueChange={(value) =>
-                      setListViewMode(value as SessionListViewMode)
-                    }
+                  <div
+                    className="asm-list-view-switch"
+                    role="group"
+                    aria-label={t("sessionManager.viewModeTooltip", {
+                      defaultValue: "查看方式",
+                    })}
                   >
-                    <SelectTrigger
-                      className="asm-list-view-trigger"
-                      aria-label={t("sessionManager.viewModeTooltip", {
-                        defaultValue: "查看方式",
+                    <button
+                      type="button"
+                      className="asm-list-view-option"
+                      aria-pressed={listViewMode === "flat"}
+                      aria-label={t("sessionManager.viewModeFlat", {
+                        defaultValue: "列表",
                       })}
-                      title={listViewModeLabel}
+                      onClick={() => setListViewMode("flat")}
                     >
-                      {listViewMode === "grouped" ? (
-                        <ListTree className="size-3.5 shrink-0" />
-                      ) : (
-                        <List className="size-3.5 shrink-0" />
-                      )}
-                    </SelectTrigger>
-                    <SelectContent className="asm-select-content w-40">
-                      <SelectItem value="flat">
-                        <div className="flex items-center gap-2">
-                          <List className="size-3.5" />
-                          <span>
-                            {t("sessionManager.viewModeFlat", {
-                              defaultValue: "列表",
-                            })}
-                          </span>
-                        </div>
-                      </SelectItem>
-                      <SelectItem value="grouped">
-                        <div className="flex items-center gap-2">
-                          <ListTree className="size-3.5" />
-                          <span>
-                            {t("sessionManager.viewModeGrouped", {
-                              defaultValue: "分类",
-                            })}
-                          </span>
-                        </div>
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
+                      {t("sessionManager.viewModeFlat", {
+                        defaultValue: "列表",
+                      })}
+                    </button>
+                    <button
+                      type="button"
+                      className="asm-list-view-option"
+                      aria-pressed={listViewMode === "grouped"}
+                      aria-label={t("sessionManager.viewModeGrouped", {
+                        defaultValue: "分类",
+                      })}
+                      onClick={() => setListViewMode("grouped")}
+                    >
+                      {t("sessionManager.viewModeGrouped", {
+                        defaultValue: "分类",
+                      })}
+                    </button>
+                  </div>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
@@ -1714,26 +1686,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
                         {/* 操作按钮组 */}
                         <div className="asm-detail-actions">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={
-                              isDeleting ||
-                              isResuming ||
-                              !selectedSession.resumeCommand ||
-                              selectedSession.cleanupPending ||
-                              selectedSession.archived ||
-                              selectedSession.residual
-                            }
-                            onClick={() => void handleResume()}
-                          >
-                            <Terminal className="mr-1 size-3.5" />
-                            {isResuming
-                              ? "恢复中…"
-                              : isMac()
-                                ? "恢复会话"
-                                : "复制恢复命令"}
-                          </Button>
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <Button

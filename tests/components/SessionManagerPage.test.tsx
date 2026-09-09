@@ -63,19 +63,11 @@ const renderPage = (appId = "codex") => {
   };
 };
 
-const openViewModeMenu = async () => {
-  await userEvent.click(screen.getByRole("combobox", { name: /查看方式/i }));
-};
-
 const switchToGroupedView = async () => {
-  await openViewModeMenu();
-  const groupedOption = await screen.findByRole("option", { name: /分类/i });
-  await userEvent.click(groupedOption);
-  await waitFor(() =>
-    expect(
-      screen.queryByRole("option", { name: /分类/i }),
-    ).not.toBeInTheDocument(),
-  );
+  const groupedOption = screen.getByRole("button", { name: "分类" });
+  if (groupedOption.getAttribute("aria-pressed") !== "true") {
+    await userEvent.click(groupedOption);
+  }
 };
 
 const switchProviderFilter = async (providerLabel: RegExp) => {
@@ -209,7 +201,8 @@ describe("SessionManagerPage", () => {
     server.use(
       http.get(GITHUB_LATEST_RELEASE_API, () =>
         HttpResponse.json({
-          tag_name: "v1.3.10",
+          tag_name: "v1.3.14",
+          body: "## 更新内容\n- 修复更新提示\n- 优化 Agent 图标",
           draft: false,
           prerelease: false,
         }),
@@ -218,8 +211,16 @@ describe("SessionManagerPage", () => {
     renderPage();
 
     const updateButton = await screen.findByRole("button", {
-      name: "发现新版本 v1.3.10",
+      name: "发现新版本 v1.3.14",
     });
+    expect(updateButton).toHaveTextContent("更新");
+    await userEvent.hover(updateButton);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "发现新版本 v1.3.14",
+    );
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "修复更新提示 优化 Agent 图标",
+    );
     await userEvent.click(updateButton);
 
     expect(openUrlMock).toHaveBeenCalledWith(GITHUB_LATEST_RELEASE_URL);
@@ -868,7 +869,7 @@ describe("SessionManagerPage", () => {
     listSpy.mockRestore();
   });
 
-  it("copies a backend-validated resume command for a current session", async () => {
+  it("does not expose a resume command action", async () => {
     setSessionFixtures(
       [
         {
@@ -881,26 +882,14 @@ describe("SessionManagerPage", () => {
       ],
       {},
     );
-    const spy = vi
-      .spyOn(sessionsApi, "resume")
-      .mockResolvedValue("codex resume resume-1");
-    const copy = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText: copy },
-    });
     renderPage();
-    fireEvent.click(
-      await screen.findByRole("button", { name: "复制恢复命令" }),
-    );
-    await waitFor(() =>
-      expect(spy).toHaveBeenCalledWith("codex", "/mock/resume.jsonl", false),
-    );
-    expect(copy).toHaveBeenCalledWith("codex resume resume-1");
-    spy.mockRestore();
+    await screen.findByRole("heading", { name: "Resume Session" });
+    expect(
+      screen.queryByRole("button", { name: "复制恢复命令" }),
+    ).not.toBeInTheDocument();
   });
 
-  it("labels archived sessions and disables direct resume", async () => {
+  it("labels archived sessions", async () => {
     setSessionFixtures(
       [
         {
@@ -917,6 +906,5 @@ describe("SessionManagerPage", () => {
     renderPage();
     await screen.findByRole("heading", { name: "Archived Session" });
     expect(screen.getAllByText("已归档").length).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "复制恢复命令" })).toBeDisabled();
   });
 });

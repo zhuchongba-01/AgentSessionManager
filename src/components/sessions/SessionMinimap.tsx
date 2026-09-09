@@ -16,10 +16,13 @@ interface MinimapTurn {
   reply: string;
 }
 
-const SLOT_HEIGHT = 14;
+const SLOT_HEIGHT = 12;
+const TICK_WIDTH = 6;
+const WAVE_AMPLITUDE = 19;
+const WAVE_RADIUS = 3.25;
 const MIN_VISIBLE_TICKS = 5;
-const MAX_VISIBLE_TICKS = 18;
-const DEFAULT_VISIBLE_TICKS = 9;
+const MAX_VISIBLE_TICKS = 28;
+const DEFAULT_VISIBLE_TICKS = 18;
 
 const clampText = (text: string, max: number) =>
   text.length > max ? text.slice(0, max) + "…" : text;
@@ -102,7 +105,7 @@ export function SessionMinimap({
   const visibleCapacity =
     containerHeight > 0
       ? clamp(
-          Math.floor((containerHeight - 32) / SLOT_HEIGHT),
+          Math.floor((containerHeight - 16) / SLOT_HEIGHT),
           MIN_VISIBLE_TICKS,
           MAX_VISIBLE_TICKS,
         )
@@ -160,8 +163,11 @@ export function SessionMinimap({
             hoveredTurnIndex === null
               ? Number.POSITIVE_INFINITY
               : Math.abs(turnIndex - hoveredTurnIndex);
-          const wave = Math.max(0, 1 - distance / 3);
-          const width = hoveredTurnIndex === null ? 8 : 8 + wave * 26;
+          const wave = Math.max(0, 1 - distance / WAVE_RADIUS);
+          const width =
+            hoveredTurnIndex === null
+              ? TICK_WIDTH
+              : TICK_WIDTH + wave * WAVE_AMPLITUDE;
           return (
             <button
               key={turn.messageIndex}

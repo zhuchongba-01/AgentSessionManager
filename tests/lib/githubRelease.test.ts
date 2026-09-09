@@ -15,21 +15,21 @@ describe("GitHub release update check", () => {
   });
 
   it("returns a newer stable release", async () => {
-    const fetcher = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            tag_name: "v1.4.0",
-            draft: false,
-            prerelease: false,
-          }),
-          { status: 200 },
-        ),
-      );
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          tag_name: "v1.4.0",
+          body: "## 更新内容\n- 修复会话扫描\n- 优化列表布局",
+          draft: false,
+          prerelease: false,
+        }),
+        { status: 200 },
+      ),
+    );
 
     await expect(checkForAvailableUpdate("1.3.8", fetcher)).resolves.toEqual({
       version: "1.4.0",
+      notes: "修复会话扫描\n优化列表布局",
     });
     expect(fetcher).toHaveBeenCalledWith(
       GITHUB_LATEST_RELEASE_API,

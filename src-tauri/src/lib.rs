@@ -53,23 +53,6 @@ async fn delete_sessions(
 }
 
 #[tauri::command]
-async fn session_resume(
-    #[allow(non_snake_case)] providerId: String,
-    #[allow(non_snake_case)] sourcePath: String,
-    launch: bool,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let command = session_manager::resume_command(&providerId, &sourcePath)?;
-        if launch {
-            session_manager::terminal::launch_terminal("terminal", &command, None, None)?;
-        }
-        Ok(command)
-    })
-    .await
-    .map_err(|error| format!("恢复会话失败：{error}"))?
-}
-
-#[tauri::command]
 fn get_pi_session_discovery() -> session_manager::providers::pi::PiSessionDiscovery {
     session_manager::providers::pi::session_discovery()
 }
@@ -139,7 +122,6 @@ pub fn run() {
             get_session_messages,
             delete_session,
             delete_sessions,
-            session_resume,
             get_pi_session_discovery,
             set_window_theme,
         ])

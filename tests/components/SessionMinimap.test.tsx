@@ -31,7 +31,7 @@ describe("SessionMinimap", () => {
     );
 
     const ticks = screen.getAllByRole("button");
-    expect(ticks).toHaveLength(9);
+    expect(ticks).toHaveLength(18);
     expect(
       screen.getByRole("button", { name: "跳转到第 21 个用户问题" }),
     ).toBeInTheDocument();
@@ -45,7 +45,7 @@ describe("SessionMinimap", () => {
     const secondVisibleTurn = screen.getByRole("button", {
       name: "跳转到第 22 个用户问题",
     });
-    expect(target.firstElementChild).toHaveStyle({ width: "8px" });
+    expect(target.firstElementChild).toHaveStyle({ width: "6px" });
     expect(target.firstElementChild).toHaveClass("is-current");
     expect(secondVisibleTurn.firstElementChild).toHaveClass("is-current");
     expect(
@@ -54,7 +54,21 @@ describe("SessionMinimap", () => {
       }).firstElementChild,
     ).not.toHaveClass("is-current");
     fireEvent.mouseEnter(target);
-    expect(target.firstElementChild).toHaveStyle({ width: "34px" });
+    expect(target.firstElementChild).toHaveStyle({ width: "25px" });
+    expect(
+      Number.parseFloat(
+        (
+          screen.getByRole("button", {
+            name: "跳转到第 24 个用户问题",
+          }).firstElementChild as HTMLElement
+        ).style.width,
+      ),
+    ).toBeGreaterThan(6);
+    expect(
+      screen.getByRole("button", {
+        name: "跳转到第 25 个用户问题",
+      }).firstElementChild,
+    ).toHaveStyle({ width: "6px" });
     expect(screen.getByRole("tooltip")).toHaveTextContent("用户问题 21");
     expect(screen.getByRole("tooltip")).toHaveTextContent("助手回答 21");
 
