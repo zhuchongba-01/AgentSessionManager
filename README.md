@@ -4,7 +4,7 @@
 
 # Agent 会话管理器
 
-**一款轻量的桌面应用，统一浏览、恢复与安全删除本地编码 Agent 的会话记录。**
+**一款轻量的桌面应用，统一浏览、分类与安全清理本地编码 Agent 的会话记录。**
 
 [![Release](https://img.shields.io/github/v/release/zhuchongba-01/AgentSessionManager?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
@@ -18,7 +18,7 @@
 
 ## 这是什么
 
-面向本地编码 Agent 的独立会话浏览、分类、恢复与安全删除工具。
+面向本地编码 Agent 的独立会话浏览、分类与安全清理工具。当前版本不负责启动 Agent 或恢复会话。
 
 当前支持扫描 **Codex、Claude Code、OpenCode、ZCode、Pi 与 Grok Build** 六种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
 
@@ -30,13 +30,16 @@
 - 🧹 **安全清理**：识别残留、归档和仅剩索引的任务，支持批量删除与失败后继续清理；会话清理绝不删除项目工作目录。
 - 🛡️ **明确失败而非假装为空**：扫描不完整或消息读取失败时显示原因，并限制超大会话的单次读取量。
 - 📚 **长历史可控**：会话列表每页最多显示 100 条，消息按可视区域渲染。
-- 💻 **纯本地运行**：扫描、展示与摘要全部在本机完成。
+- 💻 **会话数据留在本机**：扫描、展示与摘要全部在本机完成，不上传会话内容；启动时仅访问 GitHub API 检查新版本。
 
 删除前请完全退出对应 Agent（包括后台进程、终端任务），并自行备份重要会话。详细边界见 [SAFETY.md](./SAFETY.md)。
 
 ## 下载安装
 
-前往 [Releases](https://github.com/zhuchongba-01/AgentSessionManager/releases) 下载 `AgentSessionManager-Setup-vX.Y.Z.exe`（Windows x64 安装包，无需预装运行时）。
+当前仅提供 Windows x64 版本。前往 [Releases](https://github.com/zhuchongba-01/AgentSessionManager/releases) 下载 `AgentSessionManager-Setup-vX.Y.Z.exe`，无需预装运行时。
+
+> [!IMPORTANT]
+> 本程序暂未进行商业代码签名。Edge 首次下载时可能提示“不常下载”，请选择“保留”；Windows SmartScreen 如显示“Windows 已保护你的电脑”，请点击“更多信息” → “仍要运行”。请只从本仓库的 Releases 页面下载安装包。
 
 ## 开发
 
