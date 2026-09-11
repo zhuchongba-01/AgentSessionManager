@@ -15,22 +15,22 @@ fn texts() -> TrayTexts {
     let locale = sys_locale::get_locale().unwrap_or_default().to_lowercase();
     if locale.starts_with("en") {
         TrayTexts {
-            show_main: "Open Agent Session Manager",
+            show_main: "Open",
             quit: "Quit",
         }
     } else if locale.starts_with("ja") {
         TrayTexts {
-            show_main: "Agent セッションマネージャーを開く",
+            show_main: "開く",
             quit: "終了",
         }
     } else if locale.starts_with("zh-tw") || locale.starts_with("zh-hk") {
         TrayTexts {
-            show_main: "開啟 Agent 會話管理器",
+            show_main: "開啟",
             quit: "退出",
         }
     } else {
         TrayTexts {
-            show_main: "打开 Agent 会话管理器",
+            show_main: "打开",
             quit: "退出",
         }
     }
@@ -44,7 +44,6 @@ pub fn create_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Stri
         .map_err(|error| format!("创建托盘菜单失败：{error}"))?;
     MenuBuilder::new(app)
         .item(&show_main)
-        .separator()
         .item(&quit)
         .build()
         .map_err(|error| format!("创建托盘菜单失败：{error}"))

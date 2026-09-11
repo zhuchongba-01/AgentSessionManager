@@ -416,7 +416,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     getScrollElement: () => scrollContainerRef.current,
     estimateSize: () => 120,
     overscan: 5,
-    gap: 12,
+    gap: 18,
   });
   const viewportStart = virtualizer.scrollOffset ?? 0;
   const viewportEnd =
@@ -525,6 +525,18 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       }
     },
     [t],
+  );
+
+  const handleCopyMessage = useCallback(
+    (content: string) => {
+      void handleCopy(
+        content,
+        t("sessionManager.messageCopied", {
+          defaultValue: "已复制消息内容",
+        }),
+      );
+    },
+    [handleCopy, t],
   );
 
   const handleOpenUrl = useCallback(
@@ -1863,6 +1875,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                       message={
                                         visibleMessages[virtualRow.index]
                                       }
+                                      onCopy={handleCopyMessage}
                                       isActive={
                                         activeMessageIndex === virtualRow.index
                                       }

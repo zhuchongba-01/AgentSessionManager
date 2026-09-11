@@ -737,7 +737,8 @@ button.asm-chip:hover {
 }
 
 .asm-messages {
-  max-width: 770px;
+  width: 100%;
+  max-width: 1040px;
   margin: 0 auto;
 }
 
@@ -746,10 +747,6 @@ button.asm-chip:hover {
   position: relative;
   padding: 3px 0;
   border-radius: 8px;
-}
-
-.asm-message + .asm-message {
-  margin-top: 18px;
 }
 
 .asm-message-role {
@@ -767,6 +764,35 @@ button.asm-chip:hover {
   font-variant-numeric: tabular-nums;
 }
 
+.asm-message-copy {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  margin: -5px 0 -5px auto;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  opacity: 0;
+  cursor: pointer;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    background 120ms ease;
+}
+
+.asm-message:hover .asm-message-copy,
+.asm-message:focus-within .asm-message-copy {
+  opacity: 1;
+}
+
+.asm-message-copy:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+
 .asm-message-body {
   min-width: 0;
   font-size: 14px;
@@ -777,11 +803,32 @@ button.asm-chip:hover {
 
 .asm-message.is-user .asm-message-body {
   display: inline-block;
-  max-width: 88%;
+  max-width: 100%;
   padding: 9px 14px;
   border: 1px solid hsl(var(--border));
   border-radius: 12px;
   background: hsl(var(--muted) / 0.76);
+}
+
+.asm-message.is-user {
+  display: flex;
+  width: 64%;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-left: auto;
+}
+
+.asm-message.is-user .asm-message-role {
+  justify-content: flex-end;
+}
+
+.asm-message.is-user .asm-message-copy {
+  margin-left: 0;
+}
+
+.asm-message.is-assistant,
+.asm-message.is-tool {
+  width: 100%;
 }
 
 .asm-message.is-tool .asm-message-body {
@@ -795,6 +842,10 @@ button.asm-chip:hover {
 .asm-message.is-active {
   background: hsl(var(--primary) / 0.05);
   box-shadow: inset 2px 0 0 hsl(var(--primary));
+}
+
+.asm-message.is-user.is-active {
+  box-shadow: inset -2px 0 0 hsl(var(--primary));
 }
 
 @media (max-width: 1050px) {
@@ -815,6 +866,21 @@ button.asm-chip:hover {
   }
   .asm-detail-scroll {
     padding-inline: 18px;
+  }
+  .asm-message.is-user {
+    width: 74%;
+  }
+}
+
+@media (max-width: 560px) {
+  .asm-message.is-user {
+    width: 88%;
+  }
+}
+
+@media (hover: none) {
+  .asm-message-copy {
+    opacity: 0.62;
   }
 }
 

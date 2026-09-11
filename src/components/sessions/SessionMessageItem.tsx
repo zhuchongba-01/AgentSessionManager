@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronUp, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { cn } from "@/lib/utils";
@@ -12,11 +12,13 @@ const COLLAPSED_LENGTH = 1500;
 interface SessionMessageItemProps {
   message: SessionMessage;
   isActive: boolean;
+  onCopy: (content: string) => void;
 }
 
 export const SessionMessageItem = memo(function SessionMessageItem({
   message,
   isActive,
+  onCopy,
 }: SessionMessageItemProps) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
@@ -47,6 +49,16 @@ export const SessionMessageItem = memo(function SessionMessageItem({
             {formatMessageTimestamp(message.ts)}
           </span>
         )}
+        <button
+          type="button"
+          className="asm-message-copy"
+          aria-label={t("sessionManager.copyMessage", {
+            defaultValue: "复制消息",
+          })}
+          onClick={() => onCopy(message.content)}
+        >
+          <Copy className="size-3.5" aria-hidden="true" />
+        </button>
       </div>
       <div className="asm-message-body">{displayContent}</div>
       {isLong && (

@@ -201,7 +201,7 @@ describe("SessionManagerPage", () => {
     server.use(
       http.get(GITHUB_LATEST_RELEASE_API, () =>
         HttpResponse.json({
-          tag_name: "v1.3.14",
+          tag_name: "v1.3.17",
           body: "## 更新内容\n- 修复更新提示\n- 优化 Agent 图标",
           draft: false,
           prerelease: false,
@@ -211,12 +211,12 @@ describe("SessionManagerPage", () => {
     renderPage();
 
     const updateButton = await screen.findByRole("button", {
-      name: "发现新版本 v1.3.14",
+      name: "发现新版本 v1.3.17",
     });
     expect(updateButton).toHaveTextContent("更新");
     await userEvent.hover(updateButton);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "发现新版本 v1.3.14",
+      "发现新版本 v1.3.17",
     );
     expect(screen.getByRole("tooltip")).toHaveTextContent(
       "修复更新提示 优化 Agent 图标",

@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::session_manager::{SessionMessage, SessionMeta};
+use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 use crate::session_paths::{
     codex_config_dir, codex_state_db_paths, read_codex_config_text,
     CODEX_THREAD_HISTORY_DB_FILENAME,
@@ -69,6 +69,7 @@ struct RolloutDescriptor {
 #[derive(Clone, Debug)]
 struct HistorySegment {
     path: PathBuf,
+    session_id: String,
     end_byte_offset: Option<u64>,
 }
 
@@ -776,6 +777,7 @@ fn collapse_paginated_history(
                 let leaf_path = normalized_rollout_path(&continuation.path.to_string_lossy());
                 let earliest = chain
                     .iter()
+                    .filter(|segment| segment.session_id == continuation.session_id)
                     .filter_map(|segment| {
                         descriptors
                             .iter()
@@ -789,7 +791,11 @@ fn collapse_paginated_history(
                         .and_modify(|existing| *existing = (*existing).min(earliest))
                         .or_insert(earliest);
                 }
-                for segment in chain.iter().take(chain.len().saturating_sub(1)) {
+                for segment in chain
+                    .iter()
+                    .take(chain.len().saturating_sub(1))
+                    .filter(|segment| segment.session_id == continuation.session_id)
+                {
                     hidden_paths.insert(normalized_rollout_path(&segment.path.to_string_lossy()));
                 }
             }
@@ -927,6 +933,7 @@ fn resolve_paginated_chain_from_descriptors(
     let mut visited = HashSet::new();
     let mut reversed = vec![HistorySegment {
         path: current.path.clone(),
+        session_id: current.session_id.clone(),
         end_byte_offset: None,
     }];
     visited.insert(normalized_rollout_path(&current.path.to_string_lossy()));
@@ -938,24 +945,8 @@ fn resolve_paginated_chain_from_descriptors(
                 current_path.display()
             ));
         }
-        let referenced_by_other_session = descriptors.iter().any(|candidate| {
-            candidate.rollout_id == history_base.thread_id
-                && candidate.session_id != current.session_id
-        });
-        let referenced_by_same_session = descriptors.iter().any(|candidate| {
-            candidate.rollout_id == history_base.thread_id
-                && candidate.session_id == current.session_id
-        });
-        if referenced_by_other_session && !referenced_by_same_session {
-            return Err(format!(
-                "Codex 分页历史引用了不同会话，已停止处理：{}",
-                current_path.display()
-            ));
-        }
-
         let mut candidates = descriptors
             .iter()
-            .filter(|candidate| candidate.session_id == current.session_id)
             .filter(|candidate| candidate.rollout_id == history_base.thread_id)
             .filter(|candidate| !same_rollout_path(&candidate.path, &current.path))
             .filter(|candidate| {
@@ -1001,6 +992,7 @@ fn resolve_paginated_chain_from_descriptors(
         }
         reversed.push(HistorySegment {
             path: base.path.clone(),
+            session_id: base.session_id.clone(),
             end_byte_offset: Some(history_base.end_byte_offset),
         });
         current = base;
@@ -1011,8 +1003,20 @@ fn resolve_paginated_chain_from_descriptors(
 }
 
 fn rollout_descriptors_for_path(path: &Path) -> Vec<RolloutDescriptor> {
-    let mut roots = session_roots();
-    if !roots.iter().any(|root| path.starts_with(root)) {
+    rollout_descriptors_in_roots(path, session_roots())
+}
+
+fn rollout_descriptors_in_roots(path: &Path, mut roots: Vec<PathBuf>) -> Vec<RolloutDescriptor> {
+    // canonicalize() adds the Windows extended-length prefix. Compare paths in
+    // the same representation before deciding to scan an additional root.
+    let canonical_path = path.canonicalize().ok();
+    if !roots.iter().any(|root| {
+        root.canonicalize().is_ok_and(|root| {
+            canonical_path
+                .as_ref()
+                .is_some_and(|path| path.starts_with(root))
+        })
+    }) {
         if let Some(parent) = path.parent() {
             roots.push(parent.to_path_buf());
         }
@@ -1021,9 +1025,18 @@ fn rollout_descriptors_for_path(path: &Path) -> Vec<RolloutDescriptor> {
     for root in roots {
         collect_jsonl_files(&root, &mut files);
     }
+    descriptors_for_files(files)
+}
+
+fn descriptors_for_files(files: Vec<PathBuf>) -> Vec<RolloutDescriptor> {
+    let mut seen = HashSet::new();
     files
-        .iter()
-        .filter_map(|candidate| read_rollout_descriptor(candidate).ok())
+        .into_iter()
+        .filter(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            seen.insert(normalized_rollout_path(&canonical.to_string_lossy()))
+        })
+        .filter_map(|candidate| read_rollout_descriptor(&candidate).ok())
         .collect()
 }
 
@@ -1503,6 +1516,75 @@ pub fn validate_delete(path: &Path, session_id: &str) -> Result<(), String> {
     deletion_paths(path, session_id).map(|_| ())
 }
 
+/// A selected child must be deleted before a selected parent. Unselected
+/// dependants are still protected by the normal preflight at execution time.
+pub fn deletion_order(requests: &[DeleteSessionRequest]) -> Vec<usize> {
+    let descriptors = requests
+        .iter()
+        .filter(|request| request.provider_id == "codex")
+        .flat_map(|request| rollout_descriptors_for_path(Path::new(&request.source_path)))
+        .map(|descriptor| descriptor.path)
+        .collect();
+    deletion_order_with_descriptors(requests, &descriptors_for_files(descriptors))
+}
+
+fn deletion_order_with_descriptors(
+    requests: &[DeleteSessionRequest],
+    descriptors: &[RolloutDescriptor],
+) -> Vec<usize> {
+    let chains = requests
+        .iter()
+        .map(|request| {
+            if request.provider_id != "codex" {
+                return Vec::new();
+            }
+            resolve_paginated_chain_from_descriptors(Path::new(&request.source_path), descriptors)
+                .unwrap_or_default() // preflight reports unresolved chains without mutating anything
+        })
+        .collect::<Vec<_>>();
+    let owned = requests
+        .iter()
+        .zip(&chains)
+        .map(|(request, chain)| {
+            chain
+                .iter()
+                .filter(|segment| segment.session_id == request.session_id)
+                .map(|segment| normalized_rollout_path(&segment.path.to_string_lossy()))
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let depends = chains
+        .iter()
+        .enumerate()
+        .map(|(child, chain)| {
+            (0..requests.len())
+                .filter(|parent| {
+                    *parent != child
+                        && chain.iter().any(|segment| {
+                            owned[*parent]
+                                .contains(&normalized_rollout_path(&segment.path.to_string_lossy()))
+                        })
+                })
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut remaining = (0..requests.len()).collect::<Vec<_>>();
+    let mut order = Vec::new();
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|candidate| {
+            !remaining
+                .iter()
+                .any(|child| depends[*child].contains(candidate))
+        });
+        let Some(index) = ready else {
+            order.extend(remaining); // cycles remain subject to fail-closed preflight
+            break;
+        };
+        order.push(remaining.remove(index));
+    }
+    order
+}
+
 fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String> {
     let meta = parse_session(path)
         .ok_or_else(|| format!("Failed to parse Codex session metadata: {}", path.display()))?;
@@ -1520,37 +1602,105 @@ fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String>
         .find(|descriptor| same_rollout_path(&descriptor.path, path))
         .ok_or_else(|| format!("无法读取 Codex 会话元数据：{}", path.display()))?;
 
-    if target.history_base.is_some() {
-        return resolve_paginated_chain_from_descriptors(path, &descriptors)
-            .map(|chain| chain.into_iter().map(|segment| segment.path).collect());
+    let owned_segments = if target.history_base.is_some() {
+        resolve_paginated_chain_from_descriptors(path, &descriptors)?
+            .into_iter()
+            .filter(|segment| segment.session_id == session_id)
+            .collect::<Vec<_>>()
+    } else {
+        vec![HistorySegment {
+            path: path.to_path_buf(),
+            session_id: session_id.to_string(),
+            end_byte_offset: None,
+        }]
+    };
+    if owned_segments.is_empty() {
+        return Err("Codex 会话没有可安全删除的自有分页文件".into());
     }
+
+    let owned_paths = owned_segments
+        .iter()
+        .map(|segment| normalized_rollout_path(&segment.path.to_string_lossy()))
+        .collect::<HashSet<_>>();
+    let owned_rollout_ids = descriptors
+        .iter()
+        .filter(|descriptor| {
+            owned_paths.contains(&normalized_rollout_path(&descriptor.path.to_string_lossy()))
+        })
+        .map(|descriptor| descriptor.rollout_id.clone())
+        .collect::<HashSet<_>>();
 
     for continuation in descriptors
         .iter()
-        .filter(|descriptor| descriptor.session_id == session_id)
         .filter(|descriptor| descriptor.history_base.is_some())
     {
+        let continuation_path = normalized_rollout_path(&continuation.path.to_string_lossy());
+        if owned_paths.contains(&continuation_path) {
+            continue;
+        }
+
         match resolve_paginated_chain_from_descriptors(&continuation.path, &descriptors) {
             Ok(chain)
-                if chain
-                    .iter()
-                    .any(|segment| same_rollout_path(&segment.path, path)) =>
+                if chain.iter().any(|segment| {
+                    owned_paths.contains(&normalized_rollout_path(&segment.path.to_string_lossy()))
+                }) =>
             {
-                return Err("该记录是当前会话依赖的分页历史，不能单独删除".into());
+                if continuation.session_id == session_id {
+                    return Err("该记录是当前会话依赖的分页历史，不能单独删除".into());
+                }
+                return Err("该会话仍被另一条 Codex 分支会话依赖，不能删除".into());
             }
             Ok(_) => {}
-            Err(error) => {
+            Err(error)
+                if continuation.session_id == session_id
+                    || continuation
+                        .history_base
+                        .as_ref()
+                        .is_some_and(|base| owned_rollout_ids.contains(&base.thread_id)) =>
+            {
                 return Err(format!(
-                    "同 ID 的 Codex 分页历史无法确认，已禁止删除以保护会话：{error}"
+                    "Codex 分页或分支历史无法确认，已禁止删除以保护会话：{error}"
                 ));
             }
+            Err(_) => {}
         }
     }
 
-    Ok(vec![path.to_path_buf()])
+    Ok(owned_segments
+        .into_iter()
+        .map(|segment| segment.path)
+        .collect())
 }
 
 pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    let validated_paths = validated_deletion_paths(root, path, session_id)?;
+
+    // Remove the active leaf first. If a later base removal fails, no surviving
+    // continuation is left pointing at a missing history file.
+    for candidate in validated_paths.into_iter().rev() {
+        std::fs::remove_file(&candidate).map_err(|e| {
+            format!(
+                "Failed to delete Codex session file {}: {e}",
+                candidate.display()
+            )
+        })?;
+    }
+    Ok(true)
+}
+
+pub fn validate_delete_under_root(
+    root: &Path,
+    path: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    validated_deletion_paths(root, path, session_id).map(|_| ())
+}
+
+fn validated_deletion_paths(
+    root: &Path,
+    path: &Path,
+    session_id: &str,
+) -> Result<Vec<PathBuf>, String> {
     let paths = deletion_paths(path, session_id)?;
     let mut allowed_roots = session_roots();
     if !allowed_roots.iter().any(|candidate| candidate == root) {
@@ -1577,18 +1727,7 @@ pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool
         validated_paths.push(validated);
     }
 
-    // Remove the active leaf first. If a later base removal fails, no surviving
-    // continuation is left pointing at a missing history file.
-    for candidate in validated_paths.into_iter().rev() {
-        std::fs::remove_file(&candidate).map_err(|e| {
-            format!(
-                "Failed to delete Codex session file {}: {e}",
-                candidate.display()
-            )
-        })?;
-    }
-
-    Ok(true)
+    Ok(validated_paths)
 }
 
 fn parse_session(path: &Path) -> Option<SessionMeta> {
@@ -2242,6 +2381,247 @@ mod tests {
         assert_eq!(sessions[0].source_path.as_deref(), current.to_str());
         assert!(!sessions[0].residual);
         assert_eq!(sessions[0].title.as_deref(), Some("Later message"));
+    }
+
+    #[test]
+    fn canonical_path_and_overlapping_roots_do_not_duplicate_history_bases() {
+        let temp = tempdir().unwrap();
+        let day = temp.path().join("day");
+        std::fs::create_dir(&day).unwrap();
+        let parent = day.join("parent.jsonl");
+        let child = day.join("child.jsonl");
+        write_codex_session(&parent, "parent", "Parent");
+        write_paginated_session_with_base(
+            &child,
+            "child",
+            "parent",
+            parent.metadata().unwrap().len(),
+            "Child",
+        );
+        let canonical = child.canonicalize().unwrap();
+        let descriptors =
+            rollout_descriptors_in_roots(&canonical, vec![temp.path().to_path_buf(), day]);
+        assert_eq!(descriptors.len(), 2);
+        let chain = resolve_paginated_chain_from_descriptors(&canonical, &descriptors).unwrap();
+        assert_eq!(chain.len(), 2);
+        validate_delete_under_root(temp.path(), &canonical, "child").unwrap();
+        delete_session(temp.path(), &canonical, "child").unwrap();
+        assert!(parent.exists());
+        assert!(!child.exists());
+    }
+
+    #[test]
+    fn distinct_files_with_ambiguous_base_ids_are_still_rejected() {
+        let temp = tempdir().unwrap();
+        let parent_a = temp.path().join("parent-a.jsonl");
+        let parent_b = temp.path().join("parent-b.jsonl");
+        let child = temp.path().join("child.jsonl");
+        write_codex_session(&parent_a, "parent", "Parent");
+        std::fs::copy(&parent_a, &parent_b).unwrap();
+        write_paginated_session_with_base(
+            &child,
+            "child",
+            "parent",
+            parent_a.metadata().unwrap().len(),
+            "Child",
+        );
+        let descriptors = rollout_descriptors_in_roots(&child, vec![temp.path().to_path_buf()]);
+        assert_eq!(descriptors.len(), 3);
+        assert!(
+            resolve_paginated_chain_from_descriptors(&child, &descriptors)
+                .unwrap_err()
+                .contains("基座不唯一")
+        );
+    }
+
+    #[test]
+    fn batch_orders_descendants_before_parents_and_can_delete_the_selected_tree() {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let grandchild = temp.path().join("grandchild.jsonl");
+        write_codex_session(&parent, "parent", "Parent");
+        write_paginated_session_with_base(
+            &child,
+            "child",
+            "parent",
+            parent.metadata().unwrap().len(),
+            "Child",
+        );
+        write_paginated_session_with_base(
+            &grandchild,
+            "grandchild",
+            "child",
+            child.metadata().unwrap().len(),
+            "Grandchild",
+        );
+        let requests = [
+            (&parent, "parent"),
+            (&child, "child"),
+            (&grandchild, "grandchild"),
+        ]
+        .map(|(path, id)| DeleteSessionRequest {
+            provider_id: "codex".into(),
+            session_id: id.into(),
+            source_path: path.to_string_lossy().into_owned(),
+            include_project: false,
+        });
+        let descriptors = rollout_descriptors_in_roots(&parent, vec![temp.path().to_path_buf()]);
+        let order = deletion_order_with_descriptors(&requests, &descriptors);
+        assert_eq!(order, vec![2, 1, 0]);
+        for index in order {
+            let request = &requests[index];
+            delete_session(
+                temp.path(),
+                Path::new(&request.source_path),
+                &request.session_id,
+            )
+            .unwrap();
+        }
+        assert!(!parent.exists());
+        assert!(!child.exists());
+        assert!(!grandchild.exists());
+    }
+
+    #[test]
+    #[ignore = "Opt-in read-only audit of an explicit local rollout; never deletes data"]
+    fn audit_real_rollout_read_only() {
+        let path =
+            PathBuf::from(std::env::var("ASM_AUDIT_CODEX_PATH").expect("explicit audit path"));
+        let canonical = path.canonicalize().unwrap();
+        let ordinary = resolve_paginated_chain(&path).unwrap();
+        let extended = resolve_paginated_chain(&canonical).unwrap();
+        assert_eq!(ordinary.len(), extended.len());
+        for (a, b) in ordinary.iter().zip(&extended) {
+            assert!(same_rollout_path(&a.path, &b.path));
+            assert_eq!(a.end_byte_offset, b.end_byte_offset);
+        }
+        let id = read_rollout_descriptor(&path).unwrap().session_id;
+        println!(
+            "audit: {} segments, session {}, deletion preflight: {:?}",
+            extended.len(),
+            id,
+            validate_delete(&canonical, &id)
+        );
+    }
+
+    #[test]
+    fn cross_session_branch_loads_history_without_hiding_parent_session() {
+        let temp = tempdir().expect("tempdir");
+        let parent_id = "01a076ed-bae5-7a02-a191-d9a4b880afc5";
+        let parent_page_id = "01a08757-bd33-7643-96cb-7d8f560cbbe3";
+        let child_id = "01a08a9d-628b-7e60-ad4a-1ecda54372dc";
+        let parent_base = temp
+            .path()
+            .join(format!("rollout-2026-09-06T22-34-46-{parent_id}.jsonl"));
+        let parent_current = temp.path().join(format!(
+            "rollout-2026-09-10T03-04-29-{parent_id}_{parent_page_id}.jsonl"
+        ));
+        let child = temp
+            .path()
+            .join(format!("rollout-2026-09-10T18-19-25-{child_id}.jsonl"));
+        write_codex_session(&parent_base, parent_id, "Parent earlier message");
+        write_paginated_session_with_base(
+            &parent_current,
+            parent_id,
+            parent_id,
+            parent_base.metadata().expect("parent base metadata").len(),
+            "Parent current message",
+        );
+        write_paginated_session_with_base(
+            &child,
+            child_id,
+            parent_page_id,
+            parent_current
+                .metadata()
+                .expect("parent current metadata")
+                .len(),
+            "Child message",
+        );
+
+        let messages = load_messages(&child).expect("load inherited branch history");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "Parent earlier message");
+        assert_eq!(messages[1].content, "Parent current message");
+        assert_eq!(messages[2].content, "Child message");
+
+        let native_rollouts = HashMap::from([
+            (
+                parent_id.to_string(),
+                normalized_rollout_path(&parent_current.to_string_lossy()),
+            ),
+            (
+                child_id.to_string(),
+                normalized_rollout_path(&child.to_string_lossy()),
+            ),
+        ]);
+        let sessions = scan_sessions_in_roots_with_context(
+            &[temp.path().to_path_buf()],
+            &HashMap::new(),
+            &CodexProjectContext::default(),
+            Some(&native_rollouts),
+        );
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|session| {
+            session.session_id == parent_id
+                && session.source_path.as_deref() == parent_current.to_str()
+        }));
+        assert!(sessions.iter().any(|session| {
+            session.session_id == child_id && session.source_path.as_deref() == child.to_str()
+        }));
+    }
+
+    #[test]
+    fn deleting_cross_session_branch_keeps_parent_history() {
+        let temp = tempdir().expect("tempdir");
+        let parent_id = "01a076ed-bae5-7a02-a191-d9a4b880afc5";
+        let child_id = "01a08a9d-628b-7e60-ad4a-1ecda54372dc";
+        let parent = temp
+            .path()
+            .join(format!("rollout-2026-09-06T22-34-46-{parent_id}.jsonl"));
+        let child = temp
+            .path()
+            .join(format!("rollout-2026-09-10T18-19-25-{child_id}.jsonl"));
+        write_codex_session(&parent, parent_id, "Parent message");
+        write_paginated_session_with_base(
+            &child,
+            child_id,
+            parent_id,
+            parent.metadata().expect("parent metadata").len(),
+            "Child message",
+        );
+
+        delete_session(temp.path(), &child, child_id).expect("delete child branch");
+
+        assert!(!child.exists());
+        assert!(parent.exists());
+    }
+
+    #[test]
+    fn deleting_parent_with_cross_session_branch_is_rejected() {
+        let temp = tempdir().expect("tempdir");
+        let parent_id = "01a076ed-bae5-7a02-a191-d9a4b880afc5";
+        let child_id = "01a08a9d-628b-7e60-ad4a-1ecda54372dc";
+        let parent = temp
+            .path()
+            .join(format!("rollout-2026-09-06T22-34-46-{parent_id}.jsonl"));
+        let child = temp
+            .path()
+            .join(format!("rollout-2026-09-10T18-19-25-{child_id}.jsonl"));
+        write_codex_session(&parent, parent_id, "Parent message");
+        write_paginated_session_with_base(
+            &child,
+            child_id,
+            parent_id,
+            parent.metadata().expect("parent metadata").len(),
+            "Child message",
+        );
+
+        let error = validate_delete(&parent, parent_id).expect_err("parent must be protected");
+
+        assert!(error.contains("分支会话依赖"));
+        assert!(parent.exists());
+        assert!(child.exists());
     }
 
     #[test]

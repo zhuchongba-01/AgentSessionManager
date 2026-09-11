@@ -133,6 +133,11 @@ fn scan_report() -> SessionScanReport {
                 existing.resume_command = None;
                 existing.residual = item.residual;
                 existing.archived = item.archived;
+                // The native title may have disappeared with the index during
+                // partial deletion. Keep the name saved in the retry journal.
+                if item.title.is_some() {
+                    existing.title = item.title;
+                }
                 existing.summary = item.summary;
             } else {
                 sessions.push(item);
@@ -223,9 +228,29 @@ pub fn delete_session_checked(
                 && item.source_path.as_deref() == Some(source_path)
         })
         .ok_or("会话已变化或不存在，请重新扫描")?;
-    deletion::run(target, &sessions, |plan| {
+    deletion::run(target, &sessions, preflight_deletion, |plan| {
         delete_session_in_snapshot(provider_id, session_id, source_path, include_project, plan)
     })
+}
+
+fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
+    // Validate every Codex transcript in the persisted plan using the exact
+    // canonical paths later used by deletion, before any index or journal write.
+    for item in plan.iter().filter(|item| item.provider_id == "codex") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        if !path.exists() {
+            continue; // legitimate retry after the transcript was already removed
+        }
+        let canonical = canonicalize_existing_path(path, "session source")?;
+        let root = provider_roots("codex")?
+            .into_iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .find(|root| canonical.starts_with(root))
+            .ok_or("Session source is outside configured storage")?;
+        codex::validate_delete_under_root(&root, &canonical, &item.session_id)?;
+        codex::should_cleanup_index_after_delete(&item.session_id, &canonical.to_string_lossy())?;
+    }
+    Ok(())
 }
 
 /// 在预扫描的会话快照上执行删除。批量删除共用一次扫描，避免 N 项删除
@@ -370,7 +395,12 @@ fn delete_session_record(
 pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOutcome> {
     let guard = deletion::DELETE_LOCK.lock();
     let sessions = scan_sessions();
-    collect_delete_session_outcomes(requests, |request| {
+    let order = codex::deletion_order(requests);
+    let ordered = order
+        .iter()
+        .map(|index| requests[*index].clone())
+        .collect::<Vec<_>>();
+    let outcomes = collect_delete_session_outcomes(&ordered, |request| {
         if guard.is_err() {
             return Err("清理锁不可用，请重启管理器".into());
         }
@@ -386,7 +416,7 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
         }) else {
             return Err("会话已变化或不存在，请重新扫描".into());
         };
-        deletion::run(target, &sessions, |plan| {
+        deletion::run(target, &sessions, preflight_deletion, |plan| {
             delete_session_in_snapshot(
                 &request.provider_id,
                 &request.session_id,
@@ -395,7 +425,12 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
                 plan,
             )
         })
-    })
+    });
+    // Keep the API response in the caller's original order despite executing
+    // child branches first.
+    let mut outcomes = order.into_iter().zip(outcomes).collect::<Vec<_>>();
+    outcomes.sort_by_key(|(index, _)| *index);
+    outcomes.into_iter().map(|(_, outcome)| outcome).collect()
 }
 
 fn delete_session_with_roots(

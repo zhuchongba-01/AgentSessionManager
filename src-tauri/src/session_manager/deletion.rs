@@ -65,28 +65,33 @@ pub fn pending_sessions() -> Result<Vec<SessionMeta>, String> {
     Ok(sessions)
 }
 
-pub fn run<F>(
+pub fn run<P, F>(
     target: &SessionMeta,
     snapshot: &[SessionMeta],
+    preflight: P,
     action: F,
 ) -> Result<DeleteSessionReply, String>
 where
+    P: FnOnce(&[SessionMeta]) -> Result<(), String>,
     F: FnOnce(&[SessionMeta]) -> Result<DeleteSessionReply, String>,
 {
     let path = operation_path(target)?;
-    run_at(&path, target, snapshot, action)
+    run_at(&path, target, snapshot, preflight, action)
 }
 
-fn run_at<F>(
+fn run_at<P, F>(
     path: &Path,
     target: &SessionMeta,
     snapshot: &[SessionMeta],
+    preflight: P,
     action: F,
 ) -> Result<DeleteSessionReply, String>
 where
+    P: FnOnce(&[SessionMeta]) -> Result<(), String>,
     F: FnOnce(&[SessionMeta]) -> Result<DeleteSessionReply, String>,
 {
-    if !path.exists() {
+    let is_new = !path.exists();
+    let mut operation: PendingDeletion = if is_new {
         let mut targets = vec![target.clone()];
         if !target.residual {
             targets.extend(
@@ -101,30 +106,32 @@ where
                     .cloned(),
             );
         }
-        let parent = path.parent().ok_or("Invalid pending deletion directory")?;
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-        serde_json::to_writer(
-            &mut temp,
-            &PendingDeletion {
-                targets,
-                last_error: None,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        temp.flush().map_err(|e| e.to_string())?;
-        temp.as_file().sync_all().map_err(|e| e.to_string())?;
-        temp.persist(&path).map_err(|e| e.to_string())?;
-    }
-    let mut operation: PendingDeletion =
-        serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        PendingDeletion {
+            targets,
+            last_error: None,
+        }
+    } else {
+        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    };
     if !operation.targets.first().is_some_and(|saved| {
         saved.provider_id == target.provider_id
             && saved.session_id == target.session_id
             && saved.source_path == target.source_path
     }) {
         return Err("清理记录与目标不一致，已停止操作".into());
+    }
+    // Rejections are ordinary errors, not partially completed deletions. A
+    // retry retains its existing journal, but a rejected new request writes none.
+    preflight(&operation.targets)?;
+    if is_new {
+        let parent = path.parent().ok_or("Invalid pending deletion directory")?;
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut temp, &operation).map_err(|e| e.to_string())?;
+        temp.flush().map_err(|e| e.to_string())?;
+        temp.as_file().sync_all().map_err(|e| e.to_string())?;
+        temp.persist(&path).map_err(|e| e.to_string())?;
     }
     for saved in &mut operation.targets {
         saved.cleanup_pending = true;
@@ -278,6 +285,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejected_preflight_creates_no_journal_and_does_not_run_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("operation.json");
+        let target: SessionMeta = serde_json::from_value(serde_json::json!({
+            "providerId": "codex", "sessionId": "parent", "residual": false,
+            "sourcePath": "parent.jsonl"
+        }))
+        .unwrap();
+        let error = run_at(
+            &path,
+            &target,
+            &[],
+            |_| Err("branch dependency".into()),
+            |_| panic!("index/transcript deletion must not start"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "branch dependency");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejected_retry_keeps_original_partial_cleanup_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("operation.json");
+        let target: SessionMeta = serde_json::from_value(serde_json::json!({
+            "providerId": "codex", "sessionId": "child", "residual": false,
+            "sourcePath": "child.jsonl"
+        }))
+        .unwrap();
+        run_at(
+            &path,
+            &target,
+            &[],
+            |_| Ok(()),
+            |_| Err("file locked after index cleanup".into()),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(run_at(
+            &path,
+            &target,
+            &[],
+            |_| Err("cannot validate retry".into()),
+            |_| { panic!("no retry mutations") }
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
     fn failed_cleanup_is_durable_and_successful_retry_removes_journal() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("operation.json");
@@ -299,7 +356,14 @@ mod tests {
         let mut residual = target.clone();
         residual.residual = true;
         residual.source_path = Some("historical.jsonl".into());
-        let result = run_at(&path, &target, &[residual], |_| Err("index locked".into())).unwrap();
+        let result = run_at(
+            &path,
+            &target,
+            &[residual],
+            |_| Ok(()),
+            |_| Err("index locked".into()),
+        )
+        .unwrap();
         assert!(matches!(result, DeleteSessionReply::CleanupPending { .. }));
         let saved: PendingDeletion =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -307,12 +371,18 @@ mod tests {
         assert_eq!(saved.targets[0].source_path, target.source_path);
         // The retry scan no longer contains the historical file, but the
         // original plan must still include it and permit a missing primary.
-        run_at(&path, &target, &[], |plan| {
-            assert_eq!(plan.len(), 2);
-            assert!(plan.iter().all(|item| item.cleanup_pending));
-            assert_eq!(plan[1].source_path.as_deref(), Some("historical.jsonl"));
-            Ok(DeleteSessionReply::Deleted { warnings: vec![] })
-        })
+        run_at(
+            &path,
+            &target,
+            &[],
+            |_| Ok(()),
+            |plan| {
+                assert_eq!(plan.len(), 2);
+                assert!(plan.iter().all(|item| item.cleanup_pending));
+                assert_eq!(plan[1].source_path.as_deref(), Some("historical.jsonl"));
+                Ok(DeleteSessionReply::Deleted { warnings: vec![] })
+            },
+        )
         .unwrap();
         assert!(!path.exists());
     }
