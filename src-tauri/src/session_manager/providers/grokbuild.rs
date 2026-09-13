@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -5,11 +6,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::session_manager::{SessionMessage, SessionMeta};
+use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    collect_files_where, ensure_readable_size, extract_text, is_safe_session_id,
-    parse_timestamp_to_ms, truncate_summary, TITLE_MAX_CHARS,
+    checked_storage_child, collect_files_where, ensure_readable_size, extract_text,
+    is_safe_session_id, parse_timestamp_to_ms, truncate_summary, TITLE_MAX_CHARS,
 };
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,10 @@ struct GrokSessionSummary {
     updated_at: Option<Value>,
     #[serde(default)]
     last_active_at: Option<Value>,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+    #[serde(default)]
+    session_kind: Option<String>,
 }
 
 pub fn session_roots() -> Vec<PathBuf> {
@@ -111,7 +116,157 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     Ok(messages)
 }
 
+fn parent_relations_in_roots(roots: &[PathBuf]) -> Result<HashMap<String, String>, String> {
+    let mut relations = HashMap::new();
+    let mut seen_paths = HashSet::new();
+    for root in roots.iter().filter(|root| root.is_dir()) {
+        let root = root
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve Grok Build session root: {error}"))?;
+        let mut summaries = Vec::new();
+        collect_summary_files(&root, &mut summaries);
+        summaries.sort();
+        for summary_path in summaries {
+            let summary_path = checked_storage_child(&root, &summary_path)
+                .map_err(|error| format!("Invalid Grok Build summary path: {error}"))?;
+            if !seen_paths.insert(summary_path.clone()) {
+                continue;
+            }
+            let summary = read_summary(&summary_path)?;
+            let child = summary.info.id;
+            if !is_safe_session_id(&child) {
+                return Err("Grok Build summary contains an invalid session ID".into());
+            }
+            let Some(parent) = summary
+                .parent_session_id
+                .filter(|parent| !parent.trim().is_empty())
+            else {
+                continue;
+            };
+            if !is_safe_session_id(&parent) {
+                return Err(format!(
+                    "Grok Build 会话 {child} 的父会话 ID 无效，已停止删除"
+                ));
+            }
+            if child == parent {
+                return Err(format!(
+                    "Grok Build 会话 {child} 的父子关系指向自身，已停止删除"
+                ));
+            }
+            if let Some(existing) = relations.insert(child.clone(), parent.clone()) {
+                if existing != parent {
+                    return Err(format!(
+                        "Grok Build 会话 {child} 同时指向父会话 {existing} 和 {parent}，已停止删除"
+                    ));
+                }
+            }
+        }
+    }
+
+    for child in relations.keys() {
+        let mut seen = HashSet::new();
+        let mut current = child.as_str();
+        while let Some(parent) = relations.get(current) {
+            if !seen.insert(current.to_string()) {
+                return Err("Grok Build 会话父子关系存在循环，已停止删除".into());
+            }
+            current = parent;
+        }
+    }
+    Ok(relations)
+}
+
+fn preflight_delete_in_roots(
+    roots: &[PathBuf],
+    path: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    if !is_safe_session_id(session_id) {
+        return Err("Invalid Grok Build session ID".into());
+    }
+    let mut target = None;
+    for root in roots.iter().filter(|root| root.is_dir()) {
+        let root = root
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve Grok Build session root: {error}"))?;
+        if let Ok(candidate) = checked_storage_child(&root, path) {
+            target = Some(candidate);
+            break;
+        }
+    }
+    let target = target.ok_or("Grok Build session source is outside the session root")?;
+    if target.file_name().and_then(|name| name.to_str()) != Some("summary.json") {
+        return Err("Unexpected Grok Build session source".into());
+    }
+    let summary = read_summary(&target)?;
+    if summary.info.id != session_id {
+        return Err(format!(
+            "Grok Build session ID mismatch: expected {session_id}, found {}",
+            summary.info.id
+        ));
+    }
+    let relations = parent_relations_in_roots(roots)?;
+    if let Some(child) = relations
+        .iter()
+        .find_map(|(child, parent)| (parent == session_id).then_some(child))
+    {
+        return Err(format!(
+            "该 Grok Build 会话仍被子会话 {child} 依赖，请先删除子会话"
+        ));
+    }
+    Ok(())
+}
+
+pub fn preflight_delete(path: &Path, session_id: &str) -> Result<(), String> {
+    preflight_delete_in_roots(&session_roots(), path, session_id)
+}
+
+fn deletion_order_with_relations(
+    requests: &[DeleteSessionRequest],
+    initial: &[usize],
+    relations: &HashMap<String, String>,
+) -> Vec<usize> {
+    let selected = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.provider_id == "grokbuild")
+        .map(|(index, request)| (request.session_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut remaining = initial.to_vec();
+    let mut ordered = Vec::with_capacity(initial.len());
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|candidate| {
+            let Some(parent_id) = requests
+                .get(*candidate)
+                .map(|request| request.session_id.as_str())
+            else {
+                return true;
+            };
+            !relations.iter().any(|(child, parent)| {
+                parent == parent_id
+                    && selected
+                        .get(child.as_str())
+                        .is_some_and(|child_index| remaining.contains(child_index))
+            })
+        });
+        let Some(position) = ready else {
+            ordered.extend(remaining);
+            break;
+        };
+        ordered.push(remaining.remove(position));
+    }
+    ordered
+}
+
+pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    let Ok(relations) = parent_relations_in_roots(&session_roots()) else {
+        return initial.to_vec();
+    };
+    deletion_order_with_relations(requests, initial, &relations)
+}
+
 pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    preflight_delete_in_roots(&[root.to_path_buf()], path, session_id)?;
     if !path.starts_with(root) {
         return Err(format!(
             "Grok Build session source is outside the session root: {}",
@@ -173,12 +328,15 @@ fn read_summary(path: &Path) -> Result<GrokSessionSummary, String> {
 
 fn parse_summary(path: &Path) -> Option<SessionMeta> {
     let summary = read_summary(path)
-        .map_err(|error| {
+        .inspect_err(|error| {
             super::utils::scan_warning(error.clone());
-            error
         })
         .ok()?;
     let session_id = summary.info.id;
+    let is_subagent = summary
+        .session_kind
+        .as_deref()
+        .is_some_and(|kind| matches!(kind, "subagent" | "subagent_fork"));
     let title = summary
         .generated_title
         .as_deref()
@@ -205,9 +363,10 @@ fn parse_summary(path: &Path) -> Option<SessionMeta> {
     Some(SessionMeta {
         provider_id: "grokbuild".to_string(),
         session_id: session_id.clone(),
-        residual: false,
+        residual: is_subagent,
         archived: false,
         cleanup_pending: false,
+        sidebar_section: None,
         title,
         summary: session_summary,
         project_dir: summary.info.cwd,
@@ -215,7 +374,7 @@ fn parse_summary(path: &Path) -> Option<SessionMeta> {
         created_at,
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
-        resume_command: is_safe_session_id(&session_id)
+        resume_command: (!is_subagent && is_safe_session_id(&session_id))
             .then(|| format!("grok --resume {session_id}")),
     })
 }
@@ -224,6 +383,27 @@ fn parse_summary(path: &Path) -> Option<SessionMeta> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn write_summary(
+        root: &Path,
+        project: &str,
+        id: &str,
+        parent: Option<&str>,
+        kind: Option<&str>,
+    ) -> PathBuf {
+        let session_dir = root.join(project).join(id);
+        std::fs::create_dir_all(&session_dir).expect("create session directory");
+        let mut value = serde_json::json!({"info": {"id": id, "cwd": "C:/work"}});
+        if let Some(parent) = parent {
+            value["parent_session_id"] = serde_json::json!(parent);
+        }
+        if let Some(kind) = kind {
+            value["session_kind"] = serde_json::json!(kind);
+        }
+        let path = session_dir.join("summary.json");
+        std::fs::write(&path, value.to_string()).expect("write session summary");
+        path
+    }
 
     #[test]
     fn scans_native_grokbuild_session_layout() {
@@ -278,6 +458,79 @@ mod tests {
 
         assert!(session.residual);
         assert!(session.resume_command.is_none());
+    }
+
+    #[test]
+    fn subagent_summary_is_exposed_as_residual() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let child = write_summary(
+            &root,
+            "project",
+            "session-child",
+            Some("session-parent"),
+            Some("subagent"),
+        );
+
+        let session = parse_discovered_summary(&child).expect("parse child summary");
+        assert!(session.residual);
+        assert!(session.resume_command.is_none());
+    }
+
+    #[test]
+    fn grok_parent_is_protected_until_child_is_deleted() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let parent = write_summary(&root, "project", "session-parent", None, None);
+        let child = write_summary(
+            &root,
+            "project",
+            "session-child",
+            Some("session-parent"),
+            Some("subagent"),
+        );
+
+        let error =
+            preflight_delete_in_roots(std::slice::from_ref(&root), &parent, "session-parent")
+                .expect_err("parent must be protected");
+        assert!(error.contains("session-child"));
+        assert!(delete_session(&root, &child, "session-child").expect("delete child"));
+        assert!(parent.exists());
+        assert!(delete_session(&root, &parent, "session-parent").expect("delete parent"));
+    }
+
+    #[test]
+    fn grok_parent_cycles_fail_closed() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        write_summary(&root, "project", "session-a", Some("session-b"), None);
+        write_summary(&root, "project", "session-b", Some("session-a"), None);
+
+        let error = parent_relations_in_roots(&[root]).expect_err("cycle must fail");
+        assert!(error.contains("存在循环"));
+    }
+
+    #[test]
+    fn selected_grok_children_are_ordered_before_parents() {
+        let requests = vec![
+            DeleteSessionRequest {
+                provider_id: "grokbuild".into(),
+                session_id: "session-parent".into(),
+                source_path: "parent".into(),
+                include_project: false,
+            },
+            DeleteSessionRequest {
+                provider_id: "grokbuild".into(),
+                session_id: "session-child".into(),
+                source_path: "child".into(),
+                include_project: false,
+            },
+        ];
+        let relations = HashMap::from([("session-child".into(), "session-parent".into())]);
+        assert_eq!(
+            deletion_order_with_relations(&requests, &[0, 1], &relations),
+            vec![1, 0]
+        );
     }
 
     #[test]

@@ -7,10 +7,46 @@ import {
   getVisibleSessionMessages,
   groupSessionsByProviderAndDirectory,
   shouldHideCodexMessageFromToc,
+  shouldShowSessionMinimap,
 } from "@/components/sessions/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
 
 describe("session utils", () => {
+  it("groups native sidebar sections without changing underlying project paths", () => {
+    const sessions: SessionMeta[] = [
+      {
+        providerId: "codex",
+        sessionId: "one",
+        projectDir: "E:/Codex11",
+        projectName: "Codex11",
+        sidebarSection: { id: "section-a", name: "Deepseek11" },
+      },
+      {
+        providerId: "codex",
+        sessionId: "two",
+        projectName: "最近",
+        sidebarSection: { id: "section-a", name: "Deepseek11" },
+      },
+      {
+        providerId: "codex",
+        sessionId: "three",
+        projectDir: "E:/Deepseek11",
+        projectName: "Deepseek11",
+      },
+    ];
+    const groups = groupSessionsByProviderAndDirectory(sessions, "未知目录");
+    expect(groups[0].directories).toHaveLength(2);
+    expect(groups[0].directories[0]).toMatchObject({
+      label: "Deepseek11",
+      projectDir: null,
+    });
+    expect(groups[0].directories[0].sessions.map((s) => s.sessionId)).toEqual([
+      "one",
+      "two",
+    ]);
+    expect(sessions[0].projectDir).toBe("E:/Codex11");
+    expect(groups[0].directories[0].key).not.toBe(groups[0].directories[1].key);
+  });
   it("uses canonical Agent brand names and normalized icon keys", () => {
     const untranslated = (key: string) => key;
     expect(getProviderLabel("codex", untranslated)).toBe("Codex");
@@ -19,8 +55,10 @@ describe("session utils", () => {
     expect(getProviderLabel("zcode", untranslated)).toBe("ZCode");
     expect(getProviderLabel("grokbuild", untranslated)).toBe("Grok Build");
     expect(getProviderLabel("pi", untranslated)).toBe("Pi");
+    expect(getProviderLabel("deepseek", untranslated)).toBe("DeepSeek Harness");
     expect(getProviderIconName("Codex")).toBe("openai");
     expect(getProviderIconName("GROKBUILD")).toBe("grok");
+    expect(getProviderIconName("DeepSeek")).toBe("deepseek");
   });
 
   it("hides Codex internal context from the readable transcript", () => {
@@ -153,6 +191,13 @@ describe("session utils", () => {
     );
   });
 
+  it("shows the session minimap for multi-turn or long conversations", () => {
+    expect(shouldShowSessionMinimap(2, 1.2)).toBe(true);
+    expect(shouldShowSessionMinimap(1, 2)).toBe(true);
+    expect(shouldShowSessionMinimap(1, 1.99)).toBe(false);
+    expect(shouldShowSessionMinimap(0, 3)).toBe(false);
+  });
+
   it("groups sessions by provider and project directory", () => {
     const sessions: SessionMeta[] = [
       {
@@ -242,6 +287,29 @@ describe("session utils", () => {
     expect(
       groups[0].directories[0].sessions.map((session) => session.sessionId),
     ).toEqual(["codex-1", "codex-2"]);
+  });
+
+  it("uses the native ungrouped label for unassigned DeepSeek sessions", () => {
+    const sessions: SessionMeta[] = [
+      {
+        providerId: "deepseek",
+        sessionId: "deepseek-1",
+        projectDir: null,
+        projectName: null,
+      },
+    ];
+
+    const groups = groupSessionsByProviderAndDirectory(
+      sessions,
+      "未知目录",
+      "未分组",
+    );
+
+    expect(groups[0].directories[0]).toMatchObject({
+      projectDir: null,
+      projectName: null,
+      label: "未分组",
+    });
   });
 
   it("preserves filtered session order inside provider and directory groups", () => {

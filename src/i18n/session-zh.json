@@ -12,7 +12,8 @@
     "claude": "Claude Code",
     "opencode": "OpenCode",
     "zcode": "ZCode",
-    "pi": "Pi"
+    "pi": "Pi",
+    "deepseek": "DeepSeek Harness"
   },
   "sessionManager": {
     "providerFilterAll": "全部 Agent",
@@ -25,6 +26,7 @@
     "viewModeFlat": "列表",
     "viewModeGrouped": "分类",
     "unknownDirectory": "未知目录",
+    "ungroupedDirectory": "未分组",
     "toggleProviderGroup": "展开或折叠 {{provider}} 供应商分组",
     "toggleDirectoryGroup": "展开或折叠 {{directory}} 目录分组",
     "selectProviderGroupForBatch": "选择 {{provider}} 供应商分组内会话",

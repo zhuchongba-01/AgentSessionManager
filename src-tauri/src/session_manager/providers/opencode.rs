@@ -1,10 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, Transaction};
 use serde_json::Value;
 
-use crate::session_manager::{SessionMessage, SessionMeta};
+use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
     check_sqlite_message_budget, checked_storage_child, collect_files_where, is_safe_session_id,
@@ -113,11 +114,15 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
     .ok()?;
 
     conn.busy_timeout(Duration::from_secs(2)).ok()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, directory, time_created, time_updated FROM session ORDER BY time_updated DESC",
-        )
-        .ok()?;
+    let has_parent_id = connection_table_has_column(&conn, "session", "parent_id").ok()?;
+    let sql = if has_parent_id {
+        "SELECT id, title, directory, time_created, time_updated, parent_id \
+         FROM session ORDER BY time_updated DESC"
+    } else {
+        "SELECT id, title, directory, time_created, time_updated, NULL \
+         FROM session ORDER BY time_updated DESC"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
 
     let db_display = db_path.display().to_string();
 
@@ -128,7 +133,8 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
             let directory: String = row.get(2)?;
             let created: i64 = row.get(3)?;
             let updated: i64 = row.get(4)?;
-            Ok((session_id, title, directory, created, updated))
+            let parent_id: Option<String> = row.get(5)?;
+            Ok((session_id, title, directory, created, updated, parent_id))
         })
         .ok()?;
 
@@ -141,7 +147,7 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
                 continue;
             }
         };
-        let (session_id, title, directory, created, updated) = row;
+        let (session_id, title, directory, created, updated, parent_id) = row;
         let display_title = if title.is_empty() {
             path_basename(&directory)
         } else {
@@ -150,9 +156,10 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
         sessions.push(SessionMeta {
             provider_id: PROVIDER_ID.to_string(),
             session_id: session_id.clone(),
-            residual: false,
+            residual: parent_id.is_some(),
             archived: false,
             cleanup_pending: false,
+            sidebar_section: None,
             title: display_title.clone(),
             summary: display_title,
             project_dir: if directory.is_empty() {
@@ -164,7 +171,7 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
             created_at: Some(created),
             last_active_at: Some(updated),
             source_path: Some(format!("sqlite:{db_display}:{session_id}")),
-            resume_command: is_safe_session_id(&session_id)
+            resume_command: (parent_id.is_none() && is_safe_session_id(&session_id))
                 .then(|| format!("opencode -s {session_id}")),
         });
     }
@@ -337,6 +344,258 @@ pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String>
     Ok(messages)
 }
 
+fn connection_table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let quoted = quote_sqlite_identifier(table);
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({quoted})"))
+        .map_err(|error| format!("Failed to inspect OpenCode {table} columns: {error}"))?;
+    let found = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Failed to read OpenCode {table} columns: {error}"))?
+        .flatten()
+        .any(|name| name == column);
+    Ok(found)
+}
+
+fn insert_parent_relation(
+    parents: &mut HashMap<String, String>,
+    child: String,
+    parent: String,
+) -> Result<(), String> {
+    if !is_safe_session_id(&child) || !is_safe_session_id(&parent) {
+        return Err("OpenCode parent relation contains an invalid session ID".into());
+    }
+    if child == parent {
+        return Err(format!(
+            "OpenCode 会话 {child} 的父子关系指向自身，已停止删除"
+        ));
+    }
+    if let Some(existing) = parents.insert(child.clone(), parent.clone()) {
+        if existing != parent {
+            return Err(format!(
+                "OpenCode 会话 {child} 同时指向父会话 {existing} 和 {parent}，已停止删除"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_parent_graph(parents: &HashMap<String, String>) -> Result<(), String> {
+    for child in parents.keys() {
+        let mut seen = HashSet::new();
+        let mut current = child.as_str();
+        while let Some(parent) = parents.get(current) {
+            if !seen.insert(current.to_string()) {
+                return Err("OpenCode 会话父子关系存在循环，已停止删除".into());
+            }
+            current = parent;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_parent_relations(db_path: &Path) -> Result<HashMap<String, String>, String> {
+    let connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Failed to open OpenCode dependency database: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("Failed to configure OpenCode dependency check: {error}"))?;
+    if !connection_table_has_column(&connection, "session", "id")? {
+        return Err("OpenCode database is missing session.id".into());
+    }
+    if !connection_table_has_column(&connection, "session", "parent_id")? {
+        return Ok(HashMap::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id, parent_id FROM session \
+             WHERE parent_id IS NOT NULL AND parent_id<>''",
+        )
+        .map_err(|error| format!("Failed to inspect OpenCode parent sessions: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Failed to read OpenCode parent sessions: {error}"))?;
+    let mut parents = HashMap::new();
+    for row in rows {
+        let (child, parent) =
+            row.map_err(|error| format!("Invalid OpenCode parent relation: {error}"))?;
+        insert_parent_relation(&mut parents, child, parent)?;
+    }
+    validate_parent_graph(&parents)?;
+    Ok(parents)
+}
+
+fn json_parent_relations(storage: &Path) -> Result<HashMap<String, String>, String> {
+    let session_dir = storage.join("session");
+    if !session_dir.is_dir() {
+        return Ok(HashMap::new());
+    }
+    let mut files = Vec::new();
+    collect_json_files(&session_dir, &mut files);
+    files.sort();
+    let mut seen_ids = HashSet::new();
+    let mut parents = HashMap::new();
+    for file in files {
+        let value = read_json_bounded(&file, &mut (super::utils::MAX_QUERY_BYTES as u64))
+            .map_err(|error| format!("Failed to read OpenCode session metadata: {error}"))?;
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_safe_session_id(id))
+            .ok_or("OpenCode session metadata has an invalid ID")?
+            .to_string();
+        if !seen_ids.insert(id.clone()) {
+            return Err(format!("OpenCode 存在重复会话 ID {id}，已停止删除"));
+        }
+        let parent = value
+            .get("parentID")
+            .or_else(|| value.get("parentId"))
+            .or_else(|| value.get("parent_id"));
+        match parent {
+            None | Some(Value::Null) => {}
+            Some(Value::String(parent)) if parent.is_empty() => {}
+            Some(Value::String(parent)) => {
+                insert_parent_relation(&mut parents, id, parent.clone())?;
+            }
+            Some(_) => return Err("OpenCode session metadata has an invalid parent ID".into()),
+        }
+    }
+    validate_parent_graph(&parents)?;
+    Ok(parents)
+}
+
+fn reject_parent_with_child(
+    parents: &HashMap<String, String>,
+    session_id: &str,
+) -> Result<(), String> {
+    if let Some(child) = parents
+        .iter()
+        .find_map(|(child, parent)| (parent == session_id).then_some(child))
+    {
+        return Err(format!(
+            "该 OpenCode 会话仍被子会话 {child} 依赖，请先删除子会话"
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_sqlite_path(db_path: &Path, session_id: &str) -> Result<(), String> {
+    if !is_safe_session_id(session_id) {
+        return Err("Invalid OpenCode session ID".into());
+    }
+    reject_parent_with_child(&sqlite_parent_relations(db_path)?, session_id)
+}
+
+fn preflight_json_storage(storage: &Path, session_id: &str) -> Result<(), String> {
+    if !is_safe_session_id(session_id) {
+        return Err("Invalid OpenCode session ID".into());
+    }
+    reject_parent_with_child(&json_parent_relations(storage)?, session_id)
+}
+
+pub fn preflight_delete(source: &str, session_id: &str) -> Result<(), String> {
+    if let Some((db_path, referenced_id)) = parse_sqlite_source(source) {
+        if referenced_id != session_id {
+            return Err("OpenCode SQLite session ID does not match the source reference".into());
+        }
+        let expected = get_opencode_db_path()
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve OpenCode database: {error}"))?;
+        let actual = db_path
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve selected OpenCode database: {error}"))?;
+        if actual != expected {
+            return Err("SQLite path does not match expected OpenCode database".into());
+        }
+        preflight_sqlite_path(&actual, session_id)?;
+        let storage = get_opencode_data_dir();
+        if storage.join("session").is_dir() {
+            preflight_json_storage(&storage, session_id)?;
+        }
+        return Ok(());
+    }
+
+    let storage = get_opencode_data_dir()
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve OpenCode storage: {error}"))?;
+    let expected = checked_storage_child(&storage, &storage.join("message").join(session_id))?;
+    let actual = checked_storage_child(&storage, Path::new(source))?;
+    if actual != expected {
+        return Err("OpenCode source is not the selected session message directory".into());
+    }
+    preflight_json_storage(&storage, session_id)?;
+    let database = get_opencode_db_path();
+    if database.is_file() {
+        preflight_sqlite_path(&database, session_id)?;
+    }
+    Ok(())
+}
+
+fn deletion_order_with_relations(
+    requests: &[DeleteSessionRequest],
+    initial: &[usize],
+    relations: &[(String, String)],
+) -> Vec<usize> {
+    let selected = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.provider_id == PROVIDER_ID)
+        .map(|(index, request)| (request.session_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut remaining = initial.to_vec();
+    let mut ordered = Vec::with_capacity(initial.len());
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|candidate| {
+            let Some(parent_id) = requests
+                .get(*candidate)
+                .map(|request| request.session_id.as_str())
+            else {
+                return true;
+            };
+            !relations.iter().any(|(child, parent)| {
+                parent == parent_id
+                    && selected
+                        .get(child.as_str())
+                        .is_some_and(|child_index| remaining.contains(child_index))
+            })
+        });
+        let Some(position) = ready else {
+            ordered.extend(remaining);
+            break;
+        };
+        ordered.push(remaining.remove(position));
+    }
+    ordered
+}
+
+pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    let mut relations = Vec::new();
+    let db_path = get_opencode_db_path();
+    if db_path.is_file() {
+        let Ok(parents) = sqlite_parent_relations(&db_path) else {
+            return initial.to_vec();
+        };
+        relations.extend(parents);
+    }
+    let storage = get_opencode_data_dir();
+    if storage.join("session").is_dir() {
+        let Ok(parents) = json_parent_relations(&storage) else {
+            return initial.to_vec();
+        };
+        relations.extend(parents);
+    }
+    deletion_order_with_relations(requests, initial, &relations)
+}
+
 pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
     if !is_safe_session_id(session_id) {
         return Err("Invalid OpenCode session ID".into());
@@ -352,6 +611,7 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
             path.display()
         ));
     }
+    preflight_json_storage(storage, session_id)?;
 
     let mut message_files = Vec::new();
     collect_json_files(path, &mut message_files);
@@ -383,7 +643,7 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
         .transpose()?;
     // Complete validation before the first destructive operation.
     for part_dir in &part_dirs {
-        remove_dir_all_if_exists(&part_dir).map_err(|e| {
+        remove_dir_all_if_exists(part_dir).map_err(|e| {
             format!(
                 "Failed to delete OpenCode part directory {}: {e}",
                 part_dir.display()
@@ -436,6 +696,7 @@ pub fn delete_session_sqlite(session_id: &str, source: &str) -> Result<bool, Str
     if db_path != expected_db_path {
         return Err("SQLite path does not match expected OpenCode database".to_string());
     }
+    preflight_sqlite_path(&db_path, session_id)?;
 
     let mut conn =
         Connection::open(&db_path).map_err(|e| format!("Failed to open OpenCode database: {e}"))?;
@@ -525,6 +786,12 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         .get("directory")
         .and_then(Value::as_str)
         .map(|s| s.to_string());
+    let parent_id = value
+        .get("parentID")
+        .or_else(|| value.get("parentId"))
+        .or_else(|| value.get("parent_id"))
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty());
 
     let created_at = value
         .get("time")
@@ -559,9 +826,10 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
     Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
-        residual: false,
+        residual: parent_id.is_some(),
         archived: false,
         cleanup_pending: false,
+        sidebar_section: None,
         title: display_title,
         summary,
         project_dir: directory,
@@ -569,7 +837,7 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         created_at,
         last_active_at: updated_at.or(created_at),
         source_path: Some(source_path),
-        resume_command: is_safe_session_id(&session_id)
+        resume_command: (parent_id.is_none() && is_safe_session_id(&session_id))
             .then(|| format!("opencode -s {session_id}")),
     })
 }
@@ -714,6 +982,7 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn malformed_message_id_is_rejected_before_any_deletion() {
@@ -762,7 +1031,8 @@ mod tests {
                 title TEXT NOT NULL,
                 directory TEXT NOT NULL,
                 time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
+                time_updated INTEGER NOT NULL,
+                parent_id TEXT
             );
             CREATE TABLE message (
                 id TEXT PRIMARY KEY,
@@ -794,6 +1064,144 @@ mod tests {
             ",
         )
         .expect("create sqlite schema");
+    }
+
+    fn insert_sqlite_session(connection: &Connection, id: &str, parent_id: Option<&str>) {
+        connection
+            .execute(
+                "INSERT INTO session \
+                 (id, title, directory, time_created, time_updated, parent_id) \
+                 VALUES (?1, ?1, '/tmp/project', 1, 2, ?2)",
+                rusqlite::params![id, parent_id],
+            )
+            .expect("insert session");
+    }
+
+    #[test]
+    fn sqlite_parent_is_protected_until_child_is_deleted() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("open database");
+        create_sqlite_schema(&connection);
+        insert_sqlite_session(&connection, "ses_parent", None);
+        insert_sqlite_session(&connection, "ses_child", Some("ses_parent"));
+        drop(connection);
+
+        let error =
+            preflight_sqlite_path(&db_path, "ses_parent").expect_err("parent must be protected");
+        assert!(error.contains("ses_child"));
+        preflight_sqlite_path(&db_path, "ses_child").expect("leaf child can be deleted");
+
+        let connection = Connection::open(&db_path).expect("reopen database");
+        connection
+            .execute("DELETE FROM session WHERE id='ses_child'", [])
+            .expect("delete child fixture");
+        drop(connection);
+        preflight_sqlite_path(&db_path, "ses_parent").expect("parent is now a leaf");
+    }
+
+    #[test]
+    fn sqlite_parent_cycle_fails_closed() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("open database");
+        create_sqlite_schema(&connection);
+        insert_sqlite_session(&connection, "ses_a", Some("ses_b"));
+        insert_sqlite_session(&connection, "ses_b", Some("ses_a"));
+        drop(connection);
+
+        let error = sqlite_parent_relations(&db_path).expect_err("cycle must fail");
+        assert!(error.contains("存在循环"));
+    }
+
+    #[test]
+    fn legacy_json_parent_is_protected_and_child_is_residual() {
+        let temp = tempdir().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("session").join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::create_dir_all(storage.join("message").join("ses_parent")).expect("parent messages");
+        fs::create_dir_all(storage.join("message").join("ses_child")).expect("child messages");
+        fs::write(
+            session_dir.join("ses_parent.json"),
+            r#"{"id":"ses_parent","title":"Parent","directory":"/tmp/project"}"#,
+        )
+        .expect("parent metadata");
+        let child_path = session_dir.join("ses_child.json");
+        fs::write(
+            &child_path,
+            r#"{"id":"ses_child","title":"Child","directory":"/tmp/project","parentID":"ses_parent"}"#,
+        )
+        .expect("child metadata");
+
+        let child = parse_session(&storage, &child_path).expect("parse child");
+        assert!(child.residual);
+        assert!(child.resume_command.is_none());
+        let error =
+            preflight_json_storage(&storage, "ses_parent").expect_err("parent must be protected");
+        assert!(error.contains("ses_child"));
+        preflight_json_storage(&storage, "ses_child").expect("leaf child can be deleted");
+    }
+
+    #[test]
+    #[allow(deprecated)] // set_var/remove_var deprecated since Rust 1.81; serialized by mutex
+    fn sqlite_parent_is_protected_from_legacy_json_child() {
+        let _guard = opencode_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+
+        let base = temp.path().join("opencode");
+        let database = base.join("opencode.db");
+        std::fs::create_dir_all(&base).expect("base dir");
+        let connection = Connection::open(&database).expect("open database");
+        create_sqlite_schema(&connection);
+        insert_sqlite_session(&connection, "ses_parent", None);
+        drop(connection);
+        let legacy_dir = base.join("storage").join("session").join("project");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(
+            legacy_dir.join("ses_child.json"),
+            r#"{"id":"ses_child","parentID":"ses_parent"}"#,
+        )
+        .expect("legacy child");
+
+        let source = format!("sqlite:{}:ses_parent", database.display());
+        let error = preflight_delete(&source, "ses_parent")
+            .expect_err("legacy child must protect SQLite parent");
+
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        assert!(error.contains("ses_child"));
+    }
+
+    #[test]
+    fn selected_opencode_children_are_ordered_before_parents() {
+        let requests = vec![
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "ses_parent".into(),
+                source_path: "parent".into(),
+                include_project: false,
+            },
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "ses_child".into(),
+                source_path: "child".into(),
+                include_project: false,
+            },
+        ];
+        assert_eq!(
+            deletion_order_with_relations(
+                &requests,
+                &[0, 1],
+                &[("ses_child".into(), "ses_parent".into())],
+            ),
+            vec![1, 0]
+        );
     }
 
     #[test]
@@ -967,6 +1375,12 @@ mod tests {
             ("ses_2", "Named Session", "/tmp/project-b", 1_771_061_950_000_i64, 1_771_061_955_000_i64),
         )
         .expect("insert session 2");
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated, parent_id) \
+             VALUES ('ses_child', 'Hidden Child', '/tmp/project-a', 1, 2, 'ses_1')",
+            [],
+        )
+        .expect("insert child session");
         drop(conn);
 
         let sessions = scan_sessions_sqlite();
@@ -978,7 +1392,7 @@ mod tests {
             std::env::remove_var("XDG_DATA_HOME");
         }
 
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.len(), 3);
         assert_eq!(sessions[0].session_id, "ses_2");
         assert_eq!(sessions[0].title.as_deref(), Some("Named Session"));
         assert_eq!(sessions[1].session_id, "ses_1");
@@ -993,6 +1407,12 @@ mod tests {
             sessions[1].resume_command.as_deref(),
             Some("opencode -s ses_1")
         );
+        let child = sessions
+            .iter()
+            .find(|session| session.session_id == "ses_child")
+            .expect("child session");
+        assert!(child.residual);
+        assert!(child.resume_command.is_none());
     }
 
     #[test]

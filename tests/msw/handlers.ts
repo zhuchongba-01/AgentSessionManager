@@ -1,4 +1,5 @@
 import { http, HttpResponse } from "msw";
+import { APP_VERSION } from "@/lib/githubRelease";
 import { deleteSession, getSessionMessages, listSessions } from "./state";
 
 const TAURI_ENDPOINT = "http://tauri.local";
@@ -13,7 +14,7 @@ const readJson = async <T>(request: Request): Promise<T> => {
 
 export const handlers = [
   http.get(GITHUB_RELEASE_ENDPOINT, () =>
-    success({ tag_name: "v1.3.16", draft: false, prerelease: false }),
+    success({ tag_name: `v${APP_VERSION}`, draft: false, prerelease: false }),
   ),
   http.post(`${TAURI_ENDPOINT}/list_sessions`, () =>
     success({ sessions: listSessions(), warnings: [] }),

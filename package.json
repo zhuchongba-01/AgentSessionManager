@@ -1,6 +1,6 @@
 {
   "name": "agent-session-manager",
-  "version": "1.3.16",
+  "version": "1.3.17",
   "description": "Standalone local session manager for coding agents",
   "homepage": "https://github.com/zhuchongba-01/AgentSessionManager",
   "repository": {
@@ -13,7 +13,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
-    "build": "pnpm tauri build",
+    "build": "pnpm version:check && pnpm tauri build",
     "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1",
     "tauri": "tauri",
     "dev:renderer": "vite",
@@ -22,7 +22,10 @@
     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,css,json}\"",
     "format:check": "prettier --check \"src/**/*.{js,jsx,ts,tsx,css,json}\"",
     "test:unit": "vitest run",
-    "test:unit:watch": "vitest"
+    "test:unit:watch": "vitest",
+    "version:check": "node scripts/version.mjs --check",
+    "version:set": "node scripts/version.mjs",
+    "test:version": "node --test scripts/version-checks.mjs"
   },
   "keywords": [],
   "license": "MIT",

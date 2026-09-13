@@ -131,7 +131,7 @@ where
         serde_json::to_writer(&mut temp, &operation).map_err(|e| e.to_string())?;
         temp.flush().map_err(|e| e.to_string())?;
         temp.as_file().sync_all().map_err(|e| e.to_string())?;
-        temp.persist(&path).map_err(|e| e.to_string())?;
+        temp.persist(path).map_err(|e| e.to_string())?;
     }
     for saved in &mut operation.targets {
         saved.cleanup_pending = true;
@@ -139,9 +139,9 @@ where
     // Retry exactly the original plan even after scans stop finding a deleted
     // primary record. Never add new same-ID copies to an existing operation.
     let reply = match action(&operation.targets) {
-        Err(error) => return mark_pending(&path, vec![error]),
+        Err(error) => return mark_pending(path, vec![error]),
         Ok(DeleteSessionReply::Deleted { warnings }) if !warnings.is_empty() => {
-            return mark_pending(&path, warnings)
+            return mark_pending(path, warnings)
         }
         Ok(reply) => reply,
     };
@@ -149,7 +149,7 @@ where
         reply,
         DeleteSessionReply::Deleted { .. } | DeleteSessionReply::NotFound
     ) {
-        if let Err(error) = std::fs::remove_file(&path) {
+        if let Err(error) = std::fs::remove_file(path) {
             return Ok(DeleteSessionReply::CleanupPending {
                 warnings: vec![format!("清理已完成，但无法更新清理记录：{error}")],
             });
@@ -243,6 +243,7 @@ fn process_matches(executable: &str, provider: &str) -> bool {
         "zcode" => &["zcode"],
         "grokbuild" => &["grok", "grokbuild"],
         "pi" => &["pi"],
+        "deepseek" => &["dsh", "deepseek-harness"],
         _ => &[],
     };
     aliases
@@ -275,6 +276,7 @@ fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) 
         "zcode" => &["zcode"],
         "grokbuild" => &["grok", "grokbuild"],
         "pi" => &["pi", "pi-coding-agent"],
+        "deepseek" => &["dsh", "deepseek-harness"],
         _ => &[],
     };
     tokens.iter().any(|token| aliases.contains(&token.as_str()))
@@ -303,6 +305,45 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, "branch dependency");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn incomplete_deepseek_discovery_creates_no_journal_or_deletion() {
+        use crate::session_manager::providers::deepseek;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let parent = root.join("project/parent/session.v3.jsonl");
+        let child = root.join("project/child/session.v3.jsonl");
+        for (path, id, parent_id) in [(&parent, "parent", None), (&child, "child", Some("parent"))]
+        {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let header = serde_json::json!({
+                "type": "session", "version": 3, "id": id,
+                "createdAt": 1700000000000_i64, "parentSession": parent_id
+            });
+            std::fs::write(path, format!("{header}\n")).unwrap();
+        }
+        let compressed =
+            zstd::stream::encode_all(std::fs::read(&child).unwrap().as_slice(), 0).unwrap();
+        std::fs::write(child.with_extension("jsonl.zstd"), compressed).unwrap();
+        let target: SessionMeta = serde_json::from_value(serde_json::json!({
+            "providerId": "deepseek", "sessionId": "parent", "residual": false,
+            "sourcePath": parent.to_string_lossy()
+        }))
+        .unwrap();
+        let journal = temp.path().join("operation.json");
+        let error = run_at(
+            &journal,
+            &target,
+            &[],
+            |_| deepseek::preflight_delete(&root, &parent, "parent"),
+            |_| panic!("must not mutate a session with incomplete dependency evidence"),
+        )
+        .unwrap_err();
+        assert!(error.contains("依赖扫描不完整"), "{error}");
+        assert!(!journal.exists());
+        assert!(parent.exists());
+        assert!(child.exists());
     }
 
     #[test]
@@ -344,6 +385,7 @@ mod tests {
             residual: false,
             archived: false,
             cleanup_pending: false,
+            sidebar_section: None,
             title: None,
             summary: None,
             project_dir: None,
@@ -393,6 +435,11 @@ mod tests {
             "/usr/bin/node",
             Some("node /modules/pi-coding-agent/dist/cli.js"),
             "pi"
+        ));
+        assert!(script_process_matches(
+            "node.exe",
+            Some("node npx-cli.js @deepseek-ai/dsh web"),
+            "deepseek"
         ));
         assert!(!script_process_matches(
             "/usr/bin/node",

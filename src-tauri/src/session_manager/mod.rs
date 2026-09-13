@@ -5,7 +5,7 @@ pub mod terminal;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use providers::{claude, codex, grokbuild, opencode, pi, zcode};
+use providers::{claude, codex, deepseek, grokbuild, opencode, pi, zcode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +25,8 @@ pub struct SessionMeta {
     pub project_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_section: Option<SidebarSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,6 +35,12 @@ pub struct SessionMeta {
     pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidebarSection {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,7 +102,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 }
 
 fn scan_report() -> SessionScanReport {
-    let (r1, r2, r3, r4, r5, r6) = std::thread::scope(|s| {
+    let (r1, r2, r3, r4, r5, r6, r7) = std::thread::scope(|s| {
         let h1 = s.spawn(|| providers::utils::scan_with_diagnostics("codex", codex::scan_sessions));
         let h2 =
             s.spawn(|| providers::utils::scan_with_diagnostics("claude", claude::scan_sessions));
@@ -105,6 +113,8 @@ fn scan_report() -> SessionScanReport {
         });
         let h5 = s.spawn(|| providers::utils::scan_with_diagnostics("pi", pi::scan_sessions));
         let h6 = s.spawn(|| providers::utils::scan_with_diagnostics("zcode", zcode::scan_sessions));
+        let h7 = s
+            .spawn(|| providers::utils::scan_with_diagnostics("deepseek", deepseek::scan_sessions));
         (
             join_scan_results(h1),
             join_scan_results(h2),
@@ -112,12 +122,13 @@ fn scan_report() -> SessionScanReport {
             join_scan_results(h4),
             join_scan_results(h5),
             join_scan_results(h6),
+            join_scan_results(h7),
         )
     });
 
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    for (items, issues) in [r1, r2, r3, r4, r5, r6] {
+    for (items, issues) in [r1, r2, r3, r4, r5, r6, r7] {
         sessions.extend(items);
         warnings.extend(issues);
     }
@@ -196,6 +207,7 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
         "opencode" => opencode::load_messages(path),
         "grokbuild" => grokbuild::load_messages(path),
         "pi" => pi::load_messages(path),
+        "deepseek" => deepseek::load_messages(path),
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
 }
@@ -250,6 +262,40 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
         codex::validate_delete_under_root(&root, &canonical, &item.session_id)?;
         codex::should_cleanup_index_after_delete(&item.session_id, &canonical.to_string_lossy())?;
     }
+    for item in plan.iter().filter(|item| item.provider_id == "deepseek") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("deepseek")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("DeepSeek Harness 会话根目录不存在")?;
+        deepseek::preflight_delete(&root, path, &item.session_id)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "zcode") {
+        zcode::preflight_delete(
+            item.source_path.as_deref().ok_or("缺少会话路径")?,
+            &item.session_id,
+        )?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "pi") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("pi")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("Pi 会话根目录不存在")?;
+        pi::preflight_delete(&root, path, &item.session_id)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "opencode") {
+        opencode::preflight_delete(
+            item.source_path.as_deref().ok_or("缺少会话路径")?,
+            &item.session_id,
+        )?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "grokbuild") {
+        grokbuild::preflight_delete(
+            Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?),
+            &item.session_id,
+        )?;
+    }
     Ok(())
 }
 
@@ -272,7 +318,10 @@ fn delete_session_in_snapshot(
         return Err("会话清理不再删除项目目录；请使用文件管理器单独处理项目文件".into());
     }
     if selected.is_some_and(|item| item.residual && !item.cleanup_pending)
-        && matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
+        && matches!(
+            provider_id,
+            "codex" | "claude" | "grokbuild" | "pi" | "deepseek"
+        )
         && !Path::new(source_path).exists()
     {
         return Ok(DeleteSessionReply::NotFound);
@@ -395,7 +444,12 @@ fn delete_session_record(
 pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOutcome> {
     let guard = deletion::DELETE_LOCK.lock();
     let sessions = scan_sessions();
-    let order = codex::deletion_order(requests);
+    let codex_order = codex::deletion_order(requests);
+    let order = deepseek::deletion_order(requests, &codex_order);
+    let order = zcode::deletion_order(requests, &order);
+    let order = pi::deletion_order(requests, &order);
+    let order = opencode::deletion_order(requests, &order);
+    let order = grokbuild::deletion_order(requests, &order);
     let ordered = order
         .iter()
         .map(|index| requests[*index].clone())
@@ -439,6 +493,19 @@ fn delete_session_with_roots(
     source_path: &Path,
     roots: &[PathBuf],
 ) -> Result<bool, String> {
+    // A DeepSeek cleanup retry may already have removed the transcript after
+    // updating workspace.json, while its projection cache still needs work.
+    // Its provider validates the complete lexical layout (including symlinked
+    // ancestors) and is therefore the authority for both existing and missing
+    // source paths.
+    if provider_id == "deepseek" {
+        let root = roots
+            .iter()
+            .find(|root| root.exists())
+            .ok_or("DeepSeek Harness 会话根目录不存在")?;
+        return deepseek::delete_session(root, source_path, session_id);
+    }
+
     // A legacy OpenCode session can retain its metadata after its message
     // directory has already disappeared. The scanner deliberately surfaces
     // that record as a residual, so allow its exact expected message path to
@@ -505,6 +572,7 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
         "opencode" => vec![opencode::get_opencode_data_dir()],
         "grokbuild" => grokbuild::session_roots(),
         "pi" => pi::session_roots(),
+        "deepseek" => deepseek::session_roots(),
         "zcode" => vec![zcode::database_path()
             .parent()
             .ok_or("Invalid ZCode database path")?
@@ -592,6 +660,7 @@ mod tests {
             residual,
             archived: false,
             cleanup_pending: false,
+            sidebar_section: None,
             title: None,
             summary: None,
             project_dir: None,

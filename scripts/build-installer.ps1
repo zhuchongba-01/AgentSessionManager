@@ -16,6 +16,11 @@ if (-not $innoCompiler) {
 
 Push-Location $projectRoot
 try {
+    & node (Join-Path $PSScriptRoot "version.mjs") --check
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release versions are inconsistent. Run pnpm version:set X.Y.Z before packaging."
+    }
+
     # Do not replace this with `cargo build --release`: Tauri's production
     # build step enables the embedded custom protocol and bundles dist/ into
     # the executable. A plain Cargo build opens the development localhost URL.

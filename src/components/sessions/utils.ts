@@ -72,7 +72,9 @@ export const getSessionDirectoryGroupKey = (
   providerId: string,
   projectDir?: string | null,
   projectName?: string | null,
+  sidebarSection?: SessionMeta["sidebarSection"],
 ) => {
+  if (sidebarSection) return `${providerId}:section:${sidebarSection.id}`;
   const trimmed = projectDir?.trim();
   const name = projectName?.trim();
   const identity = trimmed
@@ -144,6 +146,7 @@ export const getProviderLabel = (
     zcode: "ZCode",
     grokbuild: "Grok Build",
     pi: "Pi",
+    deepseek: "DeepSeek Harness",
   };
   const key = `apps.${normalized}`;
   const translated = t(key);
@@ -186,6 +189,7 @@ export const formatSessionTitle = (session: SessionMeta) => {
 export const groupSessionsByProviderAndDirectory = (
   sessions: SessionMeta[],
   unknownDirectoryLabel: string,
+  ungroupedDirectoryLabel = unknownDirectoryLabel,
 ): SessionProviderGroup[] => {
   const providerGroups: SessionProviderGroup[] = [];
   const providerGroupMap = new Map<string, SessionProviderGroup>();
@@ -215,6 +219,7 @@ export const groupSessionsByProviderAndDirectory = (
       session.providerId,
       trimmedProjectDir,
       trimmedProjectName,
+      session.sidebarSection,
     );
     const directoryGroups = directoryGroupMaps.get(session.providerId)!;
 
@@ -222,13 +227,16 @@ export const groupSessionsByProviderAndDirectory = (
     if (!directoryGroup) {
       directoryGroup = {
         key: directoryKey,
-        projectDir: trimmedProjectDir,
+        projectDir: session.sidebarSection ? null : trimmedProjectDir,
         projectName: trimmedProjectName,
         label:
+          session.sidebarSection?.name ||
           trimmedProjectName ||
           (trimmedProjectDir
             ? getBaseName(trimmedProjectDir) || trimmedProjectDir
-            : unknownDirectoryLabel),
+            : session.providerId === "deepseek"
+              ? ungroupedDirectoryLabel
+              : unknownDirectoryLabel),
         sessions: [],
       };
       directoryGroups.set(directoryKey, directoryGroup);
@@ -276,3 +284,10 @@ export const formatSessionMessagePreview = (
     content.slice(0, maxLength) + (content.length > maxLength ? "..." : "")
   );
 };
+
+// 多轮会话即使正文不足两屏，也需要提供轮次导航；单轮长正文则继续
+// 依赖页面高度阈值，避免只有一条短刻度时占用正文左侧空间。
+export const shouldShowSessionMinimap = (
+  userTurnCount: number,
+  contentPages: number,
+) => userTurnCount > 0 && (userTurnCount >= 2 || contentPages >= 2);

@@ -8,6 +8,7 @@ export interface SessionMeta {
   summary?: string;
   projectDir?: string | null;
   projectName?: string | null;
+  sidebarSection?: { id: string; name: string } | null;
   createdAt?: number;
   lastActiveAt?: number;
   sourcePath?: string;

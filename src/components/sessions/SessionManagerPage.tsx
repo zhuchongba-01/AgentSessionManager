@@ -82,6 +82,7 @@ import {
   getSessionDirectoryGroupKey,
   getSessionKey,
   groupSessionsByProviderAndDirectory,
+  shouldShowSessionMinimap,
   type SessionDirectoryGroup,
   type SessionProviderGroup,
 } from "./utils";
@@ -110,6 +111,7 @@ type ProviderFilter =
   | "claude"
   | "opencode"
   | "pi"
+  | "deepseek"
   | "zcode";
 
 type SessionListViewMode = "flat" | "grouped";
@@ -308,6 +310,9 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         t("sessionManager.unknownDirectory", {
           defaultValue: "未知目录",
         }),
+        t("sessionManager.ungroupedDirectory", {
+          defaultValue: "未分组",
+        }),
       ),
     [filteredSessions, t],
   );
@@ -321,6 +326,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
             session.providerId,
             session.projectDir,
             session.projectName,
+            session.sidebarSection,
           ),
         ),
       ),
@@ -430,6 +436,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         item.start < viewportEnd,
     )
     .map((item) => item.index);
+  const virtualizedContentHeight = virtualizer.getTotalSize();
 
   useEffect(() => {
     if (scrollContainerRef.current) {
@@ -483,7 +490,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     setTimeout(() => setActiveMessageIndex(null), 2000);
   };
 
-  // 滚动或内容变化时计算页数（迷你导航条的显示阈值：内容满两页才出现）
+  // 滚动或内容变化时计算页数。虚拟列表会在真实消息高度测量完成后
+  // 更新总高度，因此还要监听 virtualizedContentHeight，不能只看消息数量。
   const syncScrollMetrics = useCallback(() => {
     const el = scrollContainerRef.current;
     if (!el || visibleMessages.length === 0) {
@@ -510,7 +518,12 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
   useEffect(() => {
     syncScrollMetrics();
-  }, [syncScrollMetrics, visibleMessages]);
+  }, [syncScrollMetrics, visibleMessages, virtualizedContentHeight]);
+
+  const showSessionMinimap = shouldShowSessionMinimap(
+    minimapMessageIndexes.length,
+    minimapPages,
+  );
 
   const handleCopy = useCallback(
     async (text: string, successMessage: string) => {
@@ -1170,6 +1183,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       {(
                         [
                           "codex",
+                          "deepseek",
                           "grokbuild",
                           "claude",
                           "opencode",
@@ -1807,7 +1821,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
                     {/* 消息列表 + 目录 */}
                     <div className="asm-detail-content">
-                      {minimapPages >= 2 && (
+                      {showSessionMinimap && (
                         <SessionMinimap
                           messages={visibleMessages}
                           messageIndexes={minimapMessageIndexes}
@@ -1852,7 +1866,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                           <div className="asm-messages">
                             <div
                               style={{
-                                height: virtualizer.getTotalSize(),
+                                height: virtualizedContentHeight,
                                 position: "relative",
                               }}
                             >

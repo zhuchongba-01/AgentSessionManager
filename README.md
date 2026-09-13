@@ -20,12 +20,12 @@
 
 面向本地编码 Agent 的独立会话浏览、分类与安全清理工具。当前版本不负责启动 Agent 或恢复会话。
 
-当前支持扫描 **Codex、Claude Code、OpenCode、ZCode、Pi 与 Grok Build** 六种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
+当前支持扫描 **Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi 与 Grok Build** 七种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
 
 ## 主要特性
 
-- 🔍 **六种 Agent，一个界面**：Codex、Claude Code、OpenCode、ZCode、Pi、Grok Build 的本地会话一站式浏览。
-- 🗂️ **项目分组 + 缩略导航**：会话按真实工作目录归组，紧凑型列表配合缩略导航快速定位。
+- 🔍 **七种 Agent，一个界面**：Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi、Grok Build 的本地会话一站式浏览。
+- 🗂️ **项目分组 + 缩略导航**：遵循 Agent 的项目绑定与 Codex 自定义侧边栏分区，紧凑型列表配合缩略导航快速定位。
 - 📖 **完整会话详情**：按时间线阅读本地 Agent 的对话内容，快速定位历史消息。
 - 🧹 **安全清理**：识别残留、归档和仅剩索引的任务，支持批量删除与失败后继续清理；会话清理绝不删除项目工作目录。
 - 🛡️ **明确失败而非假装为空**：扫描不完整或消息读取失败时显示原因，并限制超大会话的单次读取量。
@@ -51,10 +51,31 @@ pnpm tauri dev
 ## 验证
 
 ```powershell
+pnpm version:check
+pnpm test:version
 pnpm typecheck
+pnpm format:check
 pnpm test:unit
-cargo test --manifest-path src-tauri/Cargo.toml session_manager
+pnpm build:renderer
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
+
+GitHub Actions 在 Windows 上执行上述检查，Node 与 Rust 版本分别读取 `.node-version` 和 `rust-toolchain.toml`，pnpm 版本读取 `package.json` 的 `packageManager`。CI 不发布安装包。
+
+## 更新版本与打包
+
+```powershell
+# 仅接受 X.Y.Z 正式版号；不创建 Git 提交或标签
+pnpm version:set 1.3.17
+pnpm version:check
+pnpm build:installer
+```
+
+`version:set` 同步更新 package.json、Cargo.toml、Cargo.lock 中的本项目版本、Tauri 版本和窗口标题、Inno Setup 版本，不修改依赖版本。脚本先检查所有目标字段，再写入变更；请在无并发编辑时运行，并检查 Git diff。`version:check` 以 package.json 为准，只读检查版本一致性。标准 `pnpm build` 和 Inno Setup 打包前也会检查版本。
+
+版本脚本不依赖 node_modules，也可直接运行 `node scripts/version.mjs --check` 或 `node scripts/version.mjs 1.3.17`。版本脚本测试使用临时目录，不修改项目版本文件。
 
 ## 致谢
 

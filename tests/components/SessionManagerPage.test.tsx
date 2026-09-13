@@ -13,6 +13,7 @@ import { http, HttpResponse } from "msw";
 import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
 import { ThemeProvider } from "@/components/theme-provider";
 import {
+  APP_VERSION,
   GITHUB_LATEST_RELEASE_API,
   GITHUB_LATEST_RELEASE_URL,
   GITHUB_REPOSITORY_URL,
@@ -198,10 +199,12 @@ describe("SessionManagerPage", () => {
   });
 
   it("shows a download button only when GitHub has a newer stable release", async () => {
+    const [major, minor, patch] = APP_VERSION.split(".").map(Number);
+    const nextVersion = `${major}.${minor}.${patch + 1}`;
     server.use(
       http.get(GITHUB_LATEST_RELEASE_API, () =>
         HttpResponse.json({
-          tag_name: "v1.3.17",
+          tag_name: `v${nextVersion}`,
           body: "## 更新内容\n- 修复更新提示\n- 优化 Agent 图标",
           draft: false,
           prerelease: false,
@@ -211,12 +214,12 @@ describe("SessionManagerPage", () => {
     renderPage();
 
     const updateButton = await screen.findByRole("button", {
-      name: "发现新版本 v1.3.17",
+      name: `发现新版本 v${nextVersion}`,
     });
     expect(updateButton).toHaveTextContent("更新");
     await userEvent.hover(updateButton);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "发现新版本 v1.3.17",
+      `发现新版本 v${nextVersion}`,
     );
     expect(screen.getByRole("tooltip")).toHaveTextContent(
       "修复更新提示 优化 Agent 图标",
@@ -293,6 +296,14 @@ describe("SessionManagerPage", () => {
     const zcodeOption = screen.getByRole("option", { name: /ZCode/ });
     expect(within(zcodeOption).getByTitle("ZCode")).toBeInTheDocument();
     expect(zcodeOption).toHaveTextContent("0");
+
+    const deepseekOption = screen.getByRole("option", {
+      name: /DeepSeek Harness/,
+    });
+    expect(
+      within(deepseekOption).getByTitle("DeepSeek Harness"),
+    ).toBeInTheDocument();
+    expect(deepseekOption).toHaveTextContent("0");
   });
 
   it("coalesces rapid rescan clicks into one disk scan and one notification", async () => {

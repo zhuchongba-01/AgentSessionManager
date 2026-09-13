@@ -48,6 +48,7 @@ struct CodexProjectBinding {
 struct CodexProjectContext {
     thread_projects: HashMap<String, CodexProjectBinding>,
     projectless_threads: HashSet<String>,
+    thread_sections: HashMap<String, crate::session_manager::SidebarSection>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +120,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                         .as_ref()
                         .is_some_and(|active| !active.contains_key(&id)),
                     cleanup_pending: true,
+                    sidebar_section: None,
                     title: thread_titles
                         .get(&id)
                         .cloned()
@@ -153,6 +155,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                     residual: false,
                     archived: false,
                     cleanup_pending: true,
+                    sidebar_section: None,
                     title: Some(format!("仅剩侧边栏索引的任务 {id}")),
                     summary: Some(
                         "侧边栏索引存在，但没有找到对应日志；请退出 Codex 后继续清理".into(),
@@ -736,6 +739,10 @@ fn scan_sessions_in_roots_with_context(
     let mut sessions = Vec::new();
     for path in &files {
         if let Some(mut meta) = parse_session_with_titles(path, thread_titles) {
+            meta.sidebar_section = project_context
+                .thread_sections
+                .get(&meta.session_id)
+                .cloned();
             if let Some(binding) = project_context.thread_projects.get(&meta.session_id) {
                 meta.project_dir = binding.root_path.clone();
                 meta.project_name = (!binding.name.trim().is_empty()).then(|| binding.name.clone());
@@ -1142,15 +1149,42 @@ fn normalized_rollout_path(path: &str) -> String {
 /// project identity and must not be used for grouping when this mapping exists.
 fn load_project_context() -> CodexProjectContext {
     let path = codex_config_dir().join(".codex-global-state.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return CodexProjectContext::default();
-    };
-    let Ok(root) = serde_json::from_str::<Value>(&text) else {
-        log::warn!("Failed to parse Codex global state {}", path.display());
-        return CodexProjectContext::default();
-    };
+    let mut context = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|root| project_context_from_value(&root))
+        .unwrap_or_default();
+    let config_text = read_codex_config_text().unwrap_or_default();
+    for db_path in codex_state_db_paths(&codex_config_dir(), &config_text) {
+        let Ok(conn) =
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            continue;
+        };
+        context.thread_sections.extend(read_sidebar_sections(&conn));
+    }
+    context
+}
 
-    project_context_from_value(&root)
+fn read_sidebar_sections(
+    conn: &Connection,
+) -> HashMap<String, crate::session_manager::SidebarSection> {
+    // Older Codex databases do not have sections. Keep project grouping there.
+    let Ok(mut statement) = conn.prepare("SELECT t.id, s.id, s.name FROM threads t JOIN thread_sections s ON t.thread_section_id = s.id WHERE trim(s.name) != ''") else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            crate::session_manager::SidebarSection {
+                id: row.get(1)?,
+                name: row.get(2)?,
+            },
+        ))
+    }) else {
+        return HashMap::new();
+    };
+    rows.filter_map(Result::ok).collect()
 }
 
 fn project_context_from_value(root: &Value) -> CodexProjectContext {
@@ -1209,6 +1243,7 @@ fn project_context_from_value(root: &Value) -> CodexProjectContext {
     CodexProjectContext {
         thread_projects,
         projectless_threads,
+        thread_sections: HashMap::new(),
     }
 }
 
@@ -1867,6 +1902,7 @@ fn parse_session_with_titles(
         residual: false,
         archived: false,
         cleanup_pending: false,
+        sidebar_section: None,
         title,
         summary,
         project_dir,
@@ -1994,6 +2030,25 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sidebar_sections_follow_membership_and_support_older_databases() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(super::read_sidebar_sections(&conn).is_empty());
+        conn.execute_batch("CREATE TABLE threads (id TEXT, thread_section_id TEXT);
+            CREATE TABLE thread_sections (id TEXT, name TEXT);
+            INSERT INTO thread_sections VALUES ('section-a', 'Deepseek11');
+            INSERT INTO threads VALUES ('project-thread', 'section-a'), ('projectless-thread', 'section-a'), ('ordinary-thread', NULL), ('stale-thread', 'missing');").unwrap();
+        let sections = super::read_sidebar_sections(&conn);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections["project-thread"].name, "Deepseek11");
+        assert_eq!(sections["projectless-thread"].id, "section-a");
+        conn.execute(
+            "UPDATE threads SET thread_section_id = NULL WHERE id = 'project-thread'",
+            [],
+        )
+        .unwrap();
+        assert!(!super::read_sidebar_sections(&conn).contains_key("project-thread"));
+    }
     use super::*;
 
     #[test]

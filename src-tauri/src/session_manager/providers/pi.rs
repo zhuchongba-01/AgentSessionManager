@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::session_manager::{SessionMessage, SessionMeta};
+use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    extract_text, parse_timestamp_to_ms, path_basename, truncate_summary, TITLE_MAX_CHARS,
+    checked_storage_child, extract_text, parse_timestamp_to_ms, path_basename, truncate_summary,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "pi";
@@ -56,6 +57,7 @@ struct SessionHeader {
     cwd: String,
     timestamp: Option<i64>,
     version: u64,
+    parent_session: Option<String>,
 }
 
 #[derive(Debug)]
@@ -263,6 +265,160 @@ fn load_messages_with_layout(
     read_active_messages(&source, &tree)
 }
 
+#[derive(Debug)]
+struct SessionDescriptor {
+    id: String,
+    path: PathBuf,
+    parent_path: Option<PathBuf>,
+}
+
+fn session_descriptors(
+    root: &Path,
+    layout: SessionLayout,
+) -> Result<Vec<SessionDescriptor>, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve Pi session root: {error}"))?;
+    let mut files = Vec::new();
+    collect_jsonl_files(&root, layout, &mut files, false);
+    files.sort();
+    let mut ids = HashSet::new();
+    let mut descriptors = Vec::with_capacity(files.len());
+    for file in files {
+        let (_, path) = validate_source_under_root(&root, &file, layout)?;
+        let header = read_tree(&path)?.header;
+        if !ids.insert(header.id.clone()) {
+            return Err(format!("Pi 存在重复会话 ID {}，已停止删除", header.id));
+        }
+        let parent_path = header
+            .parent_session
+            .as_deref()
+            .map(Path::new)
+            .map(|parent| checked_storage_child(&root, parent))
+            .transpose()
+            .map_err(|error| format!("Pi 父会话路径无效：{error}"))?;
+        if parent_path
+            .as_deref()
+            .is_some_and(|parent| !matches_session_layout(&root, parent, layout))
+        {
+            return Err(format!(
+                "Pi 会话 {} 的父会话路径不符合当前存储布局",
+                header.id
+            ));
+        }
+        descriptors.push(SessionDescriptor {
+            id: header.id,
+            path,
+            parent_path,
+        });
+    }
+
+    let by_path = descriptors
+        .iter()
+        .map(|descriptor| (descriptor.path.as_path(), descriptor))
+        .collect::<HashMap<_, _>>();
+    for descriptor in &descriptors {
+        let mut seen = HashSet::new();
+        let mut current = descriptor;
+        while let Some(parent_path) = current.parent_path.as_deref() {
+            if !seen.insert(current.path.clone()) {
+                return Err("Pi 会话父子关系存在循环，已停止删除".into());
+            }
+            let Some(parent) = by_path.get(parent_path).copied() else {
+                break;
+            };
+            current = parent;
+        }
+    }
+    Ok(descriptors)
+}
+
+fn preflight_delete_with_layout(
+    root: &Path,
+    path: &Path,
+    session_id: &str,
+    layout: SessionLayout,
+) -> Result<(), String> {
+    if !is_valid_tree_id(session_id) {
+        return Err("Invalid Pi session ID".to_string());
+    }
+    let (_, source) = validate_source_under_root(root, path, layout)?;
+    let target = read_tree(&source)?.header;
+    if target.id != session_id {
+        return Err(format!(
+            "Pi session ID mismatch: expected {session_id}, found {}",
+            target.id
+        ));
+    }
+    if let Some(child) = session_descriptors(root, layout)?
+        .into_iter()
+        .find(|descriptor| descriptor.parent_path.as_deref() == Some(source.as_path()))
+    {
+        return Err(format!(
+            "该 Pi 会话仍被分支会话 {} 依赖，请先删除子会话",
+            child.id
+        ));
+    }
+    Ok(())
+}
+
+pub fn preflight_delete(root: &Path, path: &Path, session_id: &str) -> Result<(), String> {
+    let layout = layout_for_current_root(root)?;
+    preflight_delete_with_layout(root, path, session_id, layout)
+}
+
+fn deletion_order_with_descriptors(
+    requests: &[DeleteSessionRequest],
+    initial: &[usize],
+    descriptors: &[SessionDescriptor],
+) -> Vec<usize> {
+    let selected = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.provider_id == PROVIDER_ID)
+        .filter_map(|(index, request)| {
+            Path::new(&request.source_path)
+                .canonicalize()
+                .ok()
+                .map(|path| (path, index))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut remaining = initial.to_vec();
+    let mut ordered = Vec::with_capacity(initial.len());
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|candidate| {
+            let Some(parent_path) = requests
+                .get(*candidate)
+                .and_then(|request| Path::new(&request.source_path).canonicalize().ok())
+            else {
+                return true;
+            };
+            !descriptors.iter().any(|child| {
+                child.parent_path.as_deref() == Some(parent_path.as_path())
+                    && selected
+                        .get(&child.path)
+                        .is_some_and(|child_index| remaining.contains(child_index))
+            })
+        });
+        let Some(position) = ready else {
+            ordered.extend(remaining);
+            break;
+        };
+        ordered.push(remaining.remove(position));
+    }
+    ordered
+}
+
+pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    let SessionRootResolution::Available { root, layout } = resolve_session_root() else {
+        return initial.to_vec();
+    };
+    let Ok(descriptors) = session_descriptors(&root, layout) else {
+        return initial.to_vec();
+    };
+    deletion_order_with_descriptors(requests, initial, &descriptors)
+}
+
 pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
     let layout = layout_for_current_root(root)?;
     delete_session_with_layout(root, path, session_id, layout)
@@ -274,17 +430,8 @@ fn delete_session_with_layout(
     session_id: &str,
     layout: SessionLayout,
 ) -> Result<bool, String> {
-    if !is_valid_tree_id(session_id) {
-        return Err("Invalid Pi session ID".to_string());
-    }
+    preflight_delete_with_layout(root, path, session_id, layout)?;
     let (_, source) = validate_source_under_root(root, path, layout)?;
-    let tree = read_tree(&source)?;
-    if tree.header.id != session_id {
-        return Err(format!(
-            "Pi session ID mismatch: expected {session_id}, found {}",
-            tree.header.id
-        ));
-    }
     fs::remove_file(&source)
         .map_err(|error| format!("Failed to delete Pi session {}: {error}", source.display()))?;
     Ok(true)
@@ -340,12 +487,17 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         .as_deref()
         .map(|message| truncate_summary(message, 160))
         .filter(|message| !message.is_empty());
+    let residual = header
+        .parent_session
+        .as_deref()
+        .is_some_and(|parent| !Path::new(parent).is_file());
     Ok(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: header.id,
-        residual: false,
+        residual,
         archived: false,
         cleanup_pending: false,
+        sidebar_section: None,
         title,
         summary: summary_text,
         project_dir: (!header.cwd.trim().is_empty()).then(|| header.cwd.clone()),
@@ -353,10 +505,12 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         created_at: header.timestamp,
         last_active_at: summary.last_active_at.or(header.timestamp),
         source_path: Some(source_path.clone()),
-        resume_command: Some(format!(
-            "pi --session {}",
-            crate::session_manager::terminal::shell_escape(&source_path)
-        )),
+        resume_command: (!residual).then(|| {
+            format!(
+                "pi --session {}",
+                crate::session_manager::terminal::shell_escape(&source_path)
+            )
+        }),
     })
 }
 
@@ -578,6 +732,12 @@ fn parse_header(value: &Value) -> Result<SessionHeader, String> {
     if version == 0 {
         return Err(format!("Unsupported Pi session version: {version}"));
     }
+    let parent_session = match value.get("parentSession") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(parent)) if !parent.trim().is_empty() => Some(parent.clone()),
+        Some(Value::String(_)) => None,
+        Some(_) => return Err("Pi session header has an invalid parentSession".to_string()),
+    };
     Ok(SessionHeader {
         id,
         cwd: value
@@ -587,6 +747,7 @@ fn parse_header(value: &Value) -> Result<SessionHeader, String> {
             .to_string(),
         timestamp: value.get("timestamp").and_then(parse_timestamp_to_ms),
         version,
+        parent_session,
     })
 }
 
@@ -694,10 +855,53 @@ fn matches_session_layout(root: &Path, source: &Path, layout: SessionLayout) -> 
     let Ok(relative) = source.strip_prefix(root) else {
         return false;
     };
-    let depth = relative.components().count();
-    match layout {
-        SessionLayout::Flat => depth == 1,
-        SessionLayout::ProjectDirectories => depth == 2,
+    let components = relative.components().collect::<Vec<_>>();
+    let session_components = match layout {
+        SessionLayout::Flat => components.as_slice(),
+        SessionLayout::ProjectDirectories if components.len() >= 2 => &components[1..],
+        SessionLayout::ProjectDirectories => return false,
+    };
+    if session_components.len() % 2 == 0 {
+        return false;
+    }
+    session_components
+        .iter()
+        .enumerate()
+        .all(|(index, component)| index % 2 == 0 || component.as_os_str() == "forks")
+}
+
+fn collect_session_level(
+    directory: &Path,
+    output: &mut Vec<PathBuf>,
+    enforce_size_limit: bool,
+    depth: usize,
+) {
+    const MAX_FORK_DEPTH: usize = 32;
+    if depth > MAX_FORK_DEPTH {
+        super::utils::scan_warning(format!(
+            "Pi fork nesting exceeds the {MAX_FORK_DEPTH}-level safety limit: {}",
+            directory.display()
+        ));
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
+            push_jsonl_file(&entry, output, enforce_size_limit);
+            continue;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let forks = entry.path().join("forks");
+        if fs::symlink_metadata(&forks).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            collect_session_level(&forks, output, enforce_size_limit, depth + 1);
+        }
     }
 }
 
@@ -733,28 +937,14 @@ fn collect_jsonl_files(
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        match layout {
-            SessionLayout::Flat if file_type.is_file() => {
-                push_jsonl_file(&entry, output, enforce_size_limit);
-            }
-            SessionLayout::ProjectDirectories if file_type.is_dir() => {
-                let Ok(project_entries) = fs::read_dir(entry.path()) else {
-                    continue;
-                };
-                for project_entry in project_entries.flatten() {
-                    if project_entry
-                        .file_type()
-                        .is_ok_and(|file_type| file_type.is_file())
-                    {
-                        push_jsonl_file(&project_entry, output, enforce_size_limit);
-                    }
+    match layout {
+        SessionLayout::Flat => collect_session_level(root, output, enforce_size_limit, 0),
+        SessionLayout::ProjectDirectories => {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    collect_session_level(&entry.path(), output, enforce_size_limit, 0);
                 }
             }
-            SessionLayout::Flat | SessionLayout::ProjectDirectories => {}
         }
     }
 }
@@ -782,6 +972,133 @@ mod tests {
             format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"/work\"}}\n"),
         )
         .expect("write session");
+    }
+
+    fn write_fork_header(path: &Path, id: &str, parent: &Path) {
+        fs::create_dir_all(path.parent().expect("fork parent")).expect("create fork parent");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": id,
+            "cwd": "/work",
+            "parentSession": parent,
+        });
+        fs::write(path, format!("{header}\n")).expect("write fork session");
+    }
+
+    #[test]
+    fn scans_native_forks_and_marks_orphans_as_residual() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let project = root.join("project");
+        let parent = project.join("parent.jsonl");
+        let child = project.join("parent").join("forks").join("child.jsonl");
+        write_session_header(&parent, "session-parent");
+        write_fork_header(&child, "session-child", &parent);
+        let artifact = project
+            .join("subagent-artifacts")
+            .join("worker_transcript.jsonl");
+        fs::create_dir_all(artifact.parent().expect("artifact parent")).expect("artifact dir");
+        fs::write(&artifact, "{\"type\":\"message\"}\n").expect("artifact transcript");
+
+        let sessions = scan_sessions_in_root(&root, SessionLayout::ProjectDirectories);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|session| !session.residual));
+        assert!(sessions
+            .iter()
+            .any(|session| session.session_id == "session-child"));
+
+        fs::remove_file(&parent).expect("remove parent fixture");
+        let sessions = scan_sessions_in_root(&root, SessionLayout::ProjectDirectories);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-child");
+        assert!(sessions[0].residual);
+        assert!(sessions[0].resume_command.is_none());
+    }
+
+    #[test]
+    fn parent_delete_is_blocked_until_pi_fork_is_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let project = root.join("project");
+        let parent = project.join("parent.jsonl");
+        let child = project.join("parent").join("forks").join("child.jsonl");
+        write_session_header(&parent, "session-parent");
+        write_fork_header(&child, "session-child", &parent);
+
+        let error = preflight_delete_with_layout(
+            &root,
+            &parent,
+            "session-parent",
+            SessionLayout::ProjectDirectories,
+        )
+        .expect_err("parent must be protected");
+        assert!(error.contains("session-child"));
+        assert!(parent.exists());
+        assert!(child.exists());
+
+        assert!(delete_session_with_layout(
+            &root,
+            &child,
+            "session-child",
+            SessionLayout::ProjectDirectories,
+        )
+        .expect("delete child"));
+        assert!(parent.exists());
+        assert!(!child.exists());
+        assert!(delete_session_with_layout(
+            &root,
+            &parent,
+            "session-parent",
+            SessionLayout::ProjectDirectories,
+        )
+        .expect("delete parent"));
+    }
+
+    #[test]
+    fn selected_pi_forks_are_ordered_before_parents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let parent = root.join("parent.jsonl");
+        let child = root.join("parent").join("forks").join("child.jsonl");
+        write_session_header(&parent, "session-parent");
+        write_fork_header(&child, "session-child", &parent);
+        let descriptors = session_descriptors(&root, SessionLayout::Flat).expect("descriptors");
+        let requests = vec![
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "session-parent".into(),
+                source_path: parent.to_string_lossy().into_owned(),
+                include_project: false,
+            },
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "session-child".into(),
+                source_path: child.to_string_lossy().into_owned(),
+                include_project: false,
+            },
+        ];
+        assert_eq!(
+            deletion_order_with_descriptors(&requests, &[0, 1], &descriptors),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    #[ignore = "Opt-in read-only audit of the locally installed Pi session storage"]
+    fn audit_real_pi_sessions_read_only() {
+        let SessionRootResolution::Available { root, layout } = resolve_session_root() else {
+            eprintln!("Pi session storage is not globally available");
+            return;
+        };
+        let sessions = scan_sessions_in_root(&root, layout);
+        let descriptors = session_descriptors(&root, layout).expect("validate Pi descriptor graph");
+        eprintln!(
+            "Pi audit: sessions={}, residuals={}, descriptors={}",
+            sessions.len(),
+            sessions.iter().filter(|session| session.residual).count(),
+            descriptors.len()
+        );
     }
 
     #[test]

@@ -252,6 +252,7 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
         residual: false,
         archived: false,
         cleanup_pending: false,
+        sidebar_section: None,
         title,
         summary,
         project_dir,
@@ -309,6 +310,7 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("abc123-session.jsonl");
         let sidecar = temp.path().join("abc123-session");
+        let independent_branch = temp.path().join("def456-branch.jsonl");
         let subagents = sidecar.join("subagents");
         let tool_results = sidecar.join("tool-results");
 
@@ -324,11 +326,20 @@ mod tests {
             ),
         )
         .expect("write session");
+        std::fs::write(
+            &independent_branch,
+            concat!(
+                "{\"sessionId\":\"branch-456\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-03-06T10:02:00Z\"}\n",
+                "{\"message\":{\"role\":\"user\",\"content\":\"branched copy\"},\"timestamp\":\"2026-03-06T10:03:00Z\"}\n"
+            ),
+        )
+        .expect("write independent branch");
 
         delete_session(temp.path(), &path, "session-123").expect("delete session");
 
         assert!(!path.exists());
         assert!(!sidecar.exists());
+        assert!(independent_branch.exists());
     }
 
     #[test]

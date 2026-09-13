@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, Transaction};
 use serde_json::Value;
 
-use crate::session_manager::{SessionMessage, SessionMeta};
+use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 const PROVIDER_ID: &str = "zcode";
 const SOURCE_PREFIX: &str = "sqlite-zcode:";
@@ -108,6 +108,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
             residual,
             archived: false,
             cleanup_pending: false,
+            sidebar_section: None,
             title: display_title.clone(),
             summary: display_title,
             project_dir: (!directory.is_empty()).then_some(directory),
@@ -140,6 +141,250 @@ fn load_native_task_ids(path: &Path) -> Option<BTreeSet<String>> {
         .query_map([], |row| row.get::<_, String>(0))
         .ok()?;
     Some(rows.flatten().filter(|id| !id.trim().is_empty()).collect())
+}
+
+fn connection_table_names(connection: &Connection) -> Result<BTreeSet<String>, String> {
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .map_err(|error| format!("Failed to inspect ZCode database tables: {error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Failed to read ZCode database tables: {error}"))?;
+    Ok(rows.flatten().collect())
+}
+
+fn connection_table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let quoted = quote_identifier(table);
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({quoted})"))
+        .map_err(|error| format!("Failed to inspect ZCode {table} columns: {error}"))?;
+    let found = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Failed to read ZCode {table} columns: {error}"))?
+        .flatten()
+        .any(|name| name == column);
+    Ok(found)
+}
+
+fn insert_parent_relation(
+    parents: &mut HashMap<String, String>,
+    child: String,
+    parent: String,
+) -> Result<(), String> {
+    validate_session_id(&child)?;
+    validate_session_id(&parent)?;
+    if child == parent {
+        return Err(format!("ZCode 会话 {child} 的父子关系指向自身，已停止删除"));
+    }
+    if let Some(existing) = parents.insert(child.clone(), parent.clone()) {
+        if existing != parent {
+            return Err(format!(
+                "ZCode 会话 {child} 同时指向父会话 {existing} 和 {parent}，已停止删除"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_parent_rows(
+    connection: &Connection,
+    sql: &str,
+    parents: &mut HashMap<String, String>,
+    label: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("Failed to inspect ZCode {label}: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Failed to read ZCode {label}: {error}"))?;
+    for row in rows {
+        let (child, parent) =
+            row.map_err(|error| format!("Invalid ZCode {label} relation: {error}"))?;
+        insert_parent_relation(parents, child, parent)?;
+    }
+    Ok(())
+}
+
+fn validate_parent_graph(parents: &HashMap<String, String>) -> Result<(), String> {
+    for child in parents.keys() {
+        let mut seen = BTreeSet::new();
+        let mut current = child.as_str();
+        while let Some(parent) = parents.get(current) {
+            if !seen.insert(current.to_string()) {
+                return Err("ZCode 会话父子关系存在循环，已停止删除".into());
+            }
+            current = parent;
+        }
+    }
+    Ok(())
+}
+
+fn load_parent_relations(
+    primary_path: &Path,
+    index_path: &Path,
+) -> Result<HashMap<String, String>, String> {
+    let primary = Connection::open_with_flags(
+        primary_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Failed to open ZCode database for dependency check: {error}"))?;
+    primary
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("Failed to configure ZCode dependency check: {error}"))?;
+    let primary_tables = connection_table_names(&primary)?;
+    if !primary_tables.contains("session") {
+        return Err("ZCode database is missing the session table".into());
+    }
+
+    let mut parents = HashMap::new();
+    if connection_table_has_column(&primary, "session", "parent_id")? {
+        read_parent_rows(
+            &primary,
+            "SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL AND parent_id<>''",
+            &mut parents,
+            "session.parent_id",
+        )?;
+    }
+    if primary_tables.contains("session_task_link") {
+        if !connection_table_has_column(&primary, "session_task_link", "parent_session_id")?
+            || !connection_table_has_column(&primary, "session_task_link", "child_session_id")?
+        {
+            return Err("ZCode session_task_link table has an unsupported shape".into());
+        }
+        read_parent_rows(
+            &primary,
+            "SELECT child_session_id, parent_session_id FROM session_task_link \
+             WHERE child_session_id IS NOT NULL AND child_session_id<>'' \
+             AND parent_session_id IS NOT NULL AND parent_session_id<>''",
+            &mut parents,
+            "session_task_link",
+        )?;
+    }
+
+    if index_path.is_file() {
+        let index = Connection::open_with_flags(
+            index_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            format!("Failed to open ZCode task index for dependency check: {error}")
+        })?;
+        index
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("Failed to configure ZCode task index check: {error}"))?;
+        let index_tables = connection_table_names(&index)?;
+        if index_tables.contains("tasks") {
+            if !connection_table_has_column(&index, "tasks", "task_id")? {
+                return Err("ZCode tasks table is missing task_id".into());
+            }
+            if connection_table_has_column(&index, "tasks", "forked_from_task_id")? {
+                read_parent_rows(
+                    &index,
+                    "SELECT task_id, forked_from_task_id FROM tasks \
+                     WHERE forked_from_task_id IS NOT NULL AND forked_from_task_id<>''",
+                    &mut parents,
+                    "tasks.forked_from_task_id",
+                )?;
+            }
+        }
+    }
+
+    validate_parent_graph(&parents)?;
+    Ok(parents)
+}
+
+fn validate_source_database(source: &str, session_id: &str) -> Result<PathBuf, String> {
+    let (path, referenced_id) = parse_source(source)
+        .ok_or_else(|| format!("Invalid ZCode SQLite source reference: {source}"))?;
+    if referenced_id != session_id {
+        return Err("ZCode session ID does not match the source reference".to_string());
+    }
+    let expected = database_path()
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve the ZCode database: {error}"))?;
+    let actual = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve the selected ZCode database: {error}"))?;
+    if actual != expected {
+        return Err("ZCode database path is outside the configured storage root".to_string());
+    }
+    validate_session_id(session_id)?;
+    Ok(actual)
+}
+
+fn preflight_delete_with_paths(
+    primary_path: &Path,
+    index_path: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    validate_session_id(session_id)?;
+    let parents = load_parent_relations(primary_path, index_path)?;
+    if let Some(child) = parents
+        .iter()
+        .find_map(|(child, parent)| (parent == session_id).then_some(child))
+    {
+        return Err(format!(
+            "该 ZCode 会话仍被子会话 {child} 依赖，请先删除子会话"
+        ));
+    }
+    Ok(())
+}
+
+pub fn preflight_delete(source: &str, session_id: &str) -> Result<(), String> {
+    let primary_path = validate_source_database(source, session_id)?;
+    preflight_delete_with_paths(&primary_path, &tasks_index_path(), session_id)
+}
+
+fn deletion_order_with_relations(
+    requests: &[DeleteSessionRequest],
+    initial: &[usize],
+    parents: &HashMap<String, String>,
+) -> Vec<usize> {
+    let selected = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.provider_id == PROVIDER_ID)
+        .map(|(index, request)| (request.session_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut remaining = initial.to_vec();
+    let mut ordered = Vec::with_capacity(initial.len());
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|candidate| {
+            let Some(parent_id) = requests
+                .get(*candidate)
+                .map(|request| request.session_id.as_str())
+            else {
+                return true;
+            };
+            !parents.iter().any(|(child, parent)| {
+                parent == parent_id
+                    && selected
+                        .get(child.as_str())
+                        .is_some_and(|child_index| remaining.contains(child_index))
+            })
+        });
+        let Some(position) = ready else {
+            ordered.extend(remaining);
+            break;
+        };
+        ordered.push(remaining.remove(position));
+    }
+    ordered
+}
+
+pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    let primary = database_path();
+    let Ok(parents) = load_parent_relations(&primary, &tasks_index_path()) else {
+        return initial.to_vec();
+    };
+    deletion_order_with_relations(requests, initial, &parents)
 }
 
 pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
@@ -658,7 +903,11 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
-                 CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+                 CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    parent_id TEXT
+                 );
                  CREATE TABLE message (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE
@@ -672,6 +921,11 @@ mod tests {
                     id TEXT PRIMARY KEY,
                     session_id TEXT,
                     text TEXT NOT NULL
+                 );
+                 CREATE TABLE session_task_link (
+                    id TEXT PRIMARY KEY,
+                    parent_session_id TEXT REFERENCES session(id) ON DELETE SET NULL,
+                    child_session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE
                  );",
             )
             .expect("create primary schema");
@@ -713,6 +967,7 @@ mod tests {
                     workspace_key TEXT NOT NULL,
                     workspace_path TEXT NOT NULL,
                     task_id TEXT NOT NULL,
+                    forked_from_task_id TEXT,
                     PRIMARY KEY (workspace_key, task_id)
                  );
                  CREATE TABLE task_group_members (
@@ -780,6 +1035,119 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count rows")
+    }
+
+    #[test]
+    fn parent_session_is_protected_by_all_zcode_relation_sources() {
+        let temp = tempdir().expect("tempdir");
+        let primary_path = temp.path().join("db.sqlite");
+        let primary = create_primary_database(&primary_path);
+        insert_primary_session(&primary, "sess_parent", r"E:\project");
+        insert_primary_session(&primary, "sess_child", r"E:\project");
+        primary
+            .execute(
+                "UPDATE session SET parent_id='sess_parent' WHERE id='sess_child'",
+                [],
+            )
+            .expect("set parent relation");
+        primary
+            .execute(
+                "INSERT INTO session_task_link (id, parent_session_id, child_session_id) \
+                 VALUES ('link', 'sess_parent', 'sess_child')",
+                [],
+            )
+            .expect("insert task link");
+        drop(primary);
+
+        let index_path = temp.path().join("tasks-index.sqlite");
+        let index = create_task_index(&index_path);
+        insert_index_task(&index, r"E:\project", "sess_parent", 0);
+        insert_index_task(&index, r"E:\project", "sess_child", 1);
+        index
+            .execute(
+                "UPDATE tasks SET forked_from_task_id='sess_parent' WHERE task_id='sess_child'",
+                [],
+            )
+            .expect("set fork relation");
+        drop(index);
+
+        let error = preflight_delete_with_paths(&primary_path, &index_path, "sess_parent")
+            .expect_err("parent must be protected");
+        assert!(error.contains("sess_child"));
+        preflight_delete_with_paths(&primary_path, &index_path, "sess_child")
+            .expect("leaf child can be deleted");
+    }
+
+    #[test]
+    fn conflicting_or_cyclic_zcode_relations_fail_closed() {
+        let temp = tempdir().expect("tempdir");
+        let primary_path = temp.path().join("db.sqlite");
+        let primary = create_primary_database(&primary_path);
+        for id in ["sess_a", "sess_b", "sess_c"] {
+            insert_primary_session(&primary, id, r"E:\project");
+        }
+        primary
+            .execute(
+                "UPDATE session SET parent_id='sess_a' WHERE id='sess_b'",
+                [],
+            )
+            .expect("set parent relation");
+        primary
+            .execute(
+                "INSERT INTO session_task_link (id, parent_session_id, child_session_id) \
+                 VALUES ('link', 'sess_c', 'sess_b')",
+                [],
+            )
+            .expect("insert conflicting task link");
+        drop(primary);
+
+        let error = load_parent_relations(&primary_path, &temp.path().join("missing.sqlite"))
+            .expect_err("conflicting parents must fail");
+        assert!(error.contains("同时指向父会话"));
+
+        let primary = Connection::open(&primary_path).expect("reopen primary");
+        primary
+            .execute("DELETE FROM session_task_link", [])
+            .expect("clear conflict");
+        primary
+            .execute(
+                "UPDATE session SET parent_id='sess_b' WHERE id='sess_a'",
+                [],
+            )
+            .expect("create cycle");
+        drop(primary);
+        let error = load_parent_relations(&primary_path, &temp.path().join("missing.sqlite"))
+            .expect_err("cycles must fail");
+        assert!(error.contains("存在循环"));
+    }
+
+    #[test]
+    fn selected_zcode_children_are_ordered_before_parents() {
+        let requests = vec![
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "sess_parent".into(),
+                source_path: "parent".into(),
+                include_project: false,
+            },
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "sess_child".into(),
+                source_path: "child".into(),
+                include_project: false,
+            },
+            DeleteSessionRequest {
+                provider_id: "pi".into(),
+                session_id: "pi_session".into(),
+                source_path: "pi".into(),
+                include_project: false,
+            },
+        ];
+        let parents = HashMap::from([("sess_child".into(), "sess_parent".into())]);
+        assert_eq!(
+            deletion_order_with_relations(&requests, &[0, 2, 1], &parents),
+            vec![2, 1, 0]
+        );
     }
 
     #[test]
