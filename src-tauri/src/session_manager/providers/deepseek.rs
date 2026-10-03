@@ -15,7 +15,7 @@ use super::utils::{
 const PROVIDER_ID: &str = "deepseek";
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: u64 = 4 * 1024 * 1024;
-const SUPPORTED_SESSION_FORMAT: i64 = 3;
+const SUPPORTED_SESSION_FORMAT: i64 = 4;
 
 #[derive(Debug)]
 struct DecodedSession {
@@ -1224,6 +1224,41 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "real prompt");
         assert_eq!(messages[1].content, "answer");
+    }
+
+    #[test]
+    fn v4_sessions_are_scanned_like_v3() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let id = "session-v4";
+        let path = temp
+            .path()
+            .join("sessions")
+            .join("--C-work-demo--")
+            .join(id)
+            .join("session.v4.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let rows = [
+            json!({
+                "type": "session", "version": 4, "id": id,
+                "createdAt": 1700000000000_i64, "cwd": "C:/work/demo",
+                "isSeeded": false, "delegationDepth": 0, "agentPreset": "standard"
+            }),
+            json!({"type":"turn/start","seq":0,"time":1700000000100_i64,"data":{"turn":1}}),
+            json!({"type":"user/message","seq":1,"time":1700000000200_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"v4 prompt"}]}}),
+            json!({"type":"assistant/message","seq":2,"time":1700000000300_i64,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"reasoning","text":"r"},{"type":"text","text":"v4 answer"}]}}}),
+            json!({"type":"session/title","seq":3,"time":1700000000400_i64,"data":{"title":"v4 title"}}),
+        ];
+        fs::write(
+            &path,
+            rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        write_index(temp.path(), &[id], &[]);
+
+        let sessions = scan_sessions_at(temp.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("v4 title"));
+        assert_eq!(sessions[0].summary.as_deref(), Some("v4 answer"));
     }
 
     #[test]
