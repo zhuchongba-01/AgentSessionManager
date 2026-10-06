@@ -4,11 +4,15 @@
 
 # Agent 会话管理器
 
-**一款轻量的桌面应用，统一浏览、分类与安全清理本地编码 Agent 的会话记录。**
+**Codex、Claude Code、DeepSeek Harness 等本地编码 Agent 的会话管理工具**
+
+一款轻量的桌面应用，统一浏览、分类与安全清理本地编码 Agent 的会话记录。
+
+<sub>Desktop session manager for local coding agents — browse, group and safely clean up Codex, Claude Code, DeepSeek Harness, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
 [![Release](https://img.shields.io/github/v/release/zhuchongba-01/AgentSessionManager?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20amd64-blue?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
 
 ![主界面](docs/images/main-window.png)
 
@@ -36,7 +40,15 @@
 
 ## 下载安装
 
-当前仅提供 Windows x64 版本。前往 [Releases](https://github.com/zhuchongba-01/AgentSessionManager/releases) 下载 `AgentSessionManager-Setup-vX.Y.Z.exe`，无需预装运行时。
+前往 [Releases](https://github.com/zhuchongba-01/AgentSessionManager/releases) 下载安装包，无需预装运行时。
+
+**Windows x64**：下载 `AgentSessionManager-Setup-vX.Y.Z.exe`，关闭旧版管理器后运行安装包。
+
+**Linux amd64**（Ubuntu 24.04 已测试）：下载 `AgentSessionManager-X.Y.Z-amd64.deb` 后安装。
+
+```bash
+sudo apt install ./AgentSessionManager-X.Y.Z-amd64.deb
+```
 
 > [!IMPORTANT]
 > 本程序暂未进行商业代码签名。Edge 首次下载时可能提示“不常下载”，请选择“保留”；Windows SmartScreen 如显示“Windows 已保护你的电脑”，请点击“更多信息” → “仍要运行”。请只从本仓库的 Releases 页面下载安装包。
@@ -46,6 +58,15 @@
 ```powershell
 pnpm install
 pnpm tauri dev
+```
+
+Ubuntu 24.04 下开发与打包需先安装系统依赖：
+
+```bash
+sudo apt install -y build-essential curl file wget \
+  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+  librsvg2-dev libxdo-dev
+pnpm install --frozen-lockfile
 ```
 
 ## 验证
@@ -62,7 +83,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D w
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-GitHub Actions 在 Windows 上执行上述检查，Node 与 Rust 版本分别读取 `.node-version` 和 `rust-toolchain.toml`，pnpm 版本读取 `package.json` 的 `packageManager`。CI 不发布安装包。
+GitHub Actions 在 Windows 上执行上述检查，并在 Ubuntu 24.04 上运行 `pnpm build:linux` 产出 `.deb` 与 AppImage 制品。Node 与 Rust 版本分别读取 `.node-version` 和 `rust-toolchain.toml`，pnpm 版本读取 `package.json` 的 `packageManager`。CI 不创建 Release。
 
 ## 更新版本与打包
 
@@ -70,7 +91,8 @@ GitHub Actions 在 Windows 上执行上述检查，Node 与 Rust 版本分别读
 # 仅接受 X.Y.Z 正式版号；不创建 Git 提交或标签
 pnpm version:set 1.3.17
 pnpm version:check
-pnpm build:installer
+pnpm build:installer   # Windows：Tauri 构建 + Inno Setup
+pnpm build:linux       # Linux：输出 .deb 与 AppImage
 ```
 
 `version:set` 同步更新 package.json、Cargo.toml、Cargo.lock 中的本项目版本、Tauri 版本和窗口标题、Inno Setup 版本，不修改依赖版本。脚本先检查所有目标字段，再写入变更；请在无并发编辑时运行，并检查 Git diff。`version:check` 以 package.json 为准，只读检查版本一致性。标准 `pnpm build` 和 Inno Setup 打包前也会检查版本。
