@@ -1250,7 +1250,11 @@ mod tests {
         ];
         fs::write(
             &path,
-            rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
         )
         .unwrap();
         write_index(temp.path(), &[id], &[]);
