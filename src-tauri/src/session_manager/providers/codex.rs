@@ -60,6 +60,9 @@ struct HistoryBaseRef {
 #[derive(Clone, Debug)]
 struct RolloutDescriptor {
     path: PathBuf,
+    /// `path` 的比较键：同一份 rollout 在不同入口可能是普通路径、`\\?\` 扩展路径
+    /// 或 Windows 8.3 短名，直接比较字符串会把同一文件当成两个。
+    key: String,
     session_id: String,
     rollout_id: String,
     created_at: Option<i64>,
@@ -892,6 +895,7 @@ fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
         let rollout_id = rollout_instance_id(path, &session_id);
         return Ok(RolloutDescriptor {
             path: path.to_path_buf(),
+            key: rollout_path_key(path),
             session_id,
             rollout_id,
             created_at,
@@ -929,13 +933,24 @@ fn same_rollout_path(left: &Path, right: &Path) -> bool {
         == normalized_rollout_path(&right.to_string_lossy())
 }
 
+/// 路径比较键：先解析为真实路径，再按平台规范化。
+///
+/// 同一个 rollout 可能以普通路径、`\\?\` 扩展路径或 Windows 8.3 短名的形式
+/// 出现（`C:\Users\RUNNER~1\...` 与 `C:\Users\runneradmin\...` 是同一个文件），
+/// 纯字符串比较会把它当成两个文件，导致分页链解析失败并拒绝清理。解析失败时
+/// 退回字符串表示，保持原有行为。
+fn rollout_path_key(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalized_rollout_path(&resolved.to_string_lossy())
+}
+
 fn resolve_paginated_chain_from_descriptors(
     current_path: &Path,
     descriptors: &[RolloutDescriptor],
 ) -> Result<Vec<HistorySegment>, String> {
     let mut current = descriptors
         .iter()
-        .find(|descriptor| same_rollout_path(&descriptor.path, current_path))
+        .find(|descriptor| descriptor.key == rollout_path_key(current_path))
         .ok_or_else(|| format!("未找到 Codex 分页会话元数据：{}", current_path.display()))?;
     let mut visited = HashSet::new();
     let mut reversed = vec![HistorySegment {
@@ -943,7 +958,7 @@ fn resolve_paginated_chain_from_descriptors(
         session_id: current.session_id.clone(),
         end_byte_offset: None,
     }];
-    visited.insert(normalized_rollout_path(&current.path.to_string_lossy()));
+    visited.insert(current.key.clone());
 
     while let Some(history_base) = &current.history_base {
         if reversed.len() >= 64 {
@@ -955,10 +970,8 @@ fn resolve_paginated_chain_from_descriptors(
         let mut candidates = descriptors
             .iter()
             .filter(|candidate| candidate.rollout_id == history_base.thread_id)
-            .filter(|candidate| !same_rollout_path(&candidate.path, &current.path))
-            .filter(|candidate| {
-                !visited.contains(&normalized_rollout_path(&candidate.path.to_string_lossy()))
-            })
+            .filter(|candidate| candidate.key != current.key)
+            .filter(|candidate| !visited.contains(&candidate.key))
             .filter(|candidate| candidate.file_len >= history_base.end_byte_offset)
             .filter(
                 |candidate| match (candidate.created_at, current.created_at) {
@@ -990,7 +1003,7 @@ fn resolve_paginated_chain_from_descriptors(
             ));
         }
 
-        let normalized = normalized_rollout_path(&base.path.to_string_lossy());
+        let normalized = base.key.clone();
         if !visited.insert(normalized) {
             return Err(format!(
                 "Codex 分页历史形成循环，已停止处理：{}",
@@ -1039,10 +1052,7 @@ fn descriptors_for_files(files: Vec<PathBuf>) -> Vec<RolloutDescriptor> {
     let mut seen = HashSet::new();
     files
         .into_iter()
-        .filter(|path| {
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            seen.insert(normalized_rollout_path(&canonical.to_string_lossy()))
-        })
+        .filter(|path| seen.insert(rollout_path_key(path)))
         .filter_map(|candidate| read_rollout_descriptor(&candidate).ok())
         .collect()
 }
@@ -1634,7 +1644,7 @@ fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String>
     let descriptors = rollout_descriptors_for_path(path);
     let target = descriptors
         .iter()
-        .find(|descriptor| same_rollout_path(&descriptor.path, path))
+        .find(|descriptor| descriptor.key == rollout_path_key(path))
         .ok_or_else(|| format!("无法读取 Codex 会话元数据：{}", path.display()))?;
 
     let owned_segments = if target.history_base.is_some() {
@@ -2463,6 +2473,31 @@ mod tests {
         delete_session(temp.path(), &canonical, "child").unwrap();
         assert!(parent.exists());
         assert!(!child.exists());
+    }
+
+    #[test]
+    fn indirect_path_segments_resolve_the_same_paginated_chain() {
+        let temp = tempdir().unwrap();
+        let day = temp.path().join("day");
+        std::fs::create_dir(&day).unwrap();
+        let parent = day.join("parent.jsonl");
+        let child = day.join("child.jsonl");
+        write_codex_session(&parent, "parent", "Parent");
+        write_paginated_session_with_base(
+            &child,
+            "child",
+            "parent",
+            parent.metadata().unwrap().len(),
+            "Child",
+        );
+
+        // 同一份文件的另一种写法：中间夹带 `..`。纯字符串比较会把它当成另一个
+        // 文件，从而拒绝解析分页链；比较键必须先解析真实路径。
+        let indirect = day.join("..").join("day").join("child.jsonl");
+        let descriptors = rollout_descriptors_in_roots(&child, vec![temp.path().to_path_buf()]);
+        assert_eq!(descriptors.len(), 2);
+        let chain = resolve_paginated_chain_from_descriptors(&indirect, &descriptors).unwrap();
+        assert_eq!(chain.len(), 2);
     }
 
     #[test]
