@@ -14,6 +14,7 @@
   "scripts": {
     "dev": "pnpm tauri dev",
     "build": "pnpm version:check && pnpm tauri build",
+    "build:linux": "pnpm version:check && pnpm tauri build --config src-tauri/tauri.linux.conf.json",
     "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1",
     "tauri": "tauri",
     "dev:renderer": "vite",
