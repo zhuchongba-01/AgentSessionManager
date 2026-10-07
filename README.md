@@ -85,10 +85,13 @@ Codex 把会话数据放在 `~/.codex`，包含 `config.toml`、`state_5.sqlite`
 打开本管理器，按 Agent 与项目分组即可浏览 Codex 的历史会话和对话内容，不需要敲命令行。
 
 **删除的会话能恢复吗？**
-不能。会话文件与数据库记录是永久删除，不进入回收站，删除前请手动备份重要会话；列表里的“继续清理”只用于收尾未完成的删除，不提供撤销。
+不能。删除会话是永久操作，会话文件与数据库记录都不进入回收站，删除前请手动备份重要会话；列表里的“继续清理”只用于收尾未完成的删除，不提供撤销。
 
-**会话记录太多、太占空间，怎么批量清理？**
-在列表里多选后删除，支持批量删除与失败后继续清理；清理只处理会话本身，不会删除项目工作目录。
+**清理会话记录会影响我的项目文件吗？**
+不会。清理只处理会话记录本身，不会删除项目工作目录；管理器也不提供“同时删除项目目录”的选项。
+
+**会话记录太多、太占空间，怎么批量删除会话？**
+在列表里多选后删除，支持批量删除与失败后继续清理；每页最多 100 条，“全选筛选结果”会包含其他分页。
 
 **支持 Windows 和 Linux 吗？**
 两者都提供安装包（Windows exe / Linux deb），macOS 暂未发布。
@@ -98,7 +101,7 @@ Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi、Grok Build 共�
 
 <sub>Keywords: codex session manager · codex history viewer · claude code session viewer · coding agent session manager · agent session browser · session transcript viewer · local-first · AI coding agent session cleaner · Windows · Linux.</sub>
 
-<sub>关键词：Codex 会话管理 · Codex 对话记录查看 · Claude Code 历史会话 · Claude Code 会话浏览 · DeepSeek Harness 会话日志 · AI 编程助手会话管理 · 编码 Agent 会话清理 · 删除会话记录 · 本地会话查看器 · 会话记录留在本机 · Windows 与 Linux 桌面应用。</sub>
+<sub>关键词：Codex 会话管理 · Codex 对话记录查看 · Claude Code 历史会话查看 · Claude Code 会话浏览 · DeepSeek Harness 会话日志 · AI 编程助手会话管理 · 清理会话记录 · 删除会话 · 批量删除会话 · 历史会话查看 · 本地会话查看器 · 会话按项目分组 · 会话浏览与搜索 · 会话数据留在本机 · Windows 与 Linux 桌面应用。</sub>
 
 ## 开发
 
