@@ -26,6 +26,20 @@
 
 当前支持扫描 **Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi 与 Grok Build** 七种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
 
+## 支持的 Agent 与会话位置
+
+| Agent | 会话数据位置 |
+| --- | --- |
+| Codex | `~/.codex`（`config.toml`、`state_5.sqlite`、`thread_history_1.sqlite`），可用 `CODEX_HOME` 覆盖 |
+| Claude Code | `~/.claude/projects`，可用 `CLAUDE_CONFIG_DIR` 覆盖 |
+| DeepSeek Harness | `~/.dsh/sessions` |
+| OpenCode | `~/.local/share/opencode`（遵循 `XDG_DATA_HOME`） |
+| ZCode | `~/.zcode/cli/db/db.sqlite`、`~/.zcode/v2/tasks-index.sqlite` |
+| Pi | `~/.pi/agent`，可用 `PI_CODING_AGENT_DIR` 覆盖 |
+| Grok Build | `~/.grok/sessions`、`~/.grok/archived_sessions`，可用 `GROK_CONFIG_DIR` 覆盖 |
+
+Windows 下 `~` 即 `%USERPROFILE%`。本管理器只读取上述文件，不改写各 Agent 的内部格式。
+
 ## 主要特性
 
 - 🔍 **七种 Agent，一个界面**：Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi、Grok Build 的本地会话一站式浏览。
@@ -52,6 +66,28 @@ sudo apt install ./AgentSessionManager-X.Y.Z-amd64.deb
 
 > [!IMPORTANT]
 > 本程序暂未进行商业代码签名。Edge 首次下载时可能提示“不常下载”，请选择“保留”；Windows SmartScreen 如显示“Windows 已保护你的电脑”，请点击“更多信息” → “仍要运行”。请只从本仓库的 Releases 页面下载安装包。
+
+## 常见问题
+
+**Codex 的历史会话在哪里？**
+Codex 把会话数据放在 `~/.codex`，包含 `config.toml`、`state_5.sqlite`、`thread_history_1.sqlite`；设置 `CODEX_HOME` 可以改用其他目录。本管理器直接读取这些文件。
+
+**怎么删除或清理 Codex / Claude Code 的会话记录？**
+在列表中选中会话后删除，支持批量删除与失败后继续清理。删除前请完全退出对应 Agent；清理只删除会话本身，不会删除项目工作目录。
+
+**Claude Code 的会话文件存在哪里？**
+`~/.claude/projects`，可用 `CLAUDE_CONFIG_DIR` 指向其他位置。
+
+**会话内容会被上传吗？**
+不会。扫描、展示与摘要全部在本机完成，只在启动时访问 GitHub API 检查新版本。
+
+**支持 Windows 和 Linux 吗？**
+两者都提供安装包（Windows exe / Linux deb），macOS 暂未发布。
+
+**和同类会话管理工具相比有什么不同？**
+一个界面覆盖七种 Agent（Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi、Grok Build），同时提供 Windows 与 Linux 安装包，而不是只支持单一 Agent 或只支持 macOS。
+
+<sub>Keywords: codex session manager · codex history viewer · claude code session viewer · coding agent session manager · agent session browser · session transcript viewer · local-first · AI coding agent session cleaner · Windows · Linux.</sub>
 
 ## 开发
 
