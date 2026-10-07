@@ -6,7 +6,7 @@
 
 **Codex、Claude Code、DeepSeek Harness 等本地编码 Agent 的会话管理工具**
 
-一款轻量的桌面应用，统一浏览、分类与安全清理本地编码 Agent 的会话记录。
+本地优先的桌面应用：统一浏览、搜索、分类与安全清理 Codex、Claude Code、DeepSeek Harness 等 AI 编程助手的历史会话、对话记录与聊天记录，数据全部留在本机。
 
 <sub>Desktop session manager for local coding agents — browse, group and safely clean up Codex, Claude Code, DeepSeek Harness, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
@@ -22,7 +22,7 @@
 
 ## 这是什么
 
-面向本地编码 Agent 的独立会话浏览、分类与安全清理工具。当前版本不负责启动 Agent 或恢复会话。
+面向本地编码 Agent 的独立会话管理工具：浏览、搜索、分类与安全清理历史会话。当前版本不负责启动 Agent 或恢复会话，需要恢复会话请在原 Agent 中操作。
 
 当前支持扫描 **Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi 与 Grok Build** 七种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
 
@@ -81,13 +81,24 @@ Codex 把会话数据放在 `~/.codex`，包含 `config.toml`、`state_5.sqlite`
 **会话内容会被上传吗？**
 不会。扫描、展示与摘要全部在本机完成，只在启动时访问 GitHub API 检查新版本。
 
+**Codex 的对话记录怎么查看？**
+打开本管理器，按 Agent 与项目分组即可浏览 Codex 的历史会话和对话内容，不需要敲命令行。
+
+**删除的会话能恢复吗？**
+不能。会话文件与数据库记录是永久删除，不进入回收站，删除前请手动备份重要会话；列表里的“继续清理”只用于收尾未完成的删除，不提供撤销。
+
+**会话记录太多、太占空间，怎么批量清理？**
+在列表里多选后删除，支持批量删除与失败后继续清理；清理只处理会话本身，不会删除项目工作目录。
+
 **支持 Windows 和 Linux 吗？**
 两者都提供安装包（Windows exe / Linux deb），macOS 暂未发布。
 
-**和同类会话管理工具相比有什么不同？**
-一个界面覆盖七种 Agent（Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi、Grok Build），同时提供 Windows 与 Linux 安装包，而不是只支持单一 Agent 或只支持 macOS。
+**支持哪些 AI 编程助手？和同类会话管理工具相比有什么不同？**
+Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi、Grok Build 共七种，一个界面全部覆盖，同时提供 Windows 与 Linux 安装包，而不是只支持单一 Agent 或只支持 macOS。
 
 <sub>Keywords: codex session manager · codex history viewer · claude code session viewer · coding agent session manager · agent session browser · session transcript viewer · local-first · AI coding agent session cleaner · Windows · Linux.</sub>
+
+<sub>关键词：Codex 会话管理 · Codex 对话记录查看 · Claude Code 历史会话 · Claude Code 会话浏览 · DeepSeek Harness 会话日志 · AI 编程助手会话管理 · 编码 Agent 会话清理 · 删除会话记录 · 本地会话查看器 · 会话记录留在本机 · Windows 与 Linux 桌面应用。</sub>
 
 ## 开发
 
