@@ -5,6 +5,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, Transaction};
 use serde_json::Value;
 
+use crate::session_manager::cache;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 const PROVIDER_ID: &str = "zcode";
@@ -385,6 +386,15 @@ pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> V
         return initial.to_vec();
     };
     deletion_order_with_relations(requests, initial, &parents)
+}
+
+/// 正文实际依赖的文件：主库与 WAL 边车。引用无法解析时返回 `None`，由读取器报错。
+///
+/// ZCode 的会话正文全部在 `message` / `part` 表里（`load_messages` 只打开主库），
+/// 桌面任务索引库不参与正文，因此不计入指纹。
+pub fn transcript_sources(source: &str) -> Option<cache::TranscriptSources> {
+    let (path, _) = parse_source(source)?;
+    Some(cache::sqlite_transcript_sources(&path))
 }
 
 pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
@@ -896,6 +906,22 @@ mod tests {
             .expect("valid reference");
         assert_eq!(path, PathBuf::from("C:\\Users\\me\\db.sqlite"));
         assert_eq!(session_id, "session-1");
+    }
+
+    #[test]
+    fn transcript_sources_cover_the_database_and_its_wal() {
+        let sources =
+            transcript_sources("sqlite-zcode:/data/db.sqlite:session-1").expect("valid reference");
+
+        assert_eq!(
+            sources,
+            vec![
+                (PathBuf::from("/data/db.sqlite"), None),
+                (PathBuf::from("/data/db.sqlite-wal"), None),
+            ],
+            "正文全在主库的 message/part 表里；索引库不参与，WAL 必须计入"
+        );
+        assert!(transcript_sources("sqlite-zcode:/data/db.sqlite").is_none());
     }
 
     fn create_primary_database(path: &Path) -> Connection {

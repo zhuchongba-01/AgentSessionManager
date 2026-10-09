@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useCallback, useState } from "react";
 import { ChevronDown, ChevronUp, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -13,30 +13,81 @@ interface SessionMessageItemProps {
   message: SessionMessage;
   isActive: boolean;
   onCopy: (content: string) => void;
+  /**
+   * 取回被截断消息的全文。后端只下发预览的消息必须靠它才能展开/复制完整内容；
+   * 未提供时退化为只显示预览。
+   */
+  onLoadFullContent?: (message: SessionMessage) => Promise<string>;
 }
 
 export const SessionMessageItem = memo(function SessionMessageItem({
   message,
   isActive,
   onCopy,
+  onLoadFullContent,
 }: SessionMessageItemProps) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const [fullContent, setFullContent] = useState<string | null>(null);
+  const [isLoadingFull, setIsLoadingFull] = useState(false);
 
-  const normalizedRole = message.role.toLowerCase();
-  const isLong = message.content.length > COLLAPSE_THRESHOLD;
+  const isTruncated = message.truncated === true && message.index !== undefined;
+  // 未截断的长正文仍就地折叠；被截断的正文里只有预览，展开要向后端取
+  const isLong = isTruncated || message.content.length > COLLAPSE_THRESHOLD;
   const collapsed = isLong && !expanded;
+  const totalChars = message.contentChars ?? message.content.length;
+
+  const loadFullContent = useCallback(async (): Promise<string> => {
+    if (fullContent !== null) return fullContent;
+    if (!isTruncated || !onLoadFullContent) return message.content;
+
+    setIsLoadingFull(true);
+    try {
+      const content = await onLoadFullContent(message);
+      setFullContent(content);
+      return content;
+    } finally {
+      setIsLoadingFull(false);
+    }
+  }, [fullContent, isTruncated, message, onLoadFullContent]);
+
+  const handleToggle = useCallback(() => {
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
+    if (!isTruncated) {
+      setExpanded(true);
+      return;
+    }
+    // 失败提示由调用方给出；这里保持折叠状态，不做假的展开
+    void loadFullContent()
+      .then(() => setExpanded(true))
+      .catch(() => undefined);
+  }, [expanded, isTruncated, loadFullContent]);
+
+  const handleCopy = useCallback(() => {
+    if (!isTruncated) {
+      onCopy(message.content);
+      return;
+    }
+    void loadFullContent()
+      .then(onCopy)
+      .catch(() => undefined);
+  }, [isTruncated, loadFullContent, message.content, onCopy]);
+
+  const loaded = fullContent ?? message.content;
   const displayContent = collapsed
-    ? message.content.slice(0, COLLAPSED_LENGTH) + "…"
-    : message.content;
+    ? loaded.slice(0, COLLAPSED_LENGTH) + "…"
+    : loaded;
 
   return (
     <div
       className={cn(
         "asm-message group min-w-0",
-        normalizedRole === "user"
+        message.role.toLowerCase() === "user"
           ? "is-user"
-          : normalizedRole === "assistant"
+          : message.role.toLowerCase() === "assistant"
             ? "is-assistant"
             : "is-tool",
         isActive && "is-active",
@@ -55,7 +106,7 @@ export const SessionMessageItem = memo(function SessionMessageItem({
           aria-label={t("sessionManager.copyMessage", {
             defaultValue: "复制消息",
           })}
-          onClick={() => onCopy(message.content)}
+          onClick={handleCopy}
         >
           <Copy className="size-3.5" aria-hidden="true" />
         </button>
@@ -65,7 +116,8 @@ export const SessionMessageItem = memo(function SessionMessageItem({
         <button
           type="button"
           aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
+          aria-busy={isLoadingFull || undefined}
+          onClick={handleToggle}
           className="mt-1 flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
         >
           {expanded ? (
@@ -78,11 +130,15 @@ export const SessionMessageItem = memo(function SessionMessageItem({
           ) : (
             <>
               <ChevronDown className="size-3" />
-              {t("sessionManager.expandContent", {
-                defaultValue: "展开完整内容",
-              })}
+              {isLoadingFull
+                ? t("sessionManager.loadingFullContent", {
+                    defaultValue: "正在读取完整内容…",
+                  })
+                : t("sessionManager.expandContent", {
+                    defaultValue: "展开完整内容",
+                  })}
               <span className="text-muted-foreground/60">
-                ({Math.round(message.content.length / 1000)}k)
+                ({Math.round(totalChars / 1000)}k)
               </span>
             </>
           )}

@@ -1445,6 +1445,21 @@ fn load_thread_titles_from_db(db_path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
+/// 正文实际依赖的文件：分页历史链的每一段，以及该段只读到哪个字节偏移
+/// （`None` = 读到文件末尾）。
+///
+/// 正文是「当前文件 + 基座文件的前 N 字节」拼出来的，只看 `path` 会漏掉基座；
+/// 而链本身由磁盘上所有 rollout 头决定，链可以在文件一字未改的情况下改变，
+/// 所以调用方还要把返回的顺序与偏移一起当作正文身份（见 `cache::sources_digest`）。
+pub fn transcript_sources(path: &Path) -> Result<Vec<(PathBuf, Option<u64>)>, String> {
+    resolve_paginated_chain(path).map(|segments| {
+        segments
+            .into_iter()
+            .map(|segment| (segment.path, segment.end_byte_offset))
+            .collect()
+    })
+}
+
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     let mut messages = Vec::new();
     let mut remaining_bytes = MAX_MESSAGES_FILE_BYTES;
@@ -2393,6 +2408,42 @@ mod tests {
         assert!(messages
             .iter()
             .all(|message| message.content != "Discarded tail"));
+    }
+
+    #[test]
+    fn transcript_sources_lists_the_whole_paginated_chain() {
+        let temp = tempdir().expect("tempdir");
+        let base = temp.path().join("base.jsonl");
+        let current = temp.path().join("current.jsonl");
+        let base_prefix = concat!(
+            "{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-id\",\"cwd\":\"/tmp/project\"}}\n",
+            "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"Earlier message\"}}\n"
+        );
+        std::fs::write(
+            &base,
+            format!(
+                "{base_prefix}{{\"timestamp\":\"2026-03-06T21:50:14Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Discarded tail\"}}}}\n"
+            ),
+        )
+        .expect("write base");
+        write_paginated_session(
+            &current,
+            "thread-id",
+            base_prefix.len() as u64,
+            "Later message",
+        );
+
+        let sources = transcript_sources(&current).expect("resolve transcript sources");
+
+        assert_eq!(sources.len(), 2, "分页链的基座与当前段都要算进正文源");
+        assert_eq!(sources[0].0, base, "链按时间正序：基座在前");
+        assert_eq!(
+            sources[0].1,
+            Some(base_prefix.len() as u64),
+            "基座只读到记录的偏移"
+        );
+        assert_eq!(sources[1].0, current);
+        assert_eq!(sources[1].1, None, "当前段读到文件末尾");
     }
 
     #[test]

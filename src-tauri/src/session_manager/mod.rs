@@ -1,9 +1,12 @@
+pub mod cache;
 mod deletion;
 pub mod providers;
 pub mod terminal;
+pub mod wire;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use providers::{claude, codex, deepseek, grokbuild, opencode, pi, zcode};
 
@@ -183,24 +186,20 @@ fn join_scan_results(
     }
 }
 
-pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<SessionMessage>, String> {
-    // SQLite sessions use a "sqlite:" prefixed source_path
-    if provider_id == "opencode" && source_path.starts_with("sqlite:") {
-        return opencode::load_messages_sqlite(source_path);
-    }
-    if provider_id == "zcode" && source_path.starts_with("sqlite-zcode:") {
-        return zcode::load_messages(source_path);
-    }
-
+/// 校验 `source_path` 归属并返回规范化路径；SQLite 源没有文件路径，由调用方先行分发。
+fn validated_file_source(provider_id: &str, source_path: &str) -> Result<PathBuf, String> {
     let roots = provider_roots(provider_id)?;
-    let path = Path::new(source_path);
-    let canonical = canonicalize_existing_path(path, "session source")?;
+    let canonical = canonicalize_existing_path(Path::new(source_path), "session source")?;
     if !roots.iter().any(|root| {
         root.canonicalize()
             .is_ok_and(|root| canonical.starts_with(root))
     }) {
         return Err("Session source is outside configured storage".into());
     }
+    Ok(canonical)
+}
+
+fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessage>, String> {
     match provider_id {
         "codex" => codex::load_messages(path),
         "claude" => claude::load_messages(path),
@@ -209,6 +208,113 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
         "pi" => pi::load_messages(path),
         "deepseek" => deepseek::load_messages(path),
         _ => Err(format!("Unsupported provider: {provider_id}")),
+    }
+}
+
+/// 正文解析结果可缓存的 provider：返回正文实际依赖的文件（有序）与每段只读到的偏移。
+///
+/// 少列一个文件、或漏掉链的顺序/截断偏移，都会命中过期正文，因此只接受已经逐行核对
+/// 过读取范围的 provider：
+/// - `claude` / `deepseek` / `pi`：正文就是源文件本身
+/// - `grokbuild`：正文在同目录 `chat_history.jsonl`，而 `summary.json` 只在一轮
+///   结束时改写，只盯后者会让一轮进行中的会话命中旧正文
+/// - `codex`：正文是「当前文件 + 基座文件的前 N 字节」拼起来的分页历史链
+///
+/// SQLite 源（`opencode` / `zcode`）在这里拿不到路径，由 `load_transcript` 的 SQLite
+/// 分支处理。`opencode` 的旧版消息目录不接入：列出兄弟 `part/` 目录需要先读
+/// 消息文件取 id，等于把读取本身做一遍。`pi` 扫描期的 `residual` 标志依赖父会话文件是否
+/// 存在，那是元数据的顾虑，与正文无关。
+fn transcript_cache_sources(provider_id: &str, path: &Path) -> Option<cache::TranscriptSources> {
+    match provider_id {
+        "claude" | "deepseek" | "pi" => Some(vec![(path.to_path_buf(), None)]),
+        "grokbuild" => {
+            let mut sources = vec![(path.to_path_buf(), None)];
+            if let Some(parent) = path.parent() {
+                sources.push((parent.join("chat_history.jsonl"), None));
+            }
+            Some(sources)
+        }
+        // 链解析失败时不缓存，交给正文读取去报真正的错误
+        "codex" => codex::transcript_sources(path).ok(),
+        _ => None,
+    }
+}
+
+/// 该会话的正文是否已接入解析缓存。
+///
+/// 两处用途必须保持一致：`load_transcript` 据此决定是否缓存，前端下发形态据此决定能否
+/// 只发预览——只有「取全文不必重新解析整个会话」的会话才允许截断。
+pub fn transcript_cache_covered(provider_id: &str, source_path: &str) -> bool {
+    match provider_id {
+        "claude" | "deepseek" | "grokbuild" | "pi" | "codex" => true,
+        // 正文都在库里；旧版消息目录形态不接（见 transcript_cache_sources）
+        "opencode" => source_path.starts_with("sqlite:"),
+        "zcode" => source_path.starts_with("sqlite-zcode:"),
+        _ => false,
+    }
+}
+
+/// 读取会话正文：校验来源后按指纹复用上次解析结果。
+///
+/// 未接入缓存的会话与解析失败一样直接读取，不会返回过期正文。
+pub fn load_transcript(
+    provider_id: &str,
+    source_path: &str,
+) -> Result<Arc<cache::Transcript>, String> {
+    if provider_id == "opencode" && source_path.starts_with("sqlite:") {
+        return match opencode::sqlite_transcript_sources(source_path) {
+            Some(sources) => cached_transcript(provider_id, source_path, sources, || {
+                opencode::load_messages_sqlite(source_path)
+            }),
+            // 引用无法解析：不猜指纹，交给读取器报错
+            None => Ok(Arc::new(cache::Transcript::new(
+                opencode::load_messages_sqlite(source_path)?,
+            ))),
+        };
+    }
+    if provider_id == "zcode" && source_path.starts_with("sqlite-zcode:") {
+        return match zcode::transcript_sources(source_path) {
+            Some(sources) => cached_transcript(provider_id, source_path, sources, || {
+                zcode::load_messages(source_path)
+            }),
+            None => Ok(Arc::new(cache::Transcript::new(zcode::load_messages(
+                source_path,
+            )?))),
+        };
+    }
+
+    let path = validated_file_source(provider_id, source_path)?;
+    let Some(sources) = transcript_cache_sources(provider_id, &path) else {
+        return Ok(Arc::new(cache::Transcript::new(dispatch_messages(
+            provider_id,
+            &path,
+        )?)));
+    };
+    cached_transcript(provider_id, source_path, sources, || {
+        dispatch_messages(provider_id, &path)
+    })
+}
+
+/// 指纹可读时按指纹复用缓存，否则直接读取（不缓存）。
+fn cached_transcript<F>(
+    provider_id: &str,
+    source_path: &str,
+    sources: cache::TranscriptSources,
+    load: F,
+) -> Result<Arc<cache::Transcript>, String>
+where
+    F: FnOnce() -> Result<Vec<SessionMessage>, String>,
+{
+    match cache::transcript_fingerprint(&sources) {
+        Ok(fingerprint) => cache::global()
+            .get_or_load(
+                cache::cache_key(provider_id, source_path, &sources),
+                fingerprint,
+                || load().map(cache::Transcript::new),
+            )
+            .map(|(transcript, _cached)| transcript),
+        // 指纹里的文件都读不到（库被移走、权限不足）：交给读取器报真正的错误
+        Err(_) => Ok(Arc::new(cache::Transcript::new(load()?))),
     }
 }
 
@@ -240,9 +346,12 @@ pub fn delete_session_checked(
                 && item.source_path.as_deref() == Some(source_path)
         })
         .ok_or("会话已变化或不存在，请重新扫描")?;
-    deletion::run(target, &sessions, preflight_deletion, |plan| {
+    let reply = deletion::run(target, &sessions, preflight_deletion, |plan| {
         delete_session_in_snapshot(provider_id, session_id, source_path, include_project, plan)
-    })
+    });
+    // 删除会级联清理同 ID 的历史副本与索引，正文缓存整体作废
+    cache::global().clear();
+    reply
 }
 
 fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
@@ -484,6 +593,8 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
     // child branches first.
     let mut outcomes = order.into_iter().zip(outcomes).collect::<Vec<_>>();
     outcomes.sort_by_key(|(index, _)| *index);
+    // 批量删除会级联清理同 ID 的历史副本与索引，正文缓存整体作废
+    cache::global().clear();
     outcomes.into_iter().map(|(_, outcome)| outcome).collect()
 }
 
@@ -646,6 +757,44 @@ mod tests {
             ),
         )
         .expect("write source");
+    }
+
+    /// 是否已接正文缓存同时决定两件事：`load_transcript` 是否缓存，以及下发时能否只发
+    /// 预览（见 `wire::truncation_allowed`）。这条判定必须与 `transcript_cache_sources`
+    /// 实际覆盖的形态一致。
+    #[test]
+    fn transcript_cache_coverage_matches_the_wired_providers() {
+        let file = "/sessions/pi/session.jsonl";
+        for provider in ["claude", "codex", "deepseek", "grokbuild", "pi"] {
+            assert!(transcript_cache_covered(provider, file), "{provider}");
+        }
+        // 单文件源可以直接枚举；Codex 的正文源要先把分页链解析出来（链读不出来时
+        // 正文本身也读不出来，不存在「截断了却取不回全文」的情形）
+        for provider in ["claude", "deepseek", "grokbuild", "pi"] {
+            assert!(
+                transcript_cache_sources(provider, Path::new(file)).is_some(),
+                "{provider} 的正文源必须可枚举"
+            );
+        }
+
+        // SQLite 形态：库路径写在 source_path 里，指纹覆盖库与 -wal
+        assert!(transcript_cache_covered(
+            "opencode",
+            "sqlite:/data/opencode.db:ses_1"
+        ));
+        assert!(transcript_cache_covered(
+            "zcode",
+            "sqlite-zcode:/data/db.sqlite:session-1"
+        ));
+
+        // OpenCode 旧版消息目录与 ZCode 的文件形态都不接入
+        assert!(!transcript_cache_covered(
+            "opencode",
+            "/data/storage/message/ses_1"
+        ));
+        assert!(!transcript_cache_covered("zcode", file));
+        assert!(!transcript_cache_covered("unknown", file));
+        assert!(transcript_cache_sources("opencode", Path::new(file)).is_none());
     }
 
     fn session_meta(

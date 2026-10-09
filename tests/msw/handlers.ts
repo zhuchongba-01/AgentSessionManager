@@ -26,6 +26,20 @@ export const handlers = [
     }>(request);
     return success(getSessionMessages(providerId, sourcePath));
   }),
+  // 与后端一致：长度对不上就拒绝返回，避免把另一条消息的正文当成这一条
+  http.post(`${TAURI_ENDPOINT}/get_message_content`, async ({ request }) => {
+    const { providerId, sourcePath, index, expectedChars } = await readJson<{
+      providerId: string;
+      sourcePath: string;
+      index: number;
+      expectedChars: number;
+    }>(request);
+    const message = getSessionMessages(providerId, sourcePath)[index];
+    if (!message || message.content.length !== expectedChars) {
+      return new HttpResponse("会话已更新，请重新打开", { status: 400 });
+    }
+    return success(message.content);
+  }),
   http.post(`${TAURI_ENDPOINT}/delete_session`, async ({ request }) => {
     const input = await readJson<{
       providerId: string;

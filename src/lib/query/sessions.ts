@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -34,13 +35,42 @@ export const useSessionsQuery = () => {
 export const useSessionMessagesQuery = (
   providerId?: string,
   sourcePath?: string,
-) =>
-  useQuery<SessionMessage[]>({
+) => {
+  // 流式到达的部分结果只用于渐进渲染，不写进 react-query 缓存：半截数据一旦被当成
+  // 新鲜的缓存，切回这个会话就会看到被截断的正文。
+  const [streamed, setStreamed] = useState<{
+    providerId: string;
+    sourcePath: string;
+    messages: SessionMessage[];
+  } | null>(null);
+
+  const query = useQuery<SessionMessage[]>({
     queryKey: ["sessionMessages", providerId, sourcePath],
-    queryFn: () => sessionsApi.getMessages(providerId!, sourcePath!),
+    queryFn: () =>
+      sessionsApi.streamMessages(providerId!, sourcePath!, (messages) =>
+        setStreamed({
+          providerId: providerId!,
+          sourcePath: sourcePath!,
+          messages,
+        }),
+      ),
     enabled: Boolean(providerId && sourcePath),
     staleTime: 30_000,
   });
+
+  // 只在同一次取数过程中用渐进结果；流结束后交回 react-query 的完整数据
+  const progressive =
+    streamed &&
+    streamed.providerId === providerId &&
+    streamed.sourcePath === sourcePath
+      ? streamed.messages
+      : undefined;
+
+  return {
+    ...query,
+    data: query.isFetching && progressive ? progressive : query.data,
+  };
+};
 
 export const useDeleteSessionMutation = () => {
   const queryClient = useQueryClient();

@@ -5,6 +5,7 @@ use std::time::Duration;
 use rusqlite::{Connection, Transaction};
 use serde_json::Value;
 
+use crate::session_manager::cache;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
@@ -240,6 +241,16 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         .collect();
 
     Ok(messages)
+}
+
+/// 正文实际依赖的文件：库文件与 WAL 边车。引用无法解析时返回 `None`，由读取器报错。
+///
+/// 旧版消息目录（`storage/message/{sessionID}/` + 兄弟 `part/` 目录）不在其中：要列出
+/// `part/` 目录就得先读消息文件取出 id，等于把读取本身做一遍，缓存没有意义，因此那种
+/// 形态每次都重新读取。
+pub fn sqlite_transcript_sources(source: &str) -> Option<cache::TranscriptSources> {
+    let (db_path, _) = parse_sqlite_source(source)?;
+    Some(cache::sqlite_transcript_sources(&db_path))
 }
 
 /// Load messages from the OpenCode SQLite database for a given source reference.
@@ -1349,6 +1360,22 @@ mod tests {
         assert!(parse_sqlite_source("/tmp/opencode.db:ses_123").is_none());
         assert!(parse_sqlite_source("sqlite:/tmp/opencode.db:msg_123").is_none());
         assert!(parse_sqlite_source("sqlite:/tmp/opencode.db").is_none());
+    }
+
+    #[test]
+    fn sqlite_transcript_sources_cover_the_database_and_its_wal() {
+        let sources =
+            sqlite_transcript_sources("sqlite:/data/opencode.db:ses_123").expect("valid source");
+
+        assert_eq!(
+            sources,
+            vec![
+                (PathBuf::from("/data/opencode.db"), None),
+                (PathBuf::from("/data/opencode.db-wal"), None),
+            ],
+            "WAL 模式下新写入先落在 -wal，主库 mtime 不变"
+        );
+        assert!(sqlite_transcript_sources("sqlite:/data/opencode.db").is_none());
     }
 
     #[test]

@@ -769,7 +769,7 @@ describe("SessionManagerPage", () => {
 
   it("shows message read failures rather than an empty conversation", async () => {
     const spy = vi
-      .spyOn(sessionsApi, "getMessages")
+      .spyOn(sessionsApi, "streamMessages")
       .mockRejectedValue(new Error("database is locked"));
     renderPage();
     expect(
@@ -848,7 +848,7 @@ describe("SessionManagerPage", () => {
 
   it("invalidates selected messages when rescanning unchanged session paths", async () => {
     const spy = vi
-      .spyOn(sessionsApi, "getMessages")
+      .spyOn(sessionsApi, "streamMessages")
       .mockResolvedValue([{ role: "user", content: "before rescan" }]);
     renderPage();
     await waitFor(() => expect(spy).toHaveBeenCalled());

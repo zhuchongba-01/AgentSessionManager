@@ -33,7 +33,7 @@ import {
 import { piKeys } from "@/lib/query/pi";
 import { piApi } from "@/lib/api/pi";
 import { sessionsApi } from "@/lib/api/sessions";
-import type { SessionMeta } from "@/types";
+import type { SessionMessage, SessionMeta } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -550,6 +550,44 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       );
     },
     [handleCopy, t],
+  );
+
+  // 被截断消息的全文：同一会话内只取一次，展开与复制共用同一份缓存
+  const fullContentCache = useRef(new Map<string, string>());
+
+  const handleLoadFullContent = useCallback(
+    async (message: SessionMessage): Promise<string> => {
+      const providerId = selectedSession?.providerId;
+      const sourcePath = selectedSession?.sourcePath;
+      if (!providerId || !sourcePath || message.index === undefined) {
+        return message.content;
+      }
+
+      const contentChars = message.contentChars ?? message.content.length;
+      const cacheKey = `${providerId}\u0000${sourcePath}\u0000${message.index}\u0000${contentChars}`;
+      const cached = fullContentCache.current.get(cacheKey);
+      if (cached !== undefined) return cached;
+
+      try {
+        const content = await sessionsApi.getMessageContent(
+          providerId,
+          sourcePath,
+          message.index,
+          contentChars,
+        );
+        fullContentCache.current.set(cacheKey, content);
+        return content;
+      } catch (error) {
+        toast.error(
+          extractErrorMessage(error) ||
+            t("sessionManager.loadFullContentFailed", {
+              defaultValue: "读取完整内容失败",
+            }),
+        );
+        throw error;
+      }
+    },
+    [selectedSession?.providerId, selectedSession?.sourcePath, t],
   );
 
   const handleOpenUrl = useCallback(
@@ -1890,6 +1928,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                         visibleMessages[virtualRow.index]
                                       }
                                       onCopy={handleCopyMessage}
+                                      onLoadFullContent={handleLoadFullContent}
                                       isActive={
                                         activeMessageIndex === virtualRow.index
                                       }
