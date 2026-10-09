@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
@@ -340,6 +343,101 @@ pub fn path_basename(value: &str) -> Option<String> {
     Some(last.to_string())
 }
 
+/// 会话文件的扫描指纹：修改时间 + 长度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+}
+
+pub fn file_stamp(path: &Path) -> io::Result<FileStamp> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+struct CachedParse {
+    stamp: FileStamp,
+    meta: Option<crate::session_manager::SessionMeta>,
+}
+
+/// 会话文件解析结果的缓存：按文件的修改时间和大小判断有没有变，没变就复用上次
+/// 解析出的 [`SessionMeta`](crate::session_manager::SessionMeta)，只重新解析新增或
+/// 改过的文件。
+///
+/// 只存摘要（标题、路径、时间等），不存会话正文；每次扫描都用本轮看到的文件重建
+/// 整张表，已删除文件的条目随之丢弃，内存占用与会话数量成正比。解析结果必须只
+/// 取决于文件本身——依赖外部数据的部分（DeepSeek Harness 的 `workspace.json` 项目
+/// 归属、Codex 的 `config.toml` 分区、Pi 的父会话文件存在性）要么在缓存之外叠加，
+/// 要么先不接入，否则会出现「文件没变但结论已过期」的陈旧行。
+pub struct FileParseCache {
+    entries: Mutex<HashMap<PathBuf, CachedParse>>,
+}
+
+impl FileParseCache {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 按顺序解析 `files`，没变过的文件直接用缓存。返回能解析出会话的那些。
+    ///
+    /// `parse` 读失败（权限、被占用等）必须返回 `Err`：这类结果不进缓存，下一轮
+    /// 重试。若把读失败当成 `Ok(None)`，文件恢复可读后因为「文件没变」会一直命中
+    /// 「没有会话」，直到文件被改动或进程重启。
+    pub fn scan<F>(&self, files: Vec<PathBuf>, parse: F) -> Vec<crate::session_manager::SessionMeta>
+    where
+        F: Fn(&Path) -> Result<Option<crate::session_manager::SessionMeta>, String>,
+    {
+        // 锁中毒（上次扫描 panic）时丢掉旧缓存重来，不影响本次结果
+        let mut previous = match self.entries.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                HashMap::new()
+            }
+        };
+
+        let mut next = HashMap::with_capacity(files.len());
+        let mut sessions = Vec::new();
+        for path in files {
+            // 元数据都读不到（权限、被占用、刚被删除）：本轮跳过，下轮重试
+            let Ok(stamp) = file_stamp(&path) else {
+                continue;
+            };
+            let meta = match previous.remove(&path) {
+                Some(entry) if entry.stamp == stamp => entry.meta,
+                _ => match parse(&path) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        log::debug!("会话文件暂时读取失败，下轮重试 {}: {error}", path.display());
+                        continue;
+                    }
+                },
+            };
+            if let Some(meta) = &meta {
+                sessions.push(meta.clone());
+            }
+            next.insert(path, CachedParse { stamp, meta });
+        }
+
+        if let Ok(mut guard) = self.entries.lock() {
+            *guard = next;
+        }
+        sessions
+    }
+}
+
+impl Default for FileParseCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +541,114 @@ mod tests {
             .expect("size sparse file");
         let error = ensure_readable_size(&oversized).expect_err("oversized must be rejected");
         assert!(error.contains("加载上限"));
+    }
+
+    fn cache_test_meta(path: &Path, id: &str) -> Option<crate::session_manager::SessionMeta> {
+        Some(crate::session_manager::SessionMeta {
+            provider_id: "test".to_string(),
+            session_id: id.to_string(),
+            residual: false,
+            archived: false,
+            cleanup_pending: false,
+            sidebar_section: None,
+            title: None,
+            summary: None,
+            project_dir: None,
+            project_name: None,
+            created_at: None,
+            last_active_at: None,
+            source_path: Some(path.to_string_lossy().to_string()),
+            resume_command: None,
+        })
+    }
+
+    /// 读取失败不能缓存成「没有会话」：恢复读取后，文件没变也要重新解析出来
+    #[test]
+    fn file_parse_cache_retries_files_that_failed_to_parse() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a.jsonl");
+        std::fs::write(&path, "alpha").unwrap();
+
+        let cache = FileParseCache::new();
+        let fail = Cell::new(true);
+        let calls = Cell::new(0);
+        let parse = |path: &Path| {
+            calls.set(calls.get() + 1);
+            if fail.get() {
+                Err("denied".to_string())
+            } else {
+                Ok(cache_test_meta(path, "alpha"))
+            }
+        };
+
+        assert!(cache.scan(vec![path.clone()], parse).is_empty());
+        assert!(cache.scan(vec![path.clone()], parse).is_empty());
+        assert_eq!(calls.get(), 2, "失败的文件每轮都要重试，不能命中缓存");
+
+        fail.set(false);
+        let sessions = cache.scan(vec![path.clone()], parse);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "alpha");
+        assert_eq!(calls.get(), 3);
+
+        // 成功后才进缓存：再扫不重新解析
+        assert_eq!(cache.scan(vec![path], parse).len(), 1);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn file_parse_cache_reparses_only_changed_files() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a.jsonl");
+        let b = temp.path().join("b.jsonl");
+        let c = temp.path().join("c.jsonl");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "beta").unwrap();
+        std::fs::write(&c, "skip").unwrap();
+
+        let cache = FileParseCache::new();
+        let calls = Cell::new(0);
+        let parse = |path: &Path| {
+            calls.set(calls.get() + 1);
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            // 「解析不出会话」也必须进缓存：内容为 skip 的文件返回 Ok(None)，
+            // 下次扫描不再重复解析它
+            if std::fs::read_to_string(path).unwrap_or_default().trim() == "skip" {
+                return Ok(None);
+            }
+            Ok(cache_test_meta(path, id))
+        };
+        let ids = |sessions: Vec<crate::session_manager::SessionMeta>| -> Vec<String> {
+            sessions.into_iter().map(|meta| meta.session_id).collect()
+        };
+
+        // 第一次全部解析；解析不出会话的文件也记下来，下次不重复解析
+        let files = vec![a.clone(), b.clone(), c.clone()];
+        assert_eq!(ids(cache.scan(files.clone(), parse)), ["a", "b"]);
+        assert_eq!(calls.get(), 3);
+
+        // 没有改动：一个都不重新解析
+        assert_eq!(ids(cache.scan(files.clone(), parse)), ["a", "b"]);
+        assert_eq!(calls.get(), 3);
+
+        // 改了内容（长度变了）：只重新解析这一个
+        std::fs::write(&b, "beta-2").unwrap();
+        assert_eq!(ids(cache.scan(files.clone(), parse)), ["a", "b"]);
+        assert_eq!(calls.get(), 4);
+
+        // 文件删掉：不再出现，条目也被丢弃；重新出现时要重新解析
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(ids(cache.scan(files.clone(), parse)), ["b"]);
+        assert_eq!(calls.get(), 4);
+        std::fs::write(&a, "alpha").unwrap();
+        assert_eq!(ids(cache.scan(files, parse)), ["a", "b"]);
+        assert_eq!(calls.get(), 5);
     }
 }

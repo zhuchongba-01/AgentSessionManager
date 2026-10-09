@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde_json::Value;
 
@@ -9,24 +10,19 @@ use crate::session_paths::claude_config_dir;
 
 use super::utils::{
     collect_files_where, ensure_readable_size, extract_text, is_safe_session_id,
-    parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary, TITLE_MAX_CHARS,
+    parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary, FileParseCache,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "claude";
+
+static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let root = claude_config_dir().join("projects");
     let mut files = Vec::new();
     collect_jsonl_files(&root, &mut files);
-
-    let mut sessions = Vec::new();
-    for path in files {
-        if let Some(meta) = parse_session(&path) {
-            sessions.push(meta);
-        }
-    }
-
-    sessions
+    PARSE_CACHE.scan(files, parse_session_result)
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -123,16 +119,21 @@ pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool
 }
 
 fn parse_session(path: &Path) -> Option<SessionMeta> {
+    parse_session_result(path).ok().flatten()
+}
+
+/// 扫描缓存用：读失败（权限、被占用）返回 `Err`，本轮不缓存、下轮重试；`agent-*`
+/// 前缀或解析不出会话 ID 属于只依赖文件本身的确定性结果，返回 `Ok(None)` 进缓存。
+fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
     if is_agent_session(path) {
-        return None;
+        return Ok(None);
     }
 
-    let (head, tail) = read_head_tail_lines(path, 10, 30)
-        .map_err(|error| {
-            super::utils::scan_warning(format!("无法读取 {}：{error}", path.display()));
-            error
-        })
-        .ok()?;
+    let (head, tail) = read_head_tail_lines(path, 10, 30).map_err(|error| {
+        let message = format!("无法读取 {}：{error}", path.display());
+        super::utils::scan_warning(message.clone());
+        message
+    })?;
 
     let mut session_id: Option<String> = None;
     let mut project_dir: Option<String> = None;
@@ -231,7 +232,9 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
     }
 
     let session_id = session_id.or_else(|| infer_session_id_from_filename(path));
-    let session_id = session_id?;
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
 
     // Title priority: custom-title > first user message > directory basename
     let title = custom_title
@@ -246,7 +249,7 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
 
     let summary = summary.map(|text| truncate_summary(&text, 160));
 
-    Some(SessionMeta {
+    Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: false,
@@ -262,7 +265,7 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
         source_path: Some(path.to_string_lossy().to_string()),
         resume_command: is_safe_session_id(&session_id)
             .then(|| format!("claude --resume {session_id}")),
-    })
+    }))
 }
 
 fn is_agent_session(path: &Path) -> bool {

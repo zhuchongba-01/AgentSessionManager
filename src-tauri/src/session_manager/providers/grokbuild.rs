@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -10,7 +11,7 @@ use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
     checked_storage_child, collect_files_where, ensure_readable_size, extract_text,
-    is_safe_session_id, parse_timestamp_to_ms, truncate_summary, TITLE_MAX_CHARS,
+    is_safe_session_id, parse_timestamp_to_ms, truncate_summary, FileParseCache, TITLE_MAX_CHARS,
 };
 
 #[derive(Debug, Deserialize)]
@@ -47,24 +48,24 @@ pub fn session_roots() -> Vec<PathBuf> {
     ]
 }
 
+static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
+
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let mut summaries = Vec::new();
     for root in session_roots() {
         collect_summary_files(&root, &mut summaries);
     }
-    summaries
-        .into_iter()
-        .filter_map(|path| parse_discovered_summary(&path))
-        .collect()
+    PARSE_CACHE.scan(summaries, parse_discovered_summary)
 }
 
-fn parse_discovered_summary(path: &Path) -> Option<SessionMeta> {
-    let mut session = parse_summary(path)?;
-    if is_archived_summary(path) {
-        session.residual = true;
-        session.resume_command = None;
-    }
-    Some(session)
+fn parse_discovered_summary(path: &Path) -> Result<Option<SessionMeta>, String> {
+    Ok(parse_summary_result(path)?.map(|mut session| {
+        if is_archived_summary(path) {
+            session.residual = true;
+            session.resume_command = None;
+        }
+        session
+    }))
 }
 
 fn is_archived_summary(path: &Path) -> bool {
@@ -326,12 +327,12 @@ fn read_summary(path: &Path) -> Result<GrokSessionSummary, String> {
         .map_err(|e| format!("Failed to parse Grok Build session summary: {e}"))
 }
 
-fn parse_summary(path: &Path) -> Option<SessionMeta> {
-    let summary = read_summary(path)
-        .inspect_err(|error| {
-            super::utils::scan_warning(error.clone());
-        })
-        .ok()?;
+/// 扫描缓存用：读失败（权限、被占用、JSON 损坏）返回 `Err`，本轮不缓存、下轮重试，
+/// 与接入缓存前「每轮重扫都重新解析并重复警告」的行为一致。
+fn parse_summary_result(path: &Path) -> Result<Option<SessionMeta>, String> {
+    let summary = read_summary(path).inspect_err(|error| {
+        super::utils::scan_warning(error.clone());
+    })?;
     let session_id = summary.info.id;
     let is_subagent = summary
         .session_kind
@@ -360,7 +361,7 @@ fn parse_summary(path: &Path) -> Option<SessionMeta> {
         .or(summary.updated_at.as_ref())
         .and_then(parse_timestamp_to_ms);
 
-    Some(SessionMeta {
+    Ok(Some(SessionMeta {
         provider_id: "grokbuild".to_string(),
         session_id: session_id.clone(),
         residual: is_subagent,
@@ -376,7 +377,7 @@ fn parse_summary(path: &Path) -> Option<SessionMeta> {
         source_path: Some(path.to_string_lossy().to_string()),
         resume_command: (!is_subagent && is_safe_session_id(&session_id))
             .then(|| format!("grok --resume {session_id}")),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -423,7 +424,7 @@ mod tests {
         collect_summary_files(&sessions_dir, &mut files);
         let sessions = files
             .iter()
-            .filter_map(|path| parse_summary(path))
+            .filter_map(|path| parse_summary_result(path).expect("parse summary"))
             .collect::<Vec<_>>();
 
         assert_eq!(sessions.len(), 1);
@@ -454,7 +455,9 @@ mod tests {
         )
         .expect("write summary");
 
-        let session = parse_discovered_summary(&summary_path).expect("parse summary");
+        let session = parse_discovered_summary(&summary_path)
+            .expect("parse summary")
+            .expect("session meta");
 
         assert!(session.residual);
         assert!(session.resume_command.is_none());
@@ -472,7 +475,9 @@ mod tests {
             Some("subagent"),
         );
 
-        let session = parse_discovered_summary(&child).expect("parse child summary");
+        let session = parse_discovered_summary(&child)
+            .expect("parse child summary")
+            .expect("session meta");
         assert!(session.residual);
         assert!(session.resume_command.is_none());
     }
