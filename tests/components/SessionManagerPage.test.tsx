@@ -782,6 +782,37 @@ describe("SessionManagerPage", () => {
     spy.mockRestore();
   });
 
+  it("filters sessions by multiple keywords and restores results after clearing", async () => {
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索会话" }), {
+      target: { value: "beta /mock/codex" },
+    });
+    expect(
+      await screen.findByRole("heading", { name: "Beta Session" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("找到 1 条会话")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Alpha Session" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "清空搜索" }));
+    expect(screen.queryByText("找到 1 条会话")).not.toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "搜索会话" })).toHaveValue("");
+  });
+
+  it("shows a recoverable search empty state", async () => {
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索会话" }), {
+      target: { value: "no-such-session-xyz" },
+    });
+    expect(await screen.findByText("没有匹配的会话")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "清空搜索条件" }));
+    expect(
+      await screen.findByRole("heading", { name: "Alpha Session" }),
+    ).toBeInTheDocument();
+  });
+
   it("shows scan failures rather than no sessions", async () => {
     const spy = vi
       .spyOn(sessionsApi, "list")

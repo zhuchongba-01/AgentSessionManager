@@ -1,5 +1,5 @@
-import { memo, useCallback, useState } from "react";
-import { ChevronDown, ChevronUp, Copy } from "lucide-react";
+import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronUp, Copy, LoaderCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { cn } from "@/lib/utils";
@@ -11,6 +11,7 @@ const COLLAPSED_LENGTH = 1500;
 
 interface SessionMessageItemProps {
   message: SessionMessage;
+  messageRevision?: string | number;
   isActive: boolean;
   onCopy: (content: string) => void;
   /**
@@ -20,7 +21,24 @@ interface SessionMessageItemProps {
   onLoadFullContent?: (message: SessionMessage) => Promise<string>;
 }
 
-export const SessionMessageItem = memo(function SessionMessageItem({
+export const SessionMessageItem = memo(function SessionMessageItem(
+  props: SessionMessageItemProps,
+) {
+  const { message, messageRevision } = props;
+  // 等价对象刷新保留展开；读取批次变化或任一消息字段变化立即隔离旧状态。
+  const identity = JSON.stringify([
+    messageRevision,
+    message.role,
+    message.content,
+    message.ts,
+    message.index,
+    message.truncated,
+    message.contentChars,
+  ]);
+  return <SessionMessageContent key={identity} {...props} />;
+});
+
+function SessionMessageContent({
   message,
   isActive,
   onCopy,
@@ -30,6 +48,18 @@ export const SessionMessageItem = memo(function SessionMessageItem({
   const [expanded, setExpanded] = useState(false);
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [isLoadingFull, setIsLoadingFull] = useState(false);
+  const [isCopying, setIsCopying] = useState(false);
+  const mounted = useRef(false);
+  const cachedContent = useRef<string | null>(null);
+  const pendingContent = useRef<Promise<string> | null>(null);
+  const copying = useRef(false);
+
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const isTruncated = message.truncated === true && message.index !== undefined;
   // 未截断的长正文仍就地折叠；被截断的正文里只有预览，展开要向后端取
@@ -37,19 +67,33 @@ export const SessionMessageItem = memo(function SessionMessageItem({
   const collapsed = isLong && !expanded;
   const totalChars = message.contentChars ?? message.content.length;
 
-  const loadFullContent = useCallback(async (): Promise<string> => {
-    if (fullContent !== null) return fullContent;
-    if (!isTruncated || !onLoadFullContent) return message.content;
+  const loadFullContent = useCallback((): Promise<string> => {
+    if (cachedContent.current !== null) {
+      return Promise.resolve(cachedContent.current);
+    }
+    if (pendingContent.current) return pendingContent.current;
+    if (!isTruncated || !onLoadFullContent) {
+      return Promise.resolve(message.content);
+    }
 
     setIsLoadingFull(true);
-    try {
-      const content = await onLoadFullContent(message);
-      setFullContent(content);
-      return content;
-    } finally {
-      setIsLoadingFull(false);
-    }
-  }, [fullContent, isTruncated, message, onLoadFullContent]);
+    // 延后调用也使同步抛错走统一失败清理，展开和复制始终共享同一请求。
+    const request = Promise.resolve()
+      .then(() => onLoadFullContent(message))
+      .then((content) => {
+        if (mounted.current) {
+          cachedContent.current = content;
+          setFullContent(content);
+        }
+        return content;
+      })
+      .finally(() => {
+        pendingContent.current = null;
+        if (mounted.current) setIsLoadingFull(false);
+      });
+    pendingContent.current = request;
+    return request;
+  }, [isTruncated, message, onLoadFullContent]);
 
   const handleToggle = useCallback(() => {
     if (expanded) {
@@ -62,18 +106,29 @@ export const SessionMessageItem = memo(function SessionMessageItem({
     }
     // 失败提示由调用方给出；这里保持折叠状态，不做假的展开
     void loadFullContent()
-      .then(() => setExpanded(true))
+      .then(() => {
+        if (mounted.current) setExpanded(true);
+      })
       .catch(() => undefined);
   }, [expanded, isTruncated, loadFullContent]);
 
   const handleCopy = useCallback(() => {
+    if (copying.current) return;
     if (!isTruncated) {
       onCopy(message.content);
       return;
     }
+    copying.current = true;
+    setIsCopying(true);
     void loadFullContent()
-      .then(onCopy)
-      .catch(() => undefined);
+      .then((content) => {
+        if (mounted.current) onCopy(content);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        copying.current = false;
+        if (mounted.current) setIsCopying(false);
+      });
   }, [isTruncated, loadFullContent, message.content, onCopy]);
 
   const loaded = fullContent ?? message.content;
@@ -103,12 +158,34 @@ export const SessionMessageItem = memo(function SessionMessageItem({
         <button
           type="button"
           className="asm-message-copy"
-          aria-label={t("sessionManager.copyMessage", {
-            defaultValue: "复制消息",
-          })}
+          aria-label={
+            isCopying
+              ? t("sessionManager.loadingFullContent", {
+                  defaultValue: "正在读取完整内容…",
+                })
+              : t("sessionManager.copyMessage", {
+                  defaultValue: "复制消息",
+                })
+          }
+          aria-busy={isCopying || undefined}
+          disabled={isCopying}
           onClick={handleCopy}
         >
-          <Copy className="size-3.5" aria-hidden="true" />
+          {isCopying ? (
+            <>
+              <LoaderCircle
+                className="size-3.5 animate-spin"
+                aria-hidden="true"
+              />
+              <span>
+                {t("sessionManager.loadingFullContent", {
+                  defaultValue: "正在读取完整内容…",
+                })}
+              </span>
+            </>
+          ) : (
+            <Copy className="size-3.5" aria-hidden="true" />
+          )}
         </button>
       </div>
       <div className="asm-message-body">{displayContent}</div>
@@ -146,4 +223,4 @@ export const SessionMessageItem = memo(function SessionMessageItem({
       )}
     </div>
   );
-});
+}

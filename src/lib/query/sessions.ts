@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -32,43 +32,67 @@ export const useSessionsQuery = () => {
   return { ...query, warnings };
 };
 
+interface SessionTranscript {
+  messages: SessionMessage[];
+  revision: number;
+}
+
+let nextMessageRevision = 0;
+
 export const useSessionMessagesQuery = (
   providerId?: string,
   sourcePath?: string,
 ) => {
-  // 流式到达的部分结果只用于渐进渲染，不写进 react-query 缓存：半截数据一旦被当成
-  // 新鲜的缓存，切回这个会话就会看到被截断的正文。
-  const [streamed, setStreamed] = useState<{
-    providerId: string;
-    sourcePath: string;
-    messages: SessionMessage[];
-  } | null>(null);
+  // 部分结果只用于当前请求的渐进显示，不写入查询缓存。
+  // 独立批次让内容完全相同的刷新也能使按需全文缓存失效。
+  const activeRequest = useRef(0);
+  const [streamed, setStreamed] = useState<
+    (SessionTranscript & { providerId: string; sourcePath: string }) | null
+  >(null);
 
-  const query = useQuery<SessionMessage[]>({
+  const query = useQuery<SessionTranscript>({
     queryKey: ["sessionMessages", providerId, sourcePath],
-    queryFn: () =>
-      sessionsApi.streamMessages(providerId!, sourcePath!, (messages) =>
-        setStreamed({
-          providerId: providerId!,
-          sourcePath: sourcePath!,
-          messages,
-        }),
-      ),
+    queryFn: async ({ signal }) => {
+      const revision = ++nextMessageRevision;
+      activeRequest.current = revision;
+      setStreamed({
+        providerId: providerId!,
+        sourcePath: sourcePath!,
+        revision,
+        messages: [],
+      });
+      const messages = await sessionsApi.streamMessages(
+        providerId!,
+        sourcePath!,
+        (partial) => {
+          // 切换会话、取消或重新读取后，旧 Channel 可能还在发送消息。
+          if (signal.aborted || activeRequest.current !== revision) return;
+          setStreamed({
+            providerId: providerId!,
+            sourcePath: sourcePath!,
+            revision,
+            messages: partial,
+          });
+        },
+      );
+      return { messages, revision };
+    },
     enabled: Boolean(providerId && sourcePath),
     staleTime: 30_000,
   });
 
-  // 只在同一次取数过程中用渐进结果；流结束后交回 react-query 的完整数据
-  const progressive =
+  const snapshot =
+    query.isFetching &&
     streamed &&
     streamed.providerId === providerId &&
     streamed.sourcePath === sourcePath
-      ? streamed.messages
-      : undefined;
+      ? streamed
+      : query.data;
 
   return {
     ...query,
-    data: query.isFetching && progressive ? progressive : query.data,
+    data: snapshot?.messages,
+    messageRevision: snapshot?.revision ?? 0,
   };
 };
 

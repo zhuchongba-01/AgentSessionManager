@@ -4,24 +4,24 @@
 
 @layer base {
   :root {
-    --background: 41 23% 97%;
-    --foreground: 30 8% 14%;
-    --card: 40 30% 99%;
-    --card-foreground: 30 8% 14%;
-    --popover: 40 30% 99%;
-    --popover-foreground: 30 8% 14%;
+    --background: 0 0% 98%;
+    --foreground: 220 6% 16%;
+    --card: 0 0% 99%;
+    --card-foreground: 220 6% 16%;
+    --popover: 0 0% 99%;
+    --popover-foreground: 220 6% 16%;
     --primary: 221 83% 53%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 38 16% 92%;
-    --secondary-foreground: 30 8% 18%;
-    --muted: 38 16% 92%;
-    --muted-foreground: 30 5% 46%;
-    --accent: 38 20% 90%;
-    --accent-foreground: 30 8% 18%;
+    --secondary: 220 5% 95%;
+    --secondary-foreground: 220 6% 20%;
+    --muted: 220 5% 95%;
+    --muted-foreground: 220 4% 44%;
+    --accent: 220 6% 92%;
+    --accent-foreground: 220 6% 20%;
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
-    --border: 36 12% 87%;
-    --input: 36 12% 87%;
+    --border: 220 5% 88%;
+    --input: 220 5% 88%;
     --ring: 221 83% 53%;
     --radius: 0.5rem;
   }
@@ -228,7 +228,7 @@ body {
   outline-offset: -2px;
 }
 
-/* ── 主体：列表 300px + 细线 + 详情 ── */
+/* ── 主体：列表 320px + 细线 + 详情 ── */
 .asm-dashboard {
   display: flex;
   min-height: 0;
@@ -240,13 +240,14 @@ body {
 .asm-session-grid {
   display: grid;
   flex: 1;
-  grid-template-columns: 302px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
 }
 
 .asm-list {
   display: flex;
+  min-width: 0;
   min-height: 0;
   flex-direction: column;
   border-right: 1px solid hsl(var(--border));
@@ -255,11 +256,93 @@ body {
 
 .asm-list-toolbar {
   display: flex;
-  height: 46px;
+  min-height: 48px;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 4px;
+  padding: 9px 12px;
+}
+
+.asm-search {
+  display: flex;
+  min-width: 0;
+  min-height: 34px;
   flex: none;
   align-items: center;
-  gap: 4px;
-  padding: 0 12px;
+  gap: 7px;
+  margin: 0 12px 8px;
+  padding: 0 9px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 7px;
+  background: hsl(var(--background));
+  color: hsl(var(--muted-foreground));
+}
+
+.asm-search:focus-within {
+  border-color: hsl(var(--ring) / 0.6);
+  box-shadow: 0 0 0 2px hsl(var(--ring) / 0.1);
+}
+
+.asm-search svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.asm-search input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: hsl(var(--foreground));
+  font: inherit;
+  font-size: 12px;
+}
+
+.asm-search input::placeholder {
+  color: hsl(var(--muted-foreground));
+}
+
+.asm-search button {
+  display: inline-flex;
+  min-width: 24px;
+  min-height: 24px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  border: 0;
+  border-radius: 4px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.asm-search button:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+
+.asm-search-summary {
+  margin: 0 14px 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.asm-empty-search {
+  padding: 28px 16px;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 .asm-agent-filter-trigger {
@@ -536,15 +619,52 @@ body {
 
 .asm-detail-toolbar {
   display: flex;
-  height: 45px;
+  min-height: 48px;
+  min-width: 0;
   flex: none;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 7px;
-  padding: 0 14px;
+  gap: 6px;
+  padding: 8px 18px;
   border-bottom: 1px solid hsl(var(--border));
 }
 
+.asm-detail-quick-actions {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.asm-detail-quick-actions > button {
+  display: inline-flex;
+  min-height: 30px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.asm-detail-quick-actions > button:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+
 .asm-detail-provider {
+  flex: none;
   color: hsl(var(--muted-foreground));
   font-size: 13px;
   font-weight: 500;
@@ -554,6 +674,7 @@ body {
 .asm-detail-icon-tool {
   display: inline-flex;
   height: 30px;
+  flex: none;
   align-items: center;
   justify-content: center;
   gap: 6px;
@@ -561,6 +682,7 @@ body {
   border-radius: 8px;
   color: hsl(var(--muted-foreground));
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -577,7 +699,8 @@ body {
 
 .asm-detail-head {
   flex: none;
-  padding: 14px 28px 12px;
+  min-width: 0;
+  padding: 18px 28px 16px;
   border-bottom: 1px solid hsl(var(--border));
 }
 
@@ -602,21 +725,28 @@ body {
 
 .asm-detail-actions {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   flex: none;
-  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
 }
 
 .asm-detail-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 14px;
-  margin-top: 7px;
+  align-items: center;
+  gap: 5px 16px;
+  margin-top: 10px;
   min-width: 0;
 }
 
 .asm-chip {
   display: inline-flex;
-  height: 22px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 22px;
   align-items: center;
   gap: 5px;
   padding: 0;
@@ -625,7 +755,13 @@ body {
   background: transparent;
   color: hsl(var(--muted-foreground));
   font-size: 12px;
-  line-height: 1;
+  line-height: 1.5;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.asm-chip svg {
+  flex: none;
 }
 
 button.asm-chip {
@@ -643,7 +779,8 @@ button.asm-chip:hover {
 }
 
 .asm-chip-truncate {
-  max-width: 280px;
+  min-width: 0;
+  max-width: min(360px, 100%);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -751,9 +888,12 @@ button.asm-chip:hover {
 
 .asm-message-role {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-bottom: 7px;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-bottom: 8px;
   font-size: 11.5px;
   color: hsl(var(--muted-foreground));
 }
@@ -768,6 +908,7 @@ button.asm-chip:hover {
   display: inline-flex;
   width: 24px;
   height: 24px;
+  flex: none;
   align-items: center;
   justify-content: center;
   margin: -5px 0 -5px auto;
@@ -786,6 +927,29 @@ button.asm-chip:hover {
 .asm-message:hover .asm-message-copy,
 .asm-message:focus-within .asm-message-copy {
   opacity: 1;
+}
+
+.asm-message-copy[aria-busy="true"] {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  min-height: 24px;
+  gap: 5px;
+  padding: 3px 7px;
+  opacity: 1;
+  font-size: 11.5px;
+  line-height: 1.5;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: progress;
+}
+
+.asm-message-copy svg {
+  flex: none;
+}
+
+.asm-message-copy[aria-busy="true"] span {
+  min-width: 0;
 }
 
 .asm-message-copy:hover {
@@ -832,10 +996,12 @@ button.asm-chip:hover {
 }
 
 .asm-message.is-tool .asm-message-body {
-  padding: 2px 0 2px 12px;
+  padding: 7px 0 7px 14px;
   border-left: 2px solid hsl(var(--border));
   font-family: Consolas, "Cascadia Mono", monospace;
   font-size: 12px;
+  line-height: 1.65;
+  tab-size: 4;
   color: hsl(var(--muted-foreground));
 }
 
@@ -853,14 +1019,35 @@ button.asm-chip:hover {
     padding: 0 0 0 12px;
   }
   .asm-session-grid {
-    grid-template-columns: 252px minmax(0, 1fr);
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+  .asm-list-toolbar {
+    padding-inline: 10px;
+  }
+  .asm-detail-toolbar {
+    padding-inline: 12px;
+  }
+  .asm-detail-head {
+    padding: 16px 20px 14px;
+  }
+  .asm-detail-titlerow {
+    flex-wrap: wrap;
+  }
+  .asm-detail-title {
+    flex-basis: 200px;
+  }
+  .asm-detail-actions {
+    margin-left: auto;
+  }
+  .asm-detail-scroll {
+    padding: 20px;
+  }
+  .asm-message.is-user {
+    width: 78%;
   }
 }
 
 @media (max-width: 820px) {
-  .asm-session-grid {
-    grid-template-columns: 236px minmax(0, 1fr);
-  }
   .asm-detail-head {
     padding-inline: 18px;
   }

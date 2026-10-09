@@ -6,6 +6,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  Search,
+  Copy,
   AlertTriangle,
   RefreshCw,
   Trash2,
@@ -291,17 +293,42 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     setProviderFilter(appId as ProviderFilter);
   }, [appId]);
 
+  const [searchQuery, setSearchQuery] = useState("");
+  const searchTerms = searchQuery
+    .trim()
+    .toLocaleLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  const isSearching = searchTerms.length > 0;
   const filteredSessions = useMemo(() => {
-    const list =
-      providerFilter === "all"
-        ? sessions
-        : sessions.filter((session) => session.providerId === providerFilter);
+    const terms = searchQuery
+      .trim()
+      .toLocaleLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    const list = sessions.filter((session) => {
+      if (providerFilter !== "all" && session.providerId !== providerFilter)
+        return false;
+      const text = [
+        session.title,
+        session.summary,
+        session.projectDir,
+        session.projectName,
+        session.sessionId,
+        session.sourcePath,
+        session.sidebarSection?.name,
+      ]
+        .filter(Boolean)
+        .join("\n")
+        .toLocaleLowerCase();
+      return terms.every((term) => text.includes(term));
+    });
     return [...list].sort(
       (a, b) =>
         (b.lastActiveAt ?? b.createdAt ?? 0) -
         (a.lastActiveAt ?? a.createdAt ?? 0),
     );
-  }, [sessions, providerFilter]);
+  }, [sessions, providerFilter, searchQuery]);
 
   const groupedSessions = useMemo(
     () =>
@@ -404,6 +431,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const {
     data: messages = [],
     isLoading: isLoadingMessages,
+    isFetching: isFetchingMessages,
+    messageRevision,
     error: messagesError,
     refetch: refetchMessages,
   } = useSessionMessagesQuery(
@@ -552,42 +581,51 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [handleCopy, t],
   );
 
-  // 被截断消息的全文：同一会话内只取一次，展开与复制共用同一份缓存
-  const fullContentCache = useRef(new Map<string, string>());
+  // 仅保留当前会话、当前读取批次的全文；进行中的请求也共用。
+  const fullContentCache = useMemo(
+    () => new Map<string, Promise<string>>(),
+    [selectedKey, messageRevision],
+  );
+  const currentFullContentCache = useRef(fullContentCache);
+  currentFullContentCache.current = fullContentCache;
 
   const handleLoadFullContent = useCallback(
-    async (message: SessionMessage): Promise<string> => {
+    (message: SessionMessage): Promise<string> => {
       const providerId = selectedSession?.providerId;
       const sourcePath = selectedSession?.sourcePath;
       if (!providerId || !sourcePath || message.index === undefined) {
-        return message.content;
+        return Promise.resolve(message.content);
       }
 
       const contentChars = message.contentChars ?? message.content.length;
-      const cacheKey = `${providerId}\u0000${sourcePath}\u0000${message.index}\u0000${contentChars}`;
-      const cached = fullContentCache.current.get(cacheKey);
+      const cacheKey = `${message.index}\u0000${contentChars}`;
+      const cached = fullContentCache.get(cacheKey);
       if (cached !== undefined) return cached;
 
-      try {
-        const content = await sessionsApi.getMessageContent(
-          providerId,
-          sourcePath,
-          message.index,
-          contentChars,
-        );
-        fullContentCache.current.set(cacheKey, content);
-        return content;
-      } catch (error) {
-        toast.error(
-          extractErrorMessage(error) ||
-            t("sessionManager.loadFullContentFailed", {
-              defaultValue: "读取完整内容失败",
-            }),
-        );
-        throw error;
-      }
+      const request = sessionsApi
+        .getMessageContent(providerId, sourcePath, message.index, contentChars)
+        .catch((error) => {
+          // 失败不缓存；已切走的会话不再弹出迟到错误。
+          fullContentCache.delete(cacheKey);
+          if (currentFullContentCache.current === fullContentCache) {
+            toast.error(
+              extractErrorMessage(error) ||
+                t("sessionManager.loadFullContentFailed", {
+                  defaultValue: "读取完整内容失败",
+                }),
+            );
+          }
+          throw error;
+        });
+      fullContentCache.set(cacheKey, request);
+      return request;
     },
-    [selectedSession?.providerId, selectedSession?.sourcePath, t],
+    [
+      fullContentCache,
+      selectedSession?.providerId,
+      selectedSession?.sourcePath,
+      t,
+    ],
   );
 
   const handleOpenUrl = useCallback(
@@ -1419,6 +1457,33 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     </Button>
                   </div>
                 )}
+                <div className="asm-search" role="search">
+                  <Search className="size-4 shrink-0" aria-hidden="true" />
+                  <input
+                    type="search"
+                    aria-label="搜索会话"
+                    placeholder="搜索标题、项目、摘要或 ID"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setSearchQuery("");
+                    }}
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      aria-label="清空搜索"
+                      onClick={() => setSearchQuery("")}
+                    >
+                      <X className="size-3.5" aria-hidden="true" />
+                    </button>
+                  )}
+                </div>
+                {isSearching && (
+                  <div className="asm-search-summary" role="status">
+                    找到 {filteredSessions.length} 条会话
+                  </div>
+                )}
                 <div className="asm-list-scroll">
                   {isLoading ? (
                     <div className="flex items-center justify-center py-12">
@@ -1443,8 +1508,22 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     <div className="flex flex-col items-center justify-center py-12 text-center">
                       <MessageSquare className="size-8 text-muted-foreground/50 mb-2" />
                       <p className="text-sm text-muted-foreground">
-                        {t("sessionManager.noSessions")}
+                        {isSearching
+                          ? "没有匹配的会话"
+                          : t("sessionManager.noSessions")}
                       </p>
+                      {isSearching && (
+                        <div className="asm-empty-search">
+                          <p>试试更短的关键词，或调整 Agent 筛选。</p>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setSearchQuery("")}
+                          >
+                            清空搜索条件
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   ) : listViewMode === "grouped" ? (
                     <div>
@@ -1457,9 +1536,9 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         </div>
                       )}
                       {groupedSessions.map((providerGroup) => {
-                        const providerOpen = expandedProviderGroups.has(
-                          providerGroup.providerId,
-                        );
+                        const providerOpen =
+                          isSearching ||
+                          expandedProviderGroups.has(providerGroup.providerId);
                         const providerLabel = getProviderLabel(
                           providerGroup.providerId,
                           t,
@@ -1522,6 +1601,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                               {providerGroup.directories.map(
                                 (directoryGroup) => {
                                   const directoryOpen =
+                                    isSearching ||
                                     expandedDirectoryGroups.has(
                                       directoryGroup.key,
                                     );
@@ -1750,6 +1830,37 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
                         {/* 操作按钮组 */}
                         <div className="asm-detail-actions">
+                          <div className="asm-detail-quick-actions">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void handleCopy(
+                                  selectedSession.sessionId,
+                                  "已复制会话 ID",
+                                )
+                              }
+                            >
+                              <Copy className="size-3.5" aria-hidden="true" />
+                              复制 ID
+                            </button>
+                            {selectedSession.sourcePath && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleCopy(
+                                    selectedSession.sourcePath!,
+                                    t("sessionManager.sourcePathCopied"),
+                                  )
+                                }
+                              >
+                                <FileText
+                                  className="size-3.5"
+                                  aria-hidden="true"
+                                />
+                                复制源路径
+                              </button>
+                            )}
+                          </div>
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <Button
@@ -1872,9 +1983,16 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         onScroll={handleScrollMetrics}
                         className="asm-detail-scroll"
                       >
-                        {isLoadingMessages ? (
-                          <div className="flex items-center justify-center py-12">
-                            <RefreshCw className="size-5 animate-spin text-muted-foreground" />
+                        {(isLoadingMessages || isFetchingMessages) &&
+                        visibleMessages.length === 0 ? (
+                          <div
+                            role="status"
+                            className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground"
+                          >
+                            <RefreshCw className="size-5 animate-spin" />
+                            {t("sessionManager.loadingMessages", {
+                              defaultValue: "正在读取会话…",
+                            })}
                           </div>
                         ) : messagesError ? (
                           <div
@@ -1902,6 +2020,17 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                           </div>
                         ) : (
                           <div className="asm-messages">
+                            {isFetchingMessages && (
+                              <div
+                                role="status"
+                                className="flex items-center gap-2 py-2 text-xs text-muted-foreground"
+                              >
+                                <RefreshCw className="size-3.5 animate-spin" />
+                                {t("sessionManager.loadingMoreMessages", {
+                                  defaultValue: "正在继续读取会话…",
+                                })}
+                              </div>
+                            )}
                             <div
                               style={{
                                 height: virtualizedContentHeight,
@@ -1927,6 +2056,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                       message={
                                         visibleMessages[virtualRow.index]
                                       }
+                                      messageRevision={messageRevision}
                                       onCopy={handleCopyMessage}
                                       onLoadFullContent={handleLoadFullContent}
                                       isActive={
