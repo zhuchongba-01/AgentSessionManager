@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Agent会话管理器",
+  "productName": "Agent会话管理",
   "version": "1.3.18",
   "identifier": "com.agent-session-manager.desktop",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Agent会话管理器  v1.3.18",
+        "title": "Agent会话管理  v1.3.18",
         "width": 1440,
         "height": 900,
         "minWidth": 900,

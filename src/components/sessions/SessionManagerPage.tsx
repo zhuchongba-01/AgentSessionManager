@@ -1097,7 +1097,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
             <div className="asm-topbar-brand" data-tauri-drag-region>
               <img src={appIcon} alt="" className="asm-app-icon" />
               <span className="asm-app-name" data-tauri-drag-region>
-                Agent会话管理器
+                Agent会话管理
               </span>
               <span className="asm-app-version" data-tauri-drag-region>
                 v{APP_VERSION}

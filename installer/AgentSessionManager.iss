@@ -1,12 +1,12 @@
-#define MyAppName "Agent会话管理器"
+#define MyAppName "Agent会话管理"
 #define MyAppVersion "1.3.18"
-#define MyAppExeName "Agent会话管理器.exe"
+#define MyAppExeName "Agent会话管理.exe"
 
 [Setup]
 AppId={{7C1E5A93-9D4E-4F5C-B8A2-1E6D0C4B9F31}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-DefaultDirName={autopf}\Agent会话管理器
+DefaultDirName={autopf}\Agent会话管理
 DefaultGroupName={#MyAppName}
 UninstallDisplayName={#MyAppName}
 OutputDir=Output

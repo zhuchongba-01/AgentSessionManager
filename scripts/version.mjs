@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 // Only explicit release metadata is edited. Dependency versions are never touched.
 const versionField = /("version"\s*:\s*")([^"\r\n]+)(")/g;
-const windowTitle = /("title"\s*:\s*"Agent会话管理器\s+v)([^"\r\n]+)(")/g;
+const windowTitle = /("title"\s*:\s*"Agent会话管理\s+v)([^"\r\n]+)(")/g;
 const targets = [
   ["package.json", [versionField]],
   [

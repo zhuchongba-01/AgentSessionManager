@@ -179,7 +179,7 @@ pub fn run() {
         .setup(|app| {
             let menu = tray::create_tray_menu(app.handle())?;
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
-                .tooltip("Agent会话管理器")
+                .tooltip("Agent会话管理")
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     tray::handle_tray_menu_event(app, &event.id.0);
@@ -203,5 +203,5 @@ pub fn run() {
             set_window_theme,
         ])
         .run(tauri::generate_context!())
-        .expect("Agent会话管理器启动失败");
+        .expect("Agent会话管理启动失败");
 }

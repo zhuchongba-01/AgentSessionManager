@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="src-tauri/icons/icon.png" width="128" alt="Agent 会话管理器图标"/>
+<img src="src-tauri/icons/icon.png" width="128" alt="Agent 会话管理图标"/>
 
-# Agent 会话管理器
+# Agent 会话管理
 
 **Codex、Claude Code、DeepSeek Harness 等本地编码 Agent 的会话管理工具**
 

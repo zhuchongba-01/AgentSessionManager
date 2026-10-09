@@ -21,9 +21,9 @@ const files = {
   "src-tauri/Cargo.lock":
     'version = 4\r\n\r\n[[package]]\r\nname = "agent-session-manager"\r\nversion = "1.3.16"\r\n\r\n[[package]]\r\nname = "other"\r\nversion = "1.3.16"\r\n',
   "src-tauri/tauri.conf.json":
-    '{"version":"1.3.16","app":{"windows":[{"title":"Agent会话管理器  v1.3.16"}]}}\n',
+    '{"version":"1.3.16","app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]}}\n',
   "src-tauri/tauri.windows.conf.json":
-    '{"app":{"windows":[{"title":"Agent会话管理器  v1.3.16"}]}}\n',
+    '{"app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]}}\n',
   "installer/AgentSessionManager.iss":
     '#define MyAppVersion "1.3.16"\r\n[Setup]\r\nAppVersion={#MyAppVersion}\r\n',
 };
@@ -126,7 +126,7 @@ test("rejects ambiguous metadata rather than updating unintended fields", (t) =>
   const name = "src-tauri/tauri.windows.conf.json";
   writeFileSync(
     join(root, name),
-    '{"app":{"windows":[{"title":"Agent会话管理器  v1.3.16"},{"title":"Agent会话管理器  v1.3.16"}]}}',
+    '{"app":{"windows":[{"title":"Agent会话管理  v1.3.16"},{"title":"Agent会话管理  v1.3.16"}]}}',
   );
   const before = snapshot(root);
   assert.throws(
