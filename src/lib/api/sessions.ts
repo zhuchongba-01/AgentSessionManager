@@ -52,20 +52,22 @@ export const sessionsApi = {
   /**
    * 取回一条被截断消息的全文。
    *
-   * `expectedChars` 是列表里那一版正文的长度：会话在两次请求之间被改写时，同一下标
-   * 可能已指向另一条消息，后端会拒绝返回并提示重新打开。
+   * `expectedChars` / `expectedIdentity` 描述列表里那一版正文：会话在两次请求之间
+   * 被改写时，后端会拒绝返回并提示重新打开。长度单独不足以确认身份，摘要才是判据。
    */
   async getMessageContent(
     providerId: string,
     sourcePath: string,
     index: number,
     expectedChars: number,
+    expectedIdentity?: string,
   ): Promise<string> {
     return await invoke("get_message_content", {
       providerId,
       sourcePath,
       index,
       expectedChars,
+      expectedIdentity,
     });
   },
 

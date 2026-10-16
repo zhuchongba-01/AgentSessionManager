@@ -119,6 +119,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                     provider_id: PROVIDER_ID.into(),
                     session_id: id.clone(),
                     residual: false,
+                    parent_session_id: None,
                     archived: native_rollouts
                         .as_ref()
                         .is_some_and(|active| !active.contains_key(&id)),
@@ -156,6 +157,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                     provider_id: PROVIDER_ID.into(),
                     session_id: id.clone(),
                     residual: false,
+                    parent_session_id: None,
                     archived: false,
                     cleanup_pending: true,
                     sidebar_section: None,
@@ -278,7 +280,10 @@ pub fn cleanup_after_delete(
         errors.push(error);
     }
 
-    let config_text = read_codex_config_text().unwrap_or_default();
+    // 读不到 config.toml 时不能退化成「用默认库路径」：用户可能通过 `sqlite_home`
+    // 把索引库挪到了别处，那样清理会落到错误的库上、同时漏掉真正要清的那一个。
+    // 这里在读配置失败时直接报错；调用方在本函数之后才删 log，所以失败是安全的。
+    let config_text = read_codex_config_text()?;
     if let Err(error) = cleanup_index_databases(
         &config_dir,
         &config_text,
@@ -301,7 +306,12 @@ pub fn cleanup_after_delete(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("；"))
+        // 索引清理不完整必须让调用方看到：否则 Codex 桌面端会留下打不开的空条目，
+        // 而删除会被报成完全成功。
+        Err(format!(
+            "Codex 索引未能完整清理，请在退出 Codex 后重试：{}",
+            errors.join("；")
+        ))
     }
 }
 
@@ -1925,6 +1935,7 @@ fn parse_session_with_titles(
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: false,
+        parent_session_id: None,
         archived: false,
         cleanup_pending: false,
         sidebar_section: None,

@@ -87,6 +87,24 @@ const enterGroupedBatchMode = async () => {
   fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
 };
 
+/**
+ * 打开批量删除确认框。
+ *
+ * 批量工具条上已经没有删除按钮：唯一入口是右侧详情面板里那枚按钮，它在批量模式
+ * 下显示「删除已勾选的 N 条」。这个 helper 就是那个入口，避免各用例各写一遍正则。
+ */
+const batchDeleteButton = (count?: number) =>
+  screen.getByRole("button", {
+    name:
+      count === undefined
+        ? /删除已勾选的 \d+ 条/
+        : new RegExp(`删除已勾选的 ${count} 条`),
+  });
+
+const openBatchDeleteDialog = (count?: number) => {
+  fireEvent.click(batchDeleteButton(count));
+};
+
 const expandDirectoryGroup = (provider: string, directory: string) => {
   let directoryToggle = screen.queryByRole("button", {
     name: new RegExp(`展开或折叠 ${directory} 目录分组`),
@@ -332,7 +350,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
     expect(dialog).toBeInTheDocument();
@@ -394,13 +412,82 @@ describe("SessionManagerPage", () => {
     );
   });
 
+  /**
+   * 修复回归：详情面板（右侧）一直有一个红色删除按钮，它原本**只删当前打开的那一条**。
+   * 用户在批量管理里勾选多条后点这个更显眼的按钮，就会得到「多选了却只删掉一个」。
+   *
+   * 现在它是批量模式下**唯一**的删除入口（工具条上那个已按需求移除），文案带计数。
+   */
+  it("is the only batch delete entry and deletes the whole selection", async () => {
+    const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+    const deleteSpy = vi.spyOn(sessionsApi, "delete");
+    renderPage();
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Alpha Session" }),
+      ).toBeInTheDocument(),
+    );
+
+    await switchToGroupedView();
+    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
+    expect(screen.getByText("已选 3 项")).toBeInTheDocument();
+
+    // 批量工具条上不该再有删除按钮（旧文案「批量删除」已不存在）
+    expect(
+      screen.queryByRole("button", { name: /批量删除/ }),
+    ).not.toBeInTheDocument();
+    // 删除入口只有右边这一个，且文案带计数
+    expect(
+      screen.getAllByRole("button", { name: /删除已勾选的 \d+ 条/ }),
+    ).toHaveLength(1);
+
+    openBatchDeleteDialog(3);
+
+    const dialog = screen.getByTestId("confirm-dialog");
+    expect(
+      within(dialog).getByText(/已选中的 3 个本地会话记录/),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+    );
+
+    await waitFor(() => expect(deleteManySpy).toHaveBeenCalled());
+    expect(deleteManySpy.mock.calls[0][0]).toHaveLength(3);
+    // 不能退化成本地单条删除
+    expect(deleteSpy).not.toHaveBeenCalled();
+
+    deleteManySpy.mockRestore();
+    deleteSpy.mockRestore();
+  });
+
+  it("keeps the detail-pane delete button single-target outside batch mode", async () => {
+    const deleteSpy = vi
+      .spyOn(sessionsApi, "delete")
+      .mockResolvedValue({ status: "deleted" });
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+
+    // 未进入批量管理：按钮明确写成「仅删除此会话」
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/ }));
+    const dialog = screen.getByTestId("confirm-dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ includeProject: false }),
+      ),
+    );
+    deleteSpy.mockRestore();
+  });
+
   it("never offers project-directory deletion in the real confirmation dialog", async () => {
     const deleteSpy = vi
       .spyOn(sessionsApi, "delete")
       .mockResolvedValueOnce({ status: "deleted" });
     renderPage();
     await screen.findByRole("heading", { name: "Alpha Session" });
-    fireEvent.click(screen.getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/i }));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
@@ -426,7 +513,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/i }));
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
 
@@ -455,7 +542,7 @@ describe("SessionManagerPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    openBatchDeleteDialog();
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
@@ -466,11 +553,7 @@ describe("SessionManagerPage", () => {
       expect(toastErrorMock).toHaveBeenCalledWith("network error"),
     );
 
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: /批量删除/i }),
-      ).not.toBeDisabled(),
-    );
+    await waitFor(() => expect(batchDeleteButton()).not.toBeDisabled());
 
     deleteManySpy.mockRestore();
   });
@@ -495,7 +578,7 @@ describe("SessionManagerPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    openBatchDeleteDialog();
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
@@ -631,7 +714,7 @@ describe("SessionManagerPage", () => {
     await switchToGroupedView();
     fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    openBatchDeleteDialog();
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
@@ -745,7 +828,7 @@ describe("SessionManagerPage", () => {
         name: /选择 codex 目录分组内会话/,
       }),
     );
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    openBatchDeleteDialog();
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
@@ -898,7 +981,7 @@ describe("SessionManagerPage", () => {
     renderPage();
     await screen.findByRole("heading", { name: "Alpha Session" });
     const before = listSpy.mock.calls.length;
-    fireEvent.click(screen.getByRole("button", { name: /删除会话/ }));
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/ }));
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", {
         name: /删除会话/,
@@ -909,6 +992,124 @@ describe("SessionManagerPage", () => {
     );
     deleteSpy.mockRestore();
     listSpy.mockRestore();
+  });
+
+  it("keeps the confirm dialog and selection when a single deletion fails", async () => {
+    const deleteSpy = vi
+      .spyOn(sessionsApi, "delete")
+      .mockRejectedValue(new Error("Agent 仍在运行"));
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/ }));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: /删除会话/,
+      }),
+    );
+
+    // 失败后对话框必须留着：用户要能看出失败的是哪一条并直接重试
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalled());
+    expect(screen.getByTestId("confirm-dialog")).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("confirm-dialog")).getByText(/Alpha Session/),
+    ).toBeInTheDocument();
+
+    deleteSpy.mockRestore();
+  });
+
+  it("lists every batch deletion target in the confirm dialog", async () => {
+    renderPage();
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Alpha Session" }),
+      ).toBeInTheDocument(),
+    );
+
+    await switchToGroupedView();
+    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
+    openBatchDeleteDialog();
+
+    const details = within(
+      screen.getByTestId("confirm-dialog-details"),
+    ).getByRole("list");
+    for (const title of ["Alpha Session", "Beta Session", "Gamma Session"]) {
+      expect(within(details).getByText(title)).toBeInTheDocument();
+    }
+  });
+
+  /**
+   * 修复回归：曾经用「一次最多 100 条」硬拦批量删除，而列表每页正好 100 条，结果是
+   * 选择范围一旦超过一页就完全无法删除——用户看到的正是「只能删掉显示的那些」。
+   * 现在改为：删除照做，但清单列不全时必须勾选「已核对」才能确认。
+   */
+  it("deletes every selected session beyond one page once acknowledged", async () => {
+    const manySessions: SessionMeta[] = Array.from(
+      { length: 120 },
+      (_, index) => ({
+        providerId: "codex",
+        sessionId: `bulk-${index}`,
+        title: `Bulk Session ${index}`,
+        sourcePath: `/mock/bulk/session-${index}.jsonl`,
+        lastActiveAt: 1000 - index,
+      }),
+    );
+    setSessionFixtures(manySessions, {});
+    const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+    renderPage();
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Bulk Session 0" }),
+      ).toBeInTheDocument(),
+    );
+
+    await switchToGroupedView();
+    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
+    expect(screen.getByText("已选 120 项")).toBeInTheDocument();
+    openBatchDeleteDialog();
+
+    const dialog = screen.getByTestId("confirm-dialog");
+    // 清单列不全：必须先勾选「已核对」才能确认
+    const confirmButton = within(dialog).getByRole("button", {
+      name: /删除所选会话/i,
+    });
+    expect(confirmButton).toBeDisabled();
+
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    expect(confirmButton).toBeEnabled();
+    fireEvent.click(confirmButton);
+
+    await waitFor(() => expect(deleteManySpy).toHaveBeenCalled());
+    // 关键：请求必须覆盖全部 120 条，而不是只覆盖当前渲染的一页
+    expect(deleteManySpy.mock.calls[0][0]).toHaveLength(120);
+
+    deleteManySpy.mockRestore();
+  });
+
+  it("needs no extra acknowledgement when every target is listed", async () => {
+    renderPage();
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Alpha Session" }),
+      ).toBeInTheDocument(),
+    );
+
+    await switchToGroupedView();
+    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
+    openBatchDeleteDialog();
+
+    const dialog = screen.getByTestId("confirm-dialog");
+    // 能逐条列出（≤50 条）时不需要额外勾选，直接可确认
+    expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+    ).toBeEnabled();
   });
 
   it("does not expose a resume command action", async () => {
@@ -931,6 +1132,52 @@ describe("SessionManagerPage", () => {
     ).not.toBeInTheDocument();
   });
 
+  /**
+   * 缩略导航「压根不出来」的回归。
+   *
+   * 显示条件原先依赖 `scrollHeight / clientHeight` 的布局测量，同一个会话会随窗口
+   * 高度、分栏宽度与测量时机时而出现、时而消失；后来换成正文字数门槛，很短的单轮
+   * 会话又永远不出现。现在只要求「有用户提问」——这两条用例把两个方向都钉住：单轮
+   * 长正文要出现，单轮短正文同样要出现。
+   */
+  it("shows the turn navigator for a long single-question session", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "long-1",
+          title: "Long Answer",
+          sourcePath: "/mock/long.jsonl",
+          lastActiveAt: 10,
+        },
+      ],
+      {
+        "codex:/mock/long.jsonl": [
+          { role: "user", content: "只有一个问题", ts: 10 },
+          { role: "assistant", content: "长回答".repeat(1200), ts: 20 },
+        ],
+      },
+    );
+    renderPage();
+
+    await screen.findByRole("heading", { name: "Long Answer" });
+    // 导航条依赖正文，等它真正渲染出来再断言
+    expect(
+      await screen.findByRole("button", { name: /跳转到第 1 个用户问题/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the turn navigator for a short single-question session too", async () => {
+    renderPage();
+
+    await screen.findByRole("heading", { name: "Alpha Session" });
+    // 一屏能看完的会话同样要有导航条：用户不知道背后有没有长度门槛，
+    // 看不到就只会认为这个功能坏了
+    expect(
+      await screen.findByRole("button", { name: /跳转到第 1 个用户问题/ }),
+    ).toBeInTheDocument();
+  });
+
   it("labels archived sessions", async () => {
     setSessionFixtures(
       [
@@ -948,5 +1195,254 @@ describe("SessionManagerPage", () => {
     renderPage();
     await screen.findByRole("heading", { name: "Archived Session" });
     expect(screen.getAllByText("已归档").length).toBeGreaterThan(0);
+  });
+
+  /**
+   * DeepSeek Harness 会把子 Agent 会话生成成独立会话。它们在列表里只显示为「残留」，
+   * 用户既认不出归属、也没法先逐个删干净——父会话因此永远删不掉。
+   *
+   * 这里覆盖两件事：列表里说清归属；删除父会话时一次性带上整条子会话链。
+   */
+  describe("subagent lineage", () => {
+    const lineage = (): SessionMeta[] => [
+      {
+        providerId: "deepseek",
+        sessionId: "ds-parent",
+        title: "Parent Chat",
+        projectDir: "/mock/deepseek",
+        lastActiveAt: 50,
+        sourcePath: "/mock/deepseek/parent/session.v3.jsonl",
+      },
+      {
+        providerId: "deepseek",
+        sessionId: "ds-child-a",
+        title: "Sub Task A",
+        residual: true,
+        parentSessionId: "ds-parent",
+        projectDir: "/mock/deepseek",
+        lastActiveAt: 40,
+        sourcePath: "/mock/deepseek/child-a/session.v3.jsonl",
+      },
+      {
+        providerId: "deepseek",
+        sessionId: "ds-child-b",
+        title: "Sub Task B",
+        residual: true,
+        parentSessionId: "ds-parent",
+        projectDir: "/mock/deepseek",
+        lastActiveAt: 30,
+        sourcePath: "/mock/deepseek/child-b/session.v3.jsonl",
+      },
+      {
+        providerId: "deepseek",
+        sessionId: "ds-grandchild",
+        title: "Nested Helper",
+        residual: true,
+        parentSessionId: "ds-child-a",
+        projectDir: "/mock/deepseek",
+        lastActiveAt: 20,
+        sourcePath: "/mock/deepseek/grandchild/session.v3.jsonl",
+      },
+    ];
+
+    beforeEach(() => {
+      setSessionFixtures(lineage(), {
+        "deepseek:/mock/deepseek/parent/session.v3.jsonl": [
+          { role: "user", content: "parent", ts: 50 },
+        ],
+      });
+    });
+
+    const renderLineage = async () => {
+      renderPage("deepseek");
+      await screen.findByRole("heading", { name: "Parent Chat" });
+    };
+
+    it("names the parent of a subagent session instead of only marking it residual", async () => {
+      await renderLineage();
+
+      // 两条子会话属于父会话；孙会话属于子会话，各自显示各自的上层。
+      expect(screen.getAllByText("「Parent Chat」的子会话")).toHaveLength(2);
+      expect(screen.getByText("「Sub Task A」的子会话")).toBeInTheDocument();
+      // 归属比「残留」有信息量，两者不同时堆在行里
+      expect(screen.queryByText("残留")).not.toBeInTheDocument();
+    });
+
+    it("explains the lineage and the one-click cleanup on hover", async () => {
+      await renderLineage();
+
+      await userEvent.hover(screen.getAllByText("「Parent Chat」的子会话")[0]);
+
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("「Parent Chat」的子 Agent 会话");
+      expect(tooltip).toHaveTextContent("同时删除子会话");
+    });
+
+    it("deletes the parent together with every descendant in one request", async () => {
+      const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+      const deleteSpy = vi.spyOn(sessionsApi, "delete");
+      await renderLineage();
+
+      // 按钮自己就把实际范围说清楚，不再只是「仅删除此会话」
+      fireEvent.click(
+        screen.getByRole("button", { name: /删除此会话及其 3 个子会话/i }),
+      );
+
+      const dialog = screen.getByTestId("confirm-dialog");
+      expect(within(dialog).getByText(/及其 3 个子会话/)).toBeInTheDocument();
+      // 逐条列出实际删除范围，并标出每条子会话的归属（含隔代的孙会话）
+      expect(
+        within(dialog).getAllByText(/子会话 · 属于「Parent Chat」/),
+      ).toHaveLength(2);
+      expect(
+        within(dialog).getAllByText(/子会话 · 属于「Sub Task A」/),
+      ).toHaveLength(1);
+      expect(within(dialog).getByText("Nested Helper")).toBeInTheDocument();
+
+      const cascade = within(dialog).getByRole("checkbox", {
+        name: /同时删除「Parent Chat」的 3 个子会话/,
+      });
+      expect(cascade).toBeChecked();
+
+      // 单条父会话带子会话时，确认按钮自己就说明范围
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: /删除会话及其子会话/i }),
+      );
+
+      await waitFor(() => expect(deleteManySpy).toHaveBeenCalled());
+      expect(
+        deleteManySpy.mock.calls[0][0].map((item) => item.sessionId).sort(),
+      ).toEqual(["ds-child-a", "ds-child-b", "ds-grandchild", "ds-parent"]);
+      // 不能再退化成「只删父会话、留下孤儿子会话」
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      deleteManySpy.mockRestore();
+      deleteSpy.mockRestore();
+    });
+
+    it("can still delete only the parent when the cascade box is cleared", async () => {
+      const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+      const deleteSpy = vi.spyOn(sessionsApi, "delete");
+      await renderLineage();
+
+      fireEvent.click(
+        screen.getByRole("button", { name: /删除此会话及其 3 个子会话/i }),
+      );
+      const dialog = screen.getByTestId("confirm-dialog");
+      fireEvent.click(
+        within(dialog).getByRole("checkbox", {
+          name: /同时删除「Parent Chat」的 3 个子会话/,
+        }),
+      );
+
+      expect(
+        within(dialog).getByRole("checkbox", {
+          name: /同时删除「Parent Chat」的 3 个子会话/,
+        }),
+      ).not.toBeChecked();
+      // 范围缩回一条后，确认框自己也退回单条语义
+      expect(
+        within(dialog).getByRole("button", { name: /^删除会话$/ }),
+      ).toBeInTheDocument();
+
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: /^删除会话$/ }),
+      );
+
+      await waitFor(() => expect(deleteSpy).toHaveBeenCalled());
+      expect(deleteSpy.mock.calls[0][0]).toMatchObject({
+        sessionId: "ds-parent",
+        sourcePath: "/mock/deepseek/parent/session.v3.jsonl",
+      });
+      expect(deleteManySpy).not.toHaveBeenCalled();
+
+      deleteManySpy.mockRestore();
+      deleteSpy.mockRestore();
+    });
+
+    it("offers no cascade when the selected session has no children", async () => {
+      await renderLineage();
+
+      fireEvent.click(screen.getByText("Nested Helper"));
+
+      const [deleteButton] = screen.getAllByRole("button", {
+        name: /仅删除此会话/i,
+      });
+      fireEvent.click(deleteButton);
+
+      const dialog = screen.getByTestId("confirm-dialog");
+      expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(within(dialog).getByText(/Nested Helper/)).toBeInTheDocument();
+    });
+
+    it("adds the children of every selected root when several parents are picked", async () => {
+      const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+      await renderLineage();
+
+      await switchToGroupedView();
+      fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+
+      // 显式勾选父会话与孙会话两条：子会话 A/B 只作为「父会话的后代」被带上
+      const checkRow = (title: string) => {
+        // 详情面板的标题与列表行可能同名，只取列表行里的那一份
+        const rows = screen
+          .getAllByText(title)
+          .map((node) => node.closest(".asm-session-item"))
+          .filter((node): node is HTMLElement => node !== null);
+        expect(rows).toHaveLength(1);
+        fireEvent.click(
+          within(rows[0]).getByRole("checkbox", { name: "选择会话" }),
+        );
+      };
+      checkRow("Parent Chat");
+      checkRow("Nested Helper");
+
+      openBatchDeleteDialog(2);
+      const dialog = screen.getByTestId("confirm-dialog");
+      expect(
+        within(dialog).getByText(/其中 2 条是随父会话一并删除的子会话/),
+      ).toBeInTheDocument();
+      const cascade = within(dialog).getByRole("checkbox", {
+        name: /同时删除这 2 条会话下的 2 个子会话/,
+      });
+      expect(cascade).toBeChecked();
+
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      );
+
+      await waitFor(() => expect(deleteManySpy).toHaveBeenCalled());
+      expect(
+        deleteManySpy.mock.calls[0][0].map((item) => item.sessionId).sort(),
+      ).toEqual(["ds-child-a", "ds-child-b", "ds-grandchild", "ds-parent"]);
+
+      deleteManySpy.mockRestore();
+    });
+
+    it("skips the cascade prompt when the whole tree is already selected", async () => {
+      const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+      await renderLineage();
+
+      await switchToGroupedView();
+      fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+      fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
+
+      openBatchDeleteDialog(4);
+      const dialog = screen.getByTestId("confirm-dialog");
+      // 父子都在选择集里：没有额外的后代可补，勾选项不该出现
+      expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(
+        within(dialog).getByText(/已选中的 4 个本地会话记录/),
+      ).toBeInTheDocument();
+
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      );
+
+      await waitFor(() => expect(deleteManySpy).toHaveBeenCalled());
+      expect(deleteManySpy.mock.calls[0][0]).toHaveLength(4);
+
+      deleteManySpy.mockRestore();
+    });
   });
 });

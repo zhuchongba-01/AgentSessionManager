@@ -30,6 +30,10 @@ jobs:
         run: pnpm version:check
       - name: Test release version tooling
         run: pnpm test:version
+      - name: Check inline-script CSP hashes
+        run: pnpm csp:check
+      - name: Test CSP hash tooling
+        run: pnpm test:csp
       - name: Check TypeScript
         run: pnpm typecheck
       - name: Check frontend formatting

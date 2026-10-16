@@ -383,6 +383,7 @@ mod tests {
             provider_id: "codex".into(),
             session_id: "s1".into(),
             residual: false,
+            parent_session_id: None,
             archived: false,
             cleanup_pending: false,
             sidebar_section: None,

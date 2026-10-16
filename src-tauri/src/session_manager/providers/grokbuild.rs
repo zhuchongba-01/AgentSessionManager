@@ -365,6 +365,10 @@ fn parse_summary_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         provider_id: "grokbuild".to_string(),
         session_id: session_id.clone(),
         residual: is_subagent,
+        parent_session_id: summary
+            .parent_session_id
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
         archived: false,
         cleanup_pending: false,
         sidebar_section: None,
@@ -480,6 +484,20 @@ mod tests {
             .expect("session meta");
         assert!(session.residual);
         assert!(session.resume_command.is_none());
+        assert_eq!(session.parent_session_id.as_deref(), Some("session-parent"));
+    }
+
+    #[test]
+    fn a_root_summary_reports_no_parent() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let parent = write_summary(&root, "project", "session-parent", None, None);
+
+        let session = parse_discovered_summary(&parent)
+            .expect("parse parent summary")
+            .expect("session meta");
+        assert_eq!(session.parent_session_id, None);
+        assert!(!session.residual);
     }
 
     #[test]

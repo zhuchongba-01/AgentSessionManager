@@ -1,6 +1,11 @@
 import { http, HttpResponse } from "msw";
 import { APP_VERSION } from "@/lib/githubRelease";
-import { deleteSession, getSessionMessages, listSessions } from "./state";
+import {
+  contentIdentityHex,
+  deleteSession,
+  getSessionMessages,
+  listSessions,
+} from "./state";
 
 const TAURI_ENDPOINT = "http://tauri.local";
 const GITHUB_RELEASE_ENDPOINT =
@@ -26,16 +31,24 @@ export const handlers = [
     }>(request);
     return success(getSessionMessages(providerId, sourcePath));
   }),
-  // 与后端一致：长度对不上就拒绝返回，避免把另一条消息的正文当成这一条
+  // 与后端一致：长度或身份摘要对不上就拒绝返回，避免把另一条消息的正文当成这一条
   http.post(`${TAURI_ENDPOINT}/get_message_content`, async ({ request }) => {
-    const { providerId, sourcePath, index, expectedChars } = await readJson<{
-      providerId: string;
-      sourcePath: string;
-      index: number;
-      expectedChars: number;
-    }>(request);
+    const { providerId, sourcePath, index, expectedChars, expectedIdentity } =
+      await readJson<{
+        providerId: string;
+        sourcePath: string;
+        index: number;
+        expectedChars: number;
+        expectedIdentity?: string;
+      }>(request);
     const message = getSessionMessages(providerId, sourcePath)[index];
     if (!message || message.content.length !== expectedChars) {
+      return new HttpResponse("会话已更新，请重新打开", { status: 400 });
+    }
+    if (
+      expectedIdentity !== undefined &&
+      contentIdentityHex(message) !== expectedIdentity
+    ) {
       return new HttpResponse("会话已更新，请重新打开", { status: 400 });
     }
     return success(message.content);

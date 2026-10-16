@@ -14,6 +14,7 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 展开 `~` / `~/` / `~\` 前缀；其余原样保留。
 fn resolve_user_path(raw: &str) -> PathBuf {
     if raw == "~" {
         return home_dir();
@@ -24,18 +25,27 @@ fn resolve_user_path(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-pub fn claude_config_dir() -> PathBuf {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
+/// 读取一个目录类环境变量；未设置（或为空）时返回 `None`。
+///
+/// 与 `PI_CODING_AGENT_DIR` 保持一致地展开 `~` 前缀：同一个应用里不该出现
+/// 「有的变量认 `~`、有的把 `~` 当字面目录名」这种差别。
+///
+/// 注意：这里不校验绝对性。相对值只能相对**进程 cwd** 解析，而 GUI 进程的 cwd 由
+/// 启动方式决定，因此相对值在浏览时可能扫到意外目录。破坏性的删除路径另有
+/// `provider_roots` 拒绝非绝对根（见 `session_manager::provider_roots`），
+/// 保证「看到意外目录」不会升级成「删掉意外目录」。
+fn configured_dir(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable)
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".claude"))
+        .map(|value| resolve_user_path(value.to_string_lossy().as_ref()))
+}
+
+pub fn claude_config_dir() -> PathBuf {
+    configured_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home_dir().join(".claude"))
 }
 
 pub fn codex_config_dir() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".codex"))
+    configured_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex"))
 }
 
 pub fn read_codex_config_text() -> Result<String, String> {
@@ -76,10 +86,7 @@ pub fn codex_state_db_paths(config_dir: &Path, config_text: &str) -> Vec<PathBuf
 }
 
 pub fn grok_config_dir() -> PathBuf {
-    std::env::var_os("GROK_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".grok"))
+    configured_dir("GROK_CONFIG_DIR").unwrap_or_else(|| home_dir().join(".grok"))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -89,9 +96,7 @@ pub struct PiNativeDefaults {
 }
 
 pub fn pi_agent_dir() -> Result<PathBuf, String> {
-    let path = std::env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    let path = configured_dir("PI_CODING_AGENT_DIR")
         .unwrap_or_else(|| home_dir().join(".pi").join("agent"));
     if path.is_absolute() {
         Ok(path)

@@ -16,6 +16,13 @@ pub struct SessionMeta {
     pub provider_id: String,
     pub session_id: String,
     pub residual: bool,
+    /// 父会话的原生 ID（子 Agent 会话、分支会话）。
+    ///
+    /// 界面用它显示归属（「某某会话的子会话」），删除父会话时也用它把整条子会话链
+    /// 一次性带上；父会话本身的这一项为 `None`。缺失的父会话不算线索：条目只是
+    /// 展示为孤儿，删除依旧由各 provider 的预检决定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
@@ -240,46 +247,82 @@ fn transcript_cache_sources(provider_id: &str, path: &Path) -> Option<cache::Tra
     }
 }
 
-/// 该会话的正文是否已接入解析缓存。
+/// `source_path` 里 SQLite 引用的种类。
 ///
-/// 两处用途必须保持一致：`load_transcript` 据此决定是否缓存，前端下发形态据此决定能否
-/// 只发预览——只有「取全文不必重新解析整个会话」的会话才允许截断。
-pub fn transcript_cache_covered(provider_id: &str, source_path: &str) -> bool {
-    match provider_id {
-        "claude" | "deepseek" | "grokbuild" | "pi" | "codex" => true,
-        // 正文都在库里；旧版消息目录形态不接（见 transcript_cache_sources）
-        "opencode" => source_path.starts_with("sqlite:"),
-        "zcode" => source_path.starts_with("sqlite-zcode:"),
-        _ => false,
+/// `provider_id` 与 `source_path` 都来自前端且互不绑定，所以判定必须成对进行：
+/// 只按前缀分发时，`providerId="opencode"` 配一个 `sqlite-zcode:` 来源也会被当成
+/// OpenCode 的库去解析。这里先分类、再核对 provider 是否为该类的所有者。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteSourceKind {
+    OpenCode,
+    ZCode,
+}
+
+fn sqlite_source_kind(source_path: &str) -> Option<SqliteSourceKind> {
+    if source_path.starts_with("sqlite-zcode:") {
+        Some(SqliteSourceKind::ZCode)
+    } else if source_path.starts_with("sqlite:") {
+        Some(SqliteSourceKind::OpenCode)
+    } else {
+        None
     }
+}
+
+/// 该 provider 拥有的 SQLite 引用种类。
+fn sqlite_source_owner(provider_id: &str) -> Option<SqliteSourceKind> {
+    match provider_id {
+        "opencode" => Some(SqliteSourceKind::OpenCode),
+        "zcode" => Some(SqliteSourceKind::ZCode),
+        _ => None,
+    }
+}
+
+/// 校验 `source_path` 的 SQLite 引用确实属于 `provider_id`。
+///
+/// 非 SQLite 来源（普通文件路径）直接放行，由各自的文件路径校验处理。
+fn checked_sqlite_source(
+    provider_id: &str,
+    source_path: &str,
+) -> Result<Option<SqliteSourceKind>, String> {
+    let Some(kind) = sqlite_source_kind(source_path) else {
+        return Ok(None);
+    };
+    if sqlite_source_owner(provider_id) != Some(kind) {
+        return Err(format!(
+            "会话来源与 Agent 不匹配，已拒绝读取（{provider_id}）：{source_path}"
+        ));
+    }
+    Ok(Some(kind))
 }
 
 /// 读取会话正文：校验来源后按指纹复用上次解析结果。
 ///
-/// 未接入缓存的会话与解析失败一样直接读取，不会返回过期正文。
+/// 未接入缓存的会话与解析失败一样直接读取，不会返回过期正文。返回的
+/// [`cache::Transcript::cacheable`] 如实反映这次解析是否进了缓存，下发形态据此
+/// 决定能否只发预览——不再需要第二处按 provider/source_path 推断「可不可缓存」。
 pub fn load_transcript(
     provider_id: &str,
     source_path: &str,
 ) -> Result<Arc<cache::Transcript>, String> {
-    if provider_id == "opencode" && source_path.starts_with("sqlite:") {
-        return match opencode::sqlite_transcript_sources(source_path) {
-            Some(sources) => cached_transcript(provider_id, source_path, sources, || {
-                opencode::load_messages_sqlite(source_path)
-            }),
-            // 引用无法解析：不猜指纹，交给读取器报错
-            None => Ok(Arc::new(cache::Transcript::new(
-                opencode::load_messages_sqlite(source_path)?,
-            ))),
-        };
-    }
-    if provider_id == "zcode" && source_path.starts_with("sqlite-zcode:") {
-        return match zcode::transcript_sources(source_path) {
-            Some(sources) => cached_transcript(provider_id, source_path, sources, || {
-                zcode::load_messages(source_path)
-            }),
-            None => Ok(Arc::new(cache::Transcript::new(zcode::load_messages(
-                source_path,
-            )?))),
+    if let Some(kind) = checked_sqlite_source(provider_id, source_path)? {
+        return match kind {
+            SqliteSourceKind::OpenCode => match opencode::sqlite_transcript_sources(source_path) {
+                Some(sources) => cached_transcript(provider_id, source_path, sources, || {
+                    opencode::load_messages_sqlite(source_path)
+                }),
+                // 引用无法解析：不猜指纹，交给读取器报错
+                None => Ok(Arc::new(cache::Transcript::new(
+                    opencode::load_messages_sqlite(source_path)?,
+                ))),
+            },
+            SqliteSourceKind::ZCode => match zcode::transcript_sources(source_path) {
+                Some(sources) => cached_transcript(provider_id, source_path, sources, || {
+                    zcode::load_messages(source_path)
+                }),
+                None => Ok(Arc::new(cache::Transcript::new(zcode::load_messages(
+                    source_path,
+                )?))),
+            },
         };
     }
 
@@ -310,7 +353,7 @@ where
             .get_or_load(
                 cache::cache_key(provider_id, source_path, &sources),
                 fingerprint,
-                || load().map(cache::Transcript::new),
+                || load().map(|messages| cache::Transcript::new(messages).cached()),
             )
             .map(|(transcript, _cached)| transcript),
         // 指纹里的文件都读不到（库被移走、权限不足）：交给读取器报真正的错误
@@ -354,14 +397,34 @@ pub fn delete_session_checked(
     reply
 }
 
+/// 清理计划里的这一条目是否已经不需要（也无法）预检。
+///
+/// 持久化的清理计划在原样重试时，可能包含**已经被删掉**的条目：主会话删除成功、
+/// 但同 ID 的历史副本清理失败时，journal 会保留整个原始计划，好让重试可以把剩余
+/// 副本收尾。对「正文就是一个文件」的 provider（Codex 的 rollout、Pi 的 jsonl、
+/// Grok Build 的 summary.json），这些条目已经没有可校验的内容；再去读一次已经消失
+/// 的文件只会让每次重试都卡在同一个错误上，而磁盘上确实还有副本等着清理。
+///
+/// 只对文件型 provider 成立：`sqlite:` / `sqlite-zcode:` 的 `source_path` 是引用
+/// 而不是路径，把它当路径判断存在性会得到 false，从而错误地跳过真正需要的预检。
+/// 这些 provider 的预检本身要能处理缺失源（DeepSeek 会清理投影缓存；OpenCode 的
+/// `checked_storage_child` 对缺失目标也成立），所以不在这里按存在性跳过。
+fn plan_entry_skips_preflight(item: &SessionMeta) -> Result<bool, String> {
+    if !matches!(item.provider_id.as_str(), "codex" | "pi" | "grokbuild") {
+        return Ok(false);
+    }
+    let path = item.source_path.as_deref().ok_or("缺少会话路径")?;
+    Ok(!Path::new(path).exists())
+}
+
 fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
     // Validate every Codex transcript in the persisted plan using the exact
     // canonical paths later used by deletion, before any index or journal write.
     for item in plan.iter().filter(|item| item.provider_id == "codex") {
-        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
-        if !path.exists() {
+        if plan_entry_skips_preflight(item)? {
             continue; // legitimate retry after the transcript was already removed
         }
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
         let canonical = canonicalize_existing_path(path, "session source")?;
         let root = provider_roots("codex")?
             .into_iter()
@@ -386,6 +449,9 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
         )?;
     }
     for item in plan.iter().filter(|item| item.provider_id == "pi") {
+        if plan_entry_skips_preflight(item)? {
+            continue;
+        }
         let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
         let root = provider_roots("pi")?
             .into_iter()
@@ -400,10 +466,11 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
         )?;
     }
     for item in plan.iter().filter(|item| item.provider_id == "grokbuild") {
-        grokbuild::preflight_delete(
-            Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?),
-            &item.session_id,
-        )?;
+        if plan_entry_skips_preflight(item)? {
+            continue;
+        }
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        grokbuild::preflight_delete(path, &item.session_id)?;
     }
     Ok(())
 }
@@ -458,6 +525,10 @@ fn delete_session_in_snapshot(
     {
         codex::cleanup_after_delete(session_id, None, false)?;
     }
+    // DeepSeek is deliberately excluded: its provider is the authority for a
+    // retry whose transcript is already gone but whose projection cache still
+    // needs work (see `delete_session_with_roots`), so it must reach
+    // `delete_session_record` even when `source_path` no longer exists.
     let missing_file = matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
         && !Path::new(source_path).exists();
     let deleted = if missing_file {
@@ -691,6 +762,20 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
         _ => return Err(format!("Unsupported provider: {provider_id}")),
     };
 
+    // 这些根同时是删除的白名单。其中的路径可能来自 `CODEX_HOME` /
+    // `CLAUDE_CONFIG_DIR` / `GROK_CONFIG_DIR` / `XDG_DATA_HOME`，而它们不像
+    // `PI_CODING_AGENT_DIR` 那样自带绝对路径校验：相对值会相对**进程 cwd** 解析，
+    // 由启动方式（快捷方式、服务、终端）决定。浏览时扫到意外目录只是显示问题，
+    // 删除时就会变成删错目录，所以这里拒绝相对根并让用户改用绝对路径。
+    for root in &roots {
+        if !root.is_absolute() {
+            return Err(format!(
+                "{provider_id} 的会话存储路径不是绝对路径：{}。请把对应环境变量改为绝对路径后重试。",
+                root.display()
+            ));
+        }
+    }
+
     Ok(roots)
 }
 
@@ -746,6 +831,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
 
     fn write_codex_session(path: &Path, session_id: &str) {
@@ -759,42 +845,133 @@ mod tests {
         .expect("write source");
     }
 
-    /// 是否已接正文缓存同时决定两件事：`load_transcript` 是否缓存，以及下发时能否只发
-    /// 预览（见 `wire::truncation_allowed`）。这条判定必须与 `transcript_cache_sources`
-    /// 实际覆盖的形态一致。
+    /// 需要改 `CLAUDE_CONFIG_DIR` 的测试共用一把锁，避免互相把目录指走。
+    fn claude_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// 走**真实**的批量删除入口 `delete_sessions`（不是逐条调 provider），
+    /// 用一批 Claude 会话确认：选了几条就删掉几条。
+    ///
+    /// 这条测试是「多选只删掉一个」的直接对照：请求、扫描快照、逐条执行、
+    /// 结果汇总全部走生产路径。
     #[test]
-    fn transcript_cache_coverage_matches_the_wired_providers() {
-        let file = "/sessions/pi/session.jsonl";
-        for provider in ["claude", "codex", "deepseek", "grokbuild", "pi"] {
-            assert!(transcript_cache_covered(provider, file), "{provider}");
+    #[allow(deprecated)] // set_var/remove_var 自 Rust 1.81 起弃用；由互斥锁串行化
+    fn delete_sessions_removes_every_requested_session() {
+        let _guard = claude_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let projects = temp.path().join("projects").join("sandbox-project");
+        std::fs::create_dir_all(&projects).expect("create projects dir");
+
+        let original = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", temp.path());
+
+        let mut requests = Vec::new();
+        let mut files = Vec::new();
+        for index in 0..5 {
+            let session_id = format!("sandbox-{index}");
+            let path = projects.join(format!("{session_id}.jsonl"));
+            std::fs::write(
+                &path,
+                concat!(
+                    "{\"sessionId\":\"__ID__\",\"cwd\":\"/sandbox\",\"timestamp\":\"2026-03-06T10:00:00Z\"}\n",
+                    "{\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"timestamp\":\"2026-03-06T10:01:00Z\"}\n"
+                )
+                .replace("__ID__", &session_id),
+            )
+            .expect("write session");
+            requests.push(DeleteSessionRequest {
+                provider_id: "claude".to_string(),
+                session_id: session_id.clone(),
+                source_path: path.to_string_lossy().to_string(),
+                include_project: false,
+            });
+            files.push(path);
         }
-        // 单文件源可以直接枚举；Codex 的正文源要先把分页链解析出来（链读不出来时
-        // 正文本身也读不出来，不存在「截断了却取不回全文」的情形）
+
+        // 扫描必须能看到这 5 条，否则 delete_sessions 会以「会话已变化」拒绝
+        let scanned = scan_sessions()
+            .into_iter()
+            .filter(|item| item.provider_id == "claude")
+            .count();
+        assert!(
+            scanned >= requests.len(),
+            "扫描应发现全部 {0} 条沙箱会话，实际 {scanned}",
+            requests.len()
+        );
+
+        let outcomes = delete_sessions(&requests);
+
+        let failures = outcomes
+            .iter()
+            .filter(|outcome| !outcome.success)
+            .map(|outcome| format!("{}: {:?}", outcome.session_id, outcome.error))
+            .collect::<Vec<_>>();
+        assert!(failures.is_empty(), "批量删除不应有失败项：{failures:?}");
+        assert_eq!(outcomes.len(), requests.len(), "每条请求都要有结果");
+
+        let remaining = files.iter().filter(|path| path.exists()).count();
+        assert_eq!(
+            remaining,
+            0,
+            "选中的 {0} 条都必须被删除，实际剩下 {remaining} 条",
+            requests.len()
+        );
+
+        if let Some(value) = original {
+            std::env::set_var("CLAUDE_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+    }
+
+    /// 文件型 provider 的正文源可以直接枚举；Codex 的正文源要先把分页链解析出来
+    /// （链读不出来时正文本身也读不出来，那种情况下 `Transcript::cacheable` 为 false，
+    /// 下发形态据此放弃截断）。
+    #[test]
+    fn file_backed_transcript_sources_are_enumerable() {
+        let file = "/sessions/pi/session.jsonl";
         for provider in ["claude", "deepseek", "grokbuild", "pi"] {
             assert!(
                 transcript_cache_sources(provider, Path::new(file)).is_some(),
                 "{provider} 的正文源必须可枚举"
             );
         }
-
-        // SQLite 形态：库路径写在 source_path 里，指纹覆盖库与 -wal
-        assert!(transcript_cache_covered(
-            "opencode",
-            "sqlite:/data/opencode.db:ses_1"
-        ));
-        assert!(transcript_cache_covered(
-            "zcode",
-            "sqlite-zcode:/data/db.sqlite:session-1"
-        ));
-
-        // OpenCode 旧版消息目录与 ZCode 的文件形态都不接入
-        assert!(!transcript_cache_covered(
-            "opencode",
-            "/data/storage/message/ses_1"
-        ));
-        assert!(!transcript_cache_covered("zcode", file));
-        assert!(!transcript_cache_covered("unknown", file));
+        // OpenCode 旧版消息目录不接入缓存
         assert!(transcript_cache_sources("opencode", Path::new(file)).is_none());
+    }
+
+    /// `provider_id` 与 `source_path` 都来自前端且互不绑定，SQLite 引用必须成对校验：
+    /// 只按前缀分发会让 `opencode` 去解析 ZCode 的库引用。
+    #[test]
+    fn sqlite_sources_must_belong_to_their_provider() {
+        let opencode_source = "sqlite:/data/opencode.db:ses_1";
+        let zcode_source = "sqlite-zcode:/data/db.sqlite:session-1";
+
+        assert_eq!(
+            sqlite_source_kind(opencode_source),
+            Some(SqliteSourceKind::OpenCode)
+        );
+        assert_eq!(
+            sqlite_source_kind(zcode_source),
+            Some(SqliteSourceKind::ZCode)
+        );
+        // `sqlite-zcode:` 不以 `sqlite:` 开头，两种引用不会互相误判
+        assert!(checked_sqlite_source("opencode", opencode_source).is_ok());
+        assert!(checked_sqlite_source("zcode", zcode_source).is_ok());
+
+        // 跨 provider 混用必须被拒绝，而不是交给 provider 内部去撞错
+        assert!(checked_sqlite_source("opencode", zcode_source).is_err());
+        assert!(checked_sqlite_source("zcode", opencode_source).is_err());
+
+        // 普通文件路径不属于 SQLite 引用，交给各自的路径校验处理
+        assert_eq!(sqlite_source_kind("/data/storage/message/ses_1"), None);
+        assert!(
+            checked_sqlite_source("opencode", "/data/storage/message/ses_1")
+                .expect("非 SQLite 来源放行")
+                .is_none()
+        );
     }
 
     fn session_meta(
@@ -807,6 +984,7 @@ mod tests {
             provider_id: provider_id.to_string(),
             session_id: session_id.to_string(),
             residual,
+            parent_session_id: None,
             archived: false,
             cleanup_pending: false,
             sidebar_section: None,
@@ -819,6 +997,89 @@ mod tests {
             source_path: Some(source_path.to_string()),
             resume_command: None,
         }
+    }
+
+    /// 重试一份持久化的清理计划时，计划里已经删掉的条目不能再拿去预检，否则
+    /// 每次重试都会卡在同一个「文件不存在」错误上，而磁盘上仍留着待清理的副本。
+    /// 这正是 Grok Build（主目录删成功、同 ID 归档副本删失败）和 Pi 的死锁成因。
+    #[test]
+    fn retry_skips_preflight_for_vanished_file_backed_sources() {
+        for provider in ["codex", "pi", "grokbuild"] {
+            let missing = session_meta(provider, "session-1", "gone.jsonl", false);
+            assert!(
+                plan_entry_skips_preflight(&missing).expect("source path"),
+                "{provider} 的已消失源必须跳过预检"
+            );
+
+            // 源还在就必须照常预检：跳过只适用于已经删掉的情况
+            let temp = tempfile::tempdir().unwrap();
+            let present_path = temp.path().join("present.jsonl");
+            std::fs::write(&present_path, "{}").unwrap();
+            let present = session_meta(
+                provider,
+                "session-1",
+                &present_path.to_string_lossy(),
+                false,
+            );
+            assert!(
+                !plan_entry_skips_preflight(&present).expect("source path"),
+                "{provider} 的现存源不能被跳过"
+            );
+        }
+    }
+
+    /// `sqlite:` / `sqlite-zcode:` 的 source_path 是引用而不是路径。把它当路径判断
+    /// 存在性会得到 false，从而错误地跳过真正需要的父子依赖预检——那是防误删的关卡。
+    #[test]
+    fn retry_never_skips_preflight_for_sqlite_references() {
+        for (provider, source) in [
+            ("opencode", "sqlite:/data/opencode.db:ses_1"),
+            ("zcode", "sqlite-zcode:/data/db.sqlite:session-1"),
+            // DeepSeek 的预检本身要处理缺失源（重试时先清投影缓存），不能跳过
+            ("deepseek", "/data/sessions/project/session.v3.jsonl"),
+        ] {
+            let item = session_meta(provider, "session-1", source, false);
+            assert!(
+                !plan_entry_skips_preflight(&item).expect("source path"),
+                "{provider} 必须交给 provider 预检，不能按路径存在性跳过"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vanished_grokbuild_primary_does_not_block_a_cleanup_retry() {
+        // 这是死锁的完整入口：journal 原样保留了「主会话 + 同 ID 归档副本」的计划，
+        // 主会话的 summary.json 已经不在了。预检必须放行，好让残留副本继续清理。
+        // 旧实现会在这里读第一个 summary.json 并报「文件不存在」，于是每次重试都
+        // 卡在同一处，磁盘上的副本永远清不掉。
+        let plan = vec![
+            session_meta(
+                "grokbuild",
+                "session-1",
+                "/nonexistent/sessions/project/session-1/summary.json",
+                false,
+            ),
+            session_meta(
+                "grokbuild",
+                "session-1",
+                "/nonexistent/archived_sessions/project/session-1/summary.json",
+                true,
+            ),
+        ];
+
+        preflight_deletion(&plan).expect("已消失的主会话不能让整个重试永久失败");
+    }
+
+    #[test]
+    fn a_vanished_pi_session_does_not_block_a_cleanup_retry() {
+        let plan = vec![session_meta(
+            "pi",
+            "session-1",
+            "/nonexistent/pi/sessions/project/session-1.jsonl",
+            false,
+        )];
+
+        preflight_deletion(&plan).expect("Pi 的已消失源同样必须放行重试");
     }
 
     #[test]
@@ -890,6 +1151,75 @@ mod tests {
 
         assert!(deleted);
         assert!(!source.exists());
+    }
+
+    /// 批量删除把请求按「子先父后」重排，但**绝不能因此丢掉任何一条**：
+    /// 排序函数任何一处返回子集，用户就会看到「选了 N 条只删掉一部分」。
+    /// 这里用一个超过一页（100 条）的混合批次固定住「结果是全排列」。
+    #[test]
+    fn batch_ordering_is_a_permutation_of_every_request() {
+        let providers = [
+            "codex",
+            "claude",
+            "opencode",
+            "zcode",
+            "grokbuild",
+            "pi",
+            "deepseek",
+        ];
+        let requests = (0..150)
+            .map(|index| DeleteSessionRequest {
+                provider_id: providers[index % providers.len()].to_string(),
+                session_id: format!("session-{index}"),
+                // 不存在的路径：各 provider 的排序会退化成「保持原序」，
+                // 这正是要固定住的保底行为
+                source_path: format!("/nonexistent/{index}.jsonl"),
+                include_project: false,
+            })
+            .collect::<Vec<_>>();
+
+        let order = codex::deletion_order(&requests);
+        let order = deepseek::deletion_order(&requests, &order);
+        let order = zcode::deletion_order(&requests, &order);
+        let order = pi::deletion_order(&requests, &order);
+        let order = opencode::deletion_order(&requests, &order);
+        let order = grokbuild::deletion_order(&requests, &order);
+
+        assert_eq!(
+            order.len(),
+            requests.len(),
+            "重排后的条数必须与请求一致，否则部分会话会被静默跳过"
+        );
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..requests.len()).collect::<Vec<_>>(),
+            "结果必须是 0..len 的全排列：不能重复、不能遗漏"
+        );
+    }
+
+    /// 批量删除逐条执行；每条都必须独立成功，不受前一条的影响。
+    #[test]
+    fn deleting_many_codex_sessions_in_a_row_succeeds_for_every_one() {
+        let root = tempdir().expect("tempdir");
+        let sessions = (0..120)
+            .map(|index| {
+                let path = root.path().join(format!("session-{index}.jsonl"));
+                write_codex_session(&path, &format!("session-{index}"));
+                (format!("session-{index}"), path)
+            })
+            .collect::<Vec<_>>();
+
+        for (session_id, path) in &sessions {
+            let deleted =
+                delete_session_with_roots("codex", session_id, path, &[root.path().to_path_buf()])
+                    .unwrap_or_else(|error| panic!("删除 {session_id} 失败：{error}"));
+            assert!(deleted, "{session_id} 必须被删除");
+        }
+
+        let remaining = sessions.iter().filter(|(_, path)| path.exists()).count();
+        assert_eq!(remaining, 0, "逐条删除后不应留下任何会话文件");
     }
 
     #[test]

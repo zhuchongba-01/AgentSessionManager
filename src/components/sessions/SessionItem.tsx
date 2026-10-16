@@ -23,6 +23,8 @@ interface SessionItemProps {
   selectionMode: boolean;
   isChecked: boolean;
   isCheckDisabled?: boolean;
+  /** 父会话显示名，由列表层解析后传入（见 `resolveParentLabel`） */
+  parentLabel?: string;
   onSelect: (key: string) => void;
   onToggleChecked: (checked: boolean) => void;
 }
@@ -33,6 +35,7 @@ export function SessionItem({
   selectionMode,
   isChecked,
   isCheckDisabled = false,
+  parentLabel,
   onSelect,
   onToggleChecked,
 }: SessionItemProps) {
@@ -75,7 +78,7 @@ export function SessionItem({
           </TooltipContent>
         </Tooltip>
         <span className="asm-session-title">{title}</span>
-        <SessionStatusBadges session={session} />
+        <SessionStatusBadges session={session} parentLabel={parentLabel} />
         <span className="asm-session-time">
           {lastActive ? formatRelativeTime(lastActive, t) : t("common.unknown")}
         </span>

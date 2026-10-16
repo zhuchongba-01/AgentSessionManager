@@ -495,6 +495,9 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         provider_id: PROVIDER_ID.to_string(),
         session_id: header.id,
         residual,
+        // Pi 的 `parent_session` 是父会话**文件路径**，不是原生 ID：拿它去匹配列表
+        // 行的 `sessionId` 只会得到空结果，所以这里不提供归属线索。
+        parent_session_id: None,
         archived: false,
         cleanup_pending: false,
         sidebar_section: None,

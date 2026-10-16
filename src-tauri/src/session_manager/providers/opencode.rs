@@ -158,6 +158,7 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
             provider_id: PROVIDER_ID.to_string(),
             session_id: session_id.clone(),
             residual: parent_id.is_some(),
+            parent_session_id: parent_id.clone().filter(|value| !value.trim().is_empty()),
             archived: false,
             cleanup_pending: false,
             sidebar_section: None,
@@ -838,6 +839,11 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: parent_id.is_some(),
+        // 旧的 JSON 存储里 parentID 可能是空串：空串不是归属线索（`residual` 仍按
+        // 「有 parent 字段」判断，与既有语义保持一致）。
+        parent_session_id: parent_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned),
         archived: false,
         cleanup_pending: false,
         sidebar_section: None,
@@ -1148,6 +1154,7 @@ mod tests {
         let child = parse_session(&storage, &child_path).expect("parse child");
         assert!(child.residual);
         assert!(child.resume_command.is_none());
+        assert_eq!(child.parent_session_id.as_deref(), Some("ses_parent"));
         let error =
             preflight_json_storage(&storage, "ses_parent").expect_err("parent must be protected");
         assert!(error.contains("ses_child"));

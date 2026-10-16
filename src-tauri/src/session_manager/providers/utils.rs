@@ -49,6 +49,11 @@ pub const MAX_QUERY_ROWS: i64 = 20_000;
 const MAX_SCAN_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Validate every derived path, including symlinked ancestors of missing targets.
+///
+/// 目标本身是一个符号链接时**不解析它**：`canonicalize` 会把链接换成它的目标，
+/// 调用方随后拿到的就是目标路径，删除时删掉的是链接指向的真实数据（同根目录下的
+/// 备份/同步副本很容易形成这种链接）。这里改为只解析链接的父目录并保留链接文件名，
+/// 让删除落在链接本身上—— [`remove_path_if_exists`] 会摘掉链接而不跟随。
 pub fn checked_storage_child(root: &Path, child: &Path) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     if child
@@ -57,7 +62,33 @@ pub fn checked_storage_child(root: &Path, child: &Path) -> Result<PathBuf, Strin
     {
         return Err("Storage path contains a parent-directory component".into());
     }
-    let mut existing = child;
+
+    // 目标本身是链接：解析它的父目录，但保留链接自身的文件名
+    if std::fs::symlink_metadata(child).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        let parent = child
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or("Invalid storage path")?;
+        let name = child.file_name().ok_or("Invalid storage path")?;
+        let resolved = resolve_existing_ancestors(parent)?;
+        let resolved = resolved.join(name);
+        if resolved == root || !resolved.starts_with(&root) {
+            return Err("Derived storage path escapes its root".into());
+        }
+        return Ok(resolved);
+    }
+
+    let resolved = resolve_existing_ancestors(child)?;
+    if resolved == root || !resolved.starts_with(&root) {
+        return Err("Derived storage path escapes its root".into());
+    }
+    Ok(resolved)
+}
+
+/// Canonicalize the nearest existing ancestor of `path` and re-append the missing
+/// suffix as literal components (no symlink resolution for the missing part).
+fn resolve_existing_ancestors(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path;
     let mut suffix = Vec::new();
     loop {
         match std::fs::symlink_metadata(existing) {
@@ -78,10 +109,28 @@ pub fn checked_storage_child(root: &Path, child: &Path) -> Result<PathBuf, Strin
     for part in suffix.into_iter().rev() {
         resolved.push(part);
     }
-    if resolved == root || !resolved.starts_with(&root) {
-        return Err("Derived storage path escapes its root".into());
-    }
     Ok(resolved)
+}
+
+/// 删除一个可能存在也可能不存在的路径。
+///
+/// 对符号链接只摘掉链接本身，绝不跟随：跟随会把「删除一个链接」变成「删除链接指向
+/// 的真实数据」。`symlink_metadata` 不跟随链接，所以链接的 `is_dir()` 为假；Windows
+/// 上目录链接是 reparse point，要用 `remove_dir`（不是 `remove_dir_all`，不递归）。
+pub fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            #[cfg(windows)]
+            if path.is_dir() {
+                return std::fs::remove_dir(path);
+            }
+            std::fs::remove_file(path)
+        }
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn check_sqlite_message_budget(
@@ -458,6 +507,84 @@ mod tests {
         assert!(checked_storage_child(&root, &root).is_err());
     }
 
+    /// 目标本身是符号链接时，`checked_storage_child` 必须返回**链接自身**的路径，
+    /// 而不是它指向的目标：否则调用方随后删除的就是链接目标里的真实数据。
+    #[test]
+    fn a_symlinked_child_is_returned_as_the_link_not_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let target = root.join("real-data");
+        let link = root.join("link-to-data");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "keep").unwrap();
+
+        if create_dir_symlink(&target, &link).is_err() {
+            eprintln!("skipped: 本机不允许创建目录符号链接");
+            return;
+        }
+
+        // 返回的必须是链接路径本身（Windows 上 canonicalize 会带 \\?\ 前缀，
+        // 所以比文件名与链接属性，而不是比字面路径）
+        let resolved = checked_storage_child(&root, &link).expect("link stays inside root");
+        assert_eq!(resolved.file_name(), link.file_name());
+        assert!(
+            std::fs::symlink_metadata(&resolved)
+                .expect("resolved exists")
+                .file_type()
+                .is_symlink(),
+            "返回路径必须仍是链接；若返回目标路径，删除会落到链接目标上"
+        );
+
+        remove_path_if_exists(&resolved).expect("remove link");
+        assert!(std::fs::symlink_metadata(&link).is_err(), "链接本身被摘掉");
+        assert!(target.join("keep.txt").exists(), "链接目标的内容不能被动到");
+    }
+
+    /// 链接指向根目录之外时：路径校验按词法通过（链接自身在根内），
+    /// 但删除只摘掉链接本身，绝不跟随到根外的目标。
+    #[test]
+    fn a_symlink_pointing_outside_the_root_is_not_followed_on_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = root.join("escape");
+
+        if create_dir_symlink(&outside, &link).is_err() {
+            eprintln!("skipped: 本机不允许创建目录符号链接");
+            return;
+        }
+
+        // 链接自身在 root 内，所以路径校验通过；但删除只会摘掉链接本身
+        let resolved = checked_storage_child(&root, &link).expect("lexically inside root");
+        assert_eq!(resolved.file_name(), link.file_name());
+        remove_path_if_exists(&resolved).expect("remove link");
+        assert!(outside.exists(), "根目录之外的链接目标必须完好无损");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "链接本身应被摘掉，而不是跟随到目标"
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_dir_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+
     #[test]
     fn tail_discards_partial_utf8_before_decoding() {
         let temp = tempfile::tempdir().unwrap();
@@ -548,6 +675,7 @@ mod tests {
             provider_id: "test".to_string(),
             session_id: id.to_string(),
             residual: false,
+            parent_session_id: None,
             archived: false,
             cleanup_pending: false,
             sidebar_section: None,

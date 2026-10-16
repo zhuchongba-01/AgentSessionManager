@@ -1,17 +1,76 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildSessionTitleIndex,
+  buildUserMessageToc,
+  collectSessionDescendants,
   extractCodexPromptPreview,
   formatSessionMessagePreview,
   getProviderIconName,
   getProviderLabel,
   getVisibleSessionMessages,
   groupSessionsByProviderAndDirectory,
+  resolveParentLabel,
   shouldHideCodexMessageFromToc,
   shouldShowSessionMinimap,
 } from "@/components/sessions/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
 
 describe("session utils", () => {
+  /**
+   * 目录/缩略导航用的下标必须是「可见消息」空间的下标，而不是正文里的绝对下标。
+   *
+   * 虚拟列表的 count 就是 visibleMessages 的长度，scrollToIndex 与 SessionMinimap
+   * 都吃这个空间；一旦这里改用 wire 的 `SessionMessage.index`（那是取全文用的绝对
+   * 下标），点击缩略导航就会跳到错误的条目上——被过滤掉的注入消息越多，偏得越远。
+   */
+  it("derives TOC indexes in the visible-message space, not the transcript space", () => {
+    const messages: SessionMessage[] = [
+      // 被过滤的注入消息位于用户消息之前：绝对下标与可见下标必然错位
+      { role: "developer", content: "developer instructions", index: 0 },
+      { role: "user", content: "第一个问题", index: 1 },
+      { role: "assistant", content: "回答", index: 2 },
+      { role: "system", content: "system note", index: 3 },
+      { role: "user", content: "第二个问题", index: 4 },
+    ];
+
+    const visible = getVisibleSessionMessages(messages, true);
+    expect(visible.map((message) => message.content)).toEqual([
+      "第一个问题",
+      "回答",
+      "第二个问题",
+    ]);
+
+    const toc = buildUserMessageToc(visible, true);
+    expect(toc.map((entry) => entry.index)).toEqual([0, 2]);
+    expect(toc.map((entry) => entry.preview)).toEqual([
+      "第一个问题",
+      "第二个问题",
+    ]);
+
+    // 每个下标都必须能在「可见消息」里定位到同一条用户消息
+    for (const entry of toc) {
+      expect(visible[entry.index].role).toBe("user");
+      expect(visible[entry.index].content).toBe(entry.preview);
+    }
+    // 与正文绝对下标对照：它们确实不同（1/4 vs 0/2），这正是不能混用的原因
+    expect(toc.map((entry) => visible[entry.index].index)).toEqual([1, 4]);
+  });
+
+  it("keeps transcript order and timestamps in the TOC", () => {
+    const visible: SessionMessage[] = [
+      { role: "user", content: "a".repeat(80), ts: 10 },
+      { role: "assistant", content: "reply", ts: 20 },
+      { role: "user", content: "short", ts: 30 },
+    ];
+
+    const toc = buildUserMessageToc(visible, false);
+    expect(toc).toHaveLength(2);
+    expect(toc[0].ts).toBe(10);
+    expect(toc[1].ts).toBe(30);
+    // 预览按既有规则截断
+    expect(toc[0].preview.endsWith("...")).toBe(true);
+  });
+
   it("groups native sidebar sections without changing underlying project paths", () => {
     const sessions: SessionMeta[] = [
       {
@@ -191,11 +250,20 @@ describe("session utils", () => {
     );
   });
 
-  it("shows the session minimap for multi-turn or long conversations", () => {
-    expect(shouldShowSessionMinimap(2, 1.2)).toBe(true);
-    expect(shouldShowSessionMinimap(1, 2)).toBe(true);
-    expect(shouldShowSessionMinimap(1, 1.99)).toBe(false);
-    expect(shouldShowSessionMinimap(0, 3)).toBe(false);
+  /**
+   * 缩略导航「压根不出来」的回归。
+   *
+   * 判据曾经有两个：先是「正文是否超过两屏」的像素高度（同一个会话随窗口大小
+   * 时有时无），后来换成正文字符数门槛（很短的单轮会话永远不出现）。用户看到的
+   * 都是同一句「不显示」，所以现在只留一个判据：有没有用户提问。
+   */
+  it("shows the session minimap whenever the session has a user question", () => {
+    // 单轮短会话也要出现：用户不知道背后有没有长度门槛，只会认为功能坏了
+    expect(shouldShowSessionMinimap(1)).toBe(true);
+    expect(shouldShowSessionMinimap(2)).toBe(true);
+    expect(shouldShowSessionMinimap(50)).toBe(true);
+    // 没有提问就没有刻度
+    expect(shouldShowSessionMinimap(0)).toBe(false);
   });
 
   it("groups sessions by provider and project directory", () => {
@@ -348,5 +416,104 @@ describe("session utils", () => {
     expect(
       groups[0].directories[0].sessions.map((session) => session.sessionId),
     ).toEqual(["newest", "oldest"]);
+  });
+
+  describe("subagent lineage", () => {
+    const lineage: SessionMeta[] = [
+      {
+        providerId: "deepseek",
+        sessionId: "parent",
+        title: "Parent Chat",
+        sourcePath: "/ds/parent/session.v3.jsonl",
+        lastActiveAt: 50,
+      },
+      {
+        providerId: "deepseek",
+        sessionId: "child-a",
+        title: "Sub Task A",
+        residual: true,
+        parentSessionId: "parent",
+        sourcePath: "/ds/child-a/session.v3.jsonl",
+        lastActiveAt: 40,
+      },
+      {
+        providerId: "deepseek",
+        sessionId: "child-b",
+        title: "Sub Task B",
+        residual: true,
+        parentSessionId: "parent",
+        sourcePath: "/ds/child-b/session.v3.jsonl",
+        lastActiveAt: 30,
+      },
+      {
+        providerId: "deepseek",
+        sessionId: "grandchild",
+        title: "Nested Helper",
+        residual: true,
+        parentSessionId: "child-a",
+        sourcePath: "/ds/grandchild/session.v3.jsonl",
+        lastActiveAt: 20,
+      },
+      {
+        providerId: "opencode",
+        sessionId: "parent",
+        title: "同 ID 的另一家",
+        sourcePath: "/oc/parent",
+        lastActiveAt: 10,
+      },
+    ];
+
+    it("collects every descendant transitively and stops at the selected roots", () => {
+      const descendants = collectSessionDescendants(lineage, [lineage[0]]);
+
+      expect(descendants.map((session) => session.sessionId)).toEqual([
+        "child-a",
+        "child-b",
+        "grandchild",
+      ]);
+    });
+
+    it("still walks through an explicitly selected child to reach its own children", () => {
+      // 批量删除里同时勾选了父会话与其中一个子会话：那个子会话不出现在「后代」里
+      // （它已经是删除目标），但它自己的孩子仍然必须被带上，否则父会话删不掉。
+      const descendants = collectSessionDescendants(lineage, [
+        lineage[0],
+        lineage[1],
+      ]);
+
+      expect(descendants.map((session) => session.sessionId)).toEqual([
+        "child-b",
+        "grandchild",
+      ]);
+    });
+
+    it("does not treat a same-id session from another provider as lineage", () => {
+      const descendants = collectSessionDescendants(lineage, [lineage[4]]);
+
+      expect(descendants).toEqual([]);
+    });
+
+    it("terminates on a cyclic parent chain instead of expanding forever", () => {
+      const cyclic: SessionMeta[] = [
+        { providerId: "deepseek", sessionId: "a", parentSessionId: "b" },
+        { providerId: "deepseek", sessionId: "b", parentSessionId: "a" },
+      ];
+
+      expect(
+        collectSessionDescendants(cyclic, [cyclic[0]]).map(
+          (session) => session.sessionId,
+        ),
+      ).toEqual(["b"]);
+    });
+
+    it("names the parent from the scan and falls back to the raw id", () => {
+      const titles = buildSessionTitleIndex(lineage);
+
+      expect(resolveParentLabel(lineage[1], titles)).toBe("Parent Chat");
+      // 父会话不在扫描结果里（被隐藏或已删除）时不能退回「残留」这种看不出归属
+      // 的标签：宁可显示原生 ID 前 8 位。
+      expect(resolveParentLabel(lineage[3], new Map())).toBe("child-a");
+      expect(resolveParentLabel(lineage[0], titles)).toBeUndefined();
+    });
   });
 });

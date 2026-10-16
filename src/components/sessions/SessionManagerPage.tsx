@@ -50,6 +50,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import type { ConfirmDialogCheckbox } from "@/components/ConfirmDialog";
 import {
   Tooltip,
   TooltipContent,
@@ -73,9 +74,10 @@ import { SessionStatusBadges } from "./SessionStatusBadges";
 import { SessionMessageItem } from "./SessionMessageItem";
 import { SessionMinimap } from "./SessionMinimap";
 import {
-  extractCodexPromptPreview,
+  buildSessionTitleIndex,
+  buildUserMessageToc,
+  collectSessionDescendants,
   formatMessageTimestamp,
-  formatSessionMessagePreview,
   formatSessionTitle,
   getBaseName,
   getVisibleSessionMessages,
@@ -84,6 +86,7 @@ import {
   getSessionDirectoryGroupKey,
   getSessionKey,
   groupSessionsByProviderAndDirectory,
+  resolveParentLabel,
   shouldShowSessionMinimap,
   type SessionDirectoryGroup,
   type SessionProviderGroup,
@@ -92,6 +95,15 @@ import {
 const SESSION_LIST_VIEW_MODE_STORAGE_KEY = "agent-session-manager.listViewMode";
 const SESSION_GROUP_EXPANSION_STORAGE_KEY =
   "agent-session-manager.groupExpansionState";
+
+/**
+ * 确认框里逐条列出的目标数上限。
+ *
+ * 「全选筛选结果（含其他分页）」的选择范围可以远大于屏幕上渲染的行数（列表每页 100
+ * 条），而删除不可恢复。列出前 N 条用于核对；超出的部分不假装已核对，而是要求用户在
+ * 对话框里明确确认「已核对」才能继续——是知情确认，不是禁止。
+ */
+const CONFIRM_DETAIL_LIMIT = 50;
 
 // 自定义标题栏的窗口控制；浏览器/测试环境（无 Tauri IPC）静默忽略。
 // “关闭”与托盘行为一致：隐藏到托盘而不是退出（见 lib.rs CloseRequested）。
@@ -244,13 +256,13 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const [activeMessageIndex, setActiveMessageIndex] = useState<number | null>(
     null,
   );
-  // 迷你导航条：当前阅读位置对应的刻度
-  // 迷你导航条显示阈值：内容达到两页高才出现
-  const [minimapPages, setMinimapPages] = useState(0);
-  const tickRafRef = useRef<number | null>(null);
   const [deleteTargets, setDeleteTargets] = useState<SessionMeta[] | null>(
     null,
   );
+  // 删除确认框里的两个勾选项状态。勾选状态由页面持有（ConfirmDialog 受控），
+  // 这样每次打开删除框时都能明确地重置，而不是靠副作用猜测。
+  const [deleteWithChildren, setDeleteWithChildren] = useState(true);
+  const [deleteAcknowledged, setDeleteAcknowledged] = useState(false);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<Set<string>>(
     () => new Set(),
   );
@@ -423,6 +435,26 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   }, [filteredSessions, selectedKey]);
   const isCodexSession = selectedSession?.providerId === "codex";
 
+  /**
+   * 当前打开会话的子会话数量。
+   *
+   * 详情面板的删除按钮据此把它的实际范围说清楚：有子会话时它不再是「仅删除此会话」，
+   * 而是会连带清理整条子会话链（范围仍可在确认框里改动）。
+   */
+  const selectedSessionChildCount = useMemo(
+    () =>
+      selectedSession
+        ? collectSessionDescendants(sessions, [selectedSession]).length
+        : 0,
+    [selectedSession, sessions],
+  );
+
+  /** 父会话显示名：详情面板的归属徽标与删除按钮共用同一张表。 */
+  const sessionTitles = useMemo(
+    () => buildSessionTitleIndex(sessions),
+    [sessions],
+  );
+
   const providerFilterLabel =
     providerFilter === "all"
       ? t("sessionManager.providerFilterAll", { defaultValue: "全部 Agent" })
@@ -491,23 +523,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     });
   }, [sessions]);
 
-  // 提取用户消息用于目录
-  const userMessagesToc = useMemo(() => {
-    return visibleMessages
-      .map((msg, index) => ({ msg, index }))
-      .filter(({ msg }) => msg.role.toLowerCase() === "user")
-      .map(({ msg, index }) => {
-        const previewContent = isCodexSession
-          ? extractCodexPromptPreview(msg.content)
-          : msg.content;
-
-        return {
-          index,
-          preview: formatSessionMessagePreview(previewContent),
-          ts: msg.ts,
-        };
-      });
-  }, [isCodexSession, visibleMessages]);
+  // 提取用户消息用于目录。下标空间是「可见消息」，与虚拟列表、缩略导航一致。
+  const userMessagesToc = useMemo(
+    () => buildUserMessageToc(visibleMessages, isCodexSession),
+    [isCodexSession, visibleMessages],
+  );
   const minimapMessageIndexes = useMemo(
     () => userMessagesToc.map((item) => item.index),
     [userMessagesToc],
@@ -519,39 +539,10 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     setTimeout(() => setActiveMessageIndex(null), 2000);
   };
 
-  // 滚动或内容变化时计算页数。虚拟列表会在真实消息高度测量完成后
-  // 更新总高度，因此还要监听 virtualizedContentHeight，不能只看消息数量。
-  const syncScrollMetrics = useCallback(() => {
-    const el = scrollContainerRef.current;
-    if (!el || visibleMessages.length === 0) {
-      setMinimapPages(0);
-      return;
-    }
-    setMinimapPages(el.scrollHeight / Math.max(1, el.clientHeight));
-  }, [visibleMessages.length]);
-
-  const handleScrollMetrics = useCallback(() => {
-    if (tickRafRef.current !== null) return;
-    tickRafRef.current = requestAnimationFrame(() => {
-      tickRafRef.current = null;
-      syncScrollMetrics();
-    });
-  }, [syncScrollMetrics]);
-
-  useEffect(
-    () => () => {
-      if (tickRafRef.current !== null) cancelAnimationFrame(tickRafRef.current);
-    },
-    [],
-  );
-
-  useEffect(() => {
-    syncScrollMetrics();
-  }, [syncScrollMetrics, visibleMessages, virtualizedContentHeight]);
-
+  // 缩略导航的显示条件只看「有没有用户提问」：此前用过的像素高度、正文字数两个
+  // 判据都让用户看到「有时候有、有时候没有」——判据越多，越容易出现该出现却没出现。
   const showSessionMinimap = shouldShowSessionMinimap(
     minimapMessageIndexes.length,
-    minimapPages,
   );
 
   const handleCopy = useCallback(
@@ -598,12 +589,20 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       }
 
       const contentChars = message.contentChars ?? message.content.length;
-      const cacheKey = `${message.index}\u0000${contentChars}`;
+      // 摘要也要进缓存键：会话改写后同一下标、同一长度会换出另一条消息，
+      // 只按 (index, chars) 复用会把上一条的全文交给这一条。
+      const cacheKey = `${message.index}\u0000${contentChars}\u0000${message.contentIdentity ?? ""}`;
       const cached = fullContentCache.get(cacheKey);
       if (cached !== undefined) return cached;
 
       const request = sessionsApi
-        .getMessageContent(providerId, sourcePath, message.index, contentChars)
+        .getMessageContent(
+          providerId,
+          sourcePath,
+          message.index,
+          contentChars,
+          message.contentIdentity,
+        )
         .catch((error) => {
           // 失败不缓存；已切走的会话不再弹出迟到错误。
           fullContentCache.delete(cacheKey);
@@ -644,12 +643,34 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [t],
   );
 
-  const handleDeleteConfirm = async (_includeProject = false) => {
+  /**
+   * 待删会话的全部子会话（子 Agent 会话及其后继）。
+   *
+   * 从**完整扫描结果**里算，不用过滤后的列表：搜索/筛选把某条子会话藏起来不代表它
+   * 不存在，漏掉它只会让父会话的预检失败（后端会拒绝，不会真的留下孤儿）。
+   */
+  const deleteDescendants = useMemo(
+    () => collectSessionDescendants(sessions, deleteTargets ?? []),
+    [sessions, deleteTargets],
+  );
+
+  /** 本次确认框实际会删除的范围：勾选「同时删除子会话」时含全部后代。 */
+  const plannedDeleteTargets = useMemo(
+    () =>
+      deleteWithChildren
+        ? [...(deleteTargets ?? []), ...deleteDescendants]
+        : (deleteTargets ?? []),
+    [deleteTargets, deleteDescendants, deleteWithChildren],
+  );
+
+  const handleDeleteConfirm = async () => {
     if (!deleteTargets || deleteTargets.length === 0 || isDeleting) {
       return;
     }
 
-    const targets = deleteTargets.filter((session) => session.sourcePath);
+    const targets = plannedDeleteTargets.filter(
+      (session) => session.sourcePath,
+    );
     if (targets.length === 0) {
       setDeleteTargets(null);
       return;
@@ -670,9 +691,16 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           next.delete(getSessionKey(target));
           return next;
         });
-      } catch {
-        // 错误已由 mutation 的 onError 提示；关闭对话框避免停留在删除中状态
-        setDeleteTargets(null);
+      } catch (error) {
+        // mutation 的 onError 已提示原因；但对话框不能就此消失——否则用户
+        // 既看不到失败的是哪一条，也没有重试入口。保留对话框与选择状态。
+        toast.error(
+          t("sessionManager.deleteFailedRetry", {
+            defaultValue:
+              "删除失败，会话仍在列表中。请先退出对应 Agent 后重试。",
+            error: extractErrorMessage(error),
+          }),
+        );
       }
       return;
     }
@@ -699,9 +727,10 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         .filter((result) => !result.success)
         .map((result) =>
           [
+            `${formatSessionTitle(result)}（${getProviderLabel(result.providerId, t)}）`,
             result.error || t("common.unknown"),
             ...(result.warnings ?? []),
-          ].join("；"),
+          ].join("："),
         );
 
       const deleteWarnings = results
@@ -745,13 +774,16 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       }
 
       if (failedErrors.length > 0) {
+        // 逐条列出失败对象，而不是只报数量 + 第一条：混合结果下用户必须能
+        // 看出哪几条没删掉、为什么。
         toast.error(
           t("sessionManager.batchDeleteFailed", {
             defaultValue: "{{failed}} 个会话删除失败",
             failed: failedErrors.length,
           }),
           {
-            description: failedErrors[0],
+            description: failedErrors.slice(0, 5).join("\n"),
+            duration: 12_000,
           },
         );
       }
@@ -932,6 +964,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         selectionMode={selectionMode}
         isChecked={selectedSessionKeys.has(sessionKey)}
         isCheckDisabled={!session.sourcePath}
+        parentLabel={resolveParentLabel(session, sessionTitles)}
         onSelect={setSelectedKey}
         onToggleChecked={(checked) => toggleSessionChecked(session, checked)}
       />
@@ -1018,8 +1051,159 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
   const openBatchDeleteDialog = () => {
     if (selectedDeletableSessions.length === 0) return;
-    setDeleteTargets(selectedDeletableSessions);
+    openDeleteDialog(selectedDeletableSessions);
   };
+
+  /**
+   * 打开删除确认框。
+   *
+   * 默认勾选「同时删除子会话」：子会话在列表里往往只显示为「残留」，用户既认不出
+   * 归属、也没法先逐个删干净，逐条手删正是要修掉的麻烦。范围照旧在确认框里逐条列出，
+   * 用户随时可以取消勾选只删父会话。
+   */
+  const openDeleteDialog = (targets: SessionMeta[]) => {
+    if (targets.length === 0) return;
+    setDeleteWithChildren(true);
+    setDeleteAcknowledged(false);
+    setDeleteTargets(targets);
+  };
+
+  /**
+   * 当前是否处于「已勾选了要批量删除的会话」状态。
+   *
+   * 详情面板里的删除按钮据此切换语义：有勾选项时它就是批量删除，没有时才是
+   * 「只删右侧这一条」。两处删除入口共用同一个判断，避免用户在批量管理里多选
+   * 之后点到详情按钮、结果只删掉一条。
+   */
+  const hasBatchSelection =
+    selectionMode && selectedDeletableSessions.length > 0;
+
+  /**
+   * 确认框里逐条列出待删会话。数量超过上限时前半段逐条列出、其余只报数量并
+   * 明确标注「未列出」，避免用一份不完整的清单冒充已核对。
+   *
+   * 清单列的是**实际会删除的范围**（含勾选后一并删除的子会话），每条子会话都标出
+   * 它属于哪条父会话——这正是列表里「残留」标签看不出、用户最需要核对的信息。
+   */
+  const deleteConfirmDetails = useMemo(() => {
+    if (plannedDeleteTargets.length <= 1) return null;
+    const unlisted = Math.max(
+      0,
+      plannedDeleteTargets.length - CONFIRM_DETAIL_LIMIT,
+    );
+    return {
+      items: plannedDeleteTargets
+        .slice(0, CONFIRM_DETAIL_LIMIT)
+        .map((session) => {
+          const parent = resolveParentLabel(session, sessionTitles);
+          return {
+            title: formatSessionTitle(session),
+            meta: [
+              getProviderLabel(session.providerId, t),
+              parent
+                ? t("sessionManager.batchDeleteChildMeta", {
+                    defaultValue: "子会话 · 属于「{{parent}}」",
+                    parent,
+                  })
+                : session.sessionId,
+            ].join(" · "),
+          };
+        }),
+      unlisted,
+      overflowLabel:
+        unlisted > 0
+          ? t("sessionManager.batchDeleteDetailsOverflow", {
+              defaultValue:
+                "上面 {{listed}} 条已逐条列出；另有 {{count}} 条未列出，但同样在本次删除范围内。",
+              listed: CONFIRM_DETAIL_LIMIT,
+              count: unlisted,
+            })
+          : undefined,
+    };
+  }, [plannedDeleteTargets, sessionTitles, t]);
+
+  /** 勾选后一并删除的子会话里，有源路径可直接删除的数量。 */
+  const deletableDescendantCount = useMemo(
+    () => deleteDescendants.filter((session) => session.sourcePath).length,
+    [deleteDescendants],
+  );
+
+  /**
+   * 删除确认框里的勾选项。
+   *
+   * - 「同时删除子会话」：本次要修的核心。默认勾选，取消勾选时后端预检会拒绝删除
+   *   仍被依赖的父会话，不会留下孤儿。
+   * - 「已核对未列出的条目」：只有当清单列不全时才出现，且必须勾选才能确认。
+   */
+  const deleteDialogCheckboxes = useMemo<ConfirmDialogCheckbox[]>(() => {
+    const items: ConfirmDialogCheckbox[] = [];
+    if (deleteDescendants.length > 0) {
+      const blocked = deleteDescendants.length - deletableDescendantCount;
+      items.push({
+        id: "delete-with-children",
+        checked: deleteWithChildren,
+        onCheckedChange: setDeleteWithChildren,
+        label:
+          deleteTargets && deleteTargets.length > 1
+            ? t("sessionManager.cascadeDeleteLabelMulti", {
+                defaultValue:
+                  "同时删除这 {{roots}} 条会话下的 {{count}} 个子会话",
+                roots: deleteTargets.length,
+                count: deleteDescendants.length,
+              })
+            : t("sessionManager.cascadeDeleteLabel", {
+                defaultValue: "同时删除「{{title}}」的 {{count}} 个子会话",
+                title: deleteTargets?.[0]
+                  ? formatSessionTitle(deleteTargets[0])
+                  : "",
+                count: deleteDescendants.length,
+              }),
+        warning: [
+          t("sessionManager.cascadeDeleteWarning", {
+            defaultValue:
+              "子会话不与父会话一起删除就没法单独清理：它们不会进入回收站，文件与索引记录都会被永久删除。",
+          }),
+          blocked > 0
+            ? t("sessionManager.cascadeDeleteBlocked", {
+                defaultValue:
+                  "另有 {{count}} 个子会话没有可用的源路径，管理器无法删除；父会话的删除会因此被拒绝，请重新扫描后再试。",
+                count: blocked,
+              })
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      });
+    }
+    if (deleteConfirmDetails && deleteConfirmDetails.unlisted > 0) {
+      items.push({
+        id: "acknowledge-unlisted",
+        checked: deleteAcknowledged,
+        onCheckedChange: setDeleteAcknowledged,
+        required: true,
+        label: t("sessionManager.batchDeleteAcknowledge", {
+          defaultValue:
+            "我已核对将删除的 {{count}} 条会话（含未列出的 {{unlisted}} 条）",
+          count: plannedDeleteTargets.length,
+          unlisted: deleteConfirmDetails.unlisted,
+        }),
+        warning: t("sessionManager.batchDeleteAcknowledgeWarning", {
+          defaultValue:
+            "这些会话不会进入回收站：文件与数据库记录都会被永久删除，且无法撤销。",
+        }),
+      });
+    }
+    return items;
+  }, [
+    deleteAcknowledged,
+    deleteConfirmDetails,
+    deleteDescendants,
+    deleteTargets,
+    deleteWithChildren,
+    deletableDescendantCount,
+    plannedDeleteTargets.length,
+    t,
+  ]);
 
   const exitSelectionMode = () => {
     setSelectionMode(false);
@@ -1435,26 +1619,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         })}
                       </Button>
                     )}
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      className="ml-auto h-6 gap-1 px-2 whitespace-nowrap"
-                      onClick={openBatchDeleteDialog}
-                      disabled={
-                        isDeleting || selectedDeletableSessions.length === 0
-                      }
-                    >
-                      <Trash2 className="size-3" />
-                      <span className="text-xs">
-                        {isBatchDeleting
-                          ? t("sessionManager.batchDeleting", {
-                              defaultValue: "删除中...",
-                            })
-                          : t("sessionManager.deleteSelected", {
-                              defaultValue: "批量删除",
-                            })}
-                      </span>
-                    </Button>
+                    {/* 此处不放删除按钮：删除入口统一在右侧详情面板
+                        （批量模式下它显示「删除已勾选的 N 条」）。 */}
                   </div>
                 )}
                 <div className="asm-search" role="search">
@@ -1826,7 +1992,13 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         <h2 className="asm-detail-title">
                           {formatSessionTitle(selectedSession)}
                         </h2>
-                        <SessionStatusBadges session={selectedSession} />
+                        <SessionStatusBadges
+                          session={selectedSession}
+                          parentLabel={resolveParentLabel(
+                            selectedSession,
+                            sessionTitles,
+                          )}
+                        />
 
                         {/* 操作按钮组 */}
                         <div className="asm-detail-actions">
@@ -1867,11 +2039,19 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                 size="sm"
                                 variant="ghost"
                                 className="h-8 gap-1.5 rounded-md px-3 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                // 批量管理模式下只要有选中项，这个按钮就必须和
+                                // 「批量删除」同义：否则用户多选之后点这里，只会
+                                // 删掉右侧当前打开的那一条（多选被静默忽略）。
                                 onClick={() =>
-                                  setDeleteTargets([selectedSession])
+                                  hasBatchSelection
+                                    ? openBatchDeleteDialog()
+                                    : openDeleteDialog([selectedSession])
                                 }
                                 disabled={
-                                  !selectedSession.sourcePath || isDeleting
+                                  hasBatchSelection
+                                    ? isDeleting ||
+                                      selectedDeletableSessions.length === 0
+                                    : !selectedSession.sourcePath || isDeleting
                                 }
                               >
                                 <Trash2 className="size-3.5" />
@@ -1880,18 +2060,54 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                     ? t("sessionManager.deleting", {
                                         defaultValue: "删除中...",
                                       })
-                                    : selectedSession.cleanupPending
-                                      ? "继续清理"
-                                      : t("sessionManager.delete", {
-                                          defaultValue: "删除会话",
-                                        })}
+                                    : hasBatchSelection
+                                      ? t(
+                                          "sessionManager.deleteSelectedCount",
+                                          {
+                                            defaultValue:
+                                              "删除已勾选的 {{count}} 条",
+                                            count:
+                                              selectedDeletableSessions.length,
+                                          },
+                                        )
+                                      : selectedSession.cleanupPending
+                                        ? "继续清理"
+                                        : selectedSessionChildCount > 0
+                                          ? t(
+                                              "sessionManager.deleteThisWithChildren",
+                                              {
+                                                defaultValue:
+                                                  "删除此会话及其 {{count}} 个子会话",
+                                                count:
+                                                  selectedSessionChildCount,
+                                              },
+                                            )
+                                          : t("sessionManager.deleteThisOnly", {
+                                              defaultValue: "仅删除此会话",
+                                            })}
                                 </span>
                               </Button>
                             </TooltipTrigger>
                             <TooltipContent>
-                              {t("sessionManager.deleteTooltip", {
-                                defaultValue: "永久删除此本地会话记录",
-                              })}
+                              {hasBatchSelection
+                                ? t("sessionManager.deleteSelectedTooltip", {
+                                    defaultValue:
+                                      "永久删除已勾选的 {{count}} 条本地会话记录",
+                                    count: selectedDeletableSessions.length,
+                                  })
+                                : selectedSessionChildCount > 0
+                                  ? t(
+                                      "sessionManager.deleteWithChildrenTooltip",
+                                      {
+                                        defaultValue:
+                                          "永久删除右侧这一条会话及其 {{count}} 个子会话；范围可以在确认框里改",
+                                        count: selectedSessionChildCount,
+                                      },
+                                    )
+                                  : t("sessionManager.deleteTooltip", {
+                                      defaultValue:
+                                        "仅永久删除右侧这一条会话记录",
+                                    })}
                             </TooltipContent>
                           </Tooltip>
                         </div>
@@ -1980,7 +2196,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       )}
                       <div
                         ref={scrollContainerRef}
-                        onScroll={handleScrollMetrics}
                         className="asm-detail-scroll"
                       >
                         {(isLoadingMessages || isFetchingMessages) &&
@@ -2090,34 +2305,55 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           }
           message={
             deleteTargets && deleteTargets.length > 1
-              ? t("sessionManager.batchDeleteConfirmMessage", {
-                  defaultValue:
-                    "将永久删除已选中的 {{count}} 个本地会话记录。\n\n此操作不可恢复。",
-                  count: deleteTargets.length,
-                })
-              : deleteTargets?.[0]
-                ? t("sessionManager.deleteConfirmMessage", {
+              ? deleteWithChildren && deleteDescendants.length > 0
+                ? t("sessionManager.batchDeleteWithChildrenMessage", {
                     defaultValue:
-                      "将永久删除本地会话“{{title}}”\nSession ID: {{sessionId}}\n\n此操作不可恢复。",
-                    title: formatSessionTitle(deleteTargets[0]),
-                    sessionId: deleteTargets[0].sessionId,
+                      "将永久删除 {{count}} 个本地会话记录，其中 {{children}} 条是随父会话一并删除的子会话。\n\n此操作不可恢复。",
+                    count: plannedDeleteTargets.length,
+                    children: deleteDescendants.length,
                   })
+                : t("sessionManager.batchDeleteConfirmMessage", {
+                    defaultValue:
+                      "将永久删除已选中的 {{count}} 个本地会话记录。\n\n此操作不可恢复。",
+                    count: plannedDeleteTargets.length,
+                  })
+              : deleteTargets?.[0]
+                ? plannedDeleteTargets.length > 1
+                  ? t("sessionManager.deleteConfirmWithChildrenMessage", {
+                      defaultValue:
+                        "将永久删除本地会话“{{title}}”及其 {{count}} 个子会话。\n\n此操作不可恢复。",
+                      title: formatSessionTitle(deleteTargets[0]),
+                      count: plannedDeleteTargets.length - 1,
+                    })
+                  : t("sessionManager.deleteConfirmMessage", {
+                      defaultValue:
+                        "将永久删除本地会话“{{title}}”\nSession ID: {{sessionId}}\n\n此操作不可恢复。",
+                      title: formatSessionTitle(deleteTargets[0]),
+                      sessionId: deleteTargets[0].sessionId,
+                    })
                 : ""
           }
+          details={deleteConfirmDetails?.items}
+          detailsOverflowLabel={deleteConfirmDetails?.overflowLabel}
+          // 勾选项由页面持有状态：范围（是否连带子会话）和「已核对未列出的条目」都在
+          // 这里说清楚，勾选与否则回传给页面，不靠组件内部副作用同步。
+          checkboxes={deleteDialogCheckboxes}
           confirmText={
             deleteTargets && deleteTargets.length > 1
               ? t("sessionManager.batchDeleteConfirmAction", {
                   defaultValue: "删除所选会话",
                 })
-              : t("sessionManager.deleteConfirmAction", {
-                  defaultValue: "删除会话",
-                })
+              : plannedDeleteTargets.length > 1
+                ? t("sessionManager.deleteWithChildrenAction", {
+                    defaultValue: "删除会话及其子会话",
+                  })
+                : t("sessionManager.deleteConfirmAction", {
+                    defaultValue: "删除会话",
+                  })
           }
           cancelText={t("common.cancel", { defaultValue: "取消" })}
           variant="destructive"
-          onConfirm={(includeProject) =>
-            void handleDeleteConfirm(includeProject)
-          }
+          onConfirm={() => void handleDeleteConfirm()}
           onCancel={() => {
             if (!isDeleting) {
               setDeleteTargets(null);

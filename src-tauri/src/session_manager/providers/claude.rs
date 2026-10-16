@@ -10,8 +10,8 @@ use crate::session_paths::claude_config_dir;
 
 use super::utils::{
     collect_files_where, ensure_readable_size, extract_text, is_safe_session_id,
-    parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary, FileParseCache,
-    TITLE_MAX_CHARS,
+    parse_timestamp_to_ms, path_basename, read_head_tail_lines, remove_path_if_exists,
+    truncate_summary, FileParseCache, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "claude";
@@ -253,6 +253,7 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         residual: false,
+        parent_session_id: None,
         archived: false,
         cleanup_pending: false,
         sidebar_section: None,
@@ -287,20 +288,6 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
         |path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
         files,
     );
-}
-
-fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if meta.is_dir() {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
 }
 
 #[cfg(test)]
@@ -343,6 +330,71 @@ mod tests {
         assert!(!path.exists());
         assert!(!sidecar.exists());
         assert!(independent_branch.exists());
+    }
+
+    /// sidecar 位置是一个指向别处的链接时，删除只能摘掉链接本身，绝不能顺着它把
+    /// 目标目录的内容删掉。旧实现用 `metadata`（跟随链接）判断 `is_dir()`，会把
+    /// 链接当成真目录交给 `remove_dir_all`。
+    #[test]
+    fn a_symlinked_sidecar_does_not_delete_its_target_contents() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("abc123-session.jsonl");
+        let sidecar = temp.path().join("abc123-session");
+
+        // 链接目标放在另一个目录里，模拟"项目之外的真实数据"
+        let victim = temp.path().join("outside").join("real-data");
+        std::fs::create_dir_all(&victim).expect("create victim");
+        let sentinel = victim.join("keep.txt");
+        std::fs::write(&sentinel, "keep").expect("write sentinel");
+
+        if create_dir_symlink(&victim, &sidecar).is_err() {
+            // Windows 未开启开发者模式 / 无权限时跳过；CI 的 Linux 任务仍会实际执行
+            eprintln!("skipped: 本机不允许创建目录符号链接");
+            return;
+        }
+
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"session-123\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-03-06T10:00:00Z\"}\n",
+                "{\"message\":{\"role\":\"user\",\"content\":\"hello\"},\"timestamp\":\"2026-03-06T10:01:00Z\"}\n"
+            ),
+        )
+        .expect("write session");
+
+        delete_session(temp.path(), &path, "session-123").expect("delete session");
+
+        assert!(!path.exists());
+        assert!(
+            std::fs::symlink_metadata(&sidecar).is_err(),
+            "sidecar 链接本身应被删除"
+        );
+        assert!(
+            sentinel.exists(),
+            "链接目标的内容必须原样保留：删除只能摘掉链接本身"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("read sentinel"),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_dir_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
     }
 
     #[test]

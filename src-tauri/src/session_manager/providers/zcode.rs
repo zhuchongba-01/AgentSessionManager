@@ -107,6 +107,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
             provider_id: PROVIDER_ID.to_string(),
             session_id: session_id.clone(),
             residual,
+            parent_session_id: None,
             archived: false,
             cleanup_pending: false,
             sidebar_section: None,
@@ -837,7 +838,7 @@ fn task_order_session_id(node_key: &str) -> Option<String> {
 
 fn cleanup_session_sidecars(cli_root: &Path, session_id: &str) -> Result<(), String> {
     for target in session_sidecar_targets(cli_root, session_id)? {
-        remove_path_if_exists(&target).map_err(|error| {
+        super::utils::remove_path_if_exists(&target).map_err(|error| {
             format!(
                 "Failed to delete ZCode session sidecar {}: {error}",
                 target.display()
@@ -862,15 +863,6 @@ fn session_sidecar_targets(cli_root: &Path, session_id: &str) -> Result<Vec<Path
         .iter()
         .map(|target| super::utils::checked_storage_child(cli_root, target))
         .collect()
-}
-
-fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
-        Ok(_) => std::fs::remove_file(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), String> {

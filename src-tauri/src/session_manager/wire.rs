@@ -31,9 +31,49 @@ pub struct SessionMessageWire {
     pub index: Option<usize>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// 全文的字符数：前端用它提示大小，并在取全文时校验会话是否已变化
+    /// 全文的字符数：前端用它提示大小
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_chars: Option<usize>,
+    /// 全文的身份摘要：前端取回全文时会带回来校验，见 [`content_identity_hex`]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_identity: Option<String>,
+}
+
+/// 一条消息正文的身份摘要（FNV-1a 64 位）。
+///
+/// 取回被截断消息的全文时，只有「下标 + 长度」不足以确认还是同一条消息：会话在
+/// 两次请求之间被改写后，同一下标可能换成了另一条**长度恰好相同**的消息，长度校验
+/// 会放行，用户拿到的就是别人那一条的正文。把 role、时间戳与全文一起摘要，才真正
+/// 表达了「这条消息的身份」。仅用于一致性校验，不用于安全用途。
+pub fn content_identity(role: &str, ts: Option<i64>, content: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    let mut mix = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    };
+    for byte in role.as_bytes() {
+        mix(*byte);
+    }
+    mix(0);
+    for byte in ts.unwrap_or(i64::MIN).to_le_bytes() {
+        mix(byte);
+    }
+    for byte in content.as_bytes() {
+        mix(*byte);
+    }
+    hash
+}
+
+/// 身份摘要的下发形态。
+///
+/// 用 16 进制字符串而不是 JSON 数字：64 位摘要超出 IEEE-754 双精度的整数范围
+/// （2^53），直接当数字过一遍 JSON 会丢精度，前端再送回后端时比较必然失配，
+/// 于是每次展开都误报「会话已更新」。字符串形式原样往返。
+pub fn content_identity_hex(role: &str, ts: Option<i64>, content: &str) -> String {
+    format!("{:016x}", content_identity(role, ts, content))
 }
 
 /// 流式读取会话正文时按块下发的消息；与前端 `TranscriptChunk` 一一对应。
@@ -62,8 +102,8 @@ const CODEX_IDE_CONTEXT_PREFIX: &str = "# Context from my IDE setup:";
 
 /// 是否允许只下发预览。
 ///
-/// 前提是该会话的正文已接入解析缓存（`session_manager::transcript_cache_covered`）：
-/// 否则展开时取全文要重新解析整个会话，不如直接下发。
+/// 前提是该会话的正文**这次解析确实进了缓存**（`Transcript::cacheable`）：否则展开时
+/// 取全文要重新解析整个会话，不如直接下发。
 ///
 /// 在这个前提下，前端只用正文开头判断 Codex 注入消息（`# AGENTS.md instructions for `
 /// 与 `<environment_context>` 都是纯前缀判断），这类大块注入正文截断后判定不变、界面
@@ -71,8 +111,8 @@ const CODEX_IDE_CONTEXT_PREFIX: &str = "# Context from my IDE setup:";
 ///
 /// 唯一的例外是 IDE 注入：真实提问在正文末尾，截断会让前端判定「没有提问」而把这条
 /// 整条隐藏，所以这类正文一律下发全文。
-pub fn truncation_allowed(provider_id: &str, source_path: &str, role: &str, content: &str) -> bool {
-    if !super::transcript_cache_covered(provider_id, source_path) {
+pub fn truncation_allowed(cacheable: bool, provider_id: &str, role: &str, content: &str) -> bool {
+    if !cacheable {
         return false;
     }
     let ide_injected = provider_id == "codex"
@@ -83,14 +123,14 @@ pub fn truncation_allowed(provider_id: &str, source_path: &str, role: &str, cont
 
 /// 按需截断一条消息；`index` 是它在会话正文里的绝对下标。
 pub fn wire_message(
+    cacheable: bool,
     provider_id: &str,
-    source_path: &str,
     index: usize,
     message: &SessionMessage,
 ) -> SessionMessageWire {
     let chars = message.content.chars().count();
     if chars <= MAX_INLINE_MESSAGE_CHARS
-        || !truncation_allowed(provider_id, source_path, &message.role, &message.content)
+        || !truncation_allowed(cacheable, provider_id, &message.role, &message.content)
     {
         return SessionMessageWire {
             role: message.role.clone(),
@@ -99,9 +139,11 @@ pub fn wire_message(
             index: None,
             truncated: false,
             content_chars: None,
+            content_identity: None,
         };
     }
 
+    // 只在真的要截断时算摘要：未截断的消息前端不会回取全文，没必要付这份成本
     SessionMessageWire {
         role: message.role.clone(),
         content: message
@@ -113,25 +155,30 @@ pub fn wire_message(
         index: Some(index),
         truncated: true,
         content_chars: Some(chars),
+        content_identity: Some(content_identity_hex(
+            &message.role,
+            message.ts,
+            &message.content,
+        )),
     }
 }
 
 pub fn wire_messages(
+    cacheable: bool,
     provider_id: &str,
-    source_path: &str,
     messages: &[SessionMessage],
 ) -> Vec<SessionMessageWire> {
     messages
         .iter()
         .enumerate()
-        .map(|(index, message)| wire_message(provider_id, source_path, index, message))
+        .map(|(index, message)| wire_message(cacheable, provider_id, index, message))
         .collect()
 }
 
 /// 下发 `[start, end)` 这一段，保留下标在整段正文里的绝对位置。
 pub fn wire_range(
+    cacheable: bool,
     provider_id: &str,
-    source_path: &str,
     messages: &[SessionMessage],
     start: usize,
     end: usize,
@@ -139,7 +186,7 @@ pub fn wire_range(
     messages[start..end]
         .iter()
         .enumerate()
-        .map(|(offset, message)| wire_message(provider_id, source_path, start + offset, message))
+        .map(|(offset, message)| wire_message(cacheable, provider_id, start + offset, message))
         .collect()
 }
 
@@ -163,12 +210,65 @@ mod tests {
         }
     }
 
-    /// 单文件源的 source_path；截断判定只关心它的形态（SQLite 前缀等）
-    const FILE_SOURCE: &str = "/sessions/pi/session.jsonl";
+    /// 身份摘要的固定向量。
+    ///
+    /// 前端测试用的 `contentIdentityHex`（tests/msw/state.ts）是这份 Rust 实现的
+    /// 镜像，必须逐字节一致；写死向量后，任何一侧改算法都会在另一侧失败，而不是
+    /// 双双"自洽地"错下去。
+    #[test]
+    fn content_identity_hex_matches_the_pinned_vectors() {
+        let cases = [
+            ("tool", None, "hello"),
+            ("user", Some(0), ""),
+            ("assistant", Some(1_700_000_000_000), "中"),
+            ("tool", Some(-1), "混合 mixed 内容"),
+        ];
+        let actual = cases
+            .iter()
+            .map(|(role, ts, content)| content_identity_hex(role, *ts, content))
+            .collect::<Vec<_>>();
+
+        // 与 tests/msw/state.ts 的 contentIdentityHex 输出一致
+        assert_eq!(
+            actual,
+            vec![
+                "89d353117a8bfbab".to_string(),
+                "cfae74179de2f5f6".to_string(),
+                "b9aa5e9f6edb5fe8".to_string(),
+                "3de0a87aad98a68b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn content_identity_distinguishes_same_length_content() {
+        let a = "AAAA".repeat(1100);
+        let b = "BBBB".repeat(1100);
+        assert_eq!(a.len(), b.len());
+        assert_ne!(
+            content_identity("tool", None, &a),
+            content_identity("tool", None, &b),
+            "同长度但不同正文必须得到不同身份，否则长度校验会放行另一条消息"
+        );
+        // 时间戳与角色同样参与身份
+        assert_ne!(
+            content_identity("tool", Some(1), &a),
+            content_identity("tool", Some(2), &a)
+        );
+        assert_ne!(
+            content_identity("tool", None, &a),
+            content_identity("user", None, &a)
+        );
+    }
+
+    /// 已接入正文缓存的会话：可以只发预览
+    const CACHED: bool = true;
+    /// 未接入正文缓存的会话：展开要重解析整个会话，不能截断
+    const UNCACHED: bool = false;
 
     #[test]
     fn short_messages_keep_the_old_shape() {
-        let wire = wire_message("claude", FILE_SOURCE, 3, &message("user", 100));
+        let wire = wire_message(CACHED, "claude", 3, &message("user", 100));
 
         assert_eq!(wire.content.chars().count(), 100);
         assert!(!wire.truncated);
@@ -179,7 +279,7 @@ mod tests {
     #[test]
     fn long_messages_send_a_preview_with_a_locator() {
         let original = MAX_INLINE_MESSAGE_CHARS + 500;
-        let wire = wire_message("claude", FILE_SOURCE, 7, &message("tool", original));
+        let wire = wire_message(CACHED, "claude", 7, &message("tool", original));
 
         assert!(wire.truncated);
         assert_eq!(wire.index, Some(7), "取全文要用正文里的绝对下标");
@@ -189,13 +289,17 @@ mod tests {
             wire.content.chars().all(|c| c == '中'),
             "预览按字符切，不切断多字节字符"
         );
+        assert!(
+            wire.content_identity.is_some(),
+            "截断时必须带上身份摘要，否则取全文只能靠长度判定"
+        );
     }
 
     #[test]
     fn exactly_at_the_limit_is_not_truncated() {
         let wire = wire_message(
+            CACHED,
             "claude",
-            FILE_SOURCE,
             0,
             &message("assistant", MAX_INLINE_MESSAGE_CHARS),
         );
@@ -209,14 +313,14 @@ mod tests {
             "{CODEX_IDE_CONTEXT_PREFIX}\n## My request for Codex:\n修一下登录\n{}",
             "x".repeat(MAX_INLINE_MESSAGE_CHARS)
         );
-        assert!(!wire_message("codex", FILE_SOURCE, 0, &text_message("user", &request)).truncated);
+        assert!(!wire_message(CACHED, "codex", 0, &text_message("user", &request)).truncated);
 
         // 前缀前的空白不影响判定（前端先 trim 再判断）
         let indented = format!("\n  {}", request);
-        assert!(!wire_message("codex", FILE_SOURCE, 0, &text_message("user", &indented)).truncated);
+        assert!(!wire_message(CACHED, "codex", 0, &text_message("user", &indented)).truncated);
 
         // 这条例外只针对 Codex：别的 Agent 的同名前缀照常截断
-        assert!(wire_message("claude", FILE_SOURCE, 0, &text_message("user", &request)).truncated);
+        assert!(wire_message(CACHED, "claude", 0, &text_message("user", &request)).truncated);
     }
 
     #[test]
@@ -231,18 +335,18 @@ mod tests {
                 &format!("{prefix}{}", "y".repeat(MAX_INLINE_MESSAGE_CHARS)),
             );
             assert!(
-                wire_message("codex", FILE_SOURCE, 0, &injected).truncated,
+                wire_message(CACHED, "codex", 0, &injected).truncated,
                 "注入横幅正文只发预览：{prefix}"
             );
         }
 
         // 体积最大的工具输出照常截断
         let tool = message("tool", MAX_INLINE_MESSAGE_CHARS + 1);
-        assert!(wire_message("codex", FILE_SOURCE, 1, &tool).truncated);
+        assert!(wire_message(CACHED, "codex", 1, &tool).truncated);
         assert!(
             wire_message(
+                CACHED,
                 "claude",
-                FILE_SOURCE,
                 0,
                 &message("user", MAX_INLINE_MESSAGE_CHARS + 1)
             )
@@ -250,20 +354,30 @@ mod tests {
         );
     }
 
+    /// 截断与否只取决于「这次解析是否真的进了缓存」，不再单独猜会话形态。
+    ///
+    /// 旧实现按 provider + source_path 推断可缓存性，于是 Codex 的分页链读不出来时
+    /// （`transcript_sources` 返回 None，实际不缓存）仍被允许截断，展开就变成一次
+    /// 全量重解析。现在这个事实由解析结果自己携带。
     #[test]
-    fn truncation_follows_which_sessions_have_a_transcript_cache() {
+    fn truncation_requires_an_actually_cached_transcript() {
         let tool = message("tool", MAX_INLINE_MESSAGE_CHARS + 1);
-        let sqlite_db = "/data/opencode.db";
 
-        // Pi 的正文就是那个会话文件，已接入缓存 → 可以只发预览
-        assert!(wire_message("pi", FILE_SOURCE, 0, &tool).truncated);
-        // OpenCode / ZCode 只有 SQLite 形态接入；旧版消息目录展开要重解析整个会话
-        assert!(wire_message("opencode", "sqlite:/data/opencode.db:ses_1", 0, &tool).truncated);
-        assert!(!wire_message("opencode", "/data/storage/message/ses_1", 0, &tool).truncated);
-        assert!(
-            wire_message("zcode", "sqlite-zcode:/data/db.sqlite:session-1", 0, &tool).truncated
-        );
-        assert!(!wire_message("zcode", sqlite_db, 0, &tool).truncated);
+        for provider in ["claude", "codex", "deepseek", "grokbuild", "pi"] {
+            assert!(
+                wire_message(CACHED, provider, 0, &tool).truncated,
+                "{provider} 已缓存时可只发预览"
+            );
+            assert!(
+                !wire_message(UNCACHED, provider, 0, &tool).truncated,
+                "{provider} 未进缓存时不能截断"
+            );
+        }
+
+        // 未接入缓存形态的会话，即使调用方传了 true 也不该被前端回取全文；
+        // 调用方据此传参，这里固定住两种取值的差异
+        assert!(!wire_message(UNCACHED, "opencode", 0, &tool).truncated);
+        assert!(wire_message(CACHED, "opencode", 0, &tool).truncated);
     }
 
     #[test]
@@ -275,7 +389,7 @@ mod tests {
             message("tool", 10),
         ];
 
-        let wire = wire_range("claude", FILE_SOURCE, &messages, 2, 4);
+        let wire = wire_range(CACHED, "claude", &messages, 2, 4);
         assert_eq!(wire.len(), 2);
         assert_eq!(wire[0].index, Some(2));
         assert!(wire[0].truncated);

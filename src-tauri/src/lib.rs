@@ -19,7 +19,11 @@ async fn get_session_messages(
 ) -> Result<Vec<session_manager::wire::SessionMessageWire>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         session_manager::load_transcript(&providerId, &sourcePath).map(|transcript| {
-            session_manager::wire::wire_messages(&providerId, &sourcePath, &transcript.messages)
+            session_manager::wire::wire_messages(
+                transcript.cacheable,
+                &providerId,
+                &transcript.messages,
+            )
         })
     })
     .await
@@ -28,14 +32,17 @@ async fn get_session_messages(
 
 /// 取回一条被截断消息的全文。
 ///
-/// `expectedChars` 是列表里那一版正文的长度：两次请求之间会话若已被改写，同一下标
-/// 可能指向另一条消息，因此长度对不上就拒绝返回，让前端重新打开，而不是张冠李戴。
+/// `expectedChars` 与 `expectedIdentity` 描述列表里那一版正文：两次请求之间会话若
+/// 已被改写，同一下标可能指向另一条消息，校验不过就拒绝返回，让前端重新打开，而不是
+/// 张冠李戴。只比长度不足以确认身份——改写后的消息可能长度恰好相同，所以身份摘要
+/// 才是真正的判据；长度继续保留，用于兼容未携带摘要的旧调用。
 #[tauri::command]
 async fn get_message_content(
     #[allow(non_snake_case)] providerId: String,
     #[allow(non_snake_case)] sourcePath: String,
     index: usize,
     #[allow(non_snake_case)] expectedChars: usize,
+    #[allow(non_snake_case)] expectedIdentity: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let transcript = session_manager::load_transcript(&providerId, &sourcePath)?;
@@ -45,6 +52,16 @@ async fn get_message_content(
             .ok_or("会话已更新，请重新打开")?;
         if message.content.chars().count() != expectedChars {
             return Err("会话已更新，请重新打开".into());
+        }
+        if let Some(expected) = expectedIdentity {
+            let actual = session_manager::wire::content_identity_hex(
+                &message.role,
+                message.ts,
+                &message.content,
+            );
+            if actual != expected {
+                return Err("会话已更新，请重新打开".into());
+            }
         }
         Ok(message.content.clone())
     })
@@ -88,7 +105,13 @@ async fn stream_session_messages(
         for (start, end) in chunk_ranges(&transcript.message_bytes) {
             send(TranscriptChunk::Messages {
                 start,
-                messages: wire_range(&providerId, &sourcePath, &transcript.messages, start, end),
+                messages: wire_range(
+                    transcript.cacheable,
+                    &providerId,
+                    &transcript.messages,
+                    start,
+                    end,
+                ),
             })?;
         }
         send(TranscriptChunk::Done {

@@ -480,6 +480,13 @@ fn parse_session_meta(
         return Err(format!("DeepSeek Harness 会话 ID 不安全，已跳过：{id}"));
     }
     let is_subagent = decoded.header.get("origin").and_then(Value::as_str) == Some("subagent");
+    // `validate_header` 已经保证父会话存在时一定是安全 ID（空白值会让整个头被判为
+    // 损坏），所以这里不需要再过滤空串。
+    let parent_session_id = decoded
+        .header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let directory_id = path
         .parent()
         .and_then(Path::file_name)
@@ -553,6 +560,7 @@ fn parse_session_meta(
         // parent dependency can be resolved deliberately instead of making
         // the parent permanently undeletable.
         residual: is_subagent || hidden_dependency,
+        parent_session_id: parent_session_id.clone(),
         archived: catalog.archived.contains(&id),
         cleanup_pending: false,
         sidebar_section: None,
@@ -971,16 +979,28 @@ pub fn preflight_delete(root: &Path, source: &Path, session_id: &str) -> Result<
             ));
         }
     }
-    if let Some(child) = descriptors(root)?.into_iter().find(|item| {
-        item.parent_session.as_deref() == Some(session_id) && item.source_path != source
-    }) {
+    let children = descriptors(root)?
+        .into_iter()
+        .filter(|item| {
+            item.parent_session.as_deref() == Some(session_id) && item.source_path != source
+        })
+        .collect::<Vec<_>>();
+    if let Some(child) = children.first() {
         let child_kind = if child.origin.as_deref() == Some("subagent") {
             "子 Agent 会话"
         } else {
             "分支会话"
         };
+        // 删除入口现在会主动提出「连同子会话一起删除」，所以这里给的是可执行的
+        // 下一步，而不是让用户自己去列表里找子会话再逐个删。子会话不在列表里时
+        // 重新扫描是唯一出路，也必须说清楚。
+        let more = if children.len() > 1 {
+            format!("（共 {} 个）", children.len())
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "该会话仍被 DeepSeek Harness {child_kind} {} 依赖，请先删除子会话",
+            "该会话仍被 DeepSeek Harness {child_kind} {} 依赖{more}；请在删除确认框里勾选「同时删除子会话」后一起删除。若该子会话未出现在列表里，请重新扫描",
             child.id
         ));
     }
@@ -1363,6 +1383,40 @@ mod tests {
         let sessions = scan_sessions_at(temp.path());
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].residual);
+        // 「残留」本身说不出它属于谁；子会话必须带上父会话 ID，界面才能显示归属、
+        // 也才能在删除父会话时把整条子会话链一起带上。
+        assert_eq!(
+            sessions[0].parent_session_id.as_deref(),
+            Some("session-parent")
+        );
+    }
+
+    #[test]
+    fn a_parent_session_reports_no_parent_of_its_own() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp
+            .path()
+            .join("sessions")
+            .join("project")
+            .join("session-parent")
+            .join("session.v3.jsonl");
+        write_plain_session(&path, "session-parent", None, None);
+        write_index(temp.path(), &["session-parent"], &[]);
+        let sessions = scan_sessions_at(temp.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].parent_session_id, None);
+        assert!(!sessions[0].residual);
+    }
+
+    #[test]
+    fn a_malformed_parent_reference_invalidates_the_whole_session_header() {
+        // 空白 parentSession 是损坏的头，不是「没有父会话」。把损坏值当成无父会让
+        // 一条子会话以顶层会话的身份出现在列表里，所以整个头被拒绝（既有设计）。
+        let header = json!({
+            "type": "session", "version": 3, "id": "session-child",
+            "createdAt": 1_700_000_000_000_i64, "parentSession": "   "
+        });
+        assert!(validate_header(&header, Path::new("session.v3.jsonl")).is_err());
     }
 
     #[test]
@@ -1423,6 +1477,42 @@ mod tests {
             .contains("子 Agent"));
         delete_session(&root, &child, "session-child").expect("delete child");
         preflight_delete(&root, &parent, "session-parent").expect("parent now safe");
+    }
+
+    #[test]
+    fn blocked_parent_preflight_points_at_the_cascade_option() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let parent = root
+            .join("project")
+            .join("session-parent")
+            .join("session.v3.jsonl");
+        for (id, parent_id, origin) in [
+            ("session-parent", None, None),
+            ("session-child-a", Some("session-parent"), Some("subagent")),
+            ("session-child-b", Some("session-parent"), Some("subagent")),
+        ] {
+            write_plain_session(
+                &root.join("project").join(id).join("session.v3.jsonl"),
+                id,
+                parent_id,
+                origin,
+            );
+        }
+        write_index(
+            temp.path(),
+            &["session-parent", "session-child-a", "session-child-b"],
+            &[],
+        );
+
+        let error = preflight_delete(&root, &parent, "session-parent")
+            .expect_err("parent must be protected");
+        // 「请先删除子会话」是不可执行的建议：子会话在列表里只显示为残留，用户
+        // 无从判断该删哪一条。文案必须指向确认框里的那个选项。
+        assert!(error.contains("同时删除子会话"), "{error}");
+        // 子会话全部列出，用户才能核对范围（不止报第一个）。
+        assert!(error.contains("共 2 个"), "{error}");
+        assert!(error.contains("重新扫描"), "{error}");
     }
 
     #[test]

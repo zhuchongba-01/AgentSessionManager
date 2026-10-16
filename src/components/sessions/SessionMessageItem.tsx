@@ -34,6 +34,7 @@ export const SessionMessageItem = memo(function SessionMessageItem(
     message.index,
     message.truncated,
     message.contentChars,
+    message.contentIdentity,
   ]);
   return <SessionMessageContent key={identity} {...props} />;
 });
