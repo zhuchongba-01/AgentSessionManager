@@ -4,9 +4,7 @@
 
 # Agent会话管理
 
-**Codex、Claude Code、DeepSeek Harness 等本地编码 Agent 的会话管理工具**
-
-本地优先的桌面应用：统一浏览、搜索、分类与安全清理 Codex、Claude Code、DeepSeek Harness 等 AI 编程助手的历史会话、对话记录与聊天记录，数据全部留在本机。
+**Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi 与 Grok Build 七种本地编码 Agent 的会话管理工具**
 
 <sub>Desktop session manager for local coding agents — browse, group and safely clean up Codex, Claude Code, DeepSeek Harness, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
