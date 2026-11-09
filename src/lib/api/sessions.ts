@@ -73,26 +73,125 @@ export const sessionsApi = {
 
   /**
    * 分块流式读取会话正文：每收到一块就通过 `onProgress` 交出累计结果，供界面边到
-   * 边渲染；函数在流结束后返回完整消息。失败时命令会 reject，错误文案与后端一致。
+   * 边渲染。invoke 完成不代表 Channel 已送达（大包经异步 fetch 传输）；只有命令
+   * 成功且收到完整的 header/messages/done 才返回独立快照。停滞或取消会结束等待。
    */
   async streamMessages(
     providerId: string,
     sourcePath: string,
     onProgress?: (messages: SessionMessage[]) => void,
+    signal?: AbortSignal,
   ): Promise<SessionMessage[]> {
+    if (signal?.aborted) {
+      throw new DOMException("会话读取已取消", "AbortError");
+    }
     const channel = new Channel<TranscriptChunk>();
-    const messages: SessionMessage[] = [];
-    channel.onmessage = (chunk) => {
-      if (chunk.kind !== "messages") return;
-      messages.push(...chunk.messages);
-      onProgress?.(messages.slice());
-    };
-    await invoke("stream_session_messages", {
-      providerId,
-      sourcePath,
-      onChunk: channel,
+    return new Promise<SessionMessage[]>((resolve, reject) => {
+      const messages: SessionMessage[] = [];
+      let total: number | undefined;
+      let done = false;
+      let invoked = false;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+
+      const cleanup = () => {
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        // 传输层仍可收到迟到的包，但不得再改动结果或触发界面更新。
+        channel.onmessage = () => {};
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        cleanup();
+        reject(error);
+      };
+      const abort = () =>
+        fail(new DOMException("会话读取已取消", "AbortError"));
+      const armTimeout = () => {
+        clearTimeout(timer);
+        // 空会话同样必须有 header + done；缺包/命令停滞不应永久显示加载中。
+        timer = setTimeout(
+          () => fail(new Error("会话读取超时：消息流未完整结束，请重试")),
+          30_000,
+        );
+      };
+      const complete = () => {
+        if (settled || !invoked || !done) return;
+        const snapshot = messages.slice();
+        cleanup();
+        resolve(snapshot);
+      };
+      const protocolError = (detail: string) =>
+        new Error(`会话消息流不完整：${detail}`);
+      const isCount = (value: number) =>
+        Number.isSafeInteger(value) && value >= 0;
+
+      signal?.addEventListener("abort", abort, { once: true });
+      armTimeout();
+      channel.onmessage = (chunk) => {
+        if (settled) return;
+        try {
+          if (chunk.kind === "error") throw new Error(chunk.message);
+          if (done) throw protocolError("done 后收到额外数据");
+          switch (chunk.kind) {
+            case "header":
+              if (total !== undefined || !isCount(chunk.total)) {
+                throw protocolError("header total 无效或重复");
+              }
+              total = chunk.total;
+              break;
+            case "messages":
+              if (
+                total === undefined ||
+                !isCount(chunk.start) ||
+                chunk.start !== messages.length ||
+                !Array.isArray(chunk.messages) ||
+                messages.length + chunk.messages.length > total
+              ) {
+                throw protocolError("messages start/total 不匹配");
+              }
+              for (const message of chunk.messages) messages.push(message);
+              onProgress?.(messages.slice());
+              break;
+            case "done":
+              if (
+                total === undefined ||
+                !isCount(chunk.delivered) ||
+                chunk.delivered !== total ||
+                messages.length !== total
+              ) {
+                throw protocolError("done delivered/total 与已收消息不匹配");
+              }
+              done = true;
+              break;
+            default:
+              throw protocolError("未知分块类型");
+          }
+          // onProgress 的调用方也可能同步取消请求。
+          if (settled) return;
+          armTimeout();
+          complete();
+        } catch (error) {
+          fail(error);
+        }
+      };
+      // 同时观察两条完成路径；Done 即使先到，也不能吞掉命令稍后的 rejection。
+      try {
+        void invoke("stream_session_messages", {
+          providerId,
+          sourcePath,
+          onChunk: channel,
+        }).then(() => {
+          if (settled) return;
+          invoked = true;
+          armTimeout();
+          complete();
+        }, fail);
+      } catch (error) {
+        fail(error);
+      }
     });
-    return messages;
   },
 
   async delete(options: DeleteSessionOptions): Promise<DeleteSessionReply> {

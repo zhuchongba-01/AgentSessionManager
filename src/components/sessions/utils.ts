@@ -68,6 +68,28 @@ const extractCodexPromptFromIdeContext = (content: string) => {
 export const getSessionKey = (session: SessionMeta) =>
   `${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`;
 
+const normalizeDirectoryIdentity = (path: string) => {
+  // Scanned sessions can come from a different OS than the current host.
+  // Only an absolute drive path or UNC server/share identifies Windows syntax.
+  const isWindowsPath =
+    /^[a-z]:[/\\]/i.test(path) ||
+    /^(?:\\\\|\/\/)[^/\\]+[/\\][^/\\]+(?:[/\\]|$)/.test(path);
+  if (isWindowsPath) {
+    const normalized = path.replace(/[/\\]+/g, "\\").toLowerCase();
+    // Preserve the distinction between a drive root (C:\) and C:-relative paths.
+    const withoutTrailingSeparators = /^[a-z]:\\$/.test(normalized)
+      ? normalized
+      : normalized.replace(/\\+$/, "");
+    return /^[a-z]:/.test(normalized)
+      ? withoutTrailingSeparators
+      : `\\${withoutTrailingSeparators}`;
+  }
+  // In POSIX paths a backslash is a filename character, not a separator.
+  if (path.startsWith("/")) return path.replace(/\/+$/, "") || "/";
+  // Relative paths carry no reliable platform information; keep them verbatim.
+  return path;
+};
+
 export const getSessionDirectoryGroupKey = (
   providerId: string,
   projectDir?: string | null,
@@ -78,10 +100,7 @@ export const getSessionDirectoryGroupKey = (
   const trimmed = projectDir?.trim();
   const name = projectName?.trim();
   const identity = trimmed
-    ? trimmed
-        .replace(/[/\\]+/g, "\\")
-        .replace(/\\+$/, "")
-        .toLocaleLowerCase()
+    ? normalizeDirectoryIdentity(trimmed)
     : name?.toLocaleLowerCase();
   return `${providerId}:${identity || UNKNOWN_PROJECT_DIR_KEY}`;
 };
@@ -195,16 +214,41 @@ export const buildSessionTitleIndex = (
 ): Map<string, string> => {
   const index = new Map<string, string>();
   sessions.forEach((session) => {
-    index.set(
-      `${session.providerId}:${session.sessionId}`,
-      formatSessionTitle(session),
-    );
+    index.set(getSessionLineageKey(session), formatSessionTitle(session));
   });
   return index;
 };
 
 export const getSessionNativeKey = (providerId: string, sessionId: string) =>
   `${providerId}:${sessionId}`;
+
+// OpenCode databases and legacy JSON stores are independent session graphs.
+// Unknown sources get their own key, never a provider-wide fallback.
+const getSessionLineageKey = (session: SessionMeta, id = session.sessionId) => {
+  if (session.providerId !== "opencode") {
+    return getSessionNativeKey(session.providerId, id);
+  }
+  const source = session.sourcePath ?? "";
+  let scope: string | undefined;
+  if (source.startsWith("sqlite:")) {
+    const separator = source.lastIndexOf(":ses_");
+    if (separator > 7) {
+      scope = `db:${normalizeDirectoryIdentity(source.slice(7, separator))}`;
+    }
+  } else if (source) {
+    const normalized = normalizeDirectoryIdentity(source);
+    const windows = /^[a-z]:\\|^\\\\/i.test(normalized);
+    const match = windows
+      ? normalized.match(/^(.*)\\message\\[^\\]+$/)
+      : normalized.match(/^(.*)\/message\/[^/]+$/);
+    if (match) scope = `json:${match[1]}`;
+  }
+  return JSON.stringify([
+    "opencode",
+    scope ?? `unknown:${getSessionKey(session)}`,
+    id,
+  ]);
+};
 
 /**
  * 父会话的显示名。父会话不在扫描结果里时退回原生 ID 前 8 位——宁可显示 ID，
@@ -217,8 +261,7 @@ export const resolveParentLabel = (
   const parentId = session.parentSessionId;
   if (!parentId) return undefined;
   return (
-    titles.get(getSessionNativeKey(session.providerId, parentId)) ??
-    parentId.slice(0, 8)
+    titles.get(getSessionLineageKey(session, parentId)) ?? parentId.slice(0, 8)
   );
 };
 
@@ -242,7 +285,7 @@ export const collectSessionDescendants = (
   sessions.forEach((session) => {
     const parentId = session.parentSessionId;
     if (!parentId) return;
-    const key = getSessionNativeKey(session.providerId, parentId);
+    const key = getSessionLineageKey(session, parentId);
     const siblings = childrenByParent.get(key);
     if (siblings) {
       siblings.push(session);
@@ -255,7 +298,7 @@ export const collectSessionDescendants = (
   const visited = new Set<string>();
   const queue: string[] = [];
   roots.forEach((session) => {
-    const key = getSessionNativeKey(session.providerId, session.sessionId);
+    const key = getSessionLineageKey(session);
     // 同一个原生会话可能有多条同 ID 历史副本，visited 只记原生 ID，
     // 避免副本互相把对方当成对方的祖先而无限展开。
     if (visited.has(key)) return;
@@ -264,19 +307,23 @@ export const collectSessionDescendants = (
   });
 
   const descendants: SessionMeta[] = [];
+  const descendantKeys = new Set<string>();
   for (let index = 0; index < queue.length; index += 1) {
     const children = childrenByParent.get(queue[index]);
     if (!children) continue;
     children.forEach((child) => {
-      const childNativeKey = getSessionNativeKey(
-        child.providerId,
-        child.sessionId,
-      );
-      if (visited.has(childNativeKey)) return;
-      visited.add(childNativeKey);
-      queue.push(childNativeKey);
-      // 显式勾选的会话已经在删除目标里，不再重复列出。
-      if (!rootKeys.has(getSessionKey(child))) descendants.push(child);
+      const childNativeKey = getSessionLineageKey(child);
+      if (!visited.has(childNativeKey)) {
+        visited.add(childNativeKey);
+        queue.push(childNativeKey);
+      }
+      // 遍历按原生 ID 防循环，结果按具体来源去重：active/archive 都要带上。
+      // 仅排除显式勾选的具体副本，不遗漏同 ID 的其他后代来源。
+      const childKey = getSessionKey(child);
+      if (!rootKeys.has(childKey) && !descendantKeys.has(childKey)) {
+        descendantKeys.add(childKey);
+        descendants.push(child);
+      }
     });
   }
   return descendants;

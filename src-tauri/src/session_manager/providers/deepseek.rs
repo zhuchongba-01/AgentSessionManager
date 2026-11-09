@@ -249,6 +249,10 @@ fn select_generation(session_dir: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 fn open_session_reader(path: &Path) -> Result<Box<dyn Read>, String> {
+    open_session_reader_with_limit(path, true)
+}
+
+fn open_session_reader_with_limit(path: &Path, limit_body: bool) -> Result<Box<dyn Read>, String> {
     let file = File::open(path)
         .map_err(|error| format!("无法打开 DeepSeek Harness 会话 {}：{error}", path.display()))?;
     let metadata = file
@@ -260,7 +264,7 @@ fn open_session_reader(path: &Path) -> Result<Box<dyn Read>, String> {
             path.display()
         ));
     }
-    if metadata.len() > MAX_MESSAGES_FILE_BYTES {
+    if limit_body && metadata.len() > MAX_MESSAGES_FILE_BYTES {
         return Err(format!(
             "DeepSeek Harness 会话 {} 超过 {} MB 读取上限",
             path.display(),
@@ -280,7 +284,9 @@ fn open_session_reader(path: &Path) -> Result<Box<dyn Read>, String> {
 /// session's history for each deletion. Still reread headers on every preflight
 /// so new children and changed parents cannot be hidden by a stale cache.
 fn read_header(path: &Path) -> Result<Value, String> {
-    read_header_from(open_session_reader(path)?, path)
+    // A large body must not hide lineage or block unrelated sessions' preflight.
+    // The header decoder independently bounds decompressed bytes to 4 MiB.
+    read_header_from(open_session_reader_with_limit(path, false)?, path)
 }
 
 fn read_header_from(reader: impl Read, path: &Path) -> Result<Value, String> {
@@ -650,7 +656,13 @@ fn validate_index(value: &Value) -> Result<(), String> {
     validate_string_array(
         value.pointer("/global/archivedSessionIds"),
         "global.archivedSessionIds",
-    )
+    )?;
+    // Pins were added after the original workspace schema. Absence is valid
+    // for older stores; malformed present data must not be rewritten blindly.
+    if let Some(pins) = value.pointer("/global/pinnedSessionIds") {
+        validate_string_array(Some(pins), "global.pinnedSessionIds")?;
+    }
+    Ok(())
 }
 
 fn workspace_catalog(home: &Path) -> Result<WorkspaceCatalog, String> {
@@ -760,6 +772,14 @@ fn cleanup_index(home: &Path, session_id: &str) -> Result<(), String> {
     let before = archived.len();
     archived.retain(|item| item.as_str() != Some(session_id));
     changed |= archived.len() != before;
+    if let Some(pinned) = index
+        .pointer_mut("/global/pinnedSessionIds")
+        .and_then(Value::as_array_mut)
+    {
+        let before = pinned.len();
+        pinned.retain(|item| item.as_str() != Some(session_id));
+        changed |= pinned.len() != before;
+    }
     if changed {
         write_index_atomically(&workspace_index_path(home), &index)?;
     }
@@ -965,11 +985,79 @@ fn active_schedules(events: &[Value]) -> Result<usize, String> {
     Ok(active.len())
 }
 
+/// Current Harness reminders belong to a host-wide storage domain, not only
+/// historical session events. Inspect it read-only; the user cancels active
+/// tasks in Harness so delivery state is never rewritten by this manager.
+fn active_host_schedules(home: &Path, session_id: &str) -> Result<usize, String> {
+    let path = home.join("storages").join("schedule.json");
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("读取 DeepSeek Harness 主机定时任务失败：{error}")),
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_INDEX_BYTES {
+        return Err("DeepSeek Harness 主机定时任务存储类型或大小异常".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_INDEX_BYTES {
+        return Err("DeepSeek Harness 主机定时任务超过读取上限".into());
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("DeepSeek Harness 主机定时任务存储损坏：{error}"))?;
+    if value.pointer("/unit/name").and_then(Value::as_str) != Some("schedule")
+        || value.pointer("/unit/version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err("DeepSeek Harness 主机定时任务存储版本未知".into());
+    }
+    let tables = value
+        .get("tables")
+        .and_then(Value::as_object)
+        .ok_or("DeepSeek Harness 主机定时任务缺少 tables")?;
+    let Some(tasks) = tables.get("tasks") else {
+        return Ok(0);
+    };
+    let tasks = tasks
+        .as_object()
+        .ok_or("DeepSeek Harness 主机定时任务 tasks 结构异常")?;
+    let mut active = 0;
+    for (id, task) in tasks {
+        let owner = task
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("DeepSeek Harness 主机定时任务缺少归属")?;
+        if id.is_empty() || task.pointer("/record/id").and_then(Value::as_str) != Some(id.as_str())
+        {
+            return Err("DeepSeek Harness 主机定时任务 ID 不匹配".into());
+        }
+        let is_active = match task.get("status") {
+            None => true,
+            Some(Value::String(status)) if status == "active" => true,
+            Some(Value::String(status)) if status == "inactive" => false,
+            _ => return Err("DeepSeek Harness 主机定时任务状态未知".into()),
+        };
+        if owner == session_id && is_active {
+            active += 1;
+        }
+    }
+    Ok(active)
+}
+
 pub fn preflight_delete(root: &Path, source: &Path, session_id: &str) -> Result<(), String> {
     validate_delete_under_root(root, source, session_id)?;
     let (source, _) = source_layout(root, source, session_id)?;
     let home = root.parent().ok_or("DeepSeek Harness 根目录无效")?;
     read_index(home)?;
+    let active_host = active_host_schedules(home, session_id)?;
+    if active_host > 0 {
+        return Err(format!(
+            "该 DeepSeek Harness 会话仍有 {active_host} 个活动主机定时任务，请先在 Harness 中取消"
+        ));
+    }
     if source.try_exists().map_err(|error| error.to_string())? {
         let decoded = read_session(&source)?;
         let active = active_schedules(&decoded.events)?;
@@ -1181,6 +1269,161 @@ mod tests {
             .expect("serialize index"),
         )
         .expect("write index");
+    }
+
+    #[test]
+    fn compat_host_reminders_protect_sessions_even_without_log_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let source = root.join("project/target/session.v4.jsonl");
+        write_plain_session(&source, "target", None, None);
+        write_index(temp.path(), &["target"], &[]);
+        let path = temp.path().join("storages/schedule.json");
+        assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 0);
+        let mut store = json!({"unit":{"name":"schedule","version":1},"global":null,"tables":{"tasks":{
+            "daily-task":{"sessionId":"target","record":{"id":"daily-task","kind":"at","title":"Reminder","prompt":"hello","scheduledAt":"2030-01-01T00:00:00.000Z"}},
+            "stopped":{"sessionId":"target","status":"inactive","record":{"id":"stopped","kind":"at","title":"Stopped","prompt":"hello","scheduledAt":"2020-01-01T00:00:00.000Z"}},
+            "other":{"sessionId":"other-session","status":"active","record":{"id":"other","kind":"at","title":"Other","prompt":"hello","scheduledAt":"2030-01-01T00:00:00.000Z"}}
+        }}});
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 1);
+        assert!(preflight_delete(&root, &source, "target")
+            .unwrap_err()
+            .contains("主机定时任务"));
+        assert!(source.exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_file(&source).unwrap();
+        assert!(preflight_delete(&root, &source, "target")
+            .unwrap_err()
+            .contains("主机定时任务"));
+        store["tables"]["tasks"]["daily-task"]["status"] = json!("inactive");
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 0);
+        preflight_delete(&root, &source, "target").unwrap();
+        assert!(
+            read_index(temp.path()).unwrap().unwrap()["tables"]["workspaces"]["workspace-1"]
+                ["sessionIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "target")
+        );
+    }
+
+    #[test]
+    fn compat_host_reminder_store_validation_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("storages/schedule.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for invalid in [
+            json!({"unit":{"name":"schedule","version":2},"tables":{}}),
+            json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":[]}}),
+            json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":{"s":{"sessionId":"target","record":{"id":"other"}}}}}),
+            json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":{"s":{"record":{"id":"s"}}}}}),
+            json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":{"s":{"sessionId":"target","status":"paused","record":{"id":"s"}}}}}),
+        ] {
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            let before = fs::read(&path).unwrap();
+            assert!(active_host_schedules(temp.path(), "target").is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        fs::write(
+            &path,
+            b"{\"unit\":{\"name\":\"schedule\",\"version\":1},\"tables\":{}}",
+        )
+        .unwrap();
+        assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 0);
+    }
+
+    #[test]
+    fn compat_oversized_body_keeps_bounded_header_and_lineage_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let parent = root.join("project/parent/session.v4.jsonl");
+        let child = root.join("project/child/session.v4.jsonl");
+        let unrelated = root.join("project/unrelated/session.v4.jsonl");
+        write_plain_session(&parent, "parent", None, None);
+        write_plain_session(&child, "child", Some("parent"), Some("subagent"));
+        write_plain_session(&unrelated, "unrelated", None, None);
+        // Use a released v4 header explicitly; the shared legacy helper is v3.
+        let body = fs::read_to_string(&child).unwrap();
+        let (header, rest) = body.split_once('\n').unwrap();
+        let mut header: Value = serde_json::from_str(header).unwrap();
+        header["version"] = json!(4);
+        fs::write(&child, format!("{header}\n{rest}")).unwrap();
+        File::options()
+            .write(true)
+            .open(&child)
+            .unwrap()
+            .set_len(MAX_MESSAGES_FILE_BYTES + 1)
+            .unwrap();
+        assert_eq!(read_header(&child).unwrap()["id"], json!("child"));
+        assert!(read_session(&child).is_err());
+        let found = descriptors(&root).unwrap();
+        assert!(found
+            .iter()
+            .any(|entry| entry.id == "child" && entry.parent_session.as_deref() == Some("parent")));
+        // No complete body is needed from an unrelated session's dependency.
+        preflight_delete(&root, &unrelated, "unrelated").unwrap();
+        // But never erase a parent's large child or bypass its own schedule check.
+        assert!(preflight_delete(&root, &parent, "parent").is_err());
+        assert!(preflight_delete(&root, &child, "child").is_err());
+        assert!(child.exists());
+    }
+
+    #[test]
+    fn compat_cleanup_removes_pins_and_preserves_other_workspace_state() {
+        let temp = tempfile::tempdir().unwrap();
+        write_index(temp.path(), &["target", "other"], &[]);
+        let path = workspace_index_path(temp.path());
+        let mut index = read_index(temp.path()).unwrap().unwrap();
+        index["global"]["pinnedSessionIds"] = json!(["target", "other", "target"]);
+        index["global"]["defaultWorkspaceId"] = json!("workspace-1");
+        write_index_atomically(&path, &index).unwrap();
+        cleanup_index(temp.path(), "target").unwrap();
+        let cleaned = read_index(temp.path()).unwrap().unwrap();
+        assert_eq!(cleaned["global"]["pinnedSessionIds"], json!(["other"]));
+        assert_eq!(
+            cleaned["global"]["defaultWorkspaceId"],
+            json!("workspace-1")
+        );
+        assert_eq!(
+            cleaned["tables"]["workspaces"]["workspace-1"]["sessionIds"],
+            json!(["other"])
+        );
+        let before = fs::read(&path).unwrap();
+        cleanup_index(temp.path(), "target").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // A dangling pin alone is still a mutation even with no membership.
+        cleanup_index(temp.path(), "other").unwrap();
+        let mut index = read_index(temp.path()).unwrap().unwrap();
+        index["global"]["pinnedSessionIds"] = json!(["ghost"]);
+        write_index_atomically(&path, &index).unwrap();
+        cleanup_index(temp.path(), "ghost").unwrap();
+        assert_eq!(
+            read_index(temp.path()).unwrap().unwrap()["global"]["pinnedSessionIds"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn compat_cleanup_accepts_legacy_absent_pins_but_rejects_malformed_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        write_index(temp.path(), &["target"], &[]);
+        cleanup_index(temp.path(), "target").unwrap();
+        assert!(read_index(temp.path()).unwrap().unwrap()["global"]
+            .get("pinnedSessionIds")
+            .is_none());
+        let path = workspace_index_path(temp.path());
+        for malformed in [json!(null), json!({}), json!(["target", 5])] {
+            let mut index = json!({"global":{"archivedSessionIds":[]},"tables":{"workspaces":{}}});
+            index["global"]["pinnedSessionIds"] = malformed;
+            fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+            let before = fs::read(&path).unwrap();
+            assert!(cleanup_index(temp.path(), "target").is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]

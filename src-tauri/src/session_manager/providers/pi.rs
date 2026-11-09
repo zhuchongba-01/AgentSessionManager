@@ -9,8 +9,7 @@ use serde_json::Value;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    checked_storage_child, extract_text, parse_timestamp_to_ms, path_basename, truncate_summary,
-    TITLE_MAX_CHARS,
+    extract_text, parse_timestamp_to_ms, path_basename, truncate_summary, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "pi";
@@ -190,7 +189,9 @@ fn classify_configured_session_dir(
 }
 
 fn resolve_global_session_dir(value: &str, home: &Path) -> Option<PathBuf> {
-    let path = if value == "~" {
+    let path = if value.starts_with("file://") {
+        tauri::Url::parse(value).ok()?.to_file_path().ok()?
+    } else if value == "~" {
         home.to_path_buf()
     } else if let Some(suffix) = value
         .strip_prefix("~/")
@@ -230,7 +231,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 fn scan_sessions_in_root(root: &Path, layout: SessionLayout) -> Vec<SessionMeta> {
     let mut files = Vec::new();
     collect_jsonl_files(root, layout, &mut files, true);
-    files
+    let mut sessions: Vec<_> = files
         .into_iter()
         .filter_map(|path| match parse_session(&path) {
             Ok(session) => Some(session),
@@ -240,7 +241,30 @@ fn scan_sessions_in_root(root: &Path, layout: SessionLayout) -> Vec<SessionMeta>
                 None
             }
         })
-        .collect()
+        .collect();
+    // parentSession is provenance, not a runtime dependency. Resolve lineage
+    // only against files already discovered within this root; never open it.
+    let lineage_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let by_path: HashMap<_, _> = sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .source_path
+                .as_deref()
+                .map(|source| (PathBuf::from(source), session.session_id.clone()))
+        })
+        .collect();
+    for session in &mut sessions {
+        if let Some(source) = session.source_path.as_deref() {
+            session.parent_session_id = read_session_header(Path::new(source))
+                .ok()
+                .and_then(|header| header.parent_session)
+                .and_then(|parent| lineage_path(&parent, &lineage_root))
+                .and_then(|parent| by_path.get(&parent).cloned())
+                .filter(|parent| parent != &session.session_id);
+        }
+    }
+    sessions
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -267,7 +291,6 @@ fn load_messages_with_layout(
 
 #[derive(Debug)]
 struct SessionDescriptor {
-    id: String,
     path: PathBuf,
     parent_path: Option<PathBuf>,
 }
@@ -280,57 +303,54 @@ fn session_descriptors(
         .canonicalize()
         .map_err(|error| format!("Failed to resolve Pi session root: {error}"))?;
     let mut files = Vec::new();
-    collect_jsonl_files(&root, layout, &mut files, false);
+    super::utils::collect_files_where_checked(
+        &root,
+        |path| {
+            path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+                && matches_session_layout(&root, path, layout)
+        },
+        &mut files,
+    )?;
     files.sort();
-    let mut ids = HashSet::new();
     let mut descriptors = Vec::with_capacity(files.len());
     for file in files {
         let (_, path) = validate_source_under_root(&root, &file, layout)?;
-        let header = read_tree(&path)?.header;
-        if !ids.insert(header.id.clone()) {
-            return Err(format!("Pi 存在重复会话 ID {}，已停止删除", header.id));
-        }
+        let header = read_session_header(&path)?;
         let parent_path = header
             .parent_session
             .as_deref()
-            .map(Path::new)
-            .map(|parent| checked_storage_child(&root, parent))
-            .transpose()
-            .map_err(|error| format!("Pi 父会话路径无效：{error}"))?;
-        if parent_path
-            .as_deref()
-            .is_some_and(|parent| !matches_session_layout(&root, parent, layout))
-        {
-            return Err(format!(
-                "Pi 会话 {} 的父会话路径不符合当前存储布局",
-                header.id
-            ));
-        }
-        descriptors.push(SessionDescriptor {
-            id: header.id,
-            path,
-            parent_path,
-        });
+            .and_then(|parent| lineage_path(parent, &root));
+        descriptors.push(SessionDescriptor { path, parent_path });
     }
 
-    let by_path = descriptors
-        .iter()
-        .map(|descriptor| (descriptor.path.as_path(), descriptor))
-        .collect::<HashMap<_, _>>();
-    for descriptor in &descriptors {
-        let mut seen = HashSet::new();
-        let mut current = descriptor;
-        while let Some(parent_path) = current.parent_path.as_deref() {
-            if !seen.insert(current.path.clone()) {
-                return Err("Pi 会话父子关系存在循环，已停止删除".into());
-            }
-            let Some(parent) = by_path.get(parent_path).copied() else {
-                break;
-            };
-            current = parent;
-        }
-    }
     Ok(descriptors)
+}
+
+fn lineage_path(value: &str, root: &Path) -> Option<PathBuf> {
+    let path = if value.starts_with("file://") {
+        tauri::Url::parse(value).ok()?.to_file_path().ok()?
+    } else {
+        PathBuf::from(value)
+    };
+    // Do not stat/canonicalize external provenance. Prefix normalization below
+    // merely allows a normal Windows path to match an already-canonical root.
+    if !path.is_absolute() {
+        return None;
+    }
+    #[cfg(windows)]
+    let path = if root.to_string_lossy().starts_with(r"\\?\")
+        && !path.to_string_lossy().starts_with(r"\\?\")
+    {
+        let text = path.to_string_lossy().replace('/', "\\");
+        if let Some(unc) = text.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{unc}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{text}"))
+        }
+    } else {
+        path
+    };
+    path.starts_with(root).then_some(path)
 }
 
 fn preflight_delete_with_layout(
@@ -343,22 +363,15 @@ fn preflight_delete_with_layout(
         return Err("Invalid Pi session ID".to_string());
     }
     let (_, source) = validate_source_under_root(root, path, layout)?;
-    let target = read_tree(&source)?.header;
+    let target = read_session_header(&source)?;
     if target.id != session_id {
         return Err(format!(
             "Pi session ID mismatch: expected {session_id}, found {}",
             target.id
         ));
     }
-    if let Some(child) = session_descriptors(root, layout)?
-        .into_iter()
-        .find(|descriptor| descriptor.parent_path.as_deref() == Some(source.as_path()))
-    {
-        return Err(format!(
-            "该 Pi 会话仍被分支会话 {} 依赖，请先删除子会话",
-            child.id
-        ));
-    }
+    // A fork contains its own copied entries. Deletion is an explicit selection,
+    // not an implicit cascade and not gated on provenance elsewhere in the root.
     Ok(())
 }
 
@@ -471,9 +484,19 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         .to_str()
         .ok_or_else(|| "Pi session path is not valid UTF-8".to_string())?
         .to_string();
-    let SessionTree {
-        header, summary, ..
-    } = read_tree(&source)?;
+    let metadata =
+        fs::metadata(&source).map_err(|error| format!("Failed to inspect Pi session: {error}"))?;
+    let (header, summary) = if metadata.len() > MAX_SESSION_BYTES {
+        let header = read_session_header(&source)?;
+        super::utils::scan_warning(format!(
+            "Pi session {} exceeds the {MAX_SESSION_BYTES}-byte loading limit; showing header metadata only",
+            source.display()
+        ));
+        (header, SessionSummary::default())
+    } else {
+        let tree = read_tree(&source)?;
+        (tree.header, tree.summary)
+    };
     let title = summary.explicit_name.flatten().or_else(|| {
         summary
             .first_user_message
@@ -487,16 +510,12 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         .as_deref()
         .map(|message| truncate_summary(message, 160))
         .filter(|message| !message.is_empty());
-    let residual = header
-        .parent_session
-        .as_deref()
-        .is_some_and(|parent| !Path::new(parent).is_file());
+    let residual = false; // parentSession is fork provenance, even when missing.
     Ok(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: header.id,
         residual,
-        // Pi 的 `parent_session` 是父会话**文件路径**，不是原生 ID：拿它去匹配列表
-        // 行的 `sessionId` 只会得到空结果，所以这里不提供归属线索。
+        // Scan resolves this provenance path to an ID only within discovered files.
         parent_session_id: None,
         archived: false,
         cleanup_pending: false,
@@ -515,6 +534,32 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
             )
         }),
     })
+}
+
+/// Header-only fallback for oversized files: never consume the body. A bounded
+/// prefix also handles legacy leading blank/invalid lines without an unbounded scan.
+fn read_session_header(path: &Path) -> Result<SessionHeader, String> {
+    use std::io::Read;
+    const HEADER_BUDGET: u64 = 4 * 1024 * 1024;
+    let file = File::open(path).map_err(|error| format!("Failed to open Pi session: {error}"))?;
+    let mut reader = BufReader::new(file.take(HEADER_BUDGET + 1));
+    let mut consumed = 0u64;
+    loop {
+        let mut line = String::new();
+        let count = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Failed to read Pi session header: {error}"))?;
+        consumed += count as u64;
+        if consumed > HEADER_BUDGET {
+            return Err("Pi session header exceeds the scan limit".into());
+        }
+        if count == 0 {
+            return Err("Pi session has no valid header".into());
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            return parse_header(&value);
+        }
+    }
 }
 
 fn read_tree(path: &Path) -> Result<SessionTree, String> {
@@ -786,6 +831,14 @@ fn parse_message(message: &Value) -> Option<(String, String)> {
             role.to_string(),
             message.get("content").map(extract_text).unwrap_or_default(),
         ),
+        "custom" | "hookMessage"
+            if message.get("display").and_then(Value::as_bool) != Some(false) =>
+        {
+            (
+                "system".to_string(),
+                message.get("content").map(extract_text).unwrap_or_default(),
+            )
+        }
         "toolResult" => (
             "tool".to_string(),
             message.get("content").map(extract_text).unwrap_or_default(),
@@ -847,7 +900,6 @@ fn validate_source_under_root(
         .map_err(|error| format!("Failed to inspect Pi session {}: {error}", source.display()))?;
     if !metadata.file_type().is_file()
         || source.extension().and_then(|value| value.to_str()) != Some("jsonl")
-        || metadata.len() > MAX_SESSION_BYTES
     {
         return Err(format!("Invalid Pi session file: {}", source.display()));
     }
@@ -887,12 +939,33 @@ fn collect_session_level(
         ));
         return;
     }
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            super::utils::scan_warning(format!("Failed to scan {}: {error}", directory.display()));
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                super::utils::scan_warning(format!(
+                    "Failed to enumerate {}: {error}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                super::utils::scan_warning(format!(
+                    "Failed to inspect {}: {error}",
+                    entry.path().display()
+                ));
+                continue;
+            }
         };
         if file_type.is_file() {
             push_jsonl_file(&entry, output, enforce_size_limit);
@@ -902,8 +975,17 @@ fn collect_session_level(
             continue;
         }
         let forks = entry.path().join("forks");
-        if fs::symlink_metadata(&forks).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-            collect_session_level(&forks, output, enforce_size_limit, depth + 1);
+        match fs::symlink_metadata(&forks) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                collect_session_level(&forks, output, enforce_size_limit, depth + 1);
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                super::utils::scan_warning(format!(
+                    "Failed to inspect {}: {error}",
+                    forks.display()
+                ));
+            }
+            _ => {}
         }
     }
 }
@@ -937,29 +1019,51 @@ fn collect_jsonl_files(
     output: &mut Vec<PathBuf>,
     enforce_size_limit: bool,
 ) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
     match layout {
         SessionLayout::Flat => collect_session_level(root, output, enforce_size_limit, 0),
         SessionLayout::ProjectDirectories => {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                    collect_session_level(&entry.path(), output, enforce_size_limit, 0);
+            let entries = match fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => {
+                    super::utils::scan_warning(format!(
+                        "Failed to scan {}: {error}",
+                        root.display()
+                    ));
+                    return;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        super::utils::scan_warning(format!(
+                            "Failed to enumerate {}: {error}",
+                            root.display()
+                        ));
+                        continue;
+                    }
+                };
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {
+                        collect_session_level(&entry.path(), output, enforce_size_limit, 0);
+                    }
+                    Err(error) => super::utils::scan_warning(format!(
+                        "Failed to inspect {}: {error}",
+                        entry.path().display()
+                    )),
+                    _ => {}
                 }
             }
         }
     }
 }
 
-fn push_jsonl_file(entry: &fs::DirEntry, output: &mut Vec<PathBuf>, enforce_size_limit: bool) {
+fn push_jsonl_file(entry: &fs::DirEntry, output: &mut Vec<PathBuf>, _enforce_size_limit: bool) {
     let path = entry.path();
-    if path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-        && (!enforce_size_limit
-            || entry
-                .metadata()
-                .is_ok_and(|metadata| metadata.len() <= MAX_SESSION_BYTES))
-    {
+    // Oversized sessions remain discoverable; parse_session reads only their
+    // bounded header, while the message loader enforces the body limit.
+    if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
         output.push(path);
     }
 }
@@ -990,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_native_forks_and_marks_orphans_as_residual() {
+    fn compat_scans_native_forks_without_marking_missing_provenance_residual() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("sessions");
         let project = root.join("project");
@@ -1015,12 +1119,12 @@ mod tests {
         let sessions = scan_sessions_in_root(&root, SessionLayout::ProjectDirectories);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-child");
-        assert!(sessions[0].residual);
-        assert!(sessions[0].resume_command.is_none());
+        assert!(!sessions[0].residual);
+        assert!(sessions[0].resume_command.is_some());
     }
 
     #[test]
-    fn parent_delete_is_blocked_until_pi_fork_is_removed() {
+    fn compat_parent_delete_does_not_require_removing_self_contained_fork() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("sessions");
         let project = root.join("project");
@@ -1029,14 +1133,13 @@ mod tests {
         write_session_header(&parent, "session-parent");
         write_fork_header(&child, "session-child", &parent);
 
-        let error = preflight_delete_with_layout(
+        preflight_delete_with_layout(
             &root,
             &parent,
             "session-parent",
             SessionLayout::ProjectDirectories,
         )
-        .expect_err("parent must be protected");
-        assert!(error.contains("session-child"));
+        .expect("fork does not depend on parent file");
         assert!(parent.exists());
         assert!(child.exists());
 
@@ -1102,6 +1205,103 @@ mod tests {
             sessions.iter().filter(|session| session.residual).count(),
             descriptors.len()
         );
+    }
+
+    #[test]
+    fn compat_external_fork_provenance_never_blocks_unrelated_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let external = temp.path().join("external.jsonl");
+        let fork = root.join("fork.jsonl");
+        let target = root.join("target.jsonl");
+        write_session_header(&external, "external");
+        write_fork_header(&fork, "fork", &external);
+        write_session_header(&target, "target");
+        fs::write(root.join("malformed.jsonl"), "not-json").unwrap();
+        assert!(delete_session_with_layout(&root, &target, "target", SessionLayout::Flat).unwrap());
+        assert!(external.exists());
+        assert!(fork.exists());
+        assert!(delete_session_with_layout(&root, &fork, "fork", SessionLayout::Flat).unwrap());
+        assert!(external.exists());
+    }
+
+    #[test]
+    fn compat_lineage_maps_only_discovered_source_and_parent_deletion_preserves_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let parent = root.join("parent.jsonl");
+        let child = root.join("child.jsonl");
+        write_session_header(&parent, "parent");
+        write_fork_header(&child, "child", &parent);
+        let sessions = scan_sessions_in_root(root, SessionLayout::Flat);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.session_id == "child")
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("parent")
+        );
+        assert!(delete_session_with_layout(root, &parent, "parent", SessionLayout::Flat).unwrap());
+        assert!(child.exists());
+        let child = parse_session(&child).unwrap();
+        assert!(!child.residual);
+        assert!(child.resume_command.is_some());
+    }
+
+    #[test]
+    fn compat_file_url_roots_decode_without_expanding_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("space 中文");
+        fs::create_dir(&root).unwrap();
+        let uri = tauri::Url::from_directory_path(&root).unwrap().to_string();
+        let normalized = resolve_global_session_dir(&uri, temp.path()).unwrap();
+        assert_eq!(
+            normalized.canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert!(matches!(
+            classify_configured_session_dir(&uri, temp.path(), "settings"),
+            SessionRootResolution::Available {
+                layout: SessionLayout::Flat,
+                ..
+            }
+        ));
+        assert!(resolve_global_session_dir("project/.pi/sessions", temp.path()).is_none());
+    }
+
+    #[test]
+    fn compat_custom_roles_and_legacy_hook_are_distinct_from_custom_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let entries = [
+            serde_json::json!({"type":"session","id":"custom-session","version":2,"cwd":"/work"}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"legacy hook"}}),
+            serde_json::json!({"type":"message","id":"b","parentId":"a","message":{"role":"custom","content":[{"type":"text","text":"custom role"}],"display":true}}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"custom","content":"hidden role","display":false}}),
+            serde_json::json!({"type":"custom","id":"d","parentId":"c","content":"extension state"}),
+            serde_json::json!({"type":"custom_message","id":"e","parentId":"d","content":"custom entry","display":true}),
+            serde_json::json!({"type":"custom_message","id":"f","parentId":"e","content":"hidden entry","display":false}),
+        ];
+        fs::write(
+            &path,
+            entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let messages = load_messages_with_layout(temp.path(), &path, SessionLayout::Flat).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy hook", "custom role", "custom entry"]
+        );
+        assert!(messages.iter().all(|m| m.role == "system"));
     }
 
     #[test]
@@ -1372,6 +1572,86 @@ mod tests {
     }
 
     #[test]
+    fn regression_oversized_session_remains_visible_from_header_without_reading_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.jsonl");
+        write_session_header(&path, "large-session");
+        // Sparse NUL body is deliberately not JSON. Header-only discovery must
+        // not read a 128 MiB unterminated body line to obtain the list entry.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_SESSION_BYTES + 1)
+            .unwrap();
+        let sessions = scan_sessions_in_root(temp.path(), SessionLayout::Flat);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "large-session");
+        assert_eq!(sessions[0].project_dir.as_deref(), Some("/work"));
+        assert!(sessions[0].summary.is_none());
+        assert!(
+            load_messages_with_layout(temp.path(), &path, SessionLayout::Flat)
+                .unwrap_err()
+                .contains("safety limit")
+        );
+    }
+
+    #[test]
+    fn regression_session_size_boundary_accepts_exact_limit_rejects_next_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("boundary.jsonl");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_BYTES).unwrap();
+        assert!(validate_file_size(&path).is_ok());
+        file.set_len(MAX_SESSION_BYTES + 1).unwrap();
+        assert!(validate_file_size(&path).is_err());
+    }
+
+    #[test]
+    fn regression_oversized_header_fallback_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("no-header.jsonl");
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_SESSION_BYTES + 1)
+            .unwrap();
+        assert!(parse_session(&path).unwrap_err().contains("header exceeds"));
+    }
+
+    #[test]
+    fn compat_oversized_child_does_not_block_parent_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        write_session_header(&parent, "parent-session");
+        write_fork_header(&child, "child-session", &parent);
+        File::options()
+            .write(true)
+            .open(&child)
+            .unwrap()
+            .set_len(MAX_SESSION_BYTES + 1)
+            .unwrap();
+        preflight_delete_with_layout(temp.path(), &parent, "parent-session", SessionLayout::Flat)
+            .expect("fork is self-contained");
+        assert!(parent.exists());
+        assert!(preflight_delete_with_layout(
+            temp.path(),
+            &child,
+            "child-session",
+            SessionLayout::Flat
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn regression_descriptor_discovery_rejects_non_directory_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::write(&root, "not a directory").unwrap();
+        assert!(session_descriptors(&root, SessionLayout::Flat).is_err());
+    }
+
+    #[test]
     fn usage_collection_keeps_oversized_files_for_error_reporting() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("sessions");
@@ -1384,7 +1664,7 @@ mod tests {
 
         let mut browser_files = Vec::new();
         collect_jsonl_files(&root, SessionLayout::Flat, &mut browser_files, true);
-        assert!(browser_files.is_empty());
+        assert_eq!(browser_files, vec![path.clone()]);
 
         let mut usage_files = Vec::new();
         collect_jsonl_files(&root, SessionLayout::Flat, &mut usage_files, false);

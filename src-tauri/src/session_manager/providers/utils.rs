@@ -228,6 +228,70 @@ where
     walk(root, &predicate, files)
 }
 
+/// Strict dependency discovery: only a missing optional root is an empty tree.
+/// Do not publish a partial file set when any directory/entry cannot be inspected.
+pub fn collect_files_where_checked<F>(
+    root: &Path,
+    predicate: F,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String>
+where
+    F: Fn(&Path) -> bool,
+{
+    fn walk<F>(root: &Path, predicate: &F, files: &mut Vec<PathBuf>) -> Result<(), String>
+    where
+        F: Fn(&Path) -> bool + ?Sized,
+    {
+        let entries = std::fs::read_dir(root)
+            .map_err(|error| format!("Failed to scan {}: {error}", root.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("Failed to enumerate {}: {error}", root.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
+            // Links/reparse points may hide dependent sessions. Never skip them
+            // silently or follow them outside the store during deletion checks.
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
+            reject_scan_link(&path, &metadata)?;
+            if kind.is_dir() {
+                walk(&path, predicate, files)?;
+            } else if kind.is_file() && predicate(&path) {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Failed to inspect {}: {error}", root.display())),
+        Ok(metadata) => reject_scan_link(root, &metadata)?,
+    }
+    let mut discovered = Vec::new();
+    walk(root, &predicate, &mut discovered)?;
+    files.extend(discovered);
+    Ok(())
+}
+
+fn reject_scan_link(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = metadata.file_type().is_symlink();
+    if is_link {
+        return Err(format!(
+            "Dependency scan encountered a link: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Read the first `head_n` lines and last `tail_n` lines from a file.
 /// For small files (< 16 KB), reads all lines once to avoid unnecessary seeking.
 pub fn read_head_tail_lines(
@@ -269,19 +333,64 @@ pub fn read_head_tail_lines(
         head.push(line);
     }
 
-    // Seek to last ~16 KB for tail lines
-    let seek_pos = file_len.saturating_sub(16_384);
-    let mut file2 = File::open(path)?;
-    file2.seek(SeekFrom::Start(seek_pos))?;
-    let mut tail_reader = BufReader::new(file2);
-    // Discard the partial line as bytes, BEFORE attempting UTF-8 decoding.
-    if seek_pos > 0 {
-        let mut partial = Vec::new();
-        tail_reader.read_until(b'\n', &mut partial)?;
+    // Walk backwards in bounded blocks, assembling only requested complete
+    // records. Decode after finding the boundary so split UTF-8 is harmless.
+    let mut tail = Vec::new();
+    if tail_n == 0 {
+        return Ok((head, tail));
     }
-    let usable: Vec<String> = tail_reader.lines().collect::<io::Result<_>>()?;
-    let skip = usable.len().saturating_sub(tail_n);
-    let tail = usable.into_iter().skip(skip).collect();
+    let mut file2 = File::open(path)?;
+    let mut position = file_len;
+    let mut reversed_line = Vec::new();
+    let mut block = [0u8; 16_384];
+    let mut line_bytes = 0u64;
+    let mut line_terminated = false;
+    while position > 0 && tail.len() < tail_n {
+        let count = position.min(block.len() as u64) as usize;
+        position -= count as u64;
+        file2.seek(SeekFrom::Start(position))?;
+        file2.read_exact(&mut block[..count])?;
+        for index in (0..count).rev() {
+            let byte = block[index];
+            if byte == b'\n' {
+                if position + index as u64 != file_len - 1 {
+                    reversed_line.reverse();
+                    if line_terminated && reversed_line.last() == Some(&b'\r') {
+                        reversed_line.pop();
+                    }
+                    tail.push(
+                        String::from_utf8(std::mem::take(&mut reversed_line))
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    );
+                    if tail.len() == tail_n {
+                        break;
+                    }
+                }
+                line_bytes = 1; // Include the delimiter in the per-record budget.
+                line_terminated = true;
+            } else {
+                line_bytes += 1;
+                if line_bytes > MAX_SCAN_LINE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Session metadata line exceeds scan limit",
+                    ));
+                }
+                reversed_line.push(byte);
+            }
+        }
+    }
+    if position == 0 && tail.len() < tail_n && line_bytes > 0 {
+        reversed_line.reverse();
+        if line_terminated && reversed_line.last() == Some(&b'\r') {
+            reversed_line.pop();
+        }
+        tail.push(
+            String::from_utf8(reversed_line)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        );
+    }
+    tail.reverse();
 
     Ok((head, tail))
 }
@@ -594,9 +703,102 @@ mod tests {
             "中".repeat(6000)
         );
         assert_eq!(text.as_bytes()[text.len() - 16_384] & 0xc0, 0x80);
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&path, &text).unwrap();
         let (_, tail) = read_head_tail_lines(&path, 1, 30).unwrap();
-        assert_eq!(tail, vec!["{\"last\":true}"]);
+        assert_eq!(tail, text.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn regression_checked_collection_allows_missing_root_but_rejects_file_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let mut files = vec![PathBuf::from("existing")];
+        collect_files_where_checked(&root, |_| true, &mut files).unwrap();
+        std::fs::write(&root, "not a directory").unwrap();
+        assert!(collect_files_where_checked(&root, |_| true, &mut files).is_err());
+        assert_eq!(files, vec![PathBuf::from("existing")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_checked_collection_reports_unreadable_child_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("blocked");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("dependent.json"), "{}").unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let actually_denied = std::fs::read_dir(&child).is_err();
+        let mut files = Vec::new();
+        let result = collect_files_where_checked(temp.path(), |_| true, &mut files);
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if actually_denied {
+            assert!(result.is_err());
+            assert!(files.is_empty());
+        } else {
+            eprintln!("skipped permission assertion: current user bypasses mode bits");
+        }
+    }
+
+    #[test]
+    fn regression_checked_collection_rejects_hidden_link_dependencies_without_partial_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let outside = temp.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("parent.json"), "{}").unwrap();
+        std::fs::write(outside.join("child.json"), "{}").unwrap();
+        if create_dir_symlink(&outside, &root.join("linked")).is_err() {
+            eprintln!("skipped: directory symlink creation unavailable");
+            return;
+        }
+        let mut files = vec![PathBuf::from("existing")];
+        assert!(collect_files_where_checked(&root, |_| true, &mut files).is_err());
+        assert_eq!(files, vec![PathBuf::from("existing")]);
+    }
+
+    #[test]
+    fn regression_tail_reads_long_final_records_with_and_without_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tail.jsonl");
+        for content in ["x".repeat(20_000), "中🦀".repeat(5000)] {
+            for ending in ["", "\n", "\r\n"] {
+                std::fs::write(&path, format!("head\n{content}{ending}")).unwrap();
+                let (_, tail) = read_head_tail_lines(&path, 1, 1).unwrap();
+                assert_eq!(tail, vec![content.clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn regression_tail_enforces_four_mib_record_limit_without_reading_earlier_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tail.jsonl");
+        // An oversized earlier line is not read when only the final record is requested.
+        std::fs::write(
+            &path,
+            format!("{}\nlast\n", "x".repeat(MAX_SCAN_LINE_BYTES as usize + 1)),
+        )
+        .unwrap();
+        assert_eq!(read_head_tail_lines(&path, 0, 1).unwrap().1, vec!["last"]);
+        for ending in ["", "\n"] {
+            let exact = "x".repeat(MAX_SCAN_LINE_BYTES as usize - ending.len());
+            std::fs::write(&path, format!("head\n{exact}{ending}")).unwrap();
+            assert_eq!(read_head_tail_lines(&path, 1, 1).unwrap().1, vec![exact]);
+            std::fs::write(
+                &path,
+                format!(
+                    "head\n{}{ending}",
+                    "x".repeat(MAX_SCAN_LINE_BYTES as usize + 1)
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                read_head_tail_lines(&path, 1, 1).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]

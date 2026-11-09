@@ -200,12 +200,6 @@ impl Transcript {
             cacheable: false,
         }
     }
-
-    /// 标记该解析结果已在缓存中，可以安全地只下发预览。
-    pub fn cached(mut self) -> Self {
-        self.cacheable = true;
-        self
-    }
 }
 
 /// 流式分块的粒度：单块最多 256 KB 或 150 条消息，取先到者。
@@ -293,11 +287,13 @@ impl TranscriptCache {
             }
         }
 
-        let transcript = load()?;
-        let approx_bytes = transcript.approx_bytes;
+        let mut transcript = load()?;
+        // 由实际容量决定是否保留正文，不能让调用方提前标记为已缓存。
+        // 零条目容量也表示不缓存；否则新条目会在插入后立即被淘汰。
+        transcript.cacheable = self.max_entries > 0 && transcript.approx_bytes <= self.max_bytes;
         let transcript = Arc::new(transcript);
         // 超过总上限的单个会话不进缓存，否则会立刻把其他条目全部挤掉
-        if approx_bytes <= self.max_bytes {
+        if transcript.cacheable {
             let mut entries = self.lock();
             entries.push_back(Entry {
                 key,
@@ -473,6 +469,60 @@ mod tests {
             .get_or_load(key, stamp(1), || Ok(transcript("small")))
             .unwrap();
         assert!(!cached);
+    }
+
+    #[test]
+    fn cache_admission_controls_wire_truncation() {
+        use crate::session_manager::wire::{wire_messages, MAX_INLINE_MESSAGE_CHARS};
+
+        // 缩小缓存预算复现 96 MiB 边界，避免测试分配上百 MiB。
+        let content = "x".repeat(MAX_INLINE_MESSAGE_CHARS + 1);
+        let make_transcript = || {
+            Transcript::new(vec![
+                SessionMessage {
+                    role: "user".into(),
+                    content: content.clone(),
+                    ts: None,
+                },
+                SessionMessage {
+                    role: "assistant".into(),
+                    content: content.clone(),
+                    ts: None,
+                },
+            ])
+        };
+        let size = make_transcript().approx_bytes;
+        for (max_entries, max_bytes, retained) in
+            [(2, size, true), (2, size - 1, false), (0, size, false)]
+        {
+            let cache = TranscriptCache::new(max_entries, max_bytes);
+            let key = test_key("claude", KEY_A);
+            let loads = Cell::new(0);
+            for attempt in 0..2 {
+                let (result, hit) = cache
+                    .get_or_load(key.clone(), stamp(1), || {
+                        loads.set(loads.get() + 1);
+                        // 即使加载器误标记，缓存层也必须纠正实际保留状态。
+                        let mut value = make_transcript();
+                        value.cacheable = true;
+                        Ok(value)
+                    })
+                    .unwrap();
+                assert_eq!(result.cacheable, retained);
+                assert_eq!(hit, retained && attempt > 0);
+                let wire = wire_messages(result.cacheable, "claude", &result.messages);
+                assert_eq!(wire.len(), 2);
+                for message in wire {
+                    assert_eq!(message.truncated, retained);
+                    if !retained {
+                        assert_eq!(message.content, content);
+                        assert_eq!(message.index, None);
+                    }
+                }
+            }
+            assert_eq!(loads.get(), if retained { 1 } else { 2 });
+            assert_eq!(cache.keys().len(), usize::from(retained));
+        }
     }
 
     #[test]

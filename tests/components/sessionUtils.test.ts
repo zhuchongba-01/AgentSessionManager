@@ -7,6 +7,8 @@ import {
   formatSessionMessagePreview,
   getProviderIconName,
   getProviderLabel,
+  getSessionDirectoryGroupKey,
+  getSessionKey,
   getVisibleSessionMessages,
   groupSessionsByProviderAndDirectory,
   resolveParentLabel,
@@ -16,6 +18,55 @@ import {
 import type { SessionMessage, SessionMeta } from "@/types";
 
 describe("session utils", () => {
+  it("isolates OpenCode descendants and parent titles by database", () => {
+    const row = (db: string, id: string, parent?: string): SessionMeta => ({
+      providerId: "opencode",
+      sessionId: id,
+      residual: !!parent,
+      sourcePath: `sqlite:C:/fixture/${db}:` + id,
+      parentSessionId: parent,
+      title: db,
+    });
+    const main = row("main.db", "ses_parent");
+    const dev = row("dev.db", "ses_parent");
+    const mainChild = row("main.db", "ses_child", "ses_parent");
+    const devChild = row("dev.db", "ses_child", "ses_parent");
+    const legacy: SessionMeta = {
+      ...devChild,
+      sourcePath: "C:/fixture/storage/message/ses_child",
+    };
+    const all = [main, dev, mainChild, devChild, legacy];
+    expect(collectSessionDescendants(all, [main])).toEqual([mainChild]);
+    expect(collectSessionDescendants(all, [dev])).toEqual([devChild]);
+    expect(collectSessionDescendants(all, [main, dev])).toEqual([
+      mainChild,
+      devChild,
+    ]);
+    const titles = buildSessionTitleIndex(all);
+    expect(resolveParentLabel(mainChild, titles)).toBe("main.db");
+    expect(resolveParentLabel(devChild, titles)).toBe("dev.db");
+    expect(resolveParentLabel(legacy, titles)).toBe("ses_pare");
+  });
+
+  it("keeps legacy OpenCode trees local and unknown sources isolated", () => {
+    const parent: SessionMeta = {
+      providerId: "opencode",
+      sessionId: "ses_p",
+      residual: false,
+      sourcePath: "C:/store/message/ses_p",
+    };
+    const child: SessionMeta = {
+      ...parent,
+      sessionId: "ses_c",
+      parentSessionId: "ses_p",
+      sourcePath: "c:\\store\\message\\ses_c",
+    };
+    const other = { ...child, sourcePath: "D:/store/message/ses_c" };
+    const unknown = { ...child, sourcePath: undefined };
+    expect(
+      collectSessionDescendants([parent, child, other, unknown], [parent]),
+    ).toEqual([child]);
+  });
   /**
    * 目录/缩略导航用的下标必须是「可见消息」空间的下标，而不是正文里的绝对下标。
    *
@@ -330,6 +381,62 @@ describe("session utils", () => {
     ).toEqual(["codex-1", "codex-2"]);
   });
 
+  it.each([
+    ["C:/Work/Repo/", "c:\\work\\repo"],
+    ["D:\\Work\\\\Repo\\", "d:/work/repo"],
+    ["\\\\SERVER\\Share\\Repo\\", "//server/share/repo/"],
+    ["C:/", "c:\\"],
+    ["/home/a/Repo/", "/home/a/Repo"],
+  ])("merges equivalent directory syntax: %s and %s", (left, right) => {
+    expect(getSessionDirectoryGroupKey("codex", left)).toBe(
+      getSessionDirectoryGroupKey("codex", right),
+    );
+  });
+
+  it.each([
+    ["/home/a/Repo", "/home/a/repo"],
+    ["/home/a/repo\\file", "/home/a/repo/file"],
+    ["/", null],
+    ["C:/", "C:"],
+    ["Repo", "repo"],
+    ["work\\repo", "work/repo"],
+    ["C:Repo", "c:repo"],
+    ["\\Repo", "\\repo"],
+  ])(
+    "keeps distinct or ambiguous directory syntax: %s and %s",
+    (left, right) => {
+      expect(getSessionDirectoryGroupKey("codex", left)).not.toBe(
+        getSessionDirectoryGroupKey("codex", right),
+      );
+    },
+  );
+
+  it("keeps case-sensitive POSIX groups separate regardless of scan order", () => {
+    const sessions: SessionMeta[] = [
+      { providerId: "codex", sessionId: "upper", projectDir: "/home/a/Repo" },
+      { providerId: "codex", sessionId: "lower", projectDir: "/home/a/repo" },
+      {
+        providerId: "codex",
+        sessionId: "upper-copy",
+        projectDir: "/home/a/Repo/",
+      },
+    ];
+    for (const scan of [sessions, [...sessions].reverse()]) {
+      const [group] = groupSessionsByProviderAndDirectory(scan, "未知目录");
+      expect(group.directories).toHaveLength(2);
+      expect(
+        group.directories
+          .map((directory) =>
+            directory.sessions
+              .map((session) => session.sessionId)
+              .sort()
+              .join(","),
+          )
+          .sort(),
+      ).toEqual(["lower", "upper,upper-copy"]);
+    }
+  });
+
   it("uses an unknown directory group for sessions without project directories", () => {
     const sessions: SessionMeta[] = [
       {
@@ -504,6 +611,126 @@ describe("session utils", () => {
           (session) => session.sessionId,
         ),
       ).toEqual(["b"]);
+    });
+
+    const grokCopies: SessionMeta[] = [
+      {
+        providerId: "grokbuild",
+        sessionId: "parent",
+        sourcePath: "/fixture/active/parent.json",
+      },
+      {
+        providerId: "grokbuild",
+        sessionId: "child",
+        parentSessionId: "parent",
+        sourcePath: "/fixture/active/child.json",
+        residual: true,
+      },
+      {
+        providerId: "grokbuild",
+        sessionId: "child",
+        parentSessionId: "parent",
+        sourcePath: "/fixture/archive/child.json",
+        residual: true,
+      },
+      {
+        providerId: "grokbuild",
+        sessionId: "nested",
+        parentSessionId: "child",
+        sourcePath: "/fixture/active/nested.json",
+        residual: true,
+      },
+      {
+        providerId: "grokbuild",
+        sessionId: "nested",
+        parentSessionId: "child",
+        sourcePath: "/fixture/archive/nested.json",
+        residual: true,
+      },
+    ];
+
+    it("collects every source copy once independently of scan and root order", () => {
+      const scans = [
+        grokCopies,
+        [...grokCopies].reverse(),
+        [
+          grokCopies[4],
+          grokCopies[2],
+          grokCopies[0],
+          grokCopies[3],
+          grokCopies[1],
+        ],
+      ];
+      const rootSets = [
+        [grokCopies[0]],
+        [grokCopies[0], { ...grokCopies[0] }],
+        [grokCopies[0], grokCopies[1]],
+        [grokCopies[1], grokCopies[0], { ...grokCopies[1] }],
+        [grokCopies[0], grokCopies[1], grokCopies[2]],
+      ];
+      for (const scan of scans) {
+        for (const roots of rootSets) {
+          const rootKeys = new Set(roots.map(getSessionKey));
+          const expected = grokCopies
+            .slice(1)
+            .filter((session) => !rootKeys.has(getSessionKey(session)))
+            .map(getSessionKey)
+            .sort();
+          const duplicatedScan = [
+            ...scan,
+            ...scan.map((session) => ({ ...session })),
+          ];
+          expect(
+            collectSessionDescendants(duplicatedScan, roots)
+              .map(getSessionKey)
+              .sort(),
+          ).toEqual(expected);
+        }
+      }
+      expect(collectSessionDescendants(grokCopies, [])).toEqual([]);
+    });
+
+    it("terminates cycles while retaining concrete copies and excluding only selected roots", () => {
+      const [root, child, archivedChild, nested, archivedNested] = grokCopies;
+      const cyclicRoot = { ...root, parentSessionId: "nested" };
+      const rootCopy = {
+        ...cyclicRoot,
+        sourcePath: "/fixture/archive/parent.json",
+      };
+      const selfChild = { ...child, parentSessionId: "child" };
+      const unrelatedRootCopy = {
+        ...root,
+        sourcePath: "/fixture/other/parent.json",
+      };
+      const otherProviderChild = { ...child, providerId: "codex" };
+      const scan = [
+        cyclicRoot,
+        child,
+        archivedChild,
+        nested,
+        archivedNested,
+        rootCopy,
+        selfChild,
+        unrelatedRootCopy,
+        otherProviderChild,
+      ];
+      const expected = [child, archivedChild, nested, archivedNested, rootCopy]
+        .map(getSessionKey)
+        .sort();
+      for (const orderedScan of [scan, [...scan].reverse()]) {
+        expect(
+          collectSessionDescendants(orderedScan, [
+            cyclicRoot,
+            { ...cyclicRoot },
+          ])
+            .map(getSessionKey)
+            .sort(),
+        ).toEqual(expected);
+      }
+      // Native-ID equality alone does not make an unrelated root copy a descendant.
+      expect(
+        collectSessionDescendants([root, unrelatedRootCopy], [root]),
+      ).toEqual([]);
     });
 
     it("names the parent from the scan and falls back to the raw id", () => {

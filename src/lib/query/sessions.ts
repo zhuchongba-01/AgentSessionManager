@@ -74,6 +74,7 @@ export const useSessionMessagesQuery = (
             messages: partial,
           });
         },
+        signal,
       );
       return { messages, revision };
     },

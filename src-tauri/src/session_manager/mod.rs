@@ -143,26 +143,27 @@ fn scan_report() -> SessionScanReport {
         warnings.extend(issues);
     }
 
-    if let Ok(pending) = deletion::pending_sessions() {
-        for item in pending {
-            if let Some(existing) = sessions.iter_mut().find(|s| {
-                s.provider_id == item.provider_id
-                    && s.session_id == item.session_id
-                    && s.source_path == item.source_path
-            }) {
-                existing.cleanup_pending = true;
-                existing.resume_command = None;
-                existing.residual = item.residual;
-                existing.archived = item.archived;
-                // The native title may have disappeared with the index during
-                // partial deletion. Keep the name saved in the retry journal.
-                if item.title.is_some() {
-                    existing.title = item.title;
-                }
-                existing.summary = item.summary;
-            } else {
-                sessions.push(item);
+    let (pending, journal_warnings) = deletion::pending_sessions_report()
+        .unwrap_or_else(|error| (Vec::new(), vec![format!("无法读取待清理记录：{error}")]));
+    warnings.extend(journal_warnings);
+    for item in pending {
+        if let Some(existing) = sessions.iter_mut().find(|s| {
+            s.provider_id == item.provider_id
+                && s.session_id == item.session_id
+                && s.source_path == item.source_path
+        }) {
+            existing.cleanup_pending = true;
+            existing.resume_command = None;
+            existing.residual = item.residual;
+            existing.archived = item.archived;
+            // The native title may have disappeared with the index during
+            // partial deletion. Keep the name saved in the retry journal.
+            if item.title.is_some() {
+                existing.title = item.title;
             }
+            existing.summary = item.summary;
+        } else {
+            sessions.push(item);
         }
     }
     sessions.sort_by(|a, b| {
@@ -196,7 +197,12 @@ fn join_scan_results(
 /// 校验 `source_path` 归属并返回规范化路径；SQLite 源没有文件路径，由调用方先行分发。
 fn validated_file_source(provider_id: &str, source_path: &str) -> Result<PathBuf, String> {
     let roots = provider_roots(provider_id)?;
-    let canonical = canonicalize_existing_path(Path::new(source_path), "session source")?;
+    let physical = if provider_id == "codex" {
+        codex::physical_rollout_path(Path::new(source_path))?
+    } else {
+        PathBuf::from(source_path)
+    };
+    let canonical = canonicalize_existing_path(&physical, "session source")?;
     if !roots.iter().any(|root| {
         root.canonicalize()
             .is_ok_and(|root| canonical.starts_with(root))
@@ -234,13 +240,7 @@ fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessag
 fn transcript_cache_sources(provider_id: &str, path: &Path) -> Option<cache::TranscriptSources> {
     match provider_id {
         "claude" | "deepseek" | "pi" => Some(vec![(path.to_path_buf(), None)]),
-        "grokbuild" => {
-            let mut sources = vec![(path.to_path_buf(), None)];
-            if let Some(parent) = path.parent() {
-                sources.push((parent.join("chat_history.jsonl"), None));
-            }
-            Some(sources)
-        }
+        "grokbuild" => grokbuild::transcript_sources(path).ok(),
         // 链解析失败时不缓存，交给正文读取去报真正的错误
         "codex" => codex::transcript_sources(path).ok(),
         _ => None,
@@ -353,7 +353,7 @@ where
             .get_or_load(
                 cache::cache_key(provider_id, source_path, &sources),
                 fingerprint,
-                || load().map(|messages| cache::Transcript::new(messages).cached()),
+                || load().map(cache::Transcript::new),
             )
             .map(|(transcript, _cached)| transcript),
         // 指纹里的文件都读不到（库被移走、权限不足）：交给读取器报真正的错误
@@ -362,7 +362,8 @@ where
 }
 
 pub fn checked_list_sessions() -> Result<SessionScanReport, String> {
-    deletion::pending_sessions()?;
+    // 浏览不因单份清理记录损坏而整体失败：扫描报告会携带警告；删除路径仍
+    // 单独走 pending_sessions()? 严格校验，继续拒绝操作。
     Ok(scan_report())
 }
 
@@ -389,9 +390,13 @@ pub fn delete_session_checked(
                 && item.source_path.as_deref() == Some(source_path)
         })
         .ok_or("会话已变化或不存在，请重新扫描")?;
-    let reply = deletion::run(target, &sessions, preflight_deletion, |plan| {
-        delete_session_in_snapshot(provider_id, session_id, source_path, include_project, plan)
-    });
+    let reply = if provider_id == "codex" {
+        deletion::run_codex(target, &sessions, &provider_roots("codex")?)
+    } else {
+        deletion::run(target, &sessions, preflight_deletion, |plan| {
+            delete_session_in_snapshot(provider_id, session_id, source_path, include_project, plan)
+        })
+    };
     // 删除会级联清理同 ID 的历史副本与索引，正文缓存整体作废
     cache::global().clear();
     reply
@@ -401,8 +406,8 @@ pub fn delete_session_checked(
 ///
 /// 持久化的清理计划在原样重试时，可能包含**已经被删掉**的条目：主会话删除成功、
 /// 但同 ID 的历史副本清理失败时，journal 会保留整个原始计划，好让重试可以把剩余
-/// 副本收尾。对「正文就是一个文件」的 provider（Codex 的 rollout、Pi 的 jsonl、
-/// Grok Build 的 summary.json），这些条目已经没有可校验的内容；再去读一次已经消失
+/// 副本收尾。对「正文就是一个文件」的 provider（Codex 的 rollout、Pi 的 jsonl），
+/// 这些条目已经没有可校验的内容；再去读一次已经消失
 /// 的文件只会让每次重试都卡在同一个错误上，而磁盘上确实还有副本等着清理。
 ///
 /// 只对文件型 provider 成立：`sqlite:` / `sqlite-zcode:` 的 `source_path` 是引用
@@ -410,7 +415,7 @@ pub fn delete_session_checked(
 /// 这些 provider 的预检本身要能处理缺失源（DeepSeek 会清理投影缓存；OpenCode 的
 /// `checked_storage_child` 对缺失目标也成立），所以不在这里按存在性跳过。
 fn plan_entry_skips_preflight(item: &SessionMeta) -> Result<bool, String> {
-    if !matches!(item.provider_id.as_str(), "codex" | "pi" | "grokbuild") {
+    if !matches!(item.provider_id.as_str(), "codex" | "pi") {
         return Ok(false);
     }
     let path = item.source_path.as_deref().ok_or("缺少会话路径")?;
@@ -465,12 +470,18 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
             &item.session_id,
         )?;
     }
+    if plan.iter().any(|item| item.provider_id == "grokbuild") {
+        preflight_grok_deletion(plan, &provider_roots("grokbuild")?)?;
+    }
+    Ok(())
+}
+
+fn preflight_grok_deletion(plan: &[SessionMeta], roots: &[PathBuf]) -> Result<(), String> {
     for item in plan.iter().filter(|item| item.provider_id == "grokbuild") {
-        if plan_entry_skips_preflight(item)? {
-            continue;
-        }
+        // summary.json may be gone while its directory still needs cleanup.
+        // Validate the exact persisted path and ID even for wholly missing dirs.
         let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
-        grokbuild::preflight_delete(path, &item.session_id)?;
+        grokbuild::preflight_delete_in_roots(roots, path, &item.session_id)?;
     }
     Ok(())
 }
@@ -484,6 +495,27 @@ fn delete_session_in_snapshot(
     include_project: bool,
     sessions: &[SessionMeta],
 ) -> Result<DeleteSessionReply, String> {
+    delete_session_in_snapshot_with(
+        provider_id,
+        session_id,
+        source_path,
+        include_project,
+        sessions,
+        delete_session_record,
+    )
+}
+
+fn delete_session_in_snapshot_with<F>(
+    provider_id: &str,
+    session_id: &str,
+    source_path: &str,
+    include_project: bool,
+    sessions: &[SessionMeta],
+    mut delete_record: F,
+) -> Result<DeleteSessionReply, String>
+where
+    F: FnMut(&str, &str, &str, Option<&str>, bool) -> Result<bool, String>,
+{
     let selected = sessions.iter().find(|item| {
         item.provider_id == provider_id
             && item.session_id == session_id
@@ -494,10 +526,7 @@ fn delete_session_in_snapshot(
         return Err("会话清理不再删除项目目录；请使用文件管理器单独处理项目文件".into());
     }
     if selected.is_some_and(|item| item.residual && !item.cleanup_pending)
-        && matches!(
-            provider_id,
-            "codex" | "claude" | "grokbuild" | "pi" | "deepseek"
-        )
+        && matches!(provider_id, "codex" | "claude" | "pi" | "deepseek")
         && !Path::new(source_path).exists()
     {
         return Ok(DeleteSessionReply::NotFound);
@@ -525,12 +554,12 @@ fn delete_session_in_snapshot(
     {
         codex::cleanup_after_delete(session_id, None, false)?;
     }
-    // DeepSeek is deliberately excluded: its provider is the authority for a
-    // retry whose transcript is already gone but whose projection cache still
-    // needs work (see `delete_session_with_roots`), so it must reach
+    // DeepSeek and Grok are deliberately excluded: their providers finish
+    // directory/cache cleanup even after the primary source has disappeared
+    // (see `delete_session_with_roots`), so each must reach
     // `delete_session_record` even when `source_path` no longer exists.
-    let missing_file = matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
-        && !Path::new(source_path).exists();
+    let missing_file =
+        matches!(provider_id, "codex" | "claude" | "pi") && !Path::new(source_path).exists();
     let deleted = if missing_file {
         if selected.is_some_and(|item| item.cleanup_pending || item.residual) {
             true
@@ -538,7 +567,7 @@ fn delete_session_in_snapshot(
             return Err("会话文件已消失，请重新扫描".into());
         }
     } else {
-        delete_session_record(
+        delete_record(
             provider_id,
             session_id,
             source_path,
@@ -554,12 +583,12 @@ fn delete_session_in_snapshot(
     // entry itself remains deliberately scoped to that one entry.
     if deleted || selected.is_some_and(|item| item.cleanup_pending) {
         for residual_source in related_residual_sources {
-            if matches!(provider_id, "codex" | "claude" | "grokbuild" | "pi")
+            if matches!(provider_id, "codex" | "claude" | "pi")
                 && !Path::new(&residual_source).exists()
             {
                 continue;
             }
-            if let Err(error) = delete_session_record(
+            if let Err(error) = delete_record(
                 provider_id,
                 session_id,
                 &residual_source,
@@ -597,6 +626,11 @@ fn collect_related_residual_sources(
                 && item.session_id == session_id
                 && item.residual
                 && item.source_path.as_deref() != Some(selected_source)
+                && (provider_id != "opencode"
+                    || item
+                        .source_path
+                        .as_deref()
+                        .is_some_and(|source| opencode::same_storage(selected_source, source)))
         })
         .filter_map(|item| item.source_path.clone())
         .collect()
@@ -622,6 +656,17 @@ fn delete_session_record(
 }
 
 pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOutcome> {
+    let mut stop_checks = deletion::AgentStopChecks::default();
+    delete_sessions_with_check(requests, |provider| stop_checks.ensure(provider))
+}
+
+fn delete_sessions_with_check<F>(
+    requests: &[DeleteSessionRequest],
+    mut ensure_stopped: F,
+) -> Vec<DeleteSessionOutcome>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
     let guard = deletion::DELETE_LOCK.lock();
     let sessions = scan_sessions();
     let codex_order = codex::deletion_order(requests);
@@ -634,6 +679,7 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
         .iter()
         .map(|index| requests[*index].clone())
         .collect::<Vec<_>>();
+    let mut codex_progress = deletion::CodexBatchProgress::default();
     let outcomes = collect_delete_session_outcomes(&ordered, |request| {
         if guard.is_err() {
             return Err("清理锁不可用，请重启管理器".into());
@@ -641,7 +687,7 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
         if request.include_project {
             return Err("批量清理不删除项目目录".into());
         }
-        deletion::ensure_agent_stopped(&request.provider_id)?;
+        ensure_stopped(&request.provider_id)?;
         deletion::pending_sessions()?;
         let Some(target) = sessions.iter().find(|item| {
             item.provider_id == request.provider_id
@@ -650,6 +696,11 @@ pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOu
         }) else {
             return Err("会话已变化或不存在，请重新扫描".into());
         };
+        if request.provider_id == "codex" {
+            return codex_progress.run(target, &sessions, |target, remaining| {
+                deletion::run_codex(target, remaining, &provider_roots("codex")?)
+            });
+        }
         deletion::run(target, &sessions, preflight_deletion, |plan| {
             delete_session_in_snapshot(
                 &request.provider_id,
@@ -675,6 +726,12 @@ fn delete_session_with_roots(
     source_path: &Path,
     roots: &[PathBuf],
 ) -> Result<bool, String> {
+    // Grok owns a directory, not just summary.json. Preserve the original path
+    // so its validator can reject links and finish partially removed directories.
+    if provider_id == "grokbuild" {
+        return grokbuild::delete_session_in_roots(roots, source_path, session_id);
+    }
+
     // A DeepSeek cleanup retry may already have removed the transcript after
     // updating workspace.json, while its projection cache still needs work.
     // Its provider validates the complete lexical layout (including symlinked
@@ -721,9 +778,6 @@ fn delete_session_with_roots(
                 "claude" => claude::delete_session(&validated_root, &validated_source, session_id),
                 "opencode" => {
                     opencode::delete_session(&validated_root, &validated_source, session_id)
-                }
-                "grokbuild" => {
-                    grokbuild::delete_session(&validated_root, &validated_source, session_id)
                 }
                 "pi" => pi::delete_session(&validated_root, &validated_source, session_id),
                 _ => Err(format!("Unsupported provider: {provider_id}")),
@@ -901,7 +955,17 @@ mod tests {
             requests.len()
         );
 
-        let outcomes = delete_sessions(&requests);
+        // 生产路径必须传播进程检查拒绝，不能开始任何文件删除。
+        let blocked = delete_sessions_with_check(&requests, |_| Err("agent running".into()));
+        assert_eq!(blocked.len(), requests.len());
+        assert!(blocked
+            .iter()
+            .all(|item| !item.success && item.error.as_deref() == Some("agent running")));
+        assert!(files.iter().all(|path| path.exists()));
+
+        // 此测试仅删除临时夹具；宿主进程状态由独立检查测试覆盖。
+        // 不让本机恰好运行的 Claude/Node 进程造成随机失败。
+        let outcomes = delete_sessions_with_check(&requests, |_| Ok(()));
 
         let failures = outcomes
             .iter()
@@ -974,6 +1038,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compat_opencode_delete_excludes_other_database_and_legacy_residuals() {
+        let source = "sqlite:/fixture/main.db:ses_same";
+        let sessions = vec![
+            session_meta("opencode", "ses_same", source, false),
+            session_meta(
+                "opencode",
+                "ses_same",
+                "sqlite:/fixture/dev.db:ses_same",
+                true,
+            ),
+            session_meta(
+                "opencode",
+                "ses_same",
+                "/fixture/storage/message/ses_same",
+                true,
+            ),
+        ];
+        assert!(
+            collect_related_residual_sources(&sessions, "opencode", "ses_same", source, false)
+                .is_empty()
+        );
+        let mut deleted = Vec::new();
+        delete_session_in_snapshot_with(
+            "opencode",
+            "ses_same",
+            source,
+            false,
+            &sessions,
+            |_, _, path, _, _| {
+                deleted.push(path.to_string());
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted, vec![source]);
+    }
+
     fn session_meta(
         provider_id: &str,
         session_id: &str,
@@ -1001,10 +1103,10 @@ mod tests {
 
     /// 重试一份持久化的清理计划时，计划里已经删掉的条目不能再拿去预检，否则
     /// 每次重试都会卡在同一个「文件不存在」错误上，而磁盘上仍留着待清理的副本。
-    /// 这正是 Grok Build（主目录删成功、同 ID 归档副本删失败）和 Pi 的死锁成因。
+    /// Grok 的删除单位是目录，即使 summary 消失也仍需目录级预检和收尾。
     #[test]
     fn retry_skips_preflight_for_vanished_file_backed_sources() {
-        for provider in ["codex", "pi", "grokbuild"] {
+        for provider in ["codex", "pi"] {
             let missing = session_meta(provider, "session-1", "gone.jsonl", false);
             assert!(
                 plan_entry_skips_preflight(&missing).expect("source path"),
@@ -1037,6 +1139,7 @@ mod tests {
             ("zcode", "sqlite-zcode:/data/db.sqlite:session-1"),
             // DeepSeek 的预检本身要处理缺失源（重试时先清投影缓存），不能跳过
             ("deepseek", "/data/sessions/project/session.v3.jsonl"),
+            ("grokbuild", "/data/sessions/project/session/summary.json"),
         ] {
             let item = session_meta(provider, "session-1", source, false);
             assert!(
@@ -1047,27 +1150,135 @@ mod tests {
     }
 
     #[test]
-    fn a_vanished_grokbuild_primary_does_not_block_a_cleanup_retry() {
-        // 这是死锁的完整入口：journal 原样保留了「主会话 + 同 ID 归档副本」的计划，
-        // 主会话的 summary.json 已经不在了。预检必须放行，好让残留副本继续清理。
-        // 旧实现会在这里读第一个 summary.json 并报「文件不存在」，于是每次重试都
-        // 卡在同一处，磁盘上的副本永远清不掉。
-        let plan = vec![
-            session_meta(
-                "grokbuild",
-                "session-1",
-                "/nonexistent/sessions/project/session-1/summary.json",
-                false,
-            ),
-            session_meta(
-                "grokbuild",
-                "session-1",
-                "/nonexistent/archived_sessions/project/session-1/summary.json",
-                true,
-            ),
+    fn grok_cleanup_retry_removes_missing_summary_directories_from_exact_plan() {
+        let temp = tempdir().unwrap();
+        let roots = vec![
+            temp.path().join("sessions"),
+            temp.path().join("archived_sessions"),
         ];
+        let sources = roots
+            .iter()
+            .map(|root| root.join("project/session-1/summary.json"))
+            .collect::<Vec<_>>();
+        for source in &sources {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source.parent().unwrap().join("sentinel"), "remaining").unwrap();
+        }
+        // A new same-ID copy absent from the saved plan must remain untouched.
+        let unplanned = roots[0].join("other-project/session-1");
+        std::fs::create_dir_all(&unplanned).unwrap();
+        std::fs::write(unplanned.join("sentinel"), "keep").unwrap();
+        let mut plan = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let mut item = session_meta(
+                    "grokbuild",
+                    "session-1",
+                    &source.to_string_lossy(),
+                    index > 0,
+                );
+                item.cleanup_pending = true;
+                item
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            preflight_grok_deletion(&plan, &roots).expect("preflight exact saved paths");
+            let reply = delete_session_in_snapshot_with(
+                "grokbuild",
+                "session-1",
+                &sources[0].to_string_lossy(),
+                false,
+                &plan,
+                |provider, id, source, _, _| {
+                    delete_session_with_roots(provider, id, Path::new(source), &roots)
+                },
+            )
+            .expect("finish directory cleanup");
+            assert!(
+                matches!(reply, DeleteSessionReply::Deleted { warnings } if warnings.is_empty())
+            );
+            assert!(sources
+                .iter()
+                .all(|source| !source.parent().unwrap().exists()));
+            assert!(unplanned.join("sentinel").exists());
+        }
+        plan[1].session_id = "wrong-id".into();
+        assert!(preflight_grok_deletion(&plan, &roots).is_err());
+        assert!(preflight_grok_deletion(&plan[..1], &[temp.path().to_path_buf()]).is_err());
+    }
 
-        preflight_deletion(&plan).expect("已消失的主会话不能让整个重试永久失败");
+    #[test]
+    fn grok_missing_summary_residual_reaches_directory_cleanup() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let source = root.join("project/session-1/summary.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source.parent().unwrap().join("sentinel"), "remaining").unwrap();
+        let item = session_meta("grokbuild", "session-1", &source.to_string_lossy(), true);
+        let reply = delete_session_in_snapshot_with(
+            "grokbuild",
+            "session-1",
+            &source.to_string_lossy(),
+            false,
+            &[item],
+            |provider, id, source, _, _| {
+                delete_session_with_roots(
+                    provider,
+                    id,
+                    Path::new(source),
+                    std::slice::from_ref(&root),
+                )
+            },
+        )
+        .unwrap();
+        assert!(matches!(reply, DeleteSessionReply::Deleted { warnings } if warnings.is_empty()));
+        assert!(!source.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn grok_missing_summary_cleanup_failure_preserves_retry_warning() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("project/session-1/summary.json");
+        let mut primary = session_meta("grokbuild", "session-1", &source.to_string_lossy(), false);
+        primary.cleanup_pending = true;
+        let mut residual = primary.clone();
+        residual.residual = true;
+        residual.source_path = Some(
+            temp.path()
+                .join("archive/session-1/summary.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(delete_session_in_snapshot_with(
+            "grokbuild",
+            "session-1",
+            &source.to_string_lossy(),
+            false,
+            std::slice::from_ref(&primary),
+            |_, _, _, _, _| Err("primary directory still locked".into()),
+        )
+        .is_err());
+        let mut calls = 0;
+        let reply = delete_session_in_snapshot_with(
+            "grokbuild",
+            "session-1",
+            &source.to_string_lossy(),
+            false,
+            &[primary, residual],
+            |_, _, _, _, _| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(true)
+                } else {
+                    Err("directory still locked".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        // deletion::run keeps the journal for any warning from a related source.
+        assert!(matches!(reply, DeleteSessionReply::Deleted { warnings } if warnings.len() == 1));
     }
 
     #[test]

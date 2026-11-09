@@ -651,7 +651,7 @@ describe("SessionManagerPage", () => {
       expect(
         JSON.parse(window.localStorage.getItem(GROUP_EXPANSION_STORAGE_KEY)!)
           .expandedDirectoryKeys,
-      ).toContain("codex:\\mock\\codex"),
+      ).toContain("codex:/mock/codex"),
     );
 
     fireEvent.click(directoryToggle);
@@ -665,7 +665,7 @@ describe("SessionManagerPage", () => {
       expect(
         JSON.parse(window.localStorage.getItem(GROUP_EXPANSION_STORAGE_KEY)!)
           .expandedDirectoryKeys,
-      ).not.toContain("codex:\\mock\\codex"),
+      ).not.toContain("codex:/mock/codex"),
     );
   });
 
@@ -1088,6 +1088,74 @@ describe("SessionManagerPage", () => {
     expect(deleteManySpy.mock.calls[0][0]).toHaveLength(120);
 
     deleteManySpy.mockRestore();
+  });
+
+  it("requires renewed acknowledgement when cascade expands the deletion scope", async () => {
+    const parent: SessionMeta = {
+      providerId: "deepseek",
+      sessionId: "scope-parent",
+      title: "Scope Parent",
+      sourcePath: "/mock/scope/parent/session.v3.jsonl",
+      lastActiveAt: 2000,
+    };
+    const children: SessionMeta[] = Array.from({ length: 51 }, (_, index) => ({
+      providerId: "deepseek",
+      sessionId: `scope-child-${index}`,
+      parentSessionId: parent.sessionId,
+      title: `Scope Child ${index}`,
+      sourcePath: `/mock/scope/child-${index}/session.v3.jsonl`,
+      lastActiveAt: 1000 - index,
+    }));
+    setSessionFixtures([parent, ...children], {});
+    const { client } = renderPage("all");
+    await screen.findByRole("heading", { name: "Scope Parent" });
+    fireEvent.click(
+      screen.getByRole("button", { name: /删除此会话及其 51 个子会话/ }),
+    );
+    const dialog = screen.getByTestId("confirm-dialog");
+    const cascade = within(dialog).getByRole("checkbox", { name: /同时删除/ });
+    const acknowledge = () =>
+      within(dialog).getByRole("checkbox", { name: /我已核对/ });
+    fireEvent.click(acknowledge());
+    expect(
+      within(dialog).getByRole("button", { name: /删除会话及其子会话/ }),
+    ).toBeEnabled();
+    fireEvent.click(cascade);
+    expect(
+      within(dialog).queryByRole("checkbox", { name: /我已核对/ }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(cascade);
+    expect(acknowledge()).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("button", { name: /删除会话及其子会话/ }),
+    ).toBeDisabled();
+    fireEvent.click(acknowledge());
+    // 扫描结果只重排不会使同一集合的核对失效。
+    await act(async () => {
+      client.setQueryData(["sessions"], [parent, ...children].reverse());
+    });
+    expect(acknowledge()).toBeChecked();
+    // 同数量但不同源路径也属于不同目标，不能仅用数量绑定核对。
+    await act(async () => {
+      client.setQueryData(
+        ["sessions"],
+        [
+          parent,
+          ...children.map((child, index) =>
+            index === 0
+              ? {
+                  ...child,
+                  sourcePath: "/mock/scope/replaced/session.v3.jsonl",
+                }
+              : child,
+          ),
+        ],
+      );
+    });
+    await waitFor(() => expect(acknowledge()).not.toBeChecked());
+    expect(
+      within(dialog).getByRole("button", { name: /删除会话及其子会话/ }),
+    ).toBeDisabled();
   });
 
   it("needs no extra acknowledgement when every target is listed", async () => {

@@ -262,7 +262,9 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   // 删除确认框里的两个勾选项状态。勾选状态由页面持有（ConfirmDialog 受控），
   // 这样每次打开删除框时都能明确地重置，而不是靠副作用猜测。
   const [deleteWithChildren, setDeleteWithChildren] = useState(true);
-  const [deleteAcknowledged, setDeleteAcknowledged] = useState(false);
+  const [acknowledgedDeleteScope, setAcknowledgedDeleteScope] = useState<
+    string | null
+  >(null);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<Set<string>>(
     () => new Set(),
   );
@@ -663,8 +665,29 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [deleteTargets, deleteDescendants, deleteWithChildren],
   );
 
+  // 核对绑定精确目标集合；级联范围或扫描结果改变时旧核对立即失效。
+  const deleteScope = useMemo(
+    () => JSON.stringify(plannedDeleteTargets.map(getSessionKey).sort()),
+    [plannedDeleteTargets],
+  );
+  const deleteAcknowledged = acknowledgedDeleteScope === deleteScope;
+  useEffect(() => {
+    if (
+      acknowledgedDeleteScope !== null &&
+      acknowledgedDeleteScope !== deleteScope
+    ) {
+      setAcknowledgedDeleteScope(null);
+    }
+  }, [acknowledgedDeleteScope, deleteScope]);
+
   const handleDeleteConfirm = async () => {
-    if (!deleteTargets || deleteTargets.length === 0 || isDeleting) {
+    if (
+      !deleteTargets ||
+      deleteTargets.length === 0 ||
+      isDeleting ||
+      (plannedDeleteTargets.length > CONFIRM_DETAIL_LIMIT &&
+        !deleteAcknowledged)
+    ) {
       return;
     }
 
@@ -1064,7 +1087,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const openDeleteDialog = (targets: SessionMeta[]) => {
     if (targets.length === 0) return;
     setDeleteWithChildren(true);
-    setDeleteAcknowledged(false);
+    setAcknowledgedDeleteScope(null);
     setDeleteTargets(targets);
   };
 
@@ -1179,7 +1202,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       items.push({
         id: "acknowledge-unlisted",
         checked: deleteAcknowledged,
-        onCheckedChange: setDeleteAcknowledged,
+        onCheckedChange: (checked) =>
+          setAcknowledgedDeleteScope(checked ? deleteScope : null),
         required: true,
         label: t("sessionManager.batchDeleteAcknowledge", {
           defaultValue:
@@ -1196,6 +1220,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     return items;
   }, [
     deleteAcknowledged,
+    deleteScope,
     deleteConfirmDetails,
     deleteDescendants,
     deleteTargets,

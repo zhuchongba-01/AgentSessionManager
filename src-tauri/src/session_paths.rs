@@ -58,7 +58,18 @@ pub fn read_codex_config_text() -> Result<String, String> {
 }
 
 pub fn codex_state_db_paths(config_dir: &Path, config_text: &str) -> Vec<PathBuf> {
-    let mut paths = vec![config_dir.join(CODEX_STATE_DB_FILENAME)];
+    codex_state_db_paths_with_environment(
+        config_dir,
+        config_text,
+        std::env::var("CODEX_SQLITE_HOME").ok().as_deref(),
+    )
+}
+
+fn codex_state_db_paths_with_environment(
+    config_dir: &Path,
+    config_text: &str,
+    environment: Option<&str>,
+) -> Vec<PathBuf> {
     let configured = config_text
         .parse::<DocumentMut>()
         .ok()
@@ -70,19 +81,44 @@ pub fn codex_state_db_paths(config_dir: &Path, config_text: &str) -> Vec<PathBuf
                 .filter(|value| !value.is_empty())
                 .map(resolve_user_path)
         });
-    let environment = std::env::var("CODEX_SQLITE_HOME")
-        .ok()
-        .map(|value| value.trim().to_string())
+    let environment = environment
+        .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| resolve_user_path(&value));
+        .map(resolve_user_path);
+    // One authoritative location: never mutate a stale default database when
+    // Codex has selected sqlite_home elsewhere (config > environment > default).
+    vec![configured
+        .or(environment)
+        .unwrap_or_else(|| config_dir.to_path_buf())
+        .join(CODEX_STATE_DB_FILENAME)]
+}
 
-    if let Some(directory) = configured.or(environment) {
-        let path = directory.join(CODEX_STATE_DB_FILENAME);
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+    #[test]
+    fn compat_sqlite_home_precedence_without_ambient_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let default = temp.path().join("default");
+        let configured = temp.path().join("configured");
+        let environment = temp.path().join("environment");
+        let text = format!(
+            "sqlite_home = {}",
+            serde_json::to_string(&configured.to_string_lossy()).unwrap()
+        );
+        assert_eq!(
+            codex_state_db_paths_with_environment(&default, &text, environment.to_str()),
+            vec![configured.join(CODEX_STATE_DB_FILENAME)]
+        );
+        assert_eq!(
+            codex_state_db_paths_with_environment(&default, "", environment.to_str()),
+            vec![environment.join(CODEX_STATE_DB_FILENAME)]
+        );
+        assert_eq!(
+            codex_state_db_paths_with_environment(&default, "", None),
+            vec![default.join(CODEX_STATE_DB_FILENAME)]
+        );
     }
-    paths
 }
 
 pub fn grok_config_dir() -> PathBuf {

@@ -36,7 +36,7 @@
 | Pi | `~/.pi/agent`，可用 `PI_CODING_AGENT_DIR` 覆盖 |
 | Grok Build | `~/.grok/sessions`、`~/.grok/archived_sessions`，可用 `GROK_CONFIG_DIR` 覆盖 |
 
-Windows 下 `~` 即 `%USERPROFILE%`。本管理器只读取上述文件，不改写各 Agent 的内部格式。
+Windows 下 `~` 即 `%USERPROFILE%`。扫描与阅读仅访问本地会话数据，不迁移各 Agent 的存储格式；用户确认清理后，会删除选定会话及相应索引、关联记录和缓存，不删除项目工作目录。
 
 ## 主要特性
 

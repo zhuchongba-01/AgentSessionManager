@@ -1,6 +1,36 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as core from "@tauri-apps/api/core";
 
-import { sessionsApi } from "@/lib/api/sessions";
+import { sessionsApi, type TranscriptChunk } from "@/lib/api/sessions";
+import { deliverChannelMessage } from "../msw/tauriMocks";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+function controlledStream() {
+  let channel: unknown;
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const command = new Promise<void>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  const invoke = vi
+    .spyOn(core, "invoke")
+    .mockImplementation((_command, args) => {
+      channel = (args as { onChunk: unknown }).onChunk;
+      return command as Promise<never>;
+    });
+  return {
+    invoke,
+    resolve,
+    reject,
+    send: (index: number, chunk: TranscriptChunk) =>
+      deliverChannelMessage(channel, index, chunk),
+  };
+}
 import { contentIdentityHex, setSessionFixtures } from "../msw/state";
 
 const SOURCE_PATH = "/mock/stream/session.jsonl";
@@ -96,6 +126,207 @@ describe("sessionsApi.streamMessages", () => {
     await expect(
       sessionsApi.streamMessages("claude", SOURCE_PATH),
     ).resolves.toHaveLength(2);
+  });
+});
+
+describe("sessionsApi.streamMessages transport completion", () => {
+  const message = { role: "user", content: "late payload ".repeat(900) };
+  const header: TranscriptChunk = {
+    kind: "header",
+    total: 1,
+    approxBytes: 9000,
+  };
+  const block: TranscriptChunk = {
+    kind: "messages",
+    start: 0,
+    messages: [message],
+  };
+  const done: TranscriptChunk = { kind: "done", delivered: 1 };
+
+  it("waits after invoke resolves and buffers Done arriving before the large payload", async () => {
+    const transport = controlledStream();
+    const progress = vi.fn();
+    const settled = vi.fn();
+    const result = sessionsApi.streamMessages("codex", SOURCE_PATH, progress);
+    void result.then(settled);
+    transport.send(0, header);
+    transport.resolve();
+    await Promise.resolve();
+    transport.send(2, done); // 小 Done 先到传输层，Channel 必须缓存索引 2。
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    expect(progress).not.toHaveBeenCalled();
+    transport.send(1, block);
+    const snapshot = await result;
+    expect(snapshot).toEqual([message]);
+    expect(snapshot).not.toBe(progress.mock.calls[0][0]);
+    transport.send(3, { kind: "messages", start: 1, messages: [message] });
+    expect(snapshot).toHaveLength(1);
+    expect(progress).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "waits for invoke %s even after a complete Done",
+    async (outcome) => {
+      const transport = controlledStream();
+      const result = sessionsApi.streamMessages("codex", SOURCE_PATH);
+      const settled = vi.fn();
+      void result.then(settled, settled);
+      transport.send(0, header);
+      transport.send(1, block);
+      transport.send(2, done);
+      await Promise.resolve();
+      expect(settled).not.toHaveBeenCalled();
+      if (outcome === "resolve") {
+        transport.resolve();
+        await expect(result).resolves.toEqual([message]);
+      } else {
+        const error = new Error("invoke failed after Done");
+        transport.reject(error);
+        await expect(result).rejects.toBe(error);
+      }
+    },
+  );
+
+  it("preserves invoke rejection before any Channel data", async () => {
+    const transport = controlledStream();
+    const result = sessionsApi.streamMessages("codex", SOURCE_PATH);
+    const error = new Error("command failed");
+    transport.reject(error);
+    await expect(result).rejects.toBe(error);
+  });
+
+  it("rejects an error chunk after invoke success and partial progress", async () => {
+    const transport = controlledStream();
+    const progress = vi.fn();
+    const result = sessionsApi.streamMessages("codex", SOURCE_PATH, progress);
+    transport.resolve();
+    await Promise.resolve();
+    transport.send(0, header);
+    transport.send(1, block);
+    transport.send(2, { kind: "error", message: "channel read failed" });
+    await expect(result).rejects.toThrow("channel read failed");
+    expect(progress).toHaveBeenCalledTimes(1);
+  });
+
+  const malformed: [string, TranscriptChunk[]][] = [
+    ["missing header", [done]],
+    ["missing messages / logical Done before payload", [header, done]],
+    ["gap in start", [header, { ...block, start: 1 }]],
+    ["duplicate block", [header, block, block]],
+    ["negative start", [header, { ...block, start: -1 }]],
+    ["total overrun", [{ ...header, total: 0 }, block]],
+    ["negative total", [{ ...header, total: -1 }]],
+    ["fractional total", [{ ...header, total: 1.5 }]],
+    ["duplicate header", [header, header]],
+    ["delivered mismatch", [header, block, { ...done, delivered: 2 }]],
+    ["fractional delivered", [header, block, { ...done, delivered: 1.5 }]],
+    ["duplicate Done", [header, block, done, done]],
+  ];
+  it.each(malformed)("rejects %s", async (_name, chunks) => {
+    const transport = controlledStream();
+    const result = sessionsApi.streamMessages("codex", SOURCE_PATH);
+    chunks.forEach((chunk, index) => transport.send(index, chunk));
+    transport.resolve();
+    await expect(result).rejects.toThrow("会话消息流不完整");
+  });
+
+  it.each([
+    "missing transport block",
+    "missing Done",
+    "missing header",
+    "hung invoke",
+  ])("times out rather than hanging on %s", async (missing) => {
+    vi.useFakeTimers();
+    const transport = controlledStream();
+    const result = sessionsApi.streamMessages("codex", SOURCE_PATH);
+    const rejected = expect(result).rejects.toThrow("会话读取超时");
+    if (missing !== "missing header") transport.send(0, header);
+    if (missing === "missing transport block") transport.send(2, done);
+    if (missing === "missing Done" || missing === "hung invoke")
+      transport.send(1, block);
+    if (missing === "hung invoke") transport.send(2, done);
+    else transport.resolve();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("waits for Done even for an empty session", async () => {
+    const transport = controlledStream();
+    const result = sessionsApi.streamMessages("codex", SOURCE_PATH);
+    const settled = vi.fn();
+    void result.then(settled);
+    transport.send(0, { kind: "header", total: 0, approxBytes: 0 });
+    transport.resolve();
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    transport.send(1, { kind: "done", delivered: 0 });
+    await expect(result).resolves.toEqual([]);
+  });
+
+  it("cancels pending delivery, clears the timer and ignores late data", async () => {
+    vi.useFakeTimers();
+    const transport = controlledStream();
+    const controller = new AbortController();
+    const progress = vi.fn();
+    const result = sessionsApi.streamMessages(
+      "codex",
+      SOURCE_PATH,
+      progress,
+      controller.signal,
+    );
+    transport.send(0, header);
+    transport.resolve();
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ name: "AbortError" });
+    transport.send(1, block);
+    transport.send(2, done);
+    expect(progress).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears the timer when invoke throws synchronously", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(core, "invoke").mockImplementation(() => {
+      throw new Error("synchronous invoke failure");
+    });
+    await expect(
+      sessionsApi.streamMessages("codex", SOURCE_PATH),
+    ).rejects.toThrow("synchronous invoke failure");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not rearm the timer when progress synchronously cancels", async () => {
+    vi.useFakeTimers();
+    const transport = controlledStream();
+    const controller = new AbortController();
+    const result = sessionsApi.streamMessages(
+      "codex",
+      SOURCE_PATH,
+      () => controller.abort(),
+      controller.signal,
+    );
+    transport.send(0, header);
+    transport.send(1, block);
+    transport.resolve();
+    await expect(result).rejects.toMatchObject({ name: "AbortError" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not invoke for an already aborted signal", async () => {
+    const transport = controlledStream();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      sessionsApi.streamMessages(
+        "codex",
+        SOURCE_PATH,
+        undefined,
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(transport.invoke).not.toHaveBeenCalled();
   });
 });
 

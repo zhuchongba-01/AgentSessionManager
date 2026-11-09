@@ -412,13 +412,20 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
     )
     .map_err(|error| format!("Failed to open ZCode database: {error}"))?;
 
+    read_messages_from_connection(&connection, &session_id)
+}
+
+fn read_messages_from_connection(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionMessage>, String> {
     connection
         .busy_timeout(Duration::from_secs(2))
         .map_err(|e| e.to_string())?;
     connection
         .execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
-    super::utils::check_sqlite_message_budget(&connection, &session_id)?;
+    super::utils::check_sqlite_message_budget(connection, session_id)?;
 
     let mut message_statement = connection
         .prepare(
@@ -426,7 +433,7 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
         )
         .map_err(|error| format!("Failed to prepare ZCode message query: {error}"))?;
     let messages = message_statement
-        .query_map([session_id.as_str()], |row| {
+        .query_map([session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -439,7 +446,7 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
         .prepare("SELECT message_id, data FROM part WHERE session_id=?1 ORDER BY time_created")
         .map_err(|error| format!("Failed to prepare ZCode part query: {error}"))?;
     let parts = part_statement
-        .query_map([session_id.as_str()], |row| {
+        .query_map([session_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| format!("Failed to query ZCode parts: {error}"))?;
@@ -487,28 +494,10 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
         }
     }
 
-    // ZCode 的运行器在配额/并发等请求失败时会自动重试，把同一条用户消息
-    // 重复追加进 message 表（每次伴随一条 error 占位的 assistant 行，那些
-    // 行没有文本 part，本就不会显示）。桌面端把这种失败重试链折叠为一条；
-    // 这里对连续且内容完全相同的用户消息做同样的折叠（保留最后一条），
-    // 中间隔着正常 AI 回复的真实重发不受影响。
-    let output = collapse_retry_user_messages(output);
+    // Distinct persisted message IDs are distinct messages. Identical text or
+    // an empty/error assistant row does not prove an automatic retry; no stable
+    // retry identity is available in this schema, so preserve the original rows.
     Ok(output)
-}
-
-/// 折叠"连续且内容相同的用户消息"重试链，保留最后一条。
-fn collapse_retry_user_messages(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
-    let mut collapsed: Vec<SessionMessage> = Vec::with_capacity(messages.len());
-    for message in messages {
-        if let Some(last) = collapsed.last_mut() {
-            if last.role == "user" && message.role == "user" && last.content == message.content {
-                *last = message;
-                continue;
-            }
-        }
-        collapsed.push(message);
-    }
-    collapsed
 }
 
 pub fn delete_session(
@@ -1324,41 +1313,62 @@ mod tests {
         assert!(validate_session_id(r"sess\escape").is_err());
     }
 
+    fn repeated_user_fixture(with_error: bool) -> Vec<SessionMessage> {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part(message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);"
+        ).unwrap();
+        for index in 1..=5 {
+            let id = format!("user_{index}");
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, 'session', ?2, ?3)",
+                    rusqlite::params![id, r#"{"role":"user"}"#, index * 2],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO part VALUES (?1, 'session', ?2, ?3)",
+                    rusqlite::params![id, r#"{"type":"text","text":"怎么这么多"}"#, index * 2],
+                )
+                .unwrap();
+            if with_error {
+                connection
+                    .execute(
+                        "INSERT INTO message VALUES (?1, 'session', ?2, ?3)",
+                        rusqlite::params![
+                            format!("error_{index}"),
+                            r#"{"role":"assistant","error":{"name":"APIError"}}"#,
+                            index * 2 + 1
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        read_messages_from_connection(&connection, "session").unwrap()
+    }
+
     #[test]
-    fn retry_chain_of_identical_user_messages_collapses_to_the_last() {
-        let user = |content: &str, ts: i64| SessionMessage {
-            role: "user".into(),
-            content: content.into(),
-            ts: Some(ts),
-        };
-        let assistant = |content: &str| SessionMessage {
-            role: "assistant".into(),
-            content: content.into(),
-            ts: None,
-        };
+    fn regression_distinct_identical_user_messages_are_preserved_without_retry_evidence() {
+        let messages = repeated_user_fixture(false);
+        assert_eq!(messages.len(), 5);
+        assert!(messages
+            .iter()
+            .all(|message| message.content == "怎么这么多"));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.ts)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(4), Some(6), Some(8), Some(10)]
+        );
+    }
 
-        // 失败重试链：连续相同用户消息（ZCode 运行器自动重试）→ 折叠为最后一条
-        let collapsed = collapse_retry_user_messages(vec![
-            user("怎么这么多", 1),
-            user("怎么这么多", 2),
-            user("怎么这么多", 3),
-            user("怎么这么多", 4),
-            user("怎么这么多", 5),
-        ]);
-        assert_eq!(collapsed.len(), 1);
-        assert_eq!(collapsed[0].content, "怎么这么多");
-        assert_eq!(collapsed[0].ts, Some(5));
-
-        // 中间隔着正常 AI 回复的真实重发：不折叠
-        let collapsed = collapse_retry_user_messages(vec![
-            user("怎么这么多", 1),
-            assistant("这是一个 Tauri 项目"),
-            user("怎么这么多", 2),
-        ]);
-        assert_eq!(collapsed.len(), 3);
-
-        // 内容不同的连续用户消息：不折叠
-        let collapsed = collapse_retry_user_messages(vec![user("第一条", 1), user("第二条", 2)]);
-        assert_eq!(collapsed.len(), 2);
+    #[test]
+    fn regression_empty_error_assistant_rows_do_not_prove_user_retry() {
+        let messages = repeated_user_fixture(true);
+        assert_eq!(messages.len(), 5);
+        assert!(messages.iter().all(|message| message.role == "user"));
     }
 }

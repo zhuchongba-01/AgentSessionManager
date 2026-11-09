@@ -1,4 +1,12 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import * as core from "@tauri-apps/api/core";
+import { deliverChannelMessage } from "../msw/tauriMocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
@@ -44,11 +52,11 @@ const preview: SessionMessage = {
   truncated: true,
   contentChars: 6000,
 };
-function renderReader() {
+function renderReader(providerId = "claude") {
   setSessionFixtures(
     [
       {
-        providerId: "claude",
+        providerId,
         sessionId: "read-1",
         title: "Reading fixture",
         sourcePath: "/mock/reading.jsonl",
@@ -63,13 +71,120 @@ function renderReader() {
   return render(
     <QueryClientProvider client={client}>
       <ThemeProvider defaultTheme="light" storageKey="reading-test-theme">
-        <SessionManagerPage appId="claude" />
+        <SessionManagerPage appId={providerId} />
       </ThemeProvider>
     </QueryClientProvider>,
   );
 }
 
 describe("session reading integration", () => {
+  it("keeps delayed Codex messages and navigation after invoke finishes before Channel fetch", async () => {
+    const originalInvoke = core.invoke;
+    let channel: unknown;
+    let invoked = false;
+    vi.spyOn(core, "invoke").mockImplementation(async (command, args) => {
+      if (command !== "stream_session_messages")
+        return originalInvoke(command, args);
+      channel = (args as { onChunk: unknown }).onChunk;
+      deliverChannelMessage(channel, 0, {
+        kind: "header",
+        total: 3,
+        approxBytes: 10_000,
+      });
+      // Small Done arrives first on the wire, but waits behind payload index 1.
+      deliverChannelMessage(channel, 2, { kind: "done", delivered: 3 });
+      invoked = true;
+      return undefined as never;
+    });
+    renderReader("codex");
+    await waitFor(() => expect(invoked).toBe(true));
+    expect(screen.getByText("正在读取会话…")).toBeInTheDocument();
+    const key = ["sessionMessages", "codex", "/mock/reading.jsonl"];
+    expect(clients[0].getQueryData(key)).toBeUndefined();
+    const messages = [
+      {
+        role: "user",
+        content:
+          "# AGENTS.md instructions for hidden workspace\n" + "x".repeat(9000),
+      },
+      { role: "user", content: "Codex delayed visible question" },
+      { role: "assistant", content: "Codex delayed visible answer" },
+    ];
+    expect(
+      new TextEncoder().encode(JSON.stringify(messages)).length,
+    ).toBeGreaterThanOrEqual(8192);
+    await act(async () =>
+      deliverChannelMessage(channel, 1, {
+        kind: "messages",
+        start: 0,
+        messages,
+      }),
+    );
+    expect(
+      await screen.findByText("Codex delayed visible question"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Codex delayed visible answer"),
+    ).toBeInTheDocument();
+    const tick = screen.getByRole("button", { name: "跳转到第 1 个用户问题" });
+    expect(tick).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "跳转到第 2 个用户问题" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/# AGENTS.md instructions/),
+    ).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(clients[0].getQueryState(key)?.fetchStatus).toBe("idle"),
+    );
+    expect(clients[0].getQueryData(key)).toMatchObject({ messages });
+    expect(screen.queryByText("正在读取会话…")).not.toBeInTheDocument();
+    fireEvent.click(tick);
+    expect(
+      screen.getByText("Codex delayed visible answer"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "跳转到第 1 个用户问题" }),
+    ).toBeInTheDocument();
+  });
+
+  it("aborts the stream on unmount and ignores later Channel callbacks", async () => {
+    const originalInvoke = core.invoke;
+    let channel: unknown;
+    vi.spyOn(core, "invoke").mockImplementation(async (command, args) => {
+      if (command !== "stream_session_messages")
+        return originalInvoke(command, args);
+      channel = (args as { onChunk: unknown }).onChunk;
+      deliverChannelMessage(channel, 0, {
+        kind: "header",
+        total: 1,
+        approxBytes: 0,
+      });
+      return undefined as never;
+    });
+    const spy = vi.spyOn(sessionsApi, "streamMessages");
+    const view = renderReader();
+    await waitFor(() => expect(channel).toBeDefined());
+    const signal = spy.mock.calls[0][3]!;
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      deliverChannelMessage(channel, 1, {
+        kind: "messages",
+        start: 0,
+        messages: [{ role: "user", content: "late data" }],
+      });
+      deliverChannelMessage(channel, 2, { kind: "done", delivered: 1 });
+    });
+    expect(
+      clients[0].getQueryData([
+        "sessionMessages",
+        "claude",
+        "/mock/reading.jsonl",
+      ]),
+    ).toBeUndefined();
+  });
+
   it("shows the first chunk while the rest is still pending", async () => {
     let progress!: (messages: SessionMessage[]) => void;
     let finish!: (messages: SessionMessage[]) => void;

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use regex::Regex;
 use rusqlite::Connection;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
@@ -17,9 +17,9 @@ use crate::session_paths::{
 };
 
 use super::utils::{
-    collect_files_where, ensure_readable_size, extract_text, is_safe_session_id,
-    parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary,
-    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
+    checked_storage_child, collect_files_where, collect_files_where_checked, extract_text,
+    is_safe_session_id, parse_timestamp_to_ms, path_basename, read_head_tail_lines,
+    truncate_summary, MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "codex";
@@ -114,7 +114,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                     item.residual = false;
                     item.resume_command = None;
                 }
-            } else if !Path::new(&source).exists() {
+            } else if rollout_is_missing(Path::new(&source)) {
                 sessions.push(SessionMeta {
                     provider_id: PROVIDER_ID.into(),
                     session_id: id.clone(),
@@ -523,6 +523,17 @@ fn cleanup_state_db(
                 .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
             }
         }
+        if table == "thread_spawn_edges" {
+            for column in ["parent_thread_id", "child_thread_id"] {
+                if columns.iter().any(|item| item == column) {
+                    tx.execute(
+                        &format!("DELETE FROM {quoted} WHERE \"{column}\" = ?1"),
+                        [session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
         if (table == "threads" || table == "session") && columns.iter().any(|item| item == "id") {
             tx.execute(&format!("DELETE FROM {quoted} WHERE id = ?1"), [session_id])
                 .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
@@ -728,9 +739,12 @@ fn atomic_write(path: &Path, text: String, expected: &str) -> Result<(), String>
 
 #[cfg(test)]
 fn scan_sessions_in_roots(roots: &[PathBuf]) -> Vec<SessionMeta> {
-    let thread_titles = load_thread_titles();
-    let project_context = load_project_context();
-    scan_sessions_in_roots_with_context(roots, &thread_titles, &project_context, None)
+    scan_sessions_in_roots_with_context(
+        roots,
+        &HashMap::new(),
+        &CodexProjectContext::default(),
+        None,
+    )
 }
 
 fn scan_sessions_in_roots_with_context(
@@ -744,6 +758,7 @@ fn scan_sessions_in_roots_with_context(
         collect_jsonl_files(root, &mut files);
     }
 
+    let files = preferred_rollout_files(files);
     let descriptors = files
         .iter()
         .filter_map(|path| read_rollout_descriptor(path).ok())
@@ -861,10 +876,131 @@ fn collapse_paginated_history(
     }
 }
 
+fn is_compressed_rollout(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(".jsonl.zst")
+}
+
+fn plain_rollout_path(path: &Path) -> PathBuf {
+    if is_compressed_rollout(path) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+pub(crate) fn physical_rollout_path(path: &Path) -> Result<PathBuf, String> {
+    let plain = plain_rollout_path(path);
+    for candidate in [plain.clone(), plain.with_extension("jsonl.zst")] {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => return Ok(candidate),
+            Ok(_) => return Err("Codex rollout is not a regular file".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("Codex rollout is missing".into())
+}
+
+pub(crate) fn rollout_is_missing(path: &Path) -> bool {
+    let plain = plain_rollout_path(path);
+    [plain.clone(), plain.with_extension("jsonl.zst")].iter().all(|path| {
+        matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn is_rollout_file(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("jsonl") || is_compressed_rollout(path)
+}
+
+fn preferred_rollout_files(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+    files.sort_by_key(|path| is_compressed_rollout(path));
+    let mut seen = HashSet::new();
+    files
+        .into_iter()
+        .filter(|path| seen.insert(rollout_path_key(path)))
+        .collect()
+}
+
+fn open_rollout(path: &Path) -> Result<Box<dyn Read>, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    if is_compressed_rollout(path) {
+        let mut decoder = zstd::stream::read::Decoder::new(file).map_err(|e| e.to_string())?;
+        decoder.window_log_max(27).map_err(|e| e.to_string())?;
+        Ok(Box::new(decoder))
+    } else {
+        Ok(Box::new(file))
+    }
+}
+
+// All budgets and pagination offsets refer to decompressed bytes. Never allocate
+// a whole compressed transcript, nor trust its physical size as a decoding cap.
+fn rollout_length(path: &Path, limit: u64) -> Result<u64, String> {
+    if !is_compressed_rollout(path) {
+        return path.metadata().map(|m| m.len()).map_err(|e| e.to_string());
+    }
+    let count = std::io::copy(
+        &mut open_rollout(path)?.take(limit + 1),
+        &mut std::io::sink(),
+    )
+    .map_err(|e| e.to_string())?;
+    if count > limit {
+        return Err("Codex decompressed rollout exceeds byte budget".into());
+    }
+    Ok(count)
+}
+
+fn descriptor_rollout_length(path: &Path) -> Result<u64, String> {
+    if is_compressed_rollout(path) {
+        // Codex 0.166 pledges source length in the zstd frame. Use that for
+        // dependency bounds; actual message reads still enforce streaming caps.
+        let mut header = [0u8; 18];
+        let n = File::open(path)
+            .map_err(|e| e.to_string())?
+            .read(&mut header)
+            .map_err(|e| e.to_string())?;
+        if let Ok(Some(length)) = zstd::zstd_safe::get_frame_content_size(&header[..n]) {
+            return Ok(length);
+        }
+    }
+    rollout_length(path, MAX_MESSAGES_FILE_BYTES)
+}
+
+fn rollout_head_tail(path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+    if !is_compressed_rollout(path) {
+        return read_head_tail_lines(path, 10, 300).map_err(|e| e.to_string());
+    }
+    let mut reader = BufReader::new(open_rollout(path)?.take(MAX_MESSAGES_FILE_BYTES + 1));
+    let mut head = Vec::new();
+    let mut tail = std::collections::VecDeque::new();
+    let mut total = 0;
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .by_ref()
+            .take(4 * 1024 * 1024 + 1)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if n > 4 * 1024 * 1024 || total > MAX_MESSAGES_FILE_BYTES {
+            return Err("Codex decompressed scan exceeds byte budget".into());
+        }
+        let line = line.trim_end_matches(['\r', '\n']).to_string();
+        if head.len() < 10 {
+            head.push(line.clone());
+        }
+        tail.push_back(line);
+        if tail.len() > 300 {
+            tail.pop_front();
+        }
+    }
+    Ok((head, tail.into_iter().collect()))
+}
+
 fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
-    let file = File::open(path)
-        .map_err(|error| format!("无法读取 Codex 会话元数据 {}：{error}", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(open_rollout(path)?.take(4 * 1024 * 1024));
 
     for line in reader.lines().take(10) {
         let line = line.map_err(|error| error.to_string())?;
@@ -890,18 +1026,29 @@ fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
             .get("timestamp")
             .and_then(parse_timestamp_to_ms)
             .or_else(|| value.get("timestamp").and_then(parse_timestamp_to_ms));
-        let history_base = payload.get("history_base").and_then(|base| {
-            let thread_id = base.get("thread_id")?.as_str()?.trim();
-            let end_byte_offset = base.get("end_byte_offset")?.as_u64()?;
-            (!thread_id.is_empty() && end_byte_offset > 0).then(|| HistoryBaseRef {
-                thread_id: thread_id.to_string(),
-                end_byte_offset,
-            })
-        });
-        let file_len = path
-            .metadata()
-            .map_err(|error| format!("无法读取 Codex 会话大小 {}：{error}", path.display()))?
-            .len();
+        let history_base = match payload.get("history_base").filter(|base| !base.is_null()) {
+            None => None,
+            Some(base) => {
+                let thread_id = base
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| format!("Invalid Codex history_base: {}", path.display()))?;
+                let end_byte_offset = base
+                    .get("end_byte_offset")
+                    .and_then(Value::as_u64)
+                    .filter(|offset| *offset > 0)
+                    .ok_or_else(|| {
+                        format!("Invalid Codex history_base offset: {}", path.display())
+                    })?;
+                Some(HistoryBaseRef {
+                    thread_id: thread_id.into(),
+                    end_byte_offset,
+                })
+            }
+        };
+        let file_len = descriptor_rollout_length(path)?;
         let rollout_id = rollout_instance_id(path, &session_id);
         return Ok(RolloutDescriptor {
             path: path.to_path_buf(),
@@ -918,7 +1065,8 @@ fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
 }
 
 fn rollout_instance_id(path: &Path, session_id: &str) -> String {
-    let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+    let plain = plain_rollout_path(path);
+    let Some(stem) = plain.file_stem().and_then(|name| name.to_str()) else {
         return session_id.to_string();
     };
     let Some((_, suffix)) = stem.rsplit_once('_') else {
@@ -950,7 +1098,10 @@ fn same_rollout_path(left: &Path, right: &Path) -> bool {
 /// 纯字符串比较会把它当成两个文件，导致分页链解析失败并拒绝清理。解析失败时
 /// 退回字符串表示，保持原有行为。
 fn rollout_path_key(path: &Path) -> String {
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let resolved = physical_rollout_path(path)
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| path.to_path_buf());
     normalized_rollout_path(&resolved.to_string_lossy())
 }
 
@@ -1060,11 +1211,29 @@ fn rollout_descriptors_in_roots(path: &Path, mut roots: Vec<PathBuf>) -> Vec<Rol
 
 fn descriptors_for_files(files: Vec<PathBuf>) -> Vec<RolloutDescriptor> {
     let mut seen = HashSet::new();
-    files
+    preferred_rollout_files(files)
         .into_iter()
         .filter(|path| seen.insert(rollout_path_key(path)))
         .filter_map(|candidate| read_rollout_descriptor(&candidate).ok())
         .collect()
+}
+
+/// Destructive operations must never infer absence from a partial scan.
+fn rollout_descriptors_checked(roots: &[PathBuf]) -> Result<Vec<RolloutDescriptor>, String> {
+    let mut files = Vec::new();
+    for root in roots {
+        if !root.is_absolute() {
+            return Err("Codex storage root must be absolute".into());
+        }
+        collect_files_where_checked(root, is_rollout_file, &mut files)?;
+    }
+    let mut seen = HashSet::new();
+    preferred_rollout_files(files)
+        .into_iter()
+        .filter(|path| seen.insert(rollout_path_key(path)))
+        .map(|path| read_rollout_descriptor(&path))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Codex 依赖扫描不完整：{error}"))
 }
 
 fn resolve_paginated_chain(path: &Path) -> Result<Vec<HistorySegment>, String> {
@@ -1150,6 +1319,10 @@ fn is_archived_rollout(path: &str) -> bool {
 }
 
 fn normalized_rollout_path(path: &str) -> String {
+    let path = path
+        .strip_suffix(".zst")
+        .filter(|plain| plain.ends_with(".jsonl"))
+        .unwrap_or(path);
     #[cfg(not(target_os = "windows"))]
     {
         return path.trim_end_matches('/').to_string();
@@ -1337,9 +1510,13 @@ fn load_thread_titles_from_paths(
     session_index_path: &Path,
     db_paths: &[PathBuf],
 ) -> HashMap<String, String> {
-    let mut titles = load_thread_titles_from_session_index(session_index_path);
+    let mut titles = HashMap::new();
     for db_path in db_paths {
         titles.extend(load_thread_titles_from_db(db_path));
+    }
+    titles.extend(load_thread_titles_from_session_index(session_index_path));
+    for db_path in db_paths {
+        titles.extend(load_thread_titles_from_db_mode(db_path, true));
     }
     titles
 }
@@ -1381,6 +1558,10 @@ fn load_thread_titles_from_session_index(index_path: &Path) -> HashMap<String, S
 }
 
 fn load_thread_titles_from_db(db_path: &Path) -> HashMap<String, String> {
+    load_thread_titles_from_db_mode(db_path, false)
+}
+
+fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<String, String> {
     if !db_path.exists() {
         return HashMap::new();
     }
@@ -1412,11 +1593,35 @@ fn load_thread_titles_from_db(db_path: &Path) -> HashMap<String, String> {
     // when it differs from the first user message. Push the comparison into SQL
     // (NULL-safe) so we never SELECT the unbounded `first_user_message` blob —
     // it can grow large enough to OOM (openai/codex#29007).
-    let mut stmt = match conn.prepare(
-        "SELECT id, title FROM threads \
-         WHERE title <> '' \
-         AND (first_user_message IS NULL OR TRIM(title) <> TRIM(first_user_message))",
-    ) {
+    let columns = conn
+        .prepare("PRAGMA table_info(threads)")
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .ok()
+                .map(|rows| rows.flatten().collect::<HashSet<_>>())
+        })
+        .unwrap_or_default();
+    let generated = if columns.contains("first_user_message") {
+        "CASE WHEN first_user_message IS NULL OR TRIM(title) <> TRIM(first_user_message) THEN NULLIF(TRIM(title), '') END"
+    } else {
+        "NULLIF(TRIM(title), '')"
+    };
+    let expression = if names_only {
+        if columns.contains("name") {
+            "NULLIF(TRIM(name), '')".to_string()
+        } else {
+            // 旧 schema 只有 title；有效的显式标题仍高于旧 JSON 索引。
+            // 新 schema 的 title 是自动标题，只有 name 才是显式覆盖。
+            generated.to_string()
+        }
+    } else if columns.contains("name") {
+        format!("COALESCE(NULLIF(TRIM(name), ''), {generated})")
+    } else {
+        generated.to_string()
+    };
+    let query = format!("SELECT id, {expression} FROM threads WHERE {expression} IS NOT NULL");
+    let mut stmt = match conn.prepare(&query) {
         Ok(stmt) => stmt,
         Err(err) => {
             log::warn!(
@@ -1471,16 +1676,19 @@ pub fn transcript_sources(path: &Path) -> Result<Vec<(PathBuf, Option<u64>)>, St
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+    load_history_segments(resolve_paginated_chain(path)?)
+}
+
+fn load_history_segments(segments: Vec<HistorySegment>) -> Result<Vec<SessionMessage>, String> {
     let mut messages = Vec::new();
     let mut remaining_bytes = MAX_MESSAGES_FILE_BYTES;
 
-    for segment in resolve_paginated_chain(path)? {
-        let file_len = segment
-            .path
-            .metadata()
-            .map_err(|e| format!("Failed to inspect session file: {e}"))?
-            .len();
-        let segment_len = segment.end_byte_offset.unwrap_or(file_len);
+    // Validate the aggregate before allocating/reading any individual segment.
+    for segment in &segments {
+        let segment_len = match segment.end_byte_offset {
+            Some(offset) => offset,
+            None => rollout_length(&segment.path, remaining_bytes)?,
+        };
         if segment_len > remaining_bytes {
             return Err(format!(
                 "Codex 分页历史合计超过 {} MB 加载上限",
@@ -1488,6 +1696,8 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             ));
         }
         remaining_bytes -= segment_len;
+    }
+    for segment in segments {
         messages.extend(load_segment_messages(
             &segment.path,
             segment.end_byte_offset,
@@ -1501,26 +1711,31 @@ fn load_segment_messages(
     path: &Path,
     end_byte_offset: Option<u64>,
 ) -> Result<Vec<SessionMessage>, String> {
-    ensure_readable_size(path)?;
-    let file_len = path
-        .metadata()
-        .map_err(|e| format!("Failed to inspect session file: {e}"))?
-        .len();
-    if end_byte_offset.is_some_and(|offset| offset > file_len) {
-        return Err(format!(
-            "Codex 分页历史超出基座文件范围，已停止读取：{}",
-            path.display()
-        ));
+    let segment_len = match end_byte_offset {
+        Some(offset) => offset,
+        None => rollout_length(path, MAX_MESSAGES_FILE_BYTES)?,
+    };
+    if segment_len > MAX_MESSAGES_FILE_BYTES {
+        return Err("Codex history segment exceeds message byte budget".into());
     }
-    let file = File::open(path).map_err(|e| format!("Failed to open session file: {e}"))?;
-    let reader = BufReader::new(file.take(end_byte_offset.unwrap_or(u64::MAX)));
+    let mut reader = BufReader::new(open_rollout(path)?.take(segment_len));
+    let mut consumed = 0u64;
     let mut messages = Vec::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+    loop {
+        let mut line = String::new();
+        let count = reader
+            .by_ref()
+            .take(4 * 1024 * 1024 + 1)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        consumed += count as u64;
+        if count > 4 * 1024 * 1024 {
+            return Err("Codex record exceeds byte budget".into());
+        }
         let value: Value = match serde_json::from_str(&line) {
             Ok(parsed) => parsed,
             Err(_) => continue,
@@ -1559,13 +1774,17 @@ fn load_segment_messages(
                     .unwrap_or("unknown");
                 ("assistant".to_string(), format!("[Tool: {name}]"))
             }
-            "function_call_output" => {
-                let output = payload
-                    .get("output")
+            "function_call_output" | "custom_tool_call_output" => (
+                "tool".to_string(),
+                payload.get("output").map(extract_text).unwrap_or_default(),
+            ),
+            "custom_tool_call" => {
+                let name = payload
+                    .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                ("tool".to_string(), output)
+                    .unwrap_or("unknown");
+                let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
+                ("assistant".to_string(), format!("[Tool: {name}]\n{input}"))
             }
             _ => continue,
         };
@@ -1579,6 +1798,9 @@ fn load_segment_messages(
         messages.push(SessionMessage { role, content, ts });
     }
 
+    if consumed < segment_len {
+        return Err("Codex history offset exceeds decompressed length".into());
+    }
     Ok(messages)
 }
 
@@ -1656,30 +1878,43 @@ fn deletion_order_with_descriptors(
 }
 
 fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String> {
-    let meta = parse_session(path)
-        .ok_or_else(|| format!("Failed to parse Codex session metadata: {}", path.display()))?;
+    deletion_paths_with_descriptors(
+        path,
+        session_id,
+        &rollout_descriptors_checked(&session_roots())?,
+    )
+}
 
-    if meta.session_id != session_id {
-        return Err(format!(
-            "Codex session ID mismatch: expected {session_id}, found {}",
-            meta.session_id
-        ));
-    }
+fn deletion_paths_with_descriptors(
+    path: &Path,
+    session_id: &str,
+    descriptors: &[RolloutDescriptor],
+) -> Result<Vec<PathBuf>, String> {
+    deletion_paths_for_plan(path, session_id, descriptors, &HashSet::new())
+}
 
-    let descriptors = rollout_descriptors_for_path(path);
+fn deletion_paths_for_plan(
+    path: &Path,
+    session_id: &str,
+    descriptors: &[RolloutDescriptor],
+    selected: &HashSet<String>,
+) -> Result<Vec<PathBuf>, String> {
     let target = descriptors
         .iter()
         .find(|descriptor| descriptor.key == rollout_path_key(path))
         .ok_or_else(|| format!("无法读取 Codex 会话元数据：{}", path.display()))?;
 
+    if target.session_id != session_id || !is_safe_session_id(session_id) {
+        return Err("Codex session ID mismatch or invalid ID".into());
+    }
     let owned_segments = if target.history_base.is_some() {
-        resolve_paginated_chain_from_descriptors(path, &descriptors)?
+        resolve_paginated_chain_from_descriptors(path, descriptors)?
             .into_iter()
             .filter(|segment| segment.session_id == session_id)
             .collect::<Vec<_>>()
     } else {
         vec![HistorySegment {
-            path: path.to_path_buf(),
+            path: target.path.clone(),
             session_id: session_id.to_string(),
             end_byte_offset: None,
         }]
@@ -1705,11 +1940,11 @@ fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String>
         .filter(|descriptor| descriptor.history_base.is_some())
     {
         let continuation_path = normalized_rollout_path(&continuation.path.to_string_lossy());
-        if owned_paths.contains(&continuation_path) {
+        if owned_paths.contains(&continuation_path) || selected.contains(&continuation.key) {
             continue;
         }
 
-        match resolve_paginated_chain_from_descriptors(&continuation.path, &descriptors) {
+        match resolve_paginated_chain_from_descriptors(&continuation.path, descriptors) {
             Ok(chain)
                 if chain.iter().any(|segment| {
                     owned_paths.contains(&normalized_rollout_path(&segment.path.to_string_lossy()))
@@ -1732,7 +1967,7 @@ fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String>
                     "Codex 分页或分支历史无法确认，已禁止删除以保护会话：{error}"
                 ));
             }
-            Err(_) => {}
+            Err(error) => return Err(format!("Codex dependency chain is incomplete: {error}")),
         }
     }
 
@@ -1740,6 +1975,330 @@ fn deletion_paths(path: &Path, session_id: &str) -> Result<Vec<PathBuf>, String>
         .into_iter()
         .map(|segment| segment.path)
         .collect())
+}
+
+/// Frozen before any index/file mutation; progress is checkpointed by deletion.rs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DeletionPlan {
+    pub session_id: String,
+    pub source_path: String,
+    roots: Vec<PathBuf>,
+    units: Vec<DeletionUnit>, // leaf before base
+    cleanup_index: bool,
+    index_done: bool,
+    next_unit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DeletionUnit {
+    root: PathBuf,
+    path: PathBuf,
+    session_id: String,
+    rollout_id: String,
+    fingerprint: (u64, u64),
+}
+
+fn deletion_fingerprint(path: &Path) -> Result<(u64, u64), String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut length = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        length += count as u64;
+        for byte in &buffer[..count] {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok((length, hash))
+}
+
+// Missing roots still have an identity: resolve their nearest existing ancestor
+// and reject traversal/symlinks before accepting an index-only cleanup.
+fn checked_missing_rollout(root: &Path, path: &Path) -> Result<(), String> {
+    if !root.is_absolute()
+        || !path.is_absolute()
+        || path == root
+        || !path.starts_with(root)
+        || root
+            .components()
+            .chain(path.components())
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Missing Codex source is outside configured storage".into());
+    }
+    let mut anchor = root;
+    while matches!(std::fs::symlink_metadata(anchor), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        anchor = anchor.parent().ok_or("Missing storage ancestor")?;
+    }
+    let expected_root = if anchor == root {
+        anchor.canonicalize().map_err(|e| e.to_string())?
+    } else {
+        checked_storage_child(anchor, root)?
+    };
+    let checked = checked_storage_child(anchor, path)?;
+    if !checked.starts_with(expected_root) {
+        return Err("Missing Codex source escapes root".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_deletion_plan(
+    targets: &[SessionMeta],
+    roots: &[PathBuf],
+    cleanup_index: bool,
+) -> Result<DeletionPlan, String> {
+    let first = targets.first().ok_or("Empty Codex deletion plan")?;
+    let descriptors = rollout_descriptors_checked(roots)?;
+    let mut units = Vec::new();
+    let mut seen = HashSet::new();
+    let mut selected = HashSet::new();
+    for target in targets {
+        if let Some(source) = target.source_path.as_deref().filter(|source| {
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.key == rollout_path_key(Path::new(source)))
+        }) {
+            for segment in
+                resolve_paginated_chain_from_descriptors(Path::new(source), &descriptors)?
+            {
+                if segment.session_id == first.session_id {
+                    selected.insert(rollout_path_key(&segment.path));
+                }
+            }
+        }
+    }
+    for target in targets {
+        if target.provider_id != PROVIDER_ID || target.session_id != first.session_id {
+            return Err("Codex deletion target mismatch".into());
+        }
+        let source = target
+            .source_path
+            .as_deref()
+            .ok_or("Missing Codex source")?;
+        if source == format!("codex-index:{}", first.session_id) {
+            continue;
+        }
+        let requested = Path::new(source);
+        let physical = physical_rollout_path(requested).ok();
+        let path = physical.as_deref().unwrap_or(requested);
+        // Only initially missing index ghosts may have no file unit. Legacy
+        // journals are checked by deletion.rs before reaching this expansion.
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && target.cleanup_pending => {
+                if !roots
+                    .iter()
+                    .any(|root| checked_missing_rollout(root, path).is_ok())
+                {
+                    return Err("Missing Codex source is outside configured storage".into());
+                }
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => {}
+        }
+        for candidate in deletion_paths_for_plan(path, &target.session_id, &descriptors, &selected)?
+            .into_iter()
+            .rev()
+            .flat_map(|candidate| {
+                let plain = plain_rollout_path(&candidate);
+                // Delete both frozen representations, compressed first, so an
+                // obsolete sibling never reappears after deleting the plain file.
+                [plain.with_extension("jsonl.zst"), plain]
+                    .into_iter()
+                    .filter(|p| p.exists())
+            })
+        {
+            let canonical = candidate.canonicalize().map_err(|e| e.to_string())?;
+            if !seen.insert(canonical.clone()) {
+                continue;
+            }
+            let root = roots
+                .iter()
+                .find_map(|root| {
+                    checked_storage_child(root, &candidate)
+                        .ok()
+                        .filter(|checked| *checked == canonical)
+                        .and_then(|_| root.canonicalize().ok())
+                })
+                .ok_or("Codex deletion unit is outside configured storage")?;
+            let descriptor = read_rollout_descriptor(&canonical)?;
+            if descriptor.session_id != first.session_id {
+                return Err("Codex sibling identity mismatch".into());
+            }
+            units.push(DeletionUnit {
+                root,
+                path: canonical.clone(),
+                session_id: descriptor.session_id,
+                rollout_id: descriptor.rollout_id,
+                fingerprint: deletion_fingerprint(&canonical)?,
+            });
+        }
+    }
+    // Union first, then sort every selected continuation ahead of its shared
+    // bases. Per-target leaf/base concatenation would delete B before sibling C.
+    let mut depths = HashMap::new();
+    for unit in &units {
+        depths.insert(
+            rollout_path_key(&unit.path),
+            resolve_paginated_chain_from_descriptors(&unit.path, &descriptors)?.len(),
+        );
+    }
+    units.sort_by_key(|unit| std::cmp::Reverse(depths[&rollout_path_key(&unit.path)]));
+    let plan = DeletionPlan {
+        session_id: first.session_id.clone(),
+        source_path: first.source_path.clone().ok_or("Missing Codex source")?,
+        roots: roots.to_vec(),
+        units,
+        cleanup_index,
+        index_done: false,
+        next_unit: 0,
+    };
+    validate_deletion_plan(&plan, roots)?;
+    Ok(plan)
+}
+
+pub(crate) fn validate_deletion_plan(plan: &DeletionPlan, roots: &[PathBuf]) -> Result<(), String> {
+    if !is_safe_session_id(&plan.session_id)
+        || plan.next_unit > plan.units.len()
+        || plan.roots != roots
+    {
+        return Err("Codex saved deletion plan/root mismatch".into());
+    }
+    let descriptors = rollout_descriptors_checked(roots)?;
+    // An index-only plan froze absence, not permission to remove the index of
+    // a valid transcript restored or created before a retry.
+    if plan.units.is_empty() {
+        if descriptors
+            .iter()
+            .any(|item| item.session_id == plan.session_id)
+        {
+            return Err("Codex index-only cleanup found a new or restored rollout".into());
+        }
+        if !plan.source_path.starts_with("codex-index:")
+            && !rollout_is_missing(Path::new(&plan.source_path))
+        {
+            return Err("Codex index-only cleanup source reappeared".into());
+        }
+    }
+    let mut remaining = HashSet::new();
+    for (index, unit) in plan.units.iter().enumerate() {
+        if unit.session_id != plan.session_id
+            || !roots
+                .iter()
+                .any(|root| root.canonicalize().is_ok_and(|root| root == unit.root))
+            || checked_storage_child(&unit.root, &unit.path)? != unit.path
+        {
+            return Err("Codex saved deletion unit/root/ID mismatch".into());
+        }
+        let plain = plain_rollout_path(&unit.path);
+        for sibling in [plain.clone(), plain.with_extension("jsonl.zst")] {
+            match std::fs::symlink_metadata(&sibling) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+                Ok(_) => {
+                    if !plan.units.iter().any(|saved| saved.path == sibling) {
+                        return Err(
+                            "Codex representation changed after deletion plan was frozen".into(),
+                        );
+                    }
+                }
+            }
+        }
+        if index < plan.next_unit {
+            if std::fs::symlink_metadata(&unit.path).is_ok() {
+                return Err("Codex completed deletion unit reappeared".into());
+            }
+            continue;
+        }
+        remaining.insert(rollout_path_key(&unit.path));
+        match std::fs::symlink_metadata(&unit.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.to_string()),
+            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+                return Err("Codex saved file was replaced".into())
+            }
+            Ok(_) => {}
+        }
+        let descriptor = read_rollout_descriptor(&unit.path)?;
+        if descriptor.session_id != unit.session_id
+            || descriptor.rollout_id != unit.rollout_id
+            || deletion_fingerprint(&unit.path)? != unit.fingerprint
+        {
+            return Err("Codex saved file identity changed; stopped cleanup".into());
+        }
+    }
+    // Planned continuations may already have gone; only outside references can
+    // veto the remaining exact units. Never re-expand a saved leaf on retry.
+    for descriptor in descriptors
+        .iter()
+        .filter(|d| d.history_base.is_some() && !remaining.contains(&d.key))
+    {
+        let chain = resolve_paginated_chain_from_descriptors(&descriptor.path, &descriptors)?;
+        if chain
+            .iter()
+            .any(|segment| remaining.contains(&rollout_path_key(&segment.path)))
+        {
+            return Err("Codex deletion unit is still referenced by another rollout".into());
+        }
+    }
+    Ok(())
+}
+
+/// Frozen file ownership and current index ownership must agree on every retry.
+/// A residual that became the indexed rollout must be selected again, not
+/// silently promoted to a broader index-cleaning operation.
+pub(crate) fn validate_deletion_index_decision(
+    plan: &DeletionPlan,
+    current_cleanup_index: bool,
+) -> Result<(), String> {
+    if plan.cleanup_index != current_cleanup_index {
+        return Err(
+            "Codex index ownership changed since the deletion plan was frozen; rescan required"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn execute_deletion_plan<C, D, S>(
+    plan: &mut DeletionPlan,
+    roots: &[PathBuf],
+    mut cleanup: C,
+    mut remove: D,
+    mut save: S,
+) -> Result<(), String>
+where
+    C: FnMut(&str) -> Result<(), String>,
+    D: FnMut(&Path) -> Result<(), String>,
+    S: FnMut(&DeletionPlan) -> Result<(), String>,
+{
+    validate_deletion_plan(plan, roots)?;
+    // index_done is a checkpoint, not proof about today's configured databases.
+    // Cleanup resolves and rechecks the effective index each time; rerunning it
+    // is idempotent and must precede even the remaining frozen file removals.
+    if plan.cleanup_index {
+        cleanup(&plan.session_id)?;
+    }
+    if !plan.index_done {
+        plan.index_done = true;
+        save(plan)?;
+    }
+    while plan.next_unit < plan.units.len() {
+        let path = &plan.units[plan.next_unit].path;
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => remove(path)?,
+        }
+        plan.next_unit += 1;
+        save(plan)?;
+    }
+    Ok(())
 }
 
 pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
@@ -1771,12 +2330,11 @@ fn validated_deletion_paths(
     path: &Path,
     session_id: &str,
 ) -> Result<Vec<PathBuf>, String> {
-    let paths = deletion_paths(path, session_id)?;
-    let mut allowed_roots = session_roots();
-    if !allowed_roots.iter().any(|candidate| candidate == root) {
-        allowed_roots.push(root.to_path_buf());
-    }
-    let allowed_roots = allowed_roots
+    // Explicit roots keep provider tests and callers independent of CODEX_HOME.
+    let roots = vec![root.to_path_buf()];
+    let paths =
+        deletion_paths_with_descriptors(path, session_id, &rollout_descriptors_checked(&roots)?)?;
+    let allowed_roots = roots
         .iter()
         .filter_map(|candidate| candidate.canonicalize().ok())
         .collect::<Vec<_>>();
@@ -1800,6 +2358,7 @@ fn validated_deletion_paths(
     Ok(validated_paths)
 }
 
+#[cfg(test)]
 fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_with_titles(path, &HashMap::new())
 }
@@ -1808,7 +2367,7 @@ fn parse_session_with_titles(
     path: &Path,
     thread_titles: &HashMap<String, String>,
 ) -> Option<SessionMeta> {
-    let (head, tail) = read_head_tail_lines(path, 10, 300)
+    let (head, tail) = rollout_head_tail(path)
         .map_err(|error| {
             super::utils::scan_warning(format!("无法读取 {}：{error}", path.display()));
             error
@@ -1890,7 +2449,7 @@ fn parse_session_with_titles(
         if last_active_at.is_none() {
             last_active_at = value.get("timestamp").and_then(parse_timestamp_to_ms);
         }
-        if summary.is_none() && value.get("type").and_then(Value::as_str) == Some("response_item") {
+        if value.get("type").and_then(Value::as_str) == Some("response_item") {
             if let Some(payload) = value.get("payload") {
                 if payload.get("type").and_then(Value::as_str) == Some("message") {
                     let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
@@ -1900,7 +2459,7 @@ fn parse_session_with_titles(
                     if visible && latest_user_message.is_none() && role == "user" {
                         latest_user_message = title_candidate_from_user_message(&text);
                     }
-                    if visible && !text.trim().is_empty() {
+                    if visible && summary.is_none() && !text.trim().is_empty() {
                         summary = Some(text);
                     }
                 }
@@ -2057,15 +2616,490 @@ fn infer_session_id_from_filename(path: &Path) -> Option<String> {
 }
 
 fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
-    collect_files_where(
-        root,
-        |path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
-        files,
-    );
+    collect_files_where(root, is_rollout_file, files);
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compat_compressed_chain_identity_offsets_and_tool_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base.jsonl");
+        write_codex_session(&base, "base", "你好 base");
+        let offset = std::fs::metadata(&base).unwrap().len();
+        let compressed = base.with_extension("jsonl.zst");
+        let bytes = std::fs::read(&base).unwrap();
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            preferred_rollout_files(vec![compressed.clone(), base.clone()]),
+            vec![base.clone()]
+        );
+        std::fs::remove_file(&base).unwrap();
+        let child = temp.path().join("child.jsonl");
+        write_paginated_session_with_base(&child, "child", "base", offset, "child");
+        let compressed_child = child.with_extension("jsonl.zst");
+        std::fs::write(
+            &compressed_child,
+            zstd::stream::encode_all(std::fs::read(&child).unwrap().as_slice(), 0).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&child).unwrap();
+        let descriptors = rollout_descriptors_checked(&[temp.path().to_path_buf()]).unwrap();
+        let chain = resolve_paginated_chain_from_descriptors(&child, &descriptors).unwrap();
+        assert_eq!(chain[0].path, compressed);
+        assert_eq!(chain[0].end_byte_offset, Some(offset));
+        assert_eq!(
+            transcript_sources(&child).unwrap(),
+            vec![
+                (compressed.clone(), Some(offset)),
+                (compressed_child.clone(), None)
+            ]
+        );
+        assert!(!rollout_is_missing(&base));
+        assert_eq!(physical_rollout_path(&child).unwrap(), compressed_child);
+        assert_eq!(load_history_segments(chain).unwrap().len(), 2);
+        assert!(deletion_paths_with_descriptors(&base, "base", &descriptors).is_err());
+        assert_eq!(
+            scan_sessions_in_roots(&[temp.path().to_path_buf()]).len(),
+            2
+        );
+        let tools = temp.path().join("tools.jsonl");
+        std::fs::write(&tools, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"output\":[{\"type\":\"input_text\",\"text\":\"array output\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"patch\",\"input\":\"patch text\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"output\":\"done\"}}\n"
+        )).unwrap();
+        let messages = load_segment_messages(&tools, None).unwrap();
+        assert_eq!(messages[0].content, "array output");
+        assert!(messages[1].content.contains("patch text"));
+        assert_eq!(messages[2].content, "done");
+    }
+
+    #[test]
+    fn compat_compressed_plan_freezes_both_representations_and_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("thread.jsonl");
+        let compressed = plain.with_extension("jsonl.zst");
+        write_codex_session(&plain, "thread", "old");
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(std::fs::read(&plain).unwrap().as_slice(), 0).unwrap(),
+        )
+        .unwrap();
+        let target: SessionMeta = serde_json::from_value(serde_json::json!({"providerId":"codex","sessionId":"thread","residual":false,"sourcePath":plain})).unwrap();
+        let roots = [temp.path().to_path_buf()];
+        let mut plan = prepare_deletion_plan(std::slice::from_ref(&target), &roots, true).unwrap();
+        assert_eq!(plan.units.len(), 2);
+        assert!(is_compressed_rollout(&plan.units[0].path));
+        execute_deletion_plan(
+            &mut plan,
+            &roots,
+            |_| Ok(()),
+            |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!plain.exists() && !compressed.exists());
+        write_codex_session(&plain, "thread", "new");
+        assert!(validate_deletion_plan(&plan, &roots).is_err());
+        let plan = prepare_deletion_plan(&[target], &roots, true).unwrap();
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(std::fs::read(&plain).unwrap().as_slice(), 0).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        assert!(validate_deletion_plan(&plan, &roots).is_err());
+        assert!(compressed.exists());
+    }
+
+    #[test]
+    fn compat_chain_representation_transition_never_deletes_base() {
+        for start_compressed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().join("base.jsonl");
+            let leaf = temp.path().join("leaf.jsonl");
+            write_codex_session(&base, "thread", "base");
+            write_paginated_session(
+                &leaf,
+                "thread",
+                std::fs::metadata(&base).unwrap().len(),
+                "leaf",
+            );
+            let bytes = std::fs::read(&leaf).unwrap();
+            let compressed = leaf.with_extension("jsonl.zst");
+            if start_compressed {
+                std::fs::write(
+                    &compressed,
+                    zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
+                )
+                .unwrap();
+                std::fs::remove_file(&leaf).unwrap();
+            }
+            let source = if start_compressed { &compressed } else { &leaf };
+            let target: SessionMeta = serde_json::from_value(serde_json::json!({"providerId":"codex","sessionId":"thread","residual":false,"sourcePath":source})).unwrap();
+            let roots = [temp.path().to_path_buf()];
+            let mut plan = prepare_deletion_plan(&[target], &roots, true).unwrap();
+            if start_compressed {
+                std::fs::write(&leaf, &bytes).unwrap();
+                std::fs::remove_file(&compressed).unwrap();
+            } else {
+                std::fs::write(
+                    &compressed,
+                    zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
+                )
+                .unwrap();
+                std::fs::remove_file(&leaf).unwrap();
+            }
+            assert!(execute_deletion_plan(
+                &mut plan,
+                &roots,
+                |_| panic!("no cleanup"),
+                |_| panic!("no remove"),
+                |_| panic!("no checkpoint")
+            )
+            .is_err());
+            assert!(base.exists());
+        }
+    }
+
+    #[test]
+    fn compat_compressed_prefix_budget_and_corrupt_child_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("base.jsonl");
+        write_codex_session(&plain, "base", "prefix");
+        let prefix = std::fs::read(&plain).unwrap();
+        let compressed = plain.with_extension("jsonl.zst");
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed).unwrap(), 0).unwrap();
+        let huge = MAX_MESSAGES_FILE_BYTES + 1;
+        encoder
+            .set_pledged_src_size(Some(huge + prefix.len() as u64))
+            .unwrap();
+        encoder.write_all(&prefix).unwrap();
+        std::io::copy(&mut std::io::repeat(b' ').take(huge), &mut encoder).unwrap();
+        encoder.finish().unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        assert_eq!(
+            load_segment_messages(&compressed, Some(prefix.len() as u64))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(load_segment_messages(&compressed, None).is_err());
+        assert!(read_rollout_descriptor(&compressed).unwrap().file_len > MAX_MESSAGES_FILE_BYTES);
+        let bad = temp.path().join("child.jsonl.zst");
+        std::fs::write(bad, b"broken zstd").unwrap();
+        assert!(rollout_descriptors_checked(&[temp.path().to_path_buf()]).is_err());
+    }
+
+    #[test]
+    fn compat_name_old_schema_and_spawn_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT, title TEXT, name TEXT, first_user_message TEXT); INSERT INTO threads VALUES('a','generated','explicit','question'),('b','kept','','question'); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT); INSERT INTO thread_spawn_edges VALUES('a','b'),('c','a'),('c','d');").unwrap();
+        assert_eq!(load_thread_titles_from_db(&path)["a"], "explicit");
+        let index = temp.path().join("index.jsonl");
+        std::fs::write(&index, "{\"id\":\"a\",\"thread_name\":\"index a\"}\n{\"id\":\"b\",\"thread_name\":\"index b\"}\n").unwrap();
+        let titles = load_thread_titles_from_paths(&index, std::slice::from_ref(&path));
+        assert_eq!(titles["a"], "explicit");
+        assert_eq!(titles["b"], "index b");
+        cleanup_state_db(&path, "a", None, false).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM thread_spawn_edges", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        db.execute_batch("DROP TABLE threads; CREATE TABLE threads(id TEXT,title TEXT); INSERT INTO threads VALUES('old','legacy');").unwrap();
+        assert_eq!(load_thread_titles_from_db(&path)["old"], "legacy");
+    }
+
+    #[test]
+    fn compat_sqlite_home_cleanup_leaves_old_default_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("sqlite");
+        std::fs::create_dir(&configured).unwrap();
+        let old = temp
+            .path()
+            .join(crate::session_paths::CODEX_STATE_DB_FILENAME);
+        let current = configured.join(crate::session_paths::CODEX_STATE_DB_FILENAME);
+        for path in [&old, &current] {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch("CREATE TABLE threads(id TEXT); INSERT INTO threads VALUES('same');")
+                .unwrap();
+        }
+        let config = format!(
+            "sqlite_home = {}",
+            serde_json::to_string(&configured.to_string_lossy()).unwrap()
+        );
+        cleanup_index_databases(temp.path(), &config, "same", None, false).unwrap();
+        for (path, count) in [(&old, 1), (&current, 0)] {
+            assert_eq!(
+                Connection::open(path)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn compat_missing_sessions_root_ghost_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let target: SessionMeta = serde_json::from_value(serde_json::json!({"providerId":"codex","sessionId":"ghost","residual":false,"cleanupPending":true,"sourcePath":root.join("day/gone.jsonl")})).unwrap();
+        let plan = prepare_deletion_plan(
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&root),
+            true,
+        )
+        .unwrap();
+        assert!(plan.units.is_empty());
+        let mut outside = target;
+        outside.source_path = Some(temp.path().join("outside.jsonl").to_string_lossy().into());
+        assert!(prepare_deletion_plan(&[outside], &[root], true).is_err());
+    }
+    #[test]
+    fn compat_ghost_retry_protects_restored_plain_and_compressed_logs() {
+        for compressed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("sessions");
+            let source = root.join("day/gone.jsonl");
+            let target: SessionMeta = serde_json::from_value(serde_json::json!({"providerId":"codex","sessionId":"ghost","residual":false,"cleanupPending":true,"sourcePath":source})).unwrap();
+            let mut plan =
+                prepare_deletion_plan(&[target], std::slice::from_ref(&root), true).unwrap();
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            write_codex_session(&source, "ghost", "restored transcript");
+            if compressed {
+                let bytes = std::fs::read(&source).unwrap();
+                std::fs::write(
+                    source.with_extension("jsonl.zst"),
+                    zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
+                )
+                .unwrap();
+                std::fs::remove_file(&source).unwrap();
+            }
+            assert!(execute_deletion_plan(
+                &mut plan,
+                &[root],
+                |_| panic!("index must remain"),
+                |_| panic!("file must remain"),
+                |_| panic!("journal must remain")
+            )
+            .is_err());
+        }
+    }
+
+    // Test entry points carry only fixture-local roots, never ambient CODEX_HOME.
+    fn resolve_paginated_chain(path: &Path) -> Result<Vec<HistorySegment>, String> {
+        resolve_paginated_chain_from_descriptors(
+            path,
+            &rollout_descriptors_checked(&[path.parent().unwrap().to_path_buf()])?,
+        )
+    }
+    fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+        load_history_segments(resolve_paginated_chain(path)?)
+    }
+    fn transcript_sources(path: &Path) -> Result<Vec<(PathBuf, Option<u64>)>, String> {
+        Ok(resolve_paginated_chain(path)?
+            .into_iter()
+            .map(|segment| (segment.path, segment.end_byte_offset))
+            .collect())
+    }
+    fn validate_delete(path: &Path, id: &str) -> Result<(), String> {
+        deletion_paths_with_descriptors(
+            path,
+            id,
+            &rollout_descriptors_checked(&[path.parent().unwrap().to_path_buf()])?,
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn codex_segment_budget_counts_only_requested_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("huge.jsonl");
+        write_codex_session(&path, "thread", "visible prefix");
+        let prefix = path.metadata().unwrap().len();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_MESSAGES_FILE_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            load_segment_messages(&path, Some(prefix)).unwrap()[0].content,
+            "visible prefix"
+        );
+        assert!(load_segment_messages(&path, None).is_err());
+        assert!(load_segment_messages(&path, Some(MAX_MESSAGES_FILE_BYTES + 2)).is_err());
+        assert!(load_history_segments(vec![
+            HistorySegment {
+                path: path.clone(),
+                session_id: "thread".into(),
+                end_byte_offset: Some(MAX_MESSAGES_FILE_BYTES)
+            },
+            HistorySegment {
+                path,
+                session_id: "thread".into(),
+                end_byte_offset: Some(1)
+            },
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn codex_latest_user_title_survives_newer_assistant_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thread.jsonl");
+        write_codex_session(&path, "thread", "first user");
+        let mut file = File::options().append(true).open(&path).unwrap();
+        for (role, content) in [("user", "latest user"), ("assistant", "latest answer")] {
+            writeln!(file, "{}", serde_json::json!({"type":"response_item","payload":{"type":"message","role":role,"content":content}})).unwrap();
+        }
+        let meta = parse_session(&path).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("latest user"));
+        assert_eq!(meta.summary.as_deref(), Some("latest answer"));
+    }
+
+    #[test]
+    fn codex_strict_dependency_scan_rejects_bad_descriptor_and_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let leaf = temp.path().join("leaf.jsonl");
+        write_codex_session(&leaf, "thread", "hello");
+        let target = parse_session(&leaf).unwrap();
+        let bad = temp.path().join("unreadable.jsonl");
+        std::fs::write(&bad, b"not a descriptor\n").unwrap();
+        assert!(prepare_deletion_plan(
+            std::slice::from_ref(&target),
+            &[temp.path().to_path_buf()],
+            false
+        )
+        .is_err());
+        assert!(leaf.exists());
+        assert!(prepare_deletion_plan(std::slice::from_ref(&target), &[bad], false).is_err());
+        let outside = tempfile::tempdir().unwrap();
+        assert!(prepare_deletion_plan(&[target], &[outside.path().to_path_buf()], false).is_err());
+    }
+
+    #[test]
+    fn codex_plan_deletes_selected_sibling_leaves_before_shared_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = vec![temp.path().to_path_buf()];
+        let base = temp.path().join("base.jsonl");
+        let leaf = temp.path().join("leaf.jsonl");
+        let sibling = temp.path().join("sibling.jsonl");
+        write_codex_session(&base, "thread", "base");
+        let offset = base.metadata().unwrap().len();
+        write_paginated_session(&leaf, "thread", offset, "leaf");
+        write_paginated_session(&sibling, "thread", offset, "sibling");
+        let targets = vec![
+            parse_session(&leaf).unwrap(),
+            parse_session(&sibling).unwrap(),
+        ];
+        assert!(prepare_deletion_plan(&targets[..1], &roots, false).is_err());
+        let mut plan = prepare_deletion_plan(&targets, &roots, false).unwrap();
+        assert_eq!(plan.units.len(), 3);
+        assert_eq!(plan.units[2].path.file_name(), base.file_name());
+        assert!(execute_deletion_plan(
+            &mut plan,
+            &roots,
+            |_| Ok(()),
+            |path| {
+                if path.file_name() == sibling.file_name() {
+                    return Err("injected sibling failure".into());
+                }
+                std::fs::remove_file(path).map_err(|e| e.to_string())
+            },
+            |_| Ok(())
+        )
+        .is_err());
+        assert!(!leaf.exists() && sibling.exists() && base.exists());
+        execute_deletion_plan(
+            &mut plan,
+            &roots,
+            |_| Ok(()),
+            |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!base.exists() && !leaf.exists() && !sibling.exists());
+    }
+
+    #[test]
+    fn codex_checkpoint_failure_replays_missing_leaf_and_retains_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = vec![temp.path().to_path_buf()];
+        let base = temp.path().join("base.jsonl");
+        let leaf = temp.path().join("leaf.jsonl");
+        write_codex_session(&base, "thread", "base");
+        write_paginated_session(&leaf, "thread", base.metadata().unwrap().len(), "leaf");
+        let mut plan =
+            prepare_deletion_plan(&[parse_session(&leaf).unwrap()], &roots, false).unwrap();
+        let mut durable = plan.clone();
+        let mut saves = 0;
+        let result = execute_deletion_plan(
+            &mut plan,
+            &roots,
+            |_| Ok(()),
+            |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+            |progress| {
+                saves += 1;
+                if saves == 2 {
+                    return Err("injected checkpoint failure".into());
+                }
+                durable = progress.clone();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!leaf.exists() && base.exists());
+        assert_eq!(durable.next_unit, 0);
+        execute_deletion_plan(
+            &mut durable,
+            &roots,
+            |_| panic!("index already complete"),
+            |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn codex_frozen_plan_rejects_replacement_and_new_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = vec![temp.path().to_path_buf()];
+        let base = temp.path().join("base.jsonl");
+        let leaf = temp.path().join("leaf.jsonl");
+        write_codex_session(&base, "thread", "base");
+        write_paginated_session(&leaf, "thread", base.metadata().unwrap().len(), "leaf");
+        let plan = prepare_deletion_plan(&[parse_session(&leaf).unwrap()], &root, false).unwrap();
+        let original = std::fs::read(&leaf).unwrap();
+        write_codex_session(&leaf, "thread", "replaced");
+        assert!(validate_deletion_plan(&plan, &root).is_err());
+        std::fs::write(&leaf, original).unwrap();
+        let child = temp.path().join("child.jsonl");
+        write_paginated_session_with_base(
+            &child,
+            "child",
+            "thread",
+            base.metadata().unwrap().len(),
+            "new dependency",
+        );
+        assert!(validate_deletion_plan(&plan, &root).is_err());
+        let other = tempfile::tempdir().unwrap();
+        assert!(validate_deletion_plan(&plan, &[other.path().to_path_buf()]).is_err());
+    }
+
     #[test]
     fn sidebar_sections_follow_membership_and_support_older_databases() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

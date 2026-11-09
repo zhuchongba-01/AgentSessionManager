@@ -14,6 +14,8 @@ pub static DELETE_LOCK: Mutex<()> = Mutex::new(());
 struct PendingDeletion {
     targets: Vec<SessionMeta>,
     #[serde(default)]
+    codex_plan: Option<super::providers::codex::DeletionPlan>,
+    #[serde(default)]
     last_error: Option<String>,
 }
 
@@ -37,20 +39,64 @@ fn operation_path(target: &SessionMeta) -> Result<PathBuf, String> {
     Ok(directory()?.join(format!("{hash:016x}.json")))
 }
 
+/// 删除路径保持严格：任何一份清理记录读不出都拒绝继续操作，避免丢失重试依据。
 pub fn pending_sessions() -> Result<Vec<SessionMeta>, String> {
-    let root = directory()?;
-    if !root.exists() {
-        return Ok(Vec::new());
+    strict_pending_sessions(pending_sessions_report()?)
+}
+
+fn strict_pending_sessions(
+    (sessions, warnings): (Vec<SessionMeta>, Vec<String>),
+) -> Result<Vec<SessionMeta>, String> {
+    if warnings.is_empty() {
+        Ok(sessions)
+    } else {
+        Err(warnings.join("；"))
     }
+}
+
+/// 浏览路径容错：损坏的记录只转成警告，不让其他正常 Agent 的会话列表整体失败。
+/// 返回可展示的待清理条目与每份损坏记录的警告。
+pub fn pending_sessions_report() -> Result<(Vec<SessionMeta>, Vec<String>), String> {
+    let root = directory()?;
+    pending_sessions_report_in(&root)
+}
+
+fn pending_sessions_report_in(root: &Path) -> Result<(Vec<SessionMeta>, Vec<String>), String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let mut sessions = Vec::new();
-    for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
+    let mut warnings = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                warnings.push(format!("无法枚举清理记录目录 {}：{error}", root.display()));
+                continue;
+            }
+        };
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let operation: PendingDeletion =
-            serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
-                .map_err(|e| format!("清理记录 {} 无法读取：{e}", path.display()))?;
+        let operation = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| {
+                serde_json::from_str::<PendingDeletion>(&text).map_err(|e| e.to_string())
+            });
+        let operation = match operation {
+            Ok(operation) => operation,
+            Err(error) => {
+                warnings.push(format!(
+                    "清理记录 {} 无法读取（{error}），已暂停相关删除；请先核对后再操作",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         // One operation has one visible retry entry. Related historical copies
         // belong to its persisted plan, not to independently retryable tasks.
         for mut target in operation.targets.into_iter().take(1) {
@@ -62,7 +108,7 @@ pub fn pending_sessions() -> Result<Vec<SessionMeta>, String> {
             sessions.push(target);
         }
     }
-    Ok(sessions)
+    Ok((sessions, warnings))
 }
 
 pub fn run<P, F>(
@@ -102,12 +148,21 @@ where
                             && item.session_id == target.session_id
                             && item.residual
                             && item.source_path != target.source_path
+                            && (target.provider_id != "opencode"
+                                || item
+                                    .source_path
+                                    .as_deref()
+                                    .zip(target.source_path.as_deref())
+                                    .is_some_and(|(a, b)| {
+                                        super::providers::opencode::same_storage(a, b)
+                                    }))
                     })
                     .cloned(),
             );
         }
         PendingDeletion {
             targets,
+            codex_plan: None,
             last_error: None,
         }
     } else {
@@ -120,6 +175,20 @@ where
             && saved.source_path == target.source_path
     }) {
         return Err("清理记录与目标不一致，已停止操作".into());
+    }
+    if target.provider_id == "opencode"
+        && operation.targets.iter().any(|saved| {
+            saved.provider_id != target.provider_id
+                || !saved
+                    .source_path
+                    .as_deref()
+                    .zip(target.source_path.as_deref())
+                    .is_some_and(|(a, b)| super::providers::opencode::same_storage(a, b))
+        })
+    {
+        return Err(
+            "OpenCode saved deletion plan spans different storage sources; rescan required".into(),
+        );
     }
     // Rejections are ordinary errors, not partially completed deletions. A
     // retry retains its existing journal, but a rejected new request writes none.
@@ -158,6 +227,219 @@ where
     Ok(reply)
 }
 
+/// Codex pagination expands beyond the visible scan snapshot. Persist those
+/// exact units before the first destructive step, never rediscover on retry.
+pub fn run_codex(
+    target: &SessionMeta,
+    snapshot: &[SessionMeta],
+    roots: &[PathBuf],
+) -> Result<DeleteSessionReply, String> {
+    use super::providers::codex;
+    run_codex_at(
+        &operation_path(target)?,
+        target,
+        snapshot,
+        roots,
+        |target| {
+            codex::should_cleanup_index_after_delete(
+                &target.session_id,
+                target
+                    .source_path
+                    .as_deref()
+                    .ok_or("Missing Codex source")?,
+            )
+        },
+        |id| {
+            if !codex::should_cleanup_index_after_delete(
+                id,
+                target
+                    .source_path
+                    .as_deref()
+                    .ok_or("Missing Codex source")?,
+            )? {
+                return Err("Codex 当前索引已指向新的日志，停止旧清理任务".into());
+            }
+            codex::cleanup_after_delete(id, None, false)
+        },
+        |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+    )
+}
+
+/// A batch keeps its discovery snapshot fixed, but records successful exact
+/// identities. Only this in-memory evidence permits skipping an already removed
+/// residual; arbitrary missing paths still fail the ordinary plan preflight.
+#[derive(Default)]
+pub(crate) struct CodexBatchProgress {
+    completed: std::collections::HashSet<(String, String)>,
+}
+
+impl CodexBatchProgress {
+    pub(crate) fn run<F>(
+        &mut self,
+        target: &SessionMeta,
+        snapshot: &[SessionMeta],
+        action: F,
+    ) -> Result<DeleteSessionReply, String>
+    where
+        F: FnOnce(&SessionMeta, &[SessionMeta]) -> Result<DeleteSessionReply, String>,
+    {
+        let key = |item: &SessionMeta| {
+            (
+                item.session_id.clone(),
+                item.source_path.clone().unwrap_or_default(),
+            )
+        };
+        let done =
+            |item: &SessionMeta| item.provider_id == "codex" && self.completed.contains(&key(item));
+        if done(target) {
+            if !super::providers::codex::rollout_is_missing(Path::new(
+                target.source_path.as_deref().unwrap_or(""),
+            )) {
+                return Err("Codex batch source reappeared; rescan required".into());
+            }
+            return Ok(DeleteSessionReply::NotFound);
+        }
+        for item in snapshot.iter().filter(|item| done(item)) {
+            if !super::providers::codex::rollout_is_missing(Path::new(
+                item.source_path.as_deref().unwrap_or(""),
+            )) {
+                return Err("Codex completed batch source reappeared; rescan required".into());
+            }
+        }
+        let remaining = snapshot
+            .iter()
+            .filter(|item| !done(item))
+            .cloned()
+            .collect::<Vec<_>>();
+        let reply = action(target, &remaining)?;
+        if matches!(&reply, DeleteSessionReply::Deleted { warnings } if warnings.is_empty()) {
+            self.completed.insert(key(target));
+            if !target.residual {
+                for item in remaining.iter().filter(|item| {
+                    item.provider_id == "codex"
+                        && item.session_id == target.session_id
+                        && item.residual
+                }) {
+                    self.completed.insert(key(item));
+                }
+            }
+        }
+        Ok(reply)
+    }
+}
+
+fn persist_operation(path: &Path, operation: &PendingDeletion) -> Result<(), String> {
+    let parent = path.parent().ok_or("Invalid journal path")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut temp, operation).map_err(|e| e.to_string())?;
+    temp.flush().map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn run_codex_at<I, C, D>(
+    path: &Path,
+    target: &SessionMeta,
+    snapshot: &[SessionMeta],
+    roots: &[PathBuf],
+    index_decision: I,
+    cleanup: C,
+    remove: D,
+) -> Result<DeleteSessionReply, String>
+where
+    I: FnOnce(&SessionMeta) -> Result<bool, String>,
+    C: FnMut(&str) -> Result<(), String>,
+    D: FnMut(&Path) -> Result<(), String>,
+{
+    use super::providers::codex;
+    let existing = match std::fs::read(path) {
+        Ok(bytes) => {
+            Some(serde_json::from_slice::<PendingDeletion>(&bytes).map_err(|e| e.to_string())?)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let legacy = existing.as_ref().is_some_and(|op| op.codex_plan.is_none());
+    let mut operation = existing.unwrap_or_else(|| {
+        let mut targets = vec![target.clone()];
+        if !target.residual {
+            targets.extend(
+                snapshot
+                    .iter()
+                    .filter(|item| {
+                        item.provider_id == target.provider_id
+                            && item.session_id == target.session_id
+                            && item.residual
+                            && item.source_path != target.source_path
+                    })
+                    .cloned(),
+            );
+        }
+        PendingDeletion {
+            targets,
+            codex_plan: None,
+            last_error: None,
+        }
+    });
+    if !operation.targets.first().is_some_and(|saved| {
+        saved.provider_id == "codex"
+            && saved.session_id == target.session_id
+            && saved.source_path == target.source_path
+    }) {
+        return Err("Codex journal target mismatch".into());
+    }
+    if legacy
+        && operation.targets.iter().any(|item| {
+            item.source_path
+                .as_deref()
+                .is_none_or(|source| !Path::new(source).is_file())
+        })
+    {
+        return Err(
+            "旧 Codex 清理记录缺少分页删除计划且源文件已消失；保留记录，请人工核对剩余分页文件"
+                .into(),
+        );
+    }
+    // Never freeze the result of the index lookup across attempts. Configuration
+    // and authoritative thread mappings can change after an index checkpoint.
+    // Failure here must preserve both the original journal and every file.
+    let current_cleanup_index = index_decision(&operation.targets[0])?;
+    if operation.codex_plan.is_none() {
+        operation.codex_plan = Some(codex::prepare_deletion_plan(
+            &operation.targets,
+            roots,
+            current_cleanup_index,
+        )?);
+        persist_operation(path, &operation)?;
+    }
+    let mut plan = operation.codex_plan.clone().ok_or("Missing Codex plan")?;
+    if plan.session_id != target.session_id
+        || Some(plan.source_path.as_str()) != target.source_path.as_deref()
+    {
+        return Err("Codex persisted plan target mismatch".into());
+    }
+    // Validation rejection does not rewrite the existing journal.
+    codex::validate_deletion_index_decision(&plan, current_cleanup_index)?;
+    codex::validate_deletion_plan(&plan, roots)?;
+    let result = codex::execute_deletion_plan(&mut plan, roots, cleanup, remove, |progress| {
+        operation.codex_plan = Some(progress.clone());
+        persist_operation(path, &operation)
+    });
+    if let Err(error) = result {
+        return mark_pending(path, vec![error]);
+    }
+    if let Err(error) = std::fs::remove_file(path) {
+        return Ok(DeleteSessionReply::CleanupPending {
+            warnings: vec![format!("清理完成，记录更新失败：{error}")],
+        });
+    }
+    Ok(DeleteSessionReply::Deleted {
+        warnings: Vec::new(),
+    })
+}
+
 fn mark_pending(path: &Path, mut warnings: Vec<String>) -> Result<DeleteSessionReply, String> {
     let persist = || -> Result<(), String> {
         let mut operation: PendingDeletion =
@@ -176,6 +458,37 @@ fn mark_pending(path: &Path, mut warnings: Vec<String>) -> Result<DeleteSessionR
         warnings.push(format!("无法保存清理错误详情：{error}"));
     }
     Ok(DeleteSessionReply::CleanupPending { warnings })
+}
+
+/// Only shared within one batch. A short successful-check lease avoids launching
+/// PowerShell for every row, while long batches recheck before further mutations.
+#[derive(Default)]
+pub(crate) struct AgentStopChecks {
+    checked: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl AgentStopChecks {
+    pub(crate) fn ensure(&mut self, provider: &str) -> Result<(), String> {
+        self.ensure_with(provider, || ensure_agent_stopped(provider))
+    }
+
+    fn ensure_with<F>(&mut self, provider: &str, check: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if self
+            .checked
+            .get(provider)
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return Ok(());
+        }
+        self.checked.remove(provider);
+        check()?;
+        self.checked
+            .insert(provider.into(), std::time::Instant::now());
+        Ok(())
+    }
 }
 
 /// Editing an Agent's live databases/files is not a supported coordination API.
@@ -236,6 +549,11 @@ fn process_matches(executable: &str, provider: &str) -> bool {
         .unwrap_or(executable)
         .to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
+    // The packaged Windows app is not a node/bun runtime. Match its product
+    // name exactly rather than allowing similarly named helper applications.
+    if provider == "deepseek" && name == "deepseek harness" {
+        return true;
+    }
     let aliases: &[&str] = match provider {
         "codex" => &["codex"],
         "claude" => &["claude", "claude-code"],
@@ -284,7 +602,482 @@ fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batch_stop_checks_expire_and_do_not_cache_failures() {
+        let mut checks = AgentStopChecks::default();
+        let calls = std::cell::Cell::new(0);
+        let check = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        checks.ensure_with("codex", check).unwrap();
+        checks.ensure_with("codex", check).unwrap();
+        assert_eq!(calls.get(), 1);
+        checks.ensure_with("claude", check).unwrap();
+        assert_eq!(calls.get(), 2);
+        checks.checked.insert(
+            "codex".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(2),
+        );
+        assert!(checks
+            .ensure_with("codex", || Err("running".into()))
+            .is_err());
+        assert!(!checks.checked.contains_key("codex"));
+        checks.ensure_with("codex", check).unwrap();
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn corrupt_journal_isolated_in_browse_report_but_strict_for_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("broken.json"), "not json").unwrap();
+        let target: SessionMeta = serde_json::from_value(serde_json::json!({
+            "providerId": "codex", "sessionId": "thread", "residual": false,
+            "sourcePath": "session.jsonl"
+        }))
+        .unwrap();
+        persist_operation(
+            &temp.path().join("good.json"),
+            &PendingDeletion {
+                targets: vec![target],
+                codex_plan: None,
+                last_error: None,
+            },
+        )
+        .unwrap();
+        let (sessions, warnings) = pending_sessions_report_in(temp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].cleanup_pending);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("无法读取"));
+        assert!(strict_pending_sessions((sessions, warnings)).is_err());
+        std::fs::remove_file(temp.path().join("broken.json")).unwrap();
+        assert_eq!(
+            strict_pending_sessions(pending_sessions_report_in(temp.path()).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn compat_codex_batch_same_id_both_orders_fixed_snapshot() {
+        for order in [[0, 1], [1, 0]] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("sessions");
+            std::fs::create_dir(&root).unwrap();
+            let targets = [false, true].into_iter().enumerate().map(|(index, residual)| {
+                let path = root.join(format!("{index}.jsonl"));
+                std::fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"same\"}}\n").unwrap();
+                serde_json::from_value::<SessionMeta>(serde_json::json!({"providerId":"codex","sessionId":"same","residual":residual,"sourcePath":path})).unwrap()
+            }).collect::<Vec<_>>();
+            let mut progress = CodexBatchProgress::default();
+            let mut cleanup_count = 0;
+            for index in order {
+                let result = progress
+                    .run(&targets[index], &targets, |target, snapshot| {
+                        run_codex_at(
+                            &temp.path().join(format!("op-{index}.json")),
+                            target,
+                            snapshot,
+                            std::slice::from_ref(&root),
+                            |item| Ok(!item.residual),
+                            |_| {
+                                cleanup_count += 1;
+                                Ok(())
+                            },
+                            |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+                        )
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    DeleteSessionReply::Deleted { .. } | DeleteSessionReply::NotFound
+                ));
+            }
+            assert_eq!(cleanup_count, 1);
+            assert!(targets
+                .iter()
+                .all(|t| !Path::new(t.source_path.as_deref().unwrap()).exists()));
+            let mut wrong = targets[1].clone();
+            wrong.source_path = Some(temp.path().join("unknown.jsonl").to_string_lossy().into());
+            assert!(progress
+                .run(&wrong, &targets, |_, _| Err("unproven identity".into()))
+                .is_err());
+        }
+    }
     use super::*;
+
+    fn codex_fixture(root: &Path) -> (SessionMeta, PathBuf, PathBuf) {
+        let base = root.join("base.jsonl");
+        let leaf = root.join("leaf.jsonl");
+        std::fs::write(
+            &base,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+        )
+        .unwrap();
+        let offset = base.metadata().unwrap().len();
+        std::fs::write(&leaf, format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread\",\"history_base\":{{\"thread_id\":\"thread\",\"end_byte_offset\":{offset}}}}}}}\n")).unwrap();
+        let target = serde_json::from_value(serde_json::json!({
+            "providerId":"codex", "sessionId":"thread", "sourcePath":leaf.to_string_lossy(), "residual":false
+        })).unwrap();
+        (target, leaf, base)
+    }
+
+    #[test]
+    fn codex_journal_retries_hidden_base_without_new_same_id_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = vec![temp.path().to_path_buf()];
+        let journal = temp.path().join("operation.json");
+        let (target, leaf, base) = codex_fixture(temp.path());
+        let first = run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &roots,
+            |_| Ok(true),
+            |_| Ok(()),
+            |path| {
+                let saved: PendingDeletion =
+                    serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                assert!(
+                    saved.codex_plan.is_some(),
+                    "plan must precede first mutation"
+                );
+                if path.file_name() == base.file_name() {
+                    return Err("injected base failure".into());
+                }
+                std::fs::remove_file(path).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(matches!(first, DeleteSessionReply::CleanupPending { .. }));
+        assert!(!leaf.exists());
+        assert!(base.exists());
+        let new_copy = temp.path().join("new-copy.jsonl");
+        std::fs::write(
+            &new_copy,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+        )
+        .unwrap();
+        let mut residual = target.clone();
+        residual.residual = true;
+        residual.source_path = Some(new_copy.to_string_lossy().into_owned());
+        let retry = run_codex_at(
+            &journal,
+            &target,
+            &[residual],
+            &roots,
+            |_| Ok(true), // revalidate ownership, without re-expanding file units
+            |_| Ok(()),   // idempotent index cleanup also reruns after checkpoint
+            |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        assert!(matches!(retry, DeleteSessionReply::Deleted { .. }));
+        assert!(!base.exists());
+        assert!(new_copy.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn codex_retry_revalidates_index_before_cleanup_after_partial_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = vec![temp.path().to_path_buf()];
+        let (target, leaf, base) = codex_fixture(temp.path());
+        let journal = temp.path().join("operation.json");
+        let first = run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &roots,
+            |_| Ok(true),
+            |_| Err("desktop cleanup failed after state cleanup".into()),
+            |_| panic!("no file removal"),
+        )
+        .unwrap();
+        assert!(matches!(first, DeleteSessionReply::CleanupPending { .. }));
+        let mut cleaned_new_index = false;
+        let retry = run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &roots,
+            |_| Ok(true), // lookup passes; cleanup also rechecks immediately before mutation
+            |_| {
+                let current_mapping_is_original = false; // injected replacement mapping
+                if !current_mapping_is_original {
+                    return Err("index now points at new rollout".into());
+                }
+                cleaned_new_index = true;
+                Ok(())
+            },
+            |_| panic!("index rejection precedes file removal"),
+        )
+        .unwrap();
+        assert!(matches!(retry, DeleteSessionReply::CleanupPending { .. }));
+        assert!(!cleaned_new_index && journal.exists() && leaf.exists() && base.exists());
+    }
+
+    #[test]
+    fn compat_opencode_journal_never_absorbs_cross_database_residuals() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join("operation.json");
+        let make = |db: &str, residual: bool| -> SessionMeta {
+            serde_json::from_value(serde_json::json!({"providerId":"opencode", "sessionId":"ses_same", "residual":residual,
+                "sourcePath":format!("sqlite:{}:ses_same", temp.path().join(db).display())})).unwrap()
+        };
+        let target = make("default.db", false);
+        let other = make("dev.db", true);
+        run_at(
+            &journal,
+            &target,
+            std::slice::from_ref(&other),
+            |plan| {
+                assert_eq!(plan.len(), 1);
+                Ok(())
+            },
+            |plan| {
+                assert_eq!(plan.len(), 1);
+                Ok(DeleteSessionReply::Deleted { warnings: vec![] })
+            },
+        )
+        .unwrap();
+        // Old records that already span sources are preserved, never executed.
+        persist_operation(
+            &journal,
+            &PendingDeletion {
+                targets: vec![target.clone(), other],
+                codex_plan: None,
+                last_error: None,
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        assert!(run_at(
+            &journal,
+            &target,
+            &[],
+            |_| panic!("cross-store preflight"),
+            |_| panic!("cross-store action")
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+    }
+
+    #[test]
+    fn codex_completed_index_retry_cleans_restored_or_reconfigured_index() {
+        use std::cell::Cell;
+        for changed_database in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let roots = vec![temp.path().to_path_buf()];
+            let (target, leaf, base) = codex_fixture(temp.path());
+            let journal = temp.path().join("operation.json");
+            let old_index = Cell::new(true);
+            let new_index = Cell::new(true);
+            let use_new = Cell::new(false);
+            let cleanup_calls = Cell::new(0);
+            let cleanup = |_: &str| {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                if use_new.get() {
+                    new_index.set(false);
+                } else {
+                    old_index.set(false);
+                }
+                Ok(())
+            };
+            let first = run_codex_at(
+                &journal,
+                &target,
+                &[],
+                &roots,
+                |_| Ok(true),
+                cleanup,
+                |_| Err("injected file failure after index checkpoint".into()),
+            )
+            .unwrap();
+            assert!(matches!(first, DeleteSessionReply::CleanupPending { .. }));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(saved["codex_plan"]["index_done"], true);
+            // Model the effective lookup after either restoration or sqlite_home change.
+            if changed_database {
+                use_new.set(true);
+            } else {
+                old_index.set(true);
+            }
+            let decisions = Cell::new(0);
+            let retry = run_codex_at(
+                &journal,
+                &target,
+                &[],
+                &roots,
+                |_| {
+                    decisions.set(decisions.get() + 1);
+                    Ok(true)
+                },
+                cleanup,
+                |path| {
+                    assert!(!if use_new.get() {
+                        new_index.get()
+                    } else {
+                        old_index.get()
+                    });
+                    std::fs::remove_file(path).map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+            assert!(matches!(retry, DeleteSessionReply::Deleted { .. }));
+            assert_eq!(decisions.get(), 1);
+            assert_eq!(cleanup_calls.get(), 2);
+            assert!(!leaf.exists() && !base.exists() && !journal.exists());
+        }
+    }
+
+    #[test]
+    fn codex_retry_rejects_changed_index_ownership_and_lookup_failure_without_writes() {
+        for (frozen, current) in [
+            (true, Ok(false)),
+            (false, Ok(true)),
+            (true, Err("lookup failed".into())),
+            (false, Err("lookup failed".into())),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let roots = vec![temp.path().to_path_buf()];
+            let (target, leaf, base) = codex_fixture(temp.path());
+            let journal = temp.path().join("operation.json");
+            run_codex_at(
+                &journal,
+                &target,
+                &[],
+                &roots,
+                |_| Ok(frozen),
+                |_| Ok(()),
+                |_| Err("file failure".into()),
+            )
+            .unwrap();
+            let before = std::fs::read(&journal).unwrap();
+            assert!(run_codex_at(
+                &journal,
+                &target,
+                &[],
+                &roots,
+                |_| current,
+                |_| panic!("changed ownership must not clean indexes"),
+                |_| panic!("changed ownership must not remove files")
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&journal).unwrap(), before);
+            assert!(leaf.exists() && base.exists());
+        }
+    }
+
+    #[test]
+    fn codex_completed_index_retry_cleanup_failure_keeps_frozen_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = vec![temp.path().to_path_buf()];
+        let (target, leaf, base) = codex_fixture(temp.path());
+        let journal = temp.path().join("operation.json");
+        run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &roots,
+            |_| Ok(true),
+            |_| Ok(()),
+            |_| Err("file failure".into()),
+        )
+        .unwrap();
+        let retry = run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &roots,
+            |_| Ok(true),
+            |_| Err("current effective index cleanup failed".into()),
+            |_| panic!("cleanup must precede file deletion"),
+        )
+        .unwrap();
+        assert!(matches!(retry, DeleteSessionReply::CleanupPending { .. }));
+        assert!(leaf.exists() && base.exists() && journal.exists());
+    }
+
+    #[test]
+    fn codex_legacy_missing_leaf_keeps_journal_and_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, leaf, base) = codex_fixture(temp.path());
+        let journal = temp.path().join("operation.json");
+        let legacy = PendingDeletion {
+            targets: vec![target.clone()],
+            codex_plan: None,
+            last_error: None,
+        };
+        persist_operation(&journal, &legacy).unwrap();
+        std::fs::remove_file(&leaf).unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        assert!(run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &[temp.path().to_path_buf()],
+            |_| panic!("no index discovery"),
+            |_| panic!("no index mutation"),
+            |_| panic!("no file mutation")
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert!(base.exists());
+    }
+
+    #[test]
+    fn codex_legacy_intact_plan_upgrades_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, leaf, base) = codex_fixture(temp.path());
+        let journal = temp.path().join("operation.json");
+        persist_operation(
+            &journal,
+            &PendingDeletion {
+                targets: vec![target.clone()],
+                codex_plan: None,
+                last_error: None,
+            },
+        )
+        .unwrap();
+        run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &[temp.path().to_path_buf()],
+            |_| Ok(false),
+            |_| panic!("no index cleanup"),
+            |path| {
+                let saved: PendingDeletion =
+                    serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                assert!(saved.codex_plan.is_some());
+                std::fs::remove_file(path).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(!leaf.exists() && !base.exists() && !journal.exists());
+    }
+
+    #[test]
+    fn codex_incomplete_evidence_writes_no_journal_and_runs_no_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, leaf, base) = codex_fixture(temp.path());
+        let journal = temp.path().join("operation.json");
+        std::fs::write(temp.path().join("broken.jsonl"), "bad descriptor").unwrap();
+        assert!(run_codex_at(
+            &journal,
+            &target,
+            &[],
+            &[temp.path().to_path_buf()],
+            |_| Ok(false),
+            |_| panic!("no index mutation"),
+            |_| panic!("no file mutation")
+        )
+        .is_err());
+        assert!(!journal.exists() && leaf.exists() && base.exists());
+    }
 
     #[test]
     fn rejected_preflight_creates_no_journal_and_does_not_run_deletion() {
@@ -429,6 +1222,76 @@ mod tests {
         .unwrap();
         assert!(!path.exists());
     }
+    #[test]
+    fn recognizes_deepseek_packaged_product_and_existing_cli_names() {
+        for executable in [
+            "DeepSeek Harness.exe",
+            "DEEPSEEK HARNESS.EXE",
+            "DeepSeek Harness",
+            r"C:\Program Files\DeepSeek Harness\DeepSeek Harness.exe",
+            "/opt/DeepSeek Harness/DeepSeek Harness.exe",
+            "dsh.exe",
+            "deepseek-harness.exe",
+        ] {
+            assert!(process_matches(executable, "deepseek"), "{executable}");
+        }
+    }
+
+    #[test]
+    fn deepseek_product_match_rejects_similar_names_and_other_providers() {
+        for executable in [
+            "DeepSeek.exe",
+            "DeepSeek Harness Helper.exe",
+            "DeepSeek Harness Updater.exe",
+            "DeepSeek Harness-extra.exe",
+            "Other DeepSeek Harness.exe",
+            "DeepSeek Harness.exe.bak",
+            "AgentSessionManager.exe",
+            r"C:\DeepSeek Harness\unrelated.exe",
+        ] {
+            assert!(!process_matches(executable, "deepseek"), "{executable}");
+        }
+        for provider in [
+            "codex",
+            "claude",
+            "opencode",
+            "zcode",
+            "grokbuild",
+            "pi",
+            "unknown",
+        ] {
+            assert!(
+                !process_matches("DeepSeek Harness.exe", provider),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_packaged_product_is_guarded_without_script_runtime_detection() {
+        // These are the same alternatives used by ensure_agent_stopped, with
+        // synthetic process data only: no process inspection or session access.
+        for args in [
+            None,
+            Some(""),
+            Some(r#""C:\Program Files\DeepSeek Harness\DeepSeek Harness.exe" --type=renderer"#),
+        ] {
+            let executable = "DeepSeek Harness.exe";
+            assert!(!script_process_matches(executable, args, "deepseek"));
+            assert!(
+                process_matches(executable, "deepseek")
+                    || script_process_matches(executable, args, "deepseek")
+            );
+        }
+        for executable in ["unrelated.exe", "DeepSeek Harness Helper.exe"] {
+            let args = Some("--description deepseek-harness dsh");
+            assert!(
+                !process_matches(executable, "deepseek")
+                    && !script_process_matches(executable, args, "deepseek")
+            );
+        }
+    }
+
     #[test]
     fn recognizes_native_and_script_runtimes_without_matching_manager() {
         assert!(process_matches("Codex.exe", "codex"));

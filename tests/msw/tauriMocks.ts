@@ -13,10 +13,43 @@ globalThis.Headers = CrossFetchHeaders as typeof Headers;
 globalThis.Request = CrossFetchRequest as typeof Request;
 globalThis.Response = CrossFetchResponse as typeof Response;
 
+/** 传输层入口：index 是 Channel 包序号，不是 TranscriptChunk.start。 */
+export const deliverChannelMessage = (
+  channel: unknown,
+  index: number,
+  message: unknown,
+) => {
+  (channel as { receive: (raw: unknown) => void }).receive({ index, message });
+};
+
 vi.mock("@tauri-apps/api/core", () => {
-  /** 与后端 `tauri::ipc::Channel` 对应的测试替身：只保留 onmessage 回调。 */
+  /** 镜像 @tauri-apps/api 2.8 Channel 的索引缓冲和 end 清理行为。 */
   class Channel<T> {
-    onmessage: ((message: T) => void) | null = null;
+    onmessage: (message: T) => void = () => {};
+    private nextIndex = 0;
+    private pending = new Map<number, T>();
+    private endIndex?: number;
+    private closed = false;
+
+    receive(raw: { index: number; message: T } | { index: number; end: true }) {
+      if (this.closed) return;
+      if ("end" in raw) {
+        this.endIndex = raw.index;
+        this.closed = raw.index === this.nextIndex;
+        return;
+      }
+      if (raw.index !== this.nextIndex) {
+        this.pending.set(raw.index, raw.message);
+        return;
+      }
+      this.onmessage(raw.message);
+      this.nextIndex++;
+      while (this.pending.has(this.nextIndex)) {
+        this.onmessage(this.pending.get(this.nextIndex)!);
+        this.pending.delete(this.nextIndex++);
+      }
+      this.closed = this.nextIndex === this.endIndex;
+    }
   }
 
   /** 后端的 150 条/块粒度，测试替身按同一边界推块。 */
@@ -60,7 +93,7 @@ vi.mock("@tauri-apps/api/core", () => {
       const { providerId, sourcePath, onChunk } = payload as {
         providerId: string;
         sourcePath: string;
-        onChunk?: { onmessage?: (chunk: unknown) => void };
+        onChunk?: Channel<unknown>;
       };
       const messages =
         ((await callCommand("get_session_messages", {
@@ -68,23 +101,30 @@ vi.mock("@tauri-apps/api/core", () => {
           sourcePath,
         })) as Array<unknown> | undefined) ?? [];
 
-      onChunk?.onmessage?.({
-        kind: "header",
-        total: messages.length,
-        approxBytes: 0,
-      });
+      let index = 0;
+      const send = (message: unknown) => {
+        const raw = { index: index++, message };
+        // >=8192 字节的 Channel 包由异步 fetch 送达，invoke/小包可先完成。
+        if (new TextEncoder().encode(JSON.stringify(message)).length >= 8192) {
+          setTimeout(() => onChunk?.receive(raw), 0);
+        } else {
+          onChunk?.receive(raw);
+        }
+      };
+      send({ kind: "header", total: messages.length, approxBytes: 0 });
       for (
         let start = 0;
         start < messages.length;
         start += STREAM_CHUNK_MESSAGES
       ) {
-        onChunk?.onmessage?.({
+        send({
           kind: "messages",
           start,
           messages: messages.slice(start, start + STREAM_CHUNK_MESSAGES),
         });
       }
-      onChunk?.onmessage?.({ kind: "done", delivered: messages.length });
+      send({ kind: "done", delivered: messages.length });
+      onChunk?.receive({ index, end: true });
       return undefined;
     },
   };
