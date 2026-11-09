@@ -1,5 +1,5 @@
 #define MyAppName "Agent会话管理"
-#define MyAppVersion "1.3.20"
+#define MyAppVersion "1.4.0"
 #define MyAppExeName "Agent会话管理.exe"
 
 [Setup]
