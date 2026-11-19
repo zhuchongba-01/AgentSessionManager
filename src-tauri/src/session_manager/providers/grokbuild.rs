@@ -11,8 +11,8 @@ use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
     checked_storage_child, collect_files_where, collect_files_where_checked, ensure_readable_size,
-    extract_text, is_safe_session_id, parse_timestamp_to_ms, truncate_summary, FileParseCache,
-    TITLE_MAX_CHARS,
+    extract_text, is_safe_session_id, order_selected_children, parse_timestamp_to_ms,
+    truncate_summary, validate_parent_graph, FileParseCache, TITLE_MAX_CHARS,
 };
 
 #[derive(Debug, Deserialize)]
@@ -415,16 +415,7 @@ fn parent_relations_in_roots(roots: &[PathBuf]) -> Result<HashMap<String, String
         }
     }
 
-    for child in relations.keys() {
-        let mut seen = HashSet::new();
-        let mut current = child.as_str();
-        while let Some(parent) = relations.get(current) {
-            if !seen.insert(current.to_string()) {
-                return Err("Grok Build 会话父子关系存在循环，已停止删除".into());
-            }
-            current = parent;
-        }
-    }
+    validate_parent_graph(&relations, "Grok Build")?;
     Ok(relations)
 }
 
@@ -533,35 +524,24 @@ fn deletion_order_with_relations(
         .iter()
         .enumerate()
         .filter(|(_, request)| request.provider_id == "grokbuild")
-        .map(|(index, request)| (request.session_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let mut remaining = initial.to_vec();
-    let mut ordered = Vec::with_capacity(initial.len());
-    while !remaining.is_empty() {
-        let ready = remaining.iter().position(|candidate| {
-            let Some(parent_id) = requests
-                .get(*candidate)
-                .map(|request| request.session_id.as_str())
-            else {
-                return true;
-            };
-            !relations.iter().any(|(child, parent)| {
-                parent == parent_id
-                    && selected
-                        .get(child.as_str())
-                        .is_some_and(|child_index| remaining.contains(child_index))
-            })
-        });
-        let Some(position) = ready else {
-            ordered.extend(remaining);
-            break;
-        };
-        ordered.push(remaining.remove(position));
-    }
-    ordered
+        .map(|(index, request)| {
+            (
+                index,
+                request.session_id.clone(),
+                relations.get(&request.session_id).cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    order_selected_children(&selected, initial)
 }
 
 pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    if !requests
+        .iter()
+        .any(|request| request.provider_id == "grokbuild")
+    {
+        return initial.to_vec();
+    }
     let Ok(relations) = parent_relations_in_roots(&session_roots()) else {
         return initial.to_vec();
     };

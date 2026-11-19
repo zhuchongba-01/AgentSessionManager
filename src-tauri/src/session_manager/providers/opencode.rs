@@ -10,7 +10,8 @@ use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
     check_sqlite_message_budget, checked_storage_child, collect_files_where, is_safe_session_id,
-    parse_timestamp_to_ms, path_basename, truncate_summary,
+    order_selected_children, parse_timestamp_to_ms, path_basename, quote_sqlite_identifier,
+    sqlite_table_has_column, sqlite_table_names, truncate_summary, validate_parent_graph,
 };
 
 const PROVIDER_ID: &str = "opencode";
@@ -229,8 +230,8 @@ fn scan_database(db_path: &Path) -> Option<Vec<SessionMeta>> {
     .ok()?;
 
     conn.busy_timeout(Duration::from_secs(2)).ok()?;
-    let has_parent_id = connection_table_has_column(&conn, "session", "parent_id").ok()?;
-    let has_archived = connection_table_has_column(&conn, "session", "time_archived").ok()?;
+    let has_parent_id = sqlite_table_has_column(&conn, "session", "parent_id").ok()?;
+    let has_archived = sqlite_table_has_column(&conn, "session", "time_archived").ok()?;
     let sql = format!(
         "SELECT id, title, directory, time_created, time_updated, {}, {} FROM session ORDER BY time_updated DESC",
         if has_parent_id { "parent_id" } else { "NULL" },
@@ -406,7 +407,7 @@ fn load_messages_connection(
     let v2_columns = ["id", "session_id", "type", "seq", "time_created", "data"];
     let mut has_v2 = true;
     for column in v2_columns {
-        has_v2 &= connection_table_has_column(conn, "session_message", column)?;
+        has_v2 &= sqlite_table_has_column(conn, "session_message", column)?;
     }
     if has_v2 {
         let has_rows: bool = conn
@@ -416,7 +417,7 @@ fn load_messages_connection(
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if has_rows || !connection_table_has_column(conn, "message", "session_id")? {
+        if has_rows || !sqlite_table_has_column(conn, "message", "session_id")? {
             return load_v2_messages(conn, session_id);
         }
     }
@@ -640,23 +641,6 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
     Ok(messages)
 }
 
-fn connection_table_has_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, String> {
-    let quoted = quote_sqlite_identifier(table);
-    let mut statement = connection
-        .prepare(&format!("PRAGMA table_info({quoted})"))
-        .map_err(|error| format!("Failed to inspect OpenCode {table} columns: {error}"))?;
-    let found = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| format!("Failed to read OpenCode {table} columns: {error}"))?
-        .flatten()
-        .any(|name| name == column);
-    Ok(found)
-}
-
 fn insert_parent_relation(
     parents: &mut HashMap<String, String>,
     child: String,
@@ -680,20 +664,6 @@ fn insert_parent_relation(
     Ok(())
 }
 
-fn validate_parent_graph(parents: &HashMap<String, String>) -> Result<(), String> {
-    for child in parents.keys() {
-        let mut seen = HashSet::new();
-        let mut current = child.as_str();
-        while let Some(parent) = parents.get(current) {
-            if !seen.insert(current.to_string()) {
-                return Err("OpenCode 会话父子关系存在循环，已停止删除".into());
-            }
-            current = parent;
-        }
-    }
-    Ok(())
-}
-
 fn sqlite_parent_relations(db_path: &Path) -> Result<HashMap<String, String>, String> {
     let connection = Connection::open_with_flags(
         db_path,
@@ -703,10 +673,10 @@ fn sqlite_parent_relations(db_path: &Path) -> Result<HashMap<String, String>, St
     connection
         .busy_timeout(Duration::from_secs(2))
         .map_err(|error| format!("Failed to configure OpenCode dependency check: {error}"))?;
-    if !connection_table_has_column(&connection, "session", "id")? {
+    if !sqlite_table_has_column(&connection, "session", "id")? {
         return Err("OpenCode database is missing session.id".into());
     }
-    if !connection_table_has_column(&connection, "session", "parent_id")? {
+    if !sqlite_table_has_column(&connection, "session", "parent_id")? {
         return Ok(HashMap::new());
     }
     let mut statement = connection
@@ -726,7 +696,7 @@ fn sqlite_parent_relations(db_path: &Path) -> Result<HashMap<String, String>, St
             row.map_err(|error| format!("Invalid OpenCode parent relation: {error}"))?;
         insert_parent_relation(&mut parents, child, parent)?;
     }
-    validate_parent_graph(&parents)?;
+    validate_parent_graph(&parents, "OpenCode")?;
     Ok(parents)
 }
 
@@ -766,7 +736,7 @@ fn json_parent_relations(storage: &Path) -> Result<HashMap<String, String>, Stri
             Some(_) => return Err("OpenCode session metadata has an invalid parent ID".into()),
         }
     }
-    validate_parent_graph(&parents)?;
+    validate_parent_graph(&parents, "OpenCode")?;
     Ok(parents)
 }
 
@@ -855,40 +825,36 @@ fn deletion_order_with_relations(
     initial: &[usize],
     relations: &[((bool, PathBuf), String, String)],
 ) -> Vec<usize> {
-    let mut remaining = initial.to_vec();
-    let mut ordered = Vec::with_capacity(initial.len());
-    while !remaining.is_empty() {
-        let ready = remaining.iter().position(|candidate| {
-            let Some(request) = requests.get(*candidate) else {
-                return true;
-            };
-            if request.provider_id != PROVIDER_ID {
-                return true;
-            }
-            let Some(scope) = source_scope(&request.source_path) else {
-                return true;
-            };
-            !relations.iter().any(|(owner, child, parent)| {
-                owner == &scope
-                    && parent == &request.session_id
-                    && remaining.iter().any(|index| {
-                        let child_request = &requests[*index];
-                        child_request.provider_id == PROVIDER_ID
-                            && &child_request.session_id == child
-                            && source_scope(&child_request.source_path).as_ref() == Some(owner)
-                    })
-            })
-        });
-        let Some(position) = ready else {
-            ordered.extend(remaining);
-            break;
-        };
-        ordered.push(remaining.remove(position));
-    }
-    ordered
+    let scoped_parents: HashMap<((bool, PathBuf), &str), &str> = relations
+        .iter()
+        .map(|(owner, child, parent)| ((owner.clone(), child.as_str()), parent.as_str()))
+        .collect();
+    let scoped_key = |scope: &(bool, PathBuf), id: &str| -> String {
+        format!("{}:{}\0{id}", scope.0, scope.1.display())
+    };
+    let selected = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.provider_id == PROVIDER_ID)
+        .filter_map(|(index, request)| {
+            let scope = source_scope(&request.source_path)?;
+            let key = scoped_key(&scope, &request.session_id);
+            let parent = scoped_parents
+                .get(&(scope.clone(), request.session_id.as_str()))
+                .map(|parent_id| scoped_key(&scope, parent_id));
+            Some((index, key, parent))
+        })
+        .collect::<Vec<_>>();
+    order_selected_children(&selected, initial)
 }
 
 pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    if !requests
+        .iter()
+        .any(|request| request.provider_id == PROVIDER_ID)
+    {
+        return initial.to_vec();
+    }
     let mut relations = Vec::new();
     for db_path in get_opencode_db_paths()
         .into_iter()
@@ -1095,39 +1061,6 @@ fn delete_session_rows(tx: &Transaction<'_>, session_id: &str) -> Result<bool, S
         .map_err(|e| format!("Failed to delete OpenCode session: {e}"))?;
 
     Ok(deleted > 0)
-}
-
-fn sqlite_table_names(transaction: &Transaction<'_>) -> Result<Vec<String>, String> {
-    let mut statement = transaction
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .map_err(|error| error.to_string())?;
-    let names = statement
-        .query_map([], |row| row.get(0))
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .collect();
-    Ok(names)
-}
-
-fn sqlite_table_has_column(
-    transaction: &Transaction<'_>,
-    table: &str,
-    column: &str,
-) -> Result<bool, String> {
-    let quoted = quote_sqlite_identifier(table);
-    let mut statement = transaction
-        .prepare(&format!("PRAGMA table_info({quoted})"))
-        .map_err(|error| error.to_string())?;
-    let found = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .any(|name| name == column);
-    Ok(found)
-}
-
-fn quote_sqlite_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {

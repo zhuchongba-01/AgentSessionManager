@@ -98,4 +98,37 @@ describe("SessionMinimap", () => {
     expect(screen.getByRole("tooltip")).toHaveTextContent("真实问题");
     expect(screen.getByRole("tooltip")).not.toHaveTextContent("注入上下文");
   });
+
+  it("strips Codex IDE setup context from tooltip previews", () => {
+    const messages: SessionMessage[] = [
+      {
+        role: "user",
+        content: [
+          "# Context from my IDE setup:",
+          "",
+          "## Active file: src/index.ts",
+          "",
+          "## My request for Codex:",
+          "提取真实提示词",
+        ].join("\n"),
+      },
+      { role: "assistant", content: "收到，准备处理" },
+    ];
+
+    render(
+      <SessionMinimap
+        messages={messages}
+        messageIndexes={[0]}
+        visibleMessageIndexes={[0]}
+        isCodexSession
+        onTickClick={vi.fn()}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole("button"));
+    const tooltip = screen.getByRole("tooltip");
+    expect(tooltip).toHaveTextContent("提取真实提示词");
+    expect(tooltip).not.toHaveTextContent("# Context from my IDE setup:");
+    expect(tooltip).not.toHaveTextContent("Active file: src/index.ts");
+  });
 });

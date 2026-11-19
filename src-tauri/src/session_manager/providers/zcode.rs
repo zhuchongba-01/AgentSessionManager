@@ -2,11 +2,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, Transaction};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::session_manager::cache;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
+
+use super::utils::{
+    order_selected_children, quote_sqlite_identifier, sqlite_table_has_column, sqlite_table_names,
+    validate_parent_graph,
+};
 
 const PROVIDER_ID: &str = "zcode";
 const SOURCE_PREFIX: &str = "sqlite-zcode:";
@@ -145,33 +150,6 @@ fn load_native_task_ids(path: &Path) -> Option<BTreeSet<String>> {
     Some(rows.flatten().filter(|id| !id.trim().is_empty()).collect())
 }
 
-fn connection_table_names(connection: &Connection) -> Result<BTreeSet<String>, String> {
-    let mut statement = connection
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .map_err(|error| format!("Failed to inspect ZCode database tables: {error}"))?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| format!("Failed to read ZCode database tables: {error}"))?;
-    Ok(rows.flatten().collect())
-}
-
-fn connection_table_has_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, String> {
-    let quoted = quote_identifier(table);
-    let mut statement = connection
-        .prepare(&format!("PRAGMA table_info({quoted})"))
-        .map_err(|error| format!("Failed to inspect ZCode {table} columns: {error}"))?;
-    let found = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| format!("Failed to read ZCode {table} columns: {error}"))?
-        .flatten()
-        .any(|name| name == column);
-    Ok(found)
-}
-
 fn insert_parent_relation(
     parents: &mut HashMap<String, String>,
     child: String,
@@ -214,20 +192,6 @@ fn read_parent_rows(
     Ok(())
 }
 
-fn validate_parent_graph(parents: &HashMap<String, String>) -> Result<(), String> {
-    for child in parents.keys() {
-        let mut seen = BTreeSet::new();
-        let mut current = child.as_str();
-        while let Some(parent) = parents.get(current) {
-            if !seen.insert(current.to_string()) {
-                return Err("ZCode 会话父子关系存在循环，已停止删除".into());
-            }
-            current = parent;
-        }
-    }
-    Ok(())
-}
-
 fn load_parent_relations(
     primary_path: &Path,
     index_path: &Path,
@@ -240,13 +204,13 @@ fn load_parent_relations(
     primary
         .busy_timeout(Duration::from_secs(2))
         .map_err(|error| format!("Failed to configure ZCode dependency check: {error}"))?;
-    let primary_tables = connection_table_names(&primary)?;
+    let primary_tables: BTreeSet<String> = sqlite_table_names(&primary)?.into_iter().collect();
     if !primary_tables.contains("session") {
         return Err("ZCode database is missing the session table".into());
     }
 
     let mut parents = HashMap::new();
-    if connection_table_has_column(&primary, "session", "parent_id")? {
+    if sqlite_table_has_column(&primary, "session", "parent_id")? {
         read_parent_rows(
             &primary,
             "SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL AND parent_id<>''",
@@ -255,8 +219,8 @@ fn load_parent_relations(
         )?;
     }
     if primary_tables.contains("session_task_link") {
-        if !connection_table_has_column(&primary, "session_task_link", "parent_session_id")?
-            || !connection_table_has_column(&primary, "session_task_link", "child_session_id")?
+        if !sqlite_table_has_column(&primary, "session_task_link", "parent_session_id")?
+            || !sqlite_table_has_column(&primary, "session_task_link", "child_session_id")?
         {
             return Err("ZCode session_task_link table has an unsupported shape".into());
         }
@@ -281,12 +245,12 @@ fn load_parent_relations(
         index
             .busy_timeout(Duration::from_secs(2))
             .map_err(|error| format!("Failed to configure ZCode task index check: {error}"))?;
-        let index_tables = connection_table_names(&index)?;
+        let index_tables: BTreeSet<String> = sqlite_table_names(&index)?.into_iter().collect();
         if index_tables.contains("tasks") {
-            if !connection_table_has_column(&index, "tasks", "task_id")? {
+            if !sqlite_table_has_column(&index, "tasks", "task_id")? {
                 return Err("ZCode tasks table is missing task_id".into());
             }
-            if connection_table_has_column(&index, "tasks", "forked_from_task_id")? {
+            if sqlite_table_has_column(&index, "tasks", "forked_from_task_id")? {
                 read_parent_rows(
                     &index,
                     "SELECT task_id, forked_from_task_id FROM tasks \
@@ -298,7 +262,7 @@ fn load_parent_relations(
         }
     }
 
-    validate_parent_graph(&parents)?;
+    validate_parent_graph(&parents, "ZCode")?;
     Ok(parents)
 }
 
@@ -353,35 +317,24 @@ fn deletion_order_with_relations(
         .iter()
         .enumerate()
         .filter(|(_, request)| request.provider_id == PROVIDER_ID)
-        .map(|(index, request)| (request.session_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let mut remaining = initial.to_vec();
-    let mut ordered = Vec::with_capacity(initial.len());
-    while !remaining.is_empty() {
-        let ready = remaining.iter().position(|candidate| {
-            let Some(parent_id) = requests
-                .get(*candidate)
-                .map(|request| request.session_id.as_str())
-            else {
-                return true;
-            };
-            !parents.iter().any(|(child, parent)| {
-                parent == parent_id
-                    && selected
-                        .get(child.as_str())
-                        .is_some_and(|child_index| remaining.contains(child_index))
-            })
-        });
-        let Some(position) = ready else {
-            ordered.extend(remaining);
-            break;
-        };
-        ordered.push(remaining.remove(position));
-    }
-    ordered
+        .map(|(index, request)| {
+            (
+                index,
+                request.session_id.clone(),
+                parents.get(&request.session_id).cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    order_selected_children(&selected, initial)
 }
 
 pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    if !requests
+        .iter()
+        .any(|request| request.provider_id == PROVIDER_ID)
+    {
+        return initial.to_vec();
+    }
     let primary = database_path();
     let Ok(parents) = load_parent_relations(&primary, &tasks_index_path()) else {
         return initial.to_vec();
@@ -503,7 +456,6 @@ fn read_messages_from_connection(
 pub fn delete_session(
     session_id: &str,
     source: &str,
-    project_dir: Option<&str>,
     project_was_deleted: bool,
 ) -> Result<bool, String> {
     if project_was_deleted {
@@ -533,40 +485,18 @@ pub fn delete_session(
         .ok_or("Invalid ZCode CLI directory")?;
     session_sidecar_targets(cli_root, session_id)?;
 
-    let initial_ids = BTreeSet::from([session_id.to_string()]);
     // The task index is ZCode's native sidebar. Clean it first so a later
     // primary-database failure leaves a recoverable residual session instead
     // of an unopenable native ghost entry.
-    let mut session_ids = cleanup_task_index(
-        &tasks_index_path(),
-        &initial_ids,
-        project_dir,
-        project_was_deleted,
-    )?;
-    let (deleted, discovered_ids) =
-        delete_sessions_from_database(&actual, session_id, project_dir, project_was_deleted)?;
-    session_ids.extend(discovered_ids);
+    cleanup_task_index(&tasks_index_path(), session_id)?;
+    let deleted = delete_sessions_from_database(&actual, session_id)?;
 
-    let mut errors = Vec::new();
-    for id in &session_ids {
-        if let Err(error) = cleanup_session_sidecars(cli_root, id) {
-            errors.push(error);
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(deleted)
-    } else {
-        Err(errors.join("；"))
-    }
+    cleanup_session_sidecars(cli_root, session_id)?;
+    Ok(deleted)
 }
 
-fn delete_sessions_from_database(
-    path: &Path,
-    selected_session_id: &str,
-    project_dir: Option<&str>,
-    project_was_deleted: bool,
-) -> Result<(bool, BTreeSet<String>), String> {
+fn delete_sessions_from_database(path: &Path, selected_session_id: &str) -> Result<bool, String> {
+    validate_session_id(selected_session_id)?;
     let mut connection = Connection::open(path)
         .map_err(|error| format!("Failed to open ZCode database: {error}"))?;
     connection
@@ -576,135 +506,70 @@ fn delete_sessions_from_database(
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|error| format!("Failed to enable ZCode foreign keys: {error}"))?;
 
-    let mut session_ids = BTreeSet::from([selected_session_id.to_string()]);
-    if project_was_deleted {
-        if let Some(project_dir) = project_dir {
-            let target = normalized_path(project_dir);
-            let mut statement = connection
-                .prepare("SELECT id, directory FROM session")
-                .map_err(|error| format!("Failed to query ZCode project sessions: {error}"))?;
-            let matches = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|error| format!("Failed to read ZCode project sessions: {error}"))?
-                .flatten()
-                .filter(|(_, directory)| normalized_path(directory) == target)
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>();
-            drop(statement);
-            session_ids.extend(matches);
-        }
-    }
-
-    for id in &session_ids {
-        validate_session_id(id)?;
-    }
-
     let transaction = connection
         .transaction()
         .map_err(|error| format!("Failed to start ZCode deletion: {error}"))?;
-    let tables = table_names(&transaction)?;
-    for id in &session_ids {
-        for table in &tables {
-            if table == "session" || !table_has_column(&transaction, table, "session_id")? {
-                continue;
-            }
-            let quoted = quote_identifier(table);
-            transaction
-                .execute(&format!("DELETE FROM {quoted} WHERE session_id=?1"), [id])
-                .map_err(|error| format!("Failed to delete ZCode {table} rows: {error}"))?;
+    let tables = sqlite_table_names(&transaction)?;
+    for table in &tables {
+        if table == "session" || !sqlite_table_has_column(&transaction, table, "session_id")? {
+            continue;
         }
+        let quoted = quote_sqlite_identifier(table);
+        transaction
+            .execute(
+                &format!("DELETE FROM {quoted} WHERE session_id=?1"),
+                [selected_session_id],
+            )
+            .map_err(|error| format!("Failed to delete ZCode {table} rows: {error}"))?;
     }
-    let mut selected_deleted = false;
-    for id in &session_ids {
-        let count = transaction
-            .execute("DELETE FROM session WHERE id=?1", [id])
-            .map_err(|error| format!("Failed to delete ZCode session: {error}"))?;
-        if id == selected_session_id {
-            selected_deleted = count > 0;
-        }
-    }
+    let count = transaction
+        .execute("DELETE FROM session WHERE id=?1", [selected_session_id])
+        .map_err(|error| format!("Failed to delete ZCode session: {error}"))?;
     transaction
         .commit()
         .map_err(|error| format!("Failed to commit ZCode deletion: {error}"))?;
-    Ok((selected_deleted, session_ids))
+    Ok(count > 0)
 }
 
-fn cleanup_task_index(
-    path: &Path,
-    session_ids: &BTreeSet<String>,
-    project_dir: Option<&str>,
-    project_was_deleted: bool,
-) -> Result<BTreeSet<String>, String> {
+fn cleanup_task_index(path: &Path, session_id: &str) -> Result<(), String> {
     if !path.is_file() {
-        return Ok(BTreeSet::new());
+        return Ok(());
     }
+    validate_session_id(session_id)?;
     let mut connection = Connection::open(path)
         .map_err(|error| format!("Failed to open ZCode task index: {error}"))?;
     connection
         .busy_timeout(Duration::from_secs(3))
         .map_err(|error| format!("Failed to configure ZCode task index timeout: {error}"))?;
 
-    let target_project = project_was_deleted
-        .then(|| project_dir.map(normalized_path))
-        .flatten();
-    let mut ids = session_ids.clone();
-    if target_project.is_some() {
-        let target = target_project.as_deref().unwrap_or_default();
-        let mut statement = connection
-            .prepare("SELECT workspace_key, workspace_path, task_id FROM tasks")
-            .map_err(|error| format!("Failed to query ZCode task index: {error}"))?;
-        let matches = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| format!("Failed to read ZCode task index: {error}"))?
-            .flatten()
-            .filter(|(workspace_key, workspace_path, _)| {
-                normalized_path(workspace_key) == target
-                    || normalized_path(workspace_path) == target
-            })
-            .map(|(_, _, id)| id)
-            .collect::<Vec<_>>();
-        drop(statement);
-        ids.extend(matches);
-    }
-
-    for id in &ids {
-        validate_session_id(id)?;
-    }
-
     let transaction = connection
         .transaction()
         .map_err(|error| format!("Failed to start ZCode task cleanup: {error}"))?;
-    let tables = table_names(&transaction)?;
+    let tables = sqlite_table_names(&transaction)?;
     if tables.iter().any(|table| table == "task_group_members") {
-        for id in &ids {
-            transaction
-                .execute("DELETE FROM task_group_members WHERE task_id=?1", [id])
-                .map_err(|error| format!("Failed to delete ZCode task group member: {error}"))?;
-        }
+        transaction
+            .execute(
+                "DELETE FROM task_group_members WHERE task_id=?1",
+                [session_id],
+            )
+            .map_err(|error| format!("Failed to delete ZCode task group member: {error}"))?;
     }
     // Keep pace with new ZCode index tables without depending on a fixed
     // schema version. Any auxiliary table keyed by task_id is session-scoped
     // and must be cleaned before the task catalog row itself.
     for table in &tables {
         if matches!(table.as_str(), "tasks" | "task_group_members")
-            || !table_has_column(&transaction, table, "task_id")?
+            || !sqlite_table_has_column(&transaction, table, "task_id")?
         {
             continue;
         }
-        let quoted = quote_identifier(table);
-        for id in &ids {
-            transaction
-                .execute(&format!("DELETE FROM {quoted} WHERE task_id=?1"), [id])
-                .map_err(|error| format!("Failed to delete ZCode {table} row: {error}"))?;
-        }
+        let quoted = quote_sqlite_identifier(table);
+        transaction
+            .execute(
+                &format!("DELETE FROM {quoted} WHERE task_id=?1"),
+                [session_id],
+            )
+            .map_err(|error| format!("Failed to delete ZCode {table} row: {error}"))?;
     }
     if tables
         .iter()
@@ -721,9 +586,7 @@ fn cleanup_task_index(
             })
             .map_err(|error| format!("Failed to read ZCode task ordering: {error}"))?
             .flatten()
-            .filter(|(_, node_key)| {
-                task_order_session_id(node_key).is_some_and(|id| ids.contains(&id))
-            })
+            .filter(|(_, node_key)| task_order_session_id(node_key).as_deref() == Some(session_id))
             .collect::<Vec<_>>();
         drop(statement);
         for (node_type, node_key) in order_keys {
@@ -736,88 +599,14 @@ fn cleanup_task_index(
         }
     }
     if tables.iter().any(|table| table == "tasks") {
-        for id in &ids {
-            transaction
-                .execute("DELETE FROM tasks WHERE task_id=?1", [id])
-                .map_err(|error| format!("Failed to delete ZCode task index row: {error}"))?;
-        }
-    }
-    if let Some(target) = target_project {
-        if tables
-            .iter()
-            .any(|table| table == "task_group_workspace_bootstraps")
-        {
-            let keys = collect_matching_values(
-                &transaction,
-                "task_group_workspace_bootstraps",
-                "workspace_key",
-                &target,
-            )?;
-            for key in keys {
-                transaction
-                    .execute(
-                        "DELETE FROM task_group_workspace_bootstraps WHERE workspace_key=?1",
-                        [key],
-                    )
-                    .map_err(|error| {
-                        format!("Failed to delete ZCode workspace bootstrap: {error}")
-                    })?;
-            }
-        }
+        transaction
+            .execute("DELETE FROM tasks WHERE task_id=?1", [session_id])
+            .map_err(|error| format!("Failed to delete ZCode task index row: {error}"))?;
     }
     transaction
         .commit()
         .map_err(|error| format!("Failed to commit ZCode task cleanup: {error}"))?;
-    Ok(ids)
-}
-
-fn table_names(transaction: &Transaction<'_>) -> Result<Vec<String>, String> {
-    let mut statement = transaction
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .map_err(|error| error.to_string())?;
-    let names = statement
-        .query_map([], |row| row.get(0))
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .collect();
-    Ok(names)
-}
-
-fn table_has_column(
-    transaction: &Transaction<'_>,
-    table: &str,
-    column: &str,
-) -> Result<bool, String> {
-    let quoted = quote_identifier(table);
-    let mut statement = transaction
-        .prepare(&format!("PRAGMA table_info({quoted})"))
-        .map_err(|error| error.to_string())?;
-    let found = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .any(|name| name == column);
-    Ok(found)
-}
-
-fn collect_matching_values(
-    transaction: &Transaction<'_>,
-    table: &str,
-    column: &str,
-    normalized_target: &str,
-) -> Result<Vec<String>, String> {
-    let table = quote_identifier(table);
-    let column = quote_identifier(column);
-    let mut statement = transaction
-        .prepare(&format!("SELECT {column} FROM {table}"))
-        .map_err(|error| error.to_string())?;
-    let values = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .filter(|value| normalized_path(value) == normalized_target)
-        .collect();
-    Ok(values)
+    Ok(())
 }
 
 fn task_order_session_id(node_key: &str) -> Option<String> {
@@ -863,17 +652,6 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
         return Err("Invalid ZCode session ID".to_string());
     }
     Ok(())
-}
-
-fn normalized_path(value: &str) -> String {
-    value
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
-}
-
-fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -1035,8 +813,8 @@ mod tests {
             .query_row(
                 &format!(
                     "SELECT COUNT(*) FROM {} WHERE {}=?1",
-                    quote_identifier(table),
-                    quote_identifier(column)
+                    quote_sqlite_identifier(table),
+                    quote_sqlite_identifier(column)
                 ),
                 [id],
                 |row| row.get(0),
@@ -1179,15 +957,9 @@ mod tests {
         insert_primary_session(&primary, "sess_sibling", r"E:\project");
         drop(primary);
 
-        let (deleted, ids) = delete_sessions_from_database(
-            &primary_path,
-            "sess_selected",
-            Some(r"E:\project"),
-            false,
-        )
-        .expect("delete selected session");
+        let deleted = delete_sessions_from_database(&primary_path, "sess_selected")
+            .expect("delete selected session");
         assert!(deleted);
-        assert_eq!(ids, BTreeSet::from(["sess_selected".to_string()]));
 
         let primary = Connection::open(&primary_path).expect("reopen primary");
         for table in ["session", "message", "part", "input_history"] {
@@ -1206,8 +978,7 @@ mod tests {
         insert_index_task(&index, r"E:\project", "sess_sibling", 1);
         drop(index);
 
-        cleanup_task_index(&index_path, &ids, Some(r"E:\project"), false)
-            .expect("clean selected task");
+        cleanup_task_index(&index_path, "sess_selected").expect("clean selected task");
         let index = Connection::open(&index_path).expect("reopen index");
         assert_eq!(count_by_id(&index, "tasks", "task_id", "sess_selected"), 0);
         assert_eq!(count_by_id(&index, "tasks", "task_id", "sess_sibling"), 1);
@@ -1236,62 +1007,14 @@ mod tests {
     }
 
     #[test]
-    fn project_cleanup_removes_all_matching_workspace_tasks_only() {
-        let temp = tempdir().expect("tempdir");
-        let primary_path = temp.path().join("db.sqlite");
-        let primary = create_primary_database(&primary_path);
-        insert_primary_session(&primary, "sess_selected", r"E:\Project\");
-        insert_primary_session(&primary, "sess_same_project", "e:/project");
-        insert_primary_session(&primary, "sess_other", r"E:\other");
-        drop(primary);
-
-        let (deleted, ids) = delete_sessions_from_database(
-            &primary_path,
+    fn project_cascade_delete_is_rejected_without_touching_databases() {
+        let error = delete_session(
             "sess_selected",
-            Some(r"E:\project"),
+            "sqlite-zcode:/nonexistent/db.sqlite:sess_selected",
             true,
         )
-        .expect("delete project sessions");
-        assert!(deleted);
-        assert_eq!(
-            ids,
-            BTreeSet::from(["sess_same_project".to_string(), "sess_selected".to_string()])
-        );
-
-        let index_path = temp.path().join("tasks-index.sqlite");
-        let index = create_task_index(&index_path);
-        insert_index_task(&index, r"E:\PROJECT", "sess_selected", 0);
-        insert_index_task(&index, r"E:\project", "sess_index_only", 1);
-        insert_index_task(&index, r"E:\other", "sess_other", 2);
-        index
-            .execute(
-                "INSERT INTO task_group_workspace_bootstraps (workspace_key, group_id) VALUES (?1, 'group')",
-                [r"E:\Project\"],
-            )
-            .expect("insert workspace bootstrap");
-        drop(index);
-
-        let all_ids = cleanup_task_index(&index_path, &ids, Some(r"e:/project"), true)
-            .expect("clean project tasks");
-        assert!(all_ids.contains("sess_index_only"));
-        let index = Connection::open(&index_path).expect("reopen index");
-        assert_eq!(
-            index
-                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(count_by_id(&index, "tasks", "task_id", "sess_other"), 1);
-        assert_eq!(
-            index
-                .query_row(
-                    "SELECT COUNT(*) FROM task_group_workspace_bootstraps",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
+        .expect_err("project cascade must be rejected");
+        assert!(error.contains("已禁用"));
     }
 
     #[test]

@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, FixedOffset};
+use serde::Serialize;
 use serde_json::Value;
 
 thread_local! {
@@ -516,25 +517,25 @@ pub fn file_stamp(path: &Path) -> io::Result<FileStamp> {
     })
 }
 
-struct CachedParse {
+struct CachedParse<T> {
     stamp: FileStamp,
-    meta: Option<crate::session_manager::SessionMeta>,
+    meta: Option<T>,
 }
 
 /// 会话文件解析结果的缓存：按文件的修改时间和大小判断有没有变，没变就复用上次
-/// 解析出的 [`SessionMeta`](crate::session_manager::SessionMeta)，只重新解析新增或
+/// 解析出的 [`SessionMeta`](crate::session_manager::SessionMeta) 或原始结构体，只重新解析新增或
 /// 改过的文件。
 ///
 /// 只存摘要（标题、路径、时间等），不存会话正文；每次扫描都用本轮看到的文件重建
 /// 整张表，已删除文件的条目随之丢弃，内存占用与会话数量成正比。解析结果必须只
 /// 取决于文件本身——依赖外部数据的部分（DeepSeek Harness 的 `workspace.json` 项目
-/// 归属、Codex 的 `config.toml` 分区、Pi 的父会话文件存在性）要么在缓存之外叠加，
-/// 要么先不接入，否则会出现「文件没变但结论已过期」的陈旧行。
-pub struct FileParseCache {
-    entries: Mutex<HashMap<PathBuf, CachedParse>>,
+/// 归属、Codex 的 `config.toml` 分区、Pi 的父会话文件存在性）在缓存之外叠加，
+/// 否则会出现「文件没变但结论已过期」的陈旧行。
+pub struct FileParseCache<T = crate::session_manager::SessionMeta> {
+    entries: Mutex<HashMap<PathBuf, CachedParse<T>>>,
 }
 
-impl FileParseCache {
+impl<T: Clone> FileParseCache<T> {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
@@ -546,9 +547,9 @@ impl FileParseCache {
     /// `parse` 读失败（权限、被占用等）必须返回 `Err`：这类结果不进缓存，下一轮
     /// 重试。若把读失败当成 `Ok(None)`，文件恢复可读后因为「文件没变」会一直命中
     /// 「没有会话」，直到文件被改动或进程重启。
-    pub fn scan<F>(&self, files: Vec<PathBuf>, parse: F) -> Vec<crate::session_manager::SessionMeta>
+    pub fn scan<F>(&self, files: Vec<PathBuf>, parse: F) -> Vec<T>
     where
-        F: Fn(&Path) -> Result<Option<crate::session_manager::SessionMeta>, String>,
+        F: Fn(&Path) -> Result<Option<T>, String>,
     {
         // 锁中毒（上次扫描 panic）时丢掉旧缓存重来，不影响本次结果
         let mut previous = match self.entries.lock() {
@@ -590,10 +591,138 @@ impl FileParseCache {
     }
 }
 
-impl Default for FileParseCache {
+impl<T: Clone> Default for FileParseCache<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Quote a SQLite identifier safely against injection/special characters.
+pub fn quote_sqlite_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Return all table names in a SQLite database or transaction (`Transaction` derefs to `Connection`).
+pub fn sqlite_table_names(connection: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .map_err(|error| error.to_string())?;
+    let names = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .collect();
+    Ok(names)
+}
+
+/// Check if a table in a SQLite database or transaction contains a specific column.
+pub fn sqlite_table_has_column(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let quoted = quote_sqlite_identifier(table);
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({quoted})"))
+        .map_err(|error| error.to_string())?;
+    let found = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .any(|name| name == column);
+    Ok(found)
+}
+
+/// Validate a child -> parent mapping for cycles using O(V) memoized traversal.
+pub fn validate_parent_graph(
+    parents: &HashMap<String, String>,
+    provider_label: &str,
+) -> Result<(), String> {
+    let mut completed = HashSet::new();
+    for child in parents.keys() {
+        let mut seen = HashSet::new();
+        let mut current = child.as_str();
+        while let Some(parent) = parents.get(current) {
+            if completed.contains(current) {
+                break;
+            }
+            if !seen.insert(current) {
+                return Err(format!("{provider_label} 会话父子关系存在循环，已停止删除"));
+            }
+            current = parent.as_str();
+        }
+        completed.extend(seen);
+    }
+    Ok(())
+}
+
+/// Stable Kahn topological ordering: places selected children before their selected parents,
+/// while preserving the caller's relative order for all other items.
+pub fn order_selected_children(
+    selected: &[(usize, String, Option<String>)],
+    initial: &[usize],
+) -> Vec<usize> {
+    let positions = initial
+        .iter()
+        .enumerate()
+        .map(|(position, index)| (*index, position))
+        .collect::<HashMap<_, _>>();
+    let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, id, _) in selected {
+        if let Some(position) = positions.get(index) {
+            by_id.entry(id.as_str()).or_default().push(*position);
+        }
+    }
+    let mut pending_children = vec![0usize; initial.len()];
+    let mut parents = vec![Vec::new(); initial.len()];
+    for (index, _, parent) in selected {
+        let Some(&child) = positions.get(index) else {
+            continue;
+        };
+        if let Some(parent_positions) = parent.as_deref().and_then(|id| by_id.get(id)) {
+            for &parent in parent_positions {
+                pending_children[parent] += 1;
+                parents[child].push(parent);
+            }
+        }
+    }
+    let mut ready = pending_children
+        .iter()
+        .enumerate()
+        .filter_map(|(position, count)| (*count == 0).then_some(position))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(initial.len());
+    let mut emitted = vec![false; initial.len()];
+    while let Some(position) = ready.pop_first() {
+        ordered.push(initial[position]);
+        emitted[position] = true;
+        for &parent in &parents[position] {
+            pending_children[parent] -= 1;
+            if pending_children[parent] == 0 {
+                ready.insert(parent);
+            }
+        }
+    }
+    ordered.extend(
+        initial
+            .iter()
+            .enumerate()
+            .filter_map(|(position, index)| (!emitted[position]).then_some(*index)),
+    );
+    ordered
+}
+
+/// Atomically serialize a JSON value to `path` via a sibling temporary file + `sync_all`.
+pub fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path.parent().ok_or("Invalid target file path")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut temp, value).map_err(|e| e.to_string())?;
+    temp.write_all(b"\n").map_err(|e| e.to_string())?;
+    temp.flush().map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -980,5 +1109,36 @@ mod tests {
         std::fs::write(&a, "alpha").unwrap();
         assert_eq!(ids(cache.scan(files, parse)), ["a", "b"]);
         assert_eq!(calls.get(), 5);
+    }
+
+    #[test]
+    fn validate_parent_graph_accepts_acyclic_chains_and_rejects_cycles() {
+        let acyclic = HashMap::from([
+            ("grandchild".to_string(), "child".to_string()),
+            ("child".to_string(), "parent".to_string()),
+        ]);
+        assert!(validate_parent_graph(&acyclic, "Test").is_ok());
+
+        let cyclic = HashMap::from([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ]);
+        let err = validate_parent_graph(&cyclic, "Test").unwrap_err();
+        assert!(err.contains("Test 会话父子关系存在循环"));
+    }
+
+    #[test]
+    fn order_selected_children_puts_children_before_parents_preserving_unrelated_order() {
+        let selected = vec![
+            (0, "parent".to_string(), None),
+            (2, "child".to_string(), Some("parent".to_string())),
+            (3, "grandchild".to_string(), Some("child".to_string())),
+        ];
+        // Initial order: [0 (parent), 1 (unrelated), 2 (child), 3 (grandchild)]
+        // Unrelated (1) stays ahead of items blocked by children; chain resolves grandchild -> child -> parent.
+        assert_eq!(
+            order_selected_children(&selected, &[0, 1, 2, 3]),
+            vec![1, 3, 2, 0]
+        );
     }
 }

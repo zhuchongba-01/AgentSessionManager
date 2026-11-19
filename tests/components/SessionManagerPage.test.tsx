@@ -1513,4 +1513,106 @@ describe("SessionManagerPage", () => {
       deleteManySpy.mockRestore();
     });
   });
+
+  it("filters sessions by status quick-filter pills", async () => {
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+
+    const residualPill = screen.getByRole("button", { name: "残留 1" });
+    expect(residualPill).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(residualPill);
+
+    expect(residualPill).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByRole("button", { name: /Alpha Session/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Beta Session")).not.toBeInTheDocument();
+    expect(screen.queryByText("Gamma Session")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "全部 3" }));
+    expect(screen.getByText("Beta Session")).toBeInTheDocument();
+  });
+
+  it("supports in-session search navigation via toolbar or Ctrl+F", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "codex-search-1",
+          title: "Searchable Session",
+          sourcePath: "/mock/codex/search-1.jsonl",
+          lastActiveAt: 100,
+        },
+      ],
+      {
+        "codex:/mock/codex/search-1.jsonl": [
+          { role: "user", content: "first needle occurrence", ts: 10 },
+          { role: "assistant", content: "unrelated answer", ts: 20 },
+          { role: "assistant", content: "second needle occurrence", ts: 30 },
+        ],
+      },
+    );
+
+    renderPage();
+    await screen.findByRole("heading", { name: "Searchable Session" });
+
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    const searchInput = await screen.findByRole("searchbox", {
+      name: "在当前会话中搜索",
+    });
+    fireEvent.change(searchInput, { target: { value: "needle" } });
+
+    expect(await screen.findByText("1 / 2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一处匹配" }));
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+
+    fireEvent.keyDown(searchInput, { key: "Escape" });
+    expect(
+      screen.queryByRole("searchbox", { name: "在当前会话中搜索" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("toggles tool message visibility and follow-system theme", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "claude",
+          sessionId: "claude-tools-1",
+          title: "Tool Session",
+          sourcePath: "/mock/claude/tools-1.jsonl",
+          lastActiveAt: 100,
+        },
+      ],
+      {
+        "claude:/mock/claude/tools-1.jsonl": [
+          { role: "user", content: "run check", ts: 10 },
+          { role: "tool", content: "tool output", ts: 20 },
+          { role: "assistant", content: "all good", ts: 30 },
+        ],
+      },
+    );
+
+    renderPage("claude");
+    await screen.findByRole("heading", { name: "Tool Session" });
+
+    const hideToolsButton = await screen.findByRole("button", {
+      name: "隐藏工具 (1)",
+    });
+    expect(hideToolsButton).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(hideToolsButton);
+
+    const showToolsButton = screen.getByRole("button", {
+      name: "显示工具 (1)",
+    });
+    expect(showToolsButton).toHaveAttribute("aria-pressed", "true");
+
+    const systemThemeButton = screen.getByRole("button", {
+      name: "跟随系统外观",
+    });
+    expect(systemThemeButton).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(systemThemeButton);
+
+    expect(systemThemeButton).toHaveAttribute("aria-pressed", "true");
+    expect(window.localStorage.getItem("test-session-theme")).toBe("system");
+  });
 });

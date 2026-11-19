@@ -1,12 +1,15 @@
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import type { SessionMessage } from "@/types";
+import { extractCodexPromptPreview } from "./utils";
 
 interface SessionMinimapProps {
   messages: SessionMessage[];
   messageIndexes: number[];
   visibleMessageIndexes: number[];
+  isCodexSession?: boolean;
   onTickClick: (index: number) => void;
 }
 
@@ -42,8 +45,10 @@ export function SessionMinimap({
   messages,
   messageIndexes,
   visibleMessageIndexes,
+  isCodexSession = false,
   onTickClick,
 }: SessionMinimapProps) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerHeight, setContainerHeight] = useState(0);
   const [hoveredTurnIndex, setHoveredTurnIndex] = useState<number | null>(null);
@@ -67,9 +72,12 @@ export function SessionMinimap({
           .map((item) => item.content.slice(0, 220))
           .join("\n")
           .slice(0, 220);
-        return [{ messageIndex, user: message.content, reply }];
+        const user = isCodexSession
+          ? extractCodexPromptPreview(message.content)
+          : message.content;
+        return [{ messageIndex, user, reply }];
       }),
-    [messageIndexes, messages],
+    [isCodexSession, messageIndexes, messages],
   );
 
   useEffect(() => {
@@ -142,7 +150,7 @@ export function SessionMinimap({
       user: clampText(turn.user, 90),
       reply: turn.reply.trim()
         ? clampText(turn.reply, 220)
-        : "（暂无回复内容）",
+        : t("sessionManager.noReplyYet", { defaultValue: "（暂无回复内容）" }),
     });
   };
 
@@ -173,7 +181,10 @@ export function SessionMinimap({
               key={turn.messageIndex}
               type="button"
               className="asm-minimap-slot"
-              aria-label={`跳转到第 ${turnIndex + 1} 个用户问题`}
+              aria-label={t("sessionManager.jumpToUserTurn", {
+                defaultValue: "跳转到第 {{index}} 个用户问题",
+                index: turnIndex + 1,
+              })}
               onMouseEnter={(event) =>
                 enter(turnIndex, turn, event.currentTarget)
               }

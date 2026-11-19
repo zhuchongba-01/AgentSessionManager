@@ -486,10 +486,9 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         }
     }
 
-    // Extract last_active_at, summary, and custom-title from tail lines (reverse order)
+    // Extract last_active_at and summary from tail lines (reverse order)
     let mut last_active_at: Option<i64> = None;
     let mut summary: Option<String> = None;
-    let mut custom_title: Option<String> = None;
 
     for line in tail.iter().rev() {
         let value: Value = match serde_json::from_str(line) {
@@ -498,16 +497,6 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         };
         if last_active_at.is_none() {
             last_active_at = value.get("timestamp").and_then(parse_timestamp_to_ms);
-        }
-        // Look for custom-title entry (take the last one, i.e. first in reverse)
-        if custom_title.is_none()
-            && value.get("type").and_then(Value::as_str) == Some("custom-title")
-        {
-            custom_title = value
-                .get("customTitle")
-                .and_then(Value::as_str)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
         }
         if summary.is_none() {
             if !is_main_entry(&value) {
@@ -520,7 +509,7 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
                 }
             }
         }
-        if last_active_at.is_some() && summary.is_some() && custom_title.is_some() {
+        if last_active_at.is_some() && summary.is_some() {
             break;
         }
     }
@@ -532,6 +521,8 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
 
     // Explicit titles can be anywhere (including outside both sampling windows).
     // Read the complete bounded stream without retaining transcript bodies.
+    // Fast pre-check avoids serde_json deserializing tens of thousands of transcript lines
+    // when neither `"customTitle"` nor `"aiTitle"` appears in the line.
     let oversized = std::fs::metadata(path)
         .map_err(|error| error.to_string())?
         .len()
@@ -555,9 +546,12 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
             File::open(path).map_err(|error| format!("Failed to read Claude titles: {error}"))?;
         Box::new(BufReader::new(file).lines())
     };
-    custom_title = None;
+    let mut custom_title = None;
     for line in title_lines {
         let line = line.map_err(|error| format!("Failed to read Claude titles: {error}"))?;
+        if !line.contains("customTitle") && !line.contains("aiTitle") {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };

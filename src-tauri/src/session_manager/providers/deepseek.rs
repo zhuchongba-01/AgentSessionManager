@@ -1,15 +1,17 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde_json::Value;
 
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    checked_storage_child, is_safe_session_id, path_basename, scan_warning, truncate_summary,
-    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
+    atomic_write_json, checked_storage_child, is_safe_session_id, order_selected_children,
+    path_basename, scan_warning, truncate_summary, FileParseCache, MAX_MESSAGES_FILE_BYTES,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "deepseek";
@@ -63,6 +65,8 @@ fn projection_cache_root(home: &Path) -> PathBuf {
         .join("sessions")
 }
 
+static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
+
 pub fn scan_sessions() -> Vec<SessionMeta> {
     scan_sessions_at(&dsh_home())
 }
@@ -86,18 +90,18 @@ fn scan_sessions_at(home: &Path) -> Vec<SessionMeta> {
     for warning in discovery.warnings {
         scan_warning(warning);
     }
-    discovery
-        .logs
-        .into_iter()
-        .filter_map(|path| match parse_session_meta(&path, &catalog) {
-            Ok(Some(session)) => Some(session),
-            Ok(None) => None,
-            Err(error) => {
-                scan_warning(error);
-                None
-            }
+    let mut sessions = PARSE_CACHE.scan(discovery.logs, |path| {
+        parse_session_file_only(path).inspect_err(|error| {
+            scan_warning(error.clone());
         })
-        .collect()
+    });
+    for session in &mut sessions {
+        let assignment = catalog.assignments.get(&session.session_id);
+        session.archived = catalog.archived.contains(&session.session_id);
+        session.project_name = assignment.and_then(|workspace| workspace.project_name.clone());
+        session.project_dir = assignment.map(|workspace| workspace.project_dir.clone());
+    }
+    sessions
 }
 
 #[derive(Default)]
@@ -471,10 +475,7 @@ fn event_time(event: &Value) -> Option<i64> {
     event.get("time").and_then(Value::as_i64)
 }
 
-fn parse_session_meta(
-    path: &Path,
-    catalog: &WorkspaceCatalog,
-) -> Result<Option<SessionMeta>, String> {
+fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
     let decoded = read_session(path)?;
     let id = decoded
         .header
@@ -503,7 +504,6 @@ fn parse_session_meta(
             path.display()
         ));
     }
-    let assignment = catalog.assignments.get(&id);
     // Match Harness's sessionListMetadata reducer: a persisted session remains
     // blank until the first committed turn/start. Initial policy, sandbox and
     // seed events do not make it a sidebar conversation.
@@ -560,22 +560,22 @@ fn parse_session_meta(
 
     Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
-        session_id: id.clone(),
+        session_id: id,
         // Harness does not place internal subagent sessions in its ordinary
         // workspace conversation list. Surface them as residuals here so a
         // parent dependency can be resolved deliberately instead of making
         // the parent permanently undeletable.
         residual: is_subagent || hidden_dependency,
-        parent_session_id: parent_session_id.clone(),
-        archived: catalog.archived.contains(&id),
+        parent_session_id,
+        archived: false,
         cleanup_pending: false,
         sidebar_section: None,
         title,
         summary: last_visible
             .as_deref()
             .map(|value| truncate_summary(value, 160)),
-        project_name: assignment.and_then(|workspace| workspace.project_name.clone()),
-        project_dir: assignment.map(|workspace| workspace.project_dir.clone()),
+        project_name: None,
+        project_dir: None,
         created_at,
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
@@ -730,21 +730,7 @@ fn workspace_catalog(home: &Path) -> Result<WorkspaceCatalog, String> {
 }
 
 fn write_index_atomically(path: &Path, value: &Value) -> Result<(), String> {
-    let parent = path.parent().ok_or("DeepSeek Harness 索引路径无效")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("无法创建 DeepSeek Harness 索引临时文件：{error}"))?;
-    serde_json::to_writer(&mut temp, value)
-        .map_err(|error| format!("无法序列化 DeepSeek Harness 工作区索引：{error}"))?;
-    temp.write_all(b"\n")
-        .map_err(|error| format!("无法写入 DeepSeek Harness 工作区索引：{error}"))?;
-    temp.flush()
-        .map_err(|error| format!("无法刷新 DeepSeek Harness 工作区索引：{error}"))?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|error| format!("无法同步 DeepSeek Harness 工作区索引：{error}"))?;
-    temp.persist(path)
-        .map_err(|error| format!("无法替换 DeepSeek Harness 工作区索引：{error}"))?;
-    Ok(())
+    atomic_write_json(path, value)
 }
 
 fn cleanup_index(home: &Path, session_id: &str) -> Result<(), String> {
@@ -1142,6 +1128,12 @@ pub fn delete_session(root: &Path, source: &Path, session_id: &str) -> Result<bo
 /// run before their selected parents. Unselected children remain protected by
 /// the execution-time preflight.
 pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    if !requests
+        .iter()
+        .any(|request| request.provider_id == PROVIDER_ID)
+    {
+        return initial.to_vec();
+    }
     let selected = requests
         .iter()
         .enumerate()
@@ -1164,68 +1156,11 @@ pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> V
     order_selected_children(&selected, initial)
 }
 
-fn order_selected_children(
-    selected: &[(usize, String, Option<String>)],
-    initial: &[usize],
-) -> Vec<usize> {
-    let positions = initial
-        .iter()
-        .enumerate()
-        .map(|(position, index)| (*index, position))
-        .collect::<HashMap<_, _>>();
-    let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (index, id, _) in selected {
-        if let Some(position) = positions.get(index) {
-            by_id.entry(id).or_default().push(*position);
-        }
-    }
-    let mut pending_children = vec![0usize; initial.len()];
-    let mut parents = vec![Vec::new(); initial.len()];
-    for (index, _, parent) in selected {
-        let Some(&child) = positions.get(index) else {
-            continue;
-        };
-        if let Some(parent_positions) = parent.as_deref().and_then(|id| by_id.get(id)) {
-            for &parent in parent_positions {
-                pending_children[parent] += 1;
-                parents[child].push(parent);
-            }
-        }
-    }
-    // Stable Kahn ordering: earliest ready position wins. Other providers retain
-    // their previously established relative order. No repeated Vec::contains.
-    let mut ready = pending_children
-        .iter()
-        .enumerate()
-        .filter_map(|(position, count)| (*count == 0).then_some(position))
-        .collect::<BTreeSet<_>>();
-    let mut ordered = Vec::with_capacity(initial.len());
-    let mut emitted = vec![false; initial.len()];
-    while let Some(position) = ready.pop_first() {
-        ordered.push(initial[position]);
-        emitted[position] = true;
-        for &parent in &parents[position] {
-            pending_children[parent] -= 1;
-            if pending_children[parent] == 0 {
-                ready.insert(parent);
-            }
-        }
-    }
-    // Ordering is only a hint, never permission to delete. Cycles and invalid
-    // sources are rejected by each execution-time preflight without mutation.
-    ordered.extend(
-        initial
-            .iter()
-            .enumerate()
-            .filter_map(|(position, index)| (!emitted[position]).then_some(*index)),
-    );
-    ordered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
 
     fn write_plain_session(path: &Path, id: &str, parent: Option<&str>, origin: Option<&str>) {
         fs::create_dir_all(path.parent().expect("session parent")).expect("create session dir");

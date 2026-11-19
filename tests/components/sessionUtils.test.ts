@@ -14,6 +14,7 @@ import {
   resolveParentLabel,
   shouldHideCodexMessageFromToc,
   shouldShowSessionMinimap,
+  splitCodexIdeContext,
 } from "@/components/sessions/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
 
@@ -273,6 +274,69 @@ describe("session utils", () => {
     const content = "Please explain the phrase My request for Codex.";
 
     expect(extractCodexPromptPreview(content)).toBe(content);
+    expect(splitCodexIdeContext(content)).toBeNull();
+  });
+
+  it("splits Codex IDE setup context from the real request prompt", () => {
+    const multiline = [
+      "# Context from my IDE setup:",
+      "",
+      "## Active file: src/main.ts",
+      "",
+      "## My request for Codex:",
+      "Refactor the sidebar component",
+    ].join("\n");
+    expect(splitCodexIdeContext(multiline)).toEqual({
+      context: [
+        "# Context from my IDE setup:",
+        "",
+        "## Active file: src/main.ts",
+        "",
+        "## My request for Codex:",
+      ].join("\n"),
+      prompt: "Refactor the sidebar component",
+    });
+
+    const inline = [
+      "# Context from my IDE setup:",
+      "",
+      "## My request for Codex: Inline prompt",
+    ].join("\n");
+    expect(splitCodexIdeContext(inline)).toEqual({
+      context: "# Context from my IDE setup:",
+      prompt: "Inline prompt",
+    });
+
+    const repeated = [
+      "# Context from my IDE setup:",
+      "",
+      "## Active file: foo.ts",
+      "",
+      "## My request for Codex:",
+      "First mention",
+      "## My request for Codex:",
+      "Final trailing request",
+    ].join("\n");
+    expect(splitCodexIdeContext(repeated)).toEqual({
+      context: [
+        "# Context from my IDE setup:",
+        "",
+        "## Active file: foo.ts",
+        "",
+        "## My request for Codex:",
+        "First mention",
+        "## My request for Codex:",
+      ].join("\n"),
+      prompt: "Final trailing request",
+    });
+
+    const promptless = [
+      "# Context from my IDE setup:",
+      "",
+      "## My request for Codex:",
+      "   ",
+    ].join("\n");
+    expect(splitCodexIdeContext(promptless)).toBeNull();
   });
 
   it("hides Codex context messages without user prompts from the TOC", () => {

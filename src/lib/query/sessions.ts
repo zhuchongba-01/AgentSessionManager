@@ -123,10 +123,15 @@ export const useDeleteSessionMutation = () => {
         // 兼容旧后端的警告；新后端会将未完成的清理返回 cleanup_pending。
         reply.warnings?.forEach((warning) => toast.warning(warning));
       } else if (reply.status === "cleanup_pending") {
-        toast.warning("清理尚未完成，可在列表中继续清理", {
-          description: reply.warnings.join("；"),
-          duration: 12_000,
-        });
+        toast.warning(
+          t("sessionManager.cleanupPendingToast", {
+            defaultValue: "清理尚未完成，可在列表中继续清理",
+          }),
+          {
+            description: reply.warnings.join("；"),
+            duration: 12_000,
+          },
+        );
       } else if (reply.status === "not_found") {
         // 后端明确说记录已不存在：不能再报"删除成功"，但要让缓存回到真实状态。
         toast.info(

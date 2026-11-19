@@ -3,7 +3,6 @@
 use super::{DeleteSessionReply, SessionMeta};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -194,13 +193,7 @@ where
     // retry retains its existing journal, but a rejected new request writes none.
     preflight(&operation.targets)?;
     if is_new {
-        let parent = path.parent().ok_or("Invalid pending deletion directory")?;
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-        serde_json::to_writer(&mut temp, &operation).map_err(|e| e.to_string())?;
-        temp.flush().map_err(|e| e.to_string())?;
-        temp.as_file().sync_all().map_err(|e| e.to_string())?;
-        temp.persist(path).map_err(|e| e.to_string())?;
+        persist_operation(path, &operation)?;
     }
     for saved in &mut operation.targets {
         saved.cleanup_pending = true;
@@ -259,7 +252,7 @@ pub fn run_codex(
             )? {
                 return Err("Codex 当前索引已指向新的日志，停止旧清理任务".into());
             }
-            codex::cleanup_after_delete(id, None, false)
+            codex::cleanup_after_delete(id)
         },
         |path| std::fs::remove_file(path).map_err(|e| e.to_string()),
     )
@@ -329,14 +322,7 @@ impl CodexBatchProgress {
 }
 
 fn persist_operation(path: &Path, operation: &PendingDeletion) -> Result<(), String> {
-    let parent = path.parent().ok_or("Invalid journal path")?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut temp, operation).map_err(|e| e.to_string())?;
-    temp.flush().map_err(|e| e.to_string())?;
-    temp.as_file().sync_all().map_err(|e| e.to_string())?;
-    temp.persist(path).map_err(|e| e.to_string())?;
-    Ok(())
+    super::providers::utils::atomic_write_json(path, operation)
 }
 
 fn run_codex_at<I, C, D>(
@@ -423,7 +409,7 @@ where
     // Validation rejection does not rewrite the existing journal.
     codex::validate_deletion_index_decision(&plan, current_cleanup_index)?;
     codex::validate_deletion_plan(&plan, roots)?;
-    let result = codex::execute_deletion_plan(&mut plan, roots, cleanup, remove, |progress| {
+    let result = codex::execute_deletion_plan_validated(&mut plan, cleanup, remove, |progress| {
         operation.codex_plan = Some(progress.clone());
         persist_operation(path, &operation)
     });
@@ -446,13 +432,7 @@ fn mark_pending(path: &Path, mut warnings: Vec<String>) -> Result<DeleteSessionR
             serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
         operation.last_error = Some(warnings.join("；"));
-        let mut temp =
-            tempfile::NamedTempFile::new_in(path.parent().ok_or("Invalid journal path")?)
-                .map_err(|e| e.to_string())?;
-        serde_json::to_writer(&mut temp, &operation).map_err(|e| e.to_string())?;
-        temp.as_file().sync_all().map_err(|e| e.to_string())?;
-        temp.persist(path).map_err(|e| e.to_string())?;
-        Ok(())
+        persist_operation(path, &operation)
     };
     if let Err(error) = persist() {
         warnings.push(format!("无法保存清理错误详情：{error}"));
@@ -492,6 +472,22 @@ impl AgentStopChecks {
 }
 
 /// Editing an Agent's live databases/files is not a supported coordination API.
+enum ProcessMatch {
+    Direct,
+    Script { missing_cmdline: bool },
+}
+
+fn match_running_process(name: &str, args: Option<&str>, provider: &str) -> Option<ProcessMatch> {
+    if process_matches(name, provider) {
+        Some(ProcessMatch::Direct)
+    } else if script_process_matches(name, args, provider) {
+        let missing_cmdline = args.is_none_or(|value| value.trim().is_empty());
+        Some(ProcessMatch::Script { missing_cmdline })
+    } else {
+        None
+    }
+}
+
 /// Fail closed if process inspection itself fails. No shell command contains
 /// session IDs, paths or other input from session history.
 pub fn ensure_agent_stopped(provider: &str) -> Result<(), String> {
@@ -500,12 +496,12 @@ pub fn ensure_agent_stopped(provider: &str) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command",
-                "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process | Select-Object Name,CommandLine) -Compress"])
+                "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine) -Compress"])
             .creation_flags(0x08000000).output()
     };
     #[cfg(not(target_os = "windows"))]
     let output = std::process::Command::new("ps")
-        .args(["-A", "-o", "comm=", "-o", "args="])
+        .args(["-A", "-o", "pid=", "-o", "comm=", "-o", "args="])
         .output();
     let output = output.map_err(|e| format!("无法检查 Agent 运行状态，未开始清理：{e}"))?;
     if !output.status.success() {
@@ -513,9 +509,11 @@ pub fn ensure_agent_stopped(provider: &str) -> Result<(), String> {
     }
     let listing = String::from_utf8_lossy(&output.stdout);
     #[cfg(target_os = "windows")]
-    let running = {
+    let blocked = {
         #[derive(Deserialize)]
         struct Process {
+            #[serde(rename = "ProcessId")]
+            pid: u32,
             #[serde(rename = "Name")]
             name: String,
             #[serde(rename = "CommandLine")]
@@ -523,21 +521,36 @@ pub fn ensure_agent_stopped(provider: &str) -> Result<(), String> {
         }
         let processes: Vec<Process> = serde_json::from_str(listing.trim_start_matches('\u{feff}'))
             .map_err(|e| format!("无法解析 Agent 运行状态：{e}"))?;
-        processes.iter().any(|process| {
-            process_matches(&process.name, provider)
-                || script_process_matches(&process.name, process.command_line.as_deref(), provider)
+        processes.iter().find_map(|process| {
+            match_running_process(&process.name, process.command_line.as_deref(), provider)
+                .map(|kind| (process.pid.to_string(), process.name.clone(), kind))
         })
     };
     #[cfg(not(target_os = "windows"))]
-    let running = listing.lines().any(|line| {
-        let (name, args) = line
-            .trim()
+    let blocked = listing.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (pid, rest) = trimmed
             .split_once(char::is_whitespace)
-            .unwrap_or((line.trim(), ""));
-        process_matches(name, provider) || script_process_matches(name, Some(args), provider)
+            .unwrap_or((trimmed, ""));
+        let rest = rest.trim_start();
+        let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        match_running_process(name, Some(args), provider)
+            .map(|kind| (pid.to_string(), name.to_string(), kind))
     });
-    if running {
-        return Err(format!("请先完全退出 {provider}（包括后台进程和终端任务），再清理会话；无法识别的脚本进程也需退出"));
+    if let Some((pid, name, kind)) = blocked {
+        return match kind {
+            ProcessMatch::Script {
+                missing_cmdline: true,
+            } => Err(format!(
+                "请先完全退出 {provider}（检测到脚本进程 {name} [PID {pid}]，无法读取其命令行参数；包括后台进程和终端任务），再清理会话"
+            )),
+            _ => Err(format!(
+                "请先完全退出 {provider}（检测到进程 {name} [PID {pid}]，包括后台进程和终端任务），再清理会话"
+            )),
+        };
     }
     Ok(())
 }
@@ -569,24 +582,70 @@ fn process_matches(executable: &str, provider: &str) -> bool {
         .any(|alias| name == *alias || name.starts_with(&format!("{alias} ")))
 }
 
-fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) -> bool {
-    let name = executable
+fn split_command_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else if ch == '\\' && q == '"' && chars.peek() == Some(&'"') {
+                    current.push(chars.next().unwrap());
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch.is_whitespace() {
+                    if in_token {
+                        args.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                } else if ch == '\'' || ch == '"' {
+                    in_token = true;
+                    quote = Some(ch);
+                } else {
+                    in_token = true;
+                    current.push(ch);
+                }
+            }
+        }
+    }
+    if in_token {
+        args.push(current);
+    }
+    args
+}
+
+fn is_script_runtime_name(token: &str) -> bool {
+    let base = token
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or(executable)
+        .unwrap_or(token)
         .to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    if !matches!(name, "node" | "nodejs" | "bun") {
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    matches!(base, "node" | "nodejs" | "bun")
+}
+
+fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) -> bool {
+    if !is_script_runtime_name(executable) {
         return false;
     }
     let Some(args) = args.filter(|value| !value.trim().is_empty()) else {
         return true;
     };
-    let tokens: Vec<String> = args
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
+    let parsed = split_command_args(args);
+    let inspected = match parsed.first() {
+        Some(argv0) if is_script_runtime_name(argv0) => &parsed[1..],
+        _ => parsed.as_slice(),
+    };
+    if inspected.is_empty() {
+        return false;
+    }
     let aliases: &[&str] = match provider {
         "codex" => &["codex"],
         "claude" => &["claude", "claude-code"],
@@ -597,7 +656,29 @@ fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) 
         "deepseek" => &["dsh", "deepseek-harness"],
         _ => &[],
     };
-    tokens.iter().any(|token| aliases.contains(&token.as_str()))
+    inspected.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        let segments: Vec<&str> = lower
+            .split(['/', '\\'])
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let Some(&last) = segments.last() else {
+            return false;
+        };
+        let basename = last
+            .strip_suffix(".exe")
+            .or_else(|| last.strip_suffix(".cmd"))
+            .or_else(|| last.strip_suffix(".bat"))
+            .unwrap_or(last);
+        if aliases.contains(&basename) {
+            return true;
+        }
+        // Only match longer package/provider directory segments (>= 5 chars) so
+        // ordinary parent folders like `/projects/pi/` or `C:\Users\grok\` never trigger.
+        segments[..segments.len() - 1]
+            .iter()
+            .any(|segment| segment.len() >= 5 && aliases.contains(segment))
+    })
 }
 
 #[cfg(test)]
@@ -1310,6 +1391,23 @@ mod tests {
             Some("node /projects/app/server.js"),
             "pi"
         ));
+        assert!(!script_process_matches(
+            "/usr/bin/node",
+            Some("node /projects/pi/server.js"),
+            "pi"
+        ));
+        assert!(!script_process_matches(
+            "node.exe",
+            Some(r#"node C:\Users\grok\app.js"#),
+            "grokbuild"
+        ));
+        assert!(!script_process_matches("node", Some("node"), "pi"));
+        assert!(script_process_matches(
+            "/usr/bin/node",
+            Some("node /usr/local/bin/pi --session x"),
+            "pi"
+        ));
+        assert!(script_process_matches("node", None, "pi"));
         assert!(!process_matches("AgentSessionManager.exe", "codex"));
     }
 }

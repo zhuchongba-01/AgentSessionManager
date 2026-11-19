@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::SessionMessage;
 
@@ -28,13 +28,32 @@ pub const MAX_TOTAL_BYTES: usize = 96 * 1024 * 1024;
 pub struct MemberFingerprint {
     pub modified: Option<SystemTime>,
     pub len: u64,
-    /// `len` 不超过 [`MAX_DIGESTED_SOURCE_BYTES`] 时的内容摘要；超出则为 `None`
+    /// `-wal` 源，或近期修改/缺少 mtime 且有效长度不超过 [`MAX_DIGESTED_SOURCE_BYTES`] 时的内容摘要
     pub digest: Option<u64>,
 }
 
 /// 参与内容摘要的单成员体积上限。超过这个大小的源只比 `(mtime, len)`：
 /// 每次打开会话都完整读一遍大文件，代价会盖过缓存带来的收益。
 pub const MAX_DIGESTED_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn is_wal_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("-wal"))
+}
+
+fn should_digest_member(path: &Path, metadata: &fs::Metadata) -> bool {
+    if is_wal_path(path) {
+        return true;
+    }
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return true;
+    };
+    age < Duration::from_secs(2)
+}
 
 impl MemberFingerprint {
     fn of_metadata(metadata: &fs::Metadata) -> Self {
@@ -45,28 +64,34 @@ impl MemberFingerprint {
         }
     }
 
-    fn of_path(path: &Path) -> io::Result<Self> {
+    fn of_source(path: &Path, end_byte_offset: Option<u64>) -> io::Result<Self> {
         let metadata = fs::metadata(path)?;
         let mut fingerprint = Self::of_metadata(&metadata);
-        if metadata.len() <= MAX_DIGESTED_SOURCE_BYTES {
-            fingerprint.digest = Some(digest_file(path)?);
+        let effective_len =
+            end_byte_offset.map_or(metadata.len(), |limit| metadata.len().min(limit));
+        if effective_len <= MAX_DIGESTED_SOURCE_BYTES && should_digest_member(path, &metadata) {
+            fingerprint.digest = Some(digest_file(path, end_byte_offset)?);
         }
         Ok(fingerprint)
     }
 }
 
 /// 文件内容的稳定摘要（FNV-1a）。只用于判断"是否变过"，不用于安全目的。
-fn digest_file(path: &Path) -> io::Result<u64> {
+fn digest_file(path: &Path, limit: Option<u64>) -> io::Result<u64> {
     use std::io::Read;
 
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
+    let mut reader: Box<dyn Read> = match limit {
+        Some(limit) => Box::new(file.take(limit)),
+        None => Box::new(file),
+    };
     let mut hash = OFFSET_BASIS;
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -106,8 +131,8 @@ pub type TranscriptSources = Vec<(PathBuf, Option<u64>)>;
 pub fn transcript_fingerprint(sources: &[(PathBuf, Option<u64>)]) -> io::Result<Fingerprint> {
     let mut members = Vec::with_capacity(sources.len());
     let mut readable = 0;
-    for (path, _) in sources {
-        match MemberFingerprint::of_path(path) {
+    for (path, end_byte_offset) in sources {
+        match MemberFingerprint::of_source(path, *end_byte_offset) {
             Ok(fingerprint) => {
                 readable += 1;
                 members.push((path.clone(), Some(fingerprint)));
@@ -743,5 +768,49 @@ mod tests {
         let bytes = vec![CHUNK_MAX_BYTES / 2, CHUNK_MAX_BYTES / 2, 1];
         // 前两条刚好不超过上限，第三条再加就超了
         assert_eq!(chunk_ranges(&bytes), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn older_regular_member_skips_digest_while_wal_still_digests() {
+        let temp = tempfile::tempdir().unwrap();
+        let regular = temp.path().join("session.jsonl");
+        let wal = temp.path().join("opencode.db-wal");
+        std::fs::write(&regular, "regular-payload").unwrap();
+        std::fs::write(&wal, "wal-payload").unwrap();
+
+        let old_time = SystemTime::now() - Duration::from_secs(10);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&regular)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        let regular_fp = MemberFingerprint::of_source(&regular, None).unwrap();
+        let wal_fp = MemberFingerprint::of_source(&wal, None).unwrap();
+        assert!(regular_fp.digest.is_none());
+        assert!(wal_fp.digest.is_some());
+    }
+
+    #[test]
+    fn digest_file_respects_end_byte_offset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("base.jsonl");
+        std::fs::write(&path, "hello-1111").unwrap();
+        let fp_prefix_a = MemberFingerprint::of_source(&path, Some(5)).unwrap();
+
+        std::fs::write(&path, "hello-2222").unwrap();
+        let fp_prefix_b = MemberFingerprint::of_source(&path, Some(5)).unwrap();
+        assert_eq!(fp_prefix_a.digest, fp_prefix_b.digest);
+
+        std::fs::write(&path, "world-2222").unwrap();
+        let fp_prefix_c = MemberFingerprint::of_source(&path, Some(5)).unwrap();
+        assert_ne!(fp_prefix_a.digest, fp_prefix_c.digest);
     }
 }

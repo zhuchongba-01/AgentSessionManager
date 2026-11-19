@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { AlertTriangle, Info } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/utils";
 
 export interface ConfirmDialogCheckbox {
   /** 稳定标识；`onConfirm` 按它回传勾选状态 */
@@ -88,7 +89,7 @@ export function ConfirmDialog({
     >
       <DialogContent
         data-testid="confirm-dialog"
-        className="max-w-sm"
+        className={cn(details && details.length > 0 ? "max-w-lg" : "max-w-sm")}
         zIndex={zIndex}
       >
         <DialogHeader className="space-y-3 border-b-0 bg-transparent pb-0">

@@ -135,4 +135,114 @@ describe("SessionMessageItem", () => {
     fireEvent.click(screen.getByRole("button", { name: /展开完整内容/ }));
     expect(screen.getByText(long)).toBeInTheDocument();
   });
+
+  it("folds Codex IDE setup context by default while copying the full text", () => {
+    const onCopy = vi.fn();
+    const content = [
+      "# Context from my IDE setup:",
+      "",
+      "## Active file: src/App.tsx",
+      "",
+      "## My request for Codex:",
+      "真正想问的问题",
+    ].join("\n");
+
+    render(
+      <SessionMessageItem
+        message={{ role: "user", content }}
+        isActive={false}
+        isCodexSession
+        onCopy={onCopy}
+      />,
+    );
+
+    expect(screen.getByText("真正想问的问题")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Active file: src\/App\.tsx/),
+    ).not.toBeInTheDocument();
+
+    const toggle = screen.getByRole("button", { name: "查看 IDE 上下文" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+
+    expect(
+      screen.getByRole("button", { name: "收起 IDE 上下文" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/Active file: src\/App\.tsx/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起 IDE 上下文" }));
+    expect(
+      screen.queryByText(/Active file: src\/App\.tsx/),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "复制消息" }));
+    expect(onCopy).toHaveBeenCalledWith(content);
+  });
+
+  it("renders Markdown with code block copy and raw text toggle", () => {
+    const onCopy = vi.fn();
+    const onCopyCode = vi.fn();
+    const content = [
+      "查看 `utils.ts` 修改：",
+      "```ts",
+      "export const ready = true;",
+      "```",
+    ].join("\n");
+
+    const { container } = render(
+      <SessionMessageItem
+        message={{ role: "assistant", content }}
+        isActive={false}
+        onCopy={onCopy}
+        onCopyCode={onCopyCode}
+      />,
+    );
+
+    expect(container.querySelector("code.asm-inline-code")).toHaveTextContent(
+      "utils.ts",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "复制代码" }));
+    expect(onCopyCode).toHaveBeenCalledWith("export const ready = true;");
+
+    const rawToggle = screen.getByRole("button", { name: "查看原文" });
+    expect(rawToggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(rawToggle);
+
+    expect(
+      screen.getByRole("button", { name: "Markdown 视图" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(container.querySelector(".asm-code-block")).toBeNull();
+    expect(screen.getByText(/```ts/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "复制消息" }));
+    expect(onCopy).toHaveBeenCalledWith(content);
+  });
+
+  it("folds multi-line non-truncated tool output and toggles expansion", () => {
+    const lines = Array.from({ length: 12 }, (_, idx) => `tool line ${idx + 1}`);
+    render(
+      <SessionMessageItem
+        message={{ role: "tool", content: lines.join("\n") }}
+        isActive={false}
+        onCopy={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/tool line 1/)).toBeInTheDocument();
+    expect(screen.queryByText(/tool line 12/)).not.toBeInTheDocument();
+
+    const expandButton = screen.getByRole("button", {
+      name: "展开工具输出（共 12 行）",
+    });
+    expect(expandButton).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(expandButton);
+
+    expect(screen.getByText(/tool line 12/)).toBeInTheDocument();
+    const collapseButton = screen.getByRole("button", {
+      name: "收起工具输出",
+    });
+    expect(collapseButton).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(collapseButton);
+    expect(screen.queryByText(/tool line 12/)).not.toBeInTheDocument();
+  });
 });

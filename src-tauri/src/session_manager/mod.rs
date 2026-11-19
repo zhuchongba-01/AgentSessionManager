@@ -514,7 +514,7 @@ fn delete_session_in_snapshot_with<F>(
     mut delete_record: F,
 ) -> Result<DeleteSessionReply, String>
 where
-    F: FnMut(&str, &str, &str, Option<&str>, bool) -> Result<bool, String>,
+    F: FnMut(&str, &str, &str, bool) -> Result<bool, String>,
 {
     let selected = sessions.iter().find(|item| {
         item.provider_id == provider_id
@@ -531,7 +531,6 @@ where
     {
         return Ok(DeleteSessionReply::NotFound);
     }
-    let project_dir = selected.and_then(|item| item.project_dir.clone());
     let related_residual_sources = selected
         .map(|item| {
             collect_related_residual_sources(
@@ -552,7 +551,7 @@ where
     // are included in the authoritative lookup; historical copies are not.
     if provider_id == "codex" && codex::should_cleanup_index_after_delete(session_id, source_path)?
     {
-        codex::cleanup_after_delete(session_id, None, false)?;
+        codex::cleanup_after_delete(session_id)?;
     }
     // DeepSeek and Grok are deliberately excluded: their providers finish
     // directory/cache cleanup even after the primary source has disappeared
@@ -567,13 +566,7 @@ where
             return Err("会话文件已消失，请重新扫描".into());
         }
     } else {
-        delete_record(
-            provider_id,
-            session_id,
-            source_path,
-            project_dir.as_deref(),
-            false,
-        )?
+        delete_record(provider_id, session_id, source_path, false)?
     };
     let mut warnings = Vec::new();
 
@@ -588,13 +581,7 @@ where
             {
                 continue;
             }
-            if let Err(error) = delete_record(
-                provider_id,
-                session_id,
-                &residual_source,
-                project_dir.as_deref(),
-                false,
-            ) {
+            if let Err(error) = delete_record(provider_id, session_id, &residual_source, false) {
                 warnings.push(format!("会话已删除，但残留副本清理失败：{error}"));
             }
         }
@@ -640,14 +627,13 @@ fn delete_session_record(
     provider_id: &str,
     session_id: &str,
     source_path: &str,
-    project_dir: Option<&str>,
     include_project: bool,
 ) -> Result<bool, String> {
     // SQLite sessions bypass the file-based deletion path.
     let deleted = if provider_id == "opencode" && source_path.starts_with("sqlite:") {
         opencode::delete_session_sqlite(session_id, source_path)?
     } else if provider_id == "zcode" && source_path.starts_with("sqlite-zcode:") {
-        zcode::delete_session(session_id, source_path, project_dir, include_project)?
+        zcode::delete_session(session_id, source_path, include_project)?
     } else {
         let roots = provider_roots(provider_id)?;
         delete_session_with_roots(provider_id, session_id, Path::new(source_path), &roots)?
@@ -668,6 +654,7 @@ where
     F: FnMut(&str) -> Result<(), String>,
 {
     let guard = deletion::DELETE_LOCK.lock();
+    let pending_check = deletion::pending_sessions().map(|_| ());
     let sessions = scan_sessions();
     let codex_order = codex::deletion_order(requests);
     let order = deepseek::deletion_order(requests, &codex_order);
@@ -688,7 +675,9 @@ where
             return Err("批量清理不删除项目目录".into());
         }
         ensure_stopped(&request.provider_id)?;
-        deletion::pending_sessions()?;
+        if let Err(error) = &pending_check {
+            return Err(error.clone());
+        }
         let Some(target) = sessions.iter().find(|item| {
             item.provider_id == request.provider_id
                 && item.session_id == request.session_id
@@ -1067,7 +1056,7 @@ mod tests {
             source,
             false,
             &sessions,
-            |_, _, path, _, _| {
+            |_, _, path, _| {
                 deleted.push(path.to_string());
                 Ok(true)
             },
@@ -1190,7 +1179,7 @@ mod tests {
                 &sources[0].to_string_lossy(),
                 false,
                 &plan,
-                |provider, id, source, _, _| {
+                |provider, id, source, _| {
                     delete_session_with_roots(provider, id, Path::new(source), &roots)
                 },
             )
@@ -1222,7 +1211,7 @@ mod tests {
             &source.to_string_lossy(),
             false,
             &[item],
-            |provider, id, source, _, _| {
+            |provider, id, source, _| {
                 delete_session_with_roots(
                     provider,
                     id,
@@ -1256,7 +1245,7 @@ mod tests {
             &source.to_string_lossy(),
             false,
             std::slice::from_ref(&primary),
-            |_, _, _, _, _| Err("primary directory still locked".into()),
+            |_, _, _, _| Err("primary directory still locked".into()),
         )
         .is_err());
         let mut calls = 0;
@@ -1266,7 +1255,7 @@ mod tests {
             &source.to_string_lossy(),
             false,
             &[primary, residual],
-            |_, _, _, _, _| {
+            |_, _, _, _| {
                 calls += 1;
                 if calls == 1 {
                     Ok(true)

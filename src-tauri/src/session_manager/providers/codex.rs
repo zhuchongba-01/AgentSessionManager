@@ -18,8 +18,9 @@ use crate::session_paths::{
 
 use super::utils::{
     checked_storage_child, collect_files_where, collect_files_where_checked, extract_text,
-    is_safe_session_id, parse_timestamp_to_ms, path_basename, read_head_tail_lines,
-    truncate_summary, MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
+    is_safe_session_id, parse_timestamp_to_ms, path_basename, quote_sqlite_identifier,
+    read_head_tail_lines, sqlite_table_names, truncate_summary, FileParseCache,
+    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "codex";
@@ -76,6 +77,68 @@ struct HistorySegment {
     session_id: String,
     end_byte_offset: Option<u64>,
 }
+
+#[derive(Clone)]
+struct RawCodexSession {
+    session_id: String,
+    project_dir: Option<String>,
+    created_at: Option<i64>,
+    last_active_at: Option<i64>,
+    first_user_message: Option<String>,
+    latest_user_message: Option<String>,
+    summary: Option<String>,
+    source_path: String,
+}
+
+impl RawCodexSession {
+    fn into_session_meta(self, thread_titles: &HashMap<String, String>) -> SessionMeta {
+        let title = thread_titles
+            .get(&self.session_id)
+            .cloned()
+            .or_else(|| {
+                self.latest_user_message
+                    .filter(|text| !text.trim().is_empty())
+            })
+            .or_else(|| {
+                self.first_user_message
+                    .map(|t| truncate_summary(&t, TITLE_MAX_CHARS))
+            })
+            .or_else(|| {
+                self.project_dir
+                    .as_deref()
+                    .and_then(path_basename)
+                    .map(|v| v.to_string())
+            });
+        let resume_command = is_safe_session_id(&self.session_id)
+            .then(|| format!("codex resume {}", self.session_id));
+
+        SessionMeta {
+            provider_id: PROVIDER_ID.to_string(),
+            session_id: self.session_id,
+            residual: false,
+            parent_session_id: None,
+            archived: false,
+            cleanup_pending: false,
+            sidebar_section: None,
+            title,
+            summary: self.summary,
+            project_dir: self.project_dir,
+            project_name: None,
+            created_at: self.created_at,
+            last_active_at: self.last_active_at,
+            source_path: Some(self.source_path),
+            resume_command,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedCodexFile {
+    descriptor: Option<RolloutDescriptor>,
+    session: Option<RawCodexSession>,
+}
+
+static PARSE_CACHE: LazyLock<FileParseCache<CachedCodexFile>> = LazyLock::new(FileParseCache::new);
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let roots = session_roots();
@@ -267,11 +330,7 @@ fn load_indexed_rollouts_from_paths(
 /// Remove the exact Codex desktop indexes that survive after a rollout file or
 /// real project directory has been deleted.  This is what prevents the Codex
 /// sidebar from keeping a grey, empty project entry.
-pub fn cleanup_after_delete(
-    session_id: &str,
-    project_dir: Option<&str>,
-    project_was_deleted: bool,
-) -> Result<(), String> {
+pub fn cleanup_after_delete(session_id: &str) -> Result<(), String> {
     let config_dir = codex_config_dir();
     let mut errors = Vec::new();
     if let Err(error) =
@@ -284,22 +343,13 @@ pub fn cleanup_after_delete(
     // 把索引库挪到了别处，那样清理会落到错误的库上、同时漏掉真正要清的那一个。
     // 这里在读配置失败时直接报错；调用方在本函数之后才删 log，所以失败是安全的。
     let config_text = read_codex_config_text()?;
-    if let Err(error) = cleanup_index_databases(
-        &config_dir,
-        &config_text,
-        session_id,
-        project_dir,
-        project_was_deleted,
-    ) {
+    if let Err(error) = cleanup_index_databases(&config_dir, &config_text, session_id) {
         errors.push(error);
     }
 
-    if let Err(error) = cleanup_global_state(
-        &config_dir.join(".codex-global-state.json"),
-        session_id,
-        project_dir,
-        project_was_deleted,
-    ) {
+    if let Err(error) =
+        cleanup_global_state(&config_dir.join(".codex-global-state.json"), session_id)
+    {
         errors.push(error);
     }
 
@@ -319,14 +369,10 @@ fn cleanup_index_databases(
     config_dir: &Path,
     config_text: &str,
     session_id: &str,
-    project_dir: Option<&str>,
-    project_was_deleted: bool,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     for state_db_path in codex_state_db_paths(config_dir, config_text) {
-        if let Err(error) =
-            cleanup_state_db(&state_db_path, session_id, project_dir, project_was_deleted)
-        {
+        if let Err(error) = cleanup_state_db(&state_db_path, session_id) {
             errors.push(error);
         }
 
@@ -334,7 +380,7 @@ fn cleanup_index_databases(
         // Leaving these rows behind after deleting the rollout produces a
         // ghost entry that opens with "no rollout found for thread id ...".
         let history_db_path = state_db_path.with_file_name(CODEX_THREAD_HISTORY_DB_FILENAME);
-        if let Err(error) = cleanup_state_db(&history_db_path, session_id, None, false) {
+        if let Err(error) = cleanup_state_db(&history_db_path, session_id) {
             errors.push(error);
         }
     }
@@ -390,17 +436,7 @@ fn cleanup_desktop_catalog_db(path: &Path, session_id: &str) -> Result<(), Strin
         .transaction()
         .map_err(|error| format!("无法开始清理 Codex 桌面索引：{error}"))?;
 
-    let table_names: std::collections::HashSet<String> = {
-        let mut stmt = tx
-            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-            .map_err(|error| error.to_string())?;
-        let names = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|error| error.to_string())?
-            .flatten()
-            .collect();
-        names
-    };
+    let table_names: HashSet<String> = sqlite_table_names(&tx)?.into_iter().collect();
 
     let mut catalog_changed = false;
     for table in [
@@ -411,9 +447,10 @@ fn cleanup_desktop_catalog_db(path: &Path, session_id: &str) -> Result<(), Strin
         if !table_names.contains(table) {
             continue;
         }
+        let quoted = quote_sqlite_identifier(table);
         let changed = tx
             .execute(
-                &format!("DELETE FROM {table} WHERE thread_id = ?1"),
+                &format!("DELETE FROM {quoted} WHERE thread_id = ?1"),
                 [session_id],
             )
             .map_err(|error| format!("清理 Codex 桌面表 {table} 失败：{error}"))?;
@@ -466,12 +503,7 @@ fn rewrite_session_index(path: &Path, session_id: &str) -> Result<(), String> {
     )
 }
 
-fn cleanup_state_db(
-    path: &Path,
-    session_id: &str,
-    project_dir: Option<&str>,
-    project_was_deleted: bool,
-) -> Result<(), String> {
+fn cleanup_state_db(path: &Path, session_id: &str) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
@@ -485,19 +517,9 @@ fn cleanup_state_db(
         .transaction()
         .map_err(|e| format!("无法开始清理 Codex 数据库：{e}"))?;
 
-    let table_names: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
-        rows
-    };
+    let table_names = sqlite_table_names(&tx)?;
     for table in &table_names {
-        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        let quoted = quote_sqlite_identifier(table);
         let columns: Vec<String> = {
             let mut stmt = tx
                 .prepare(&format!("PRAGMA table_info({quoted})"))
@@ -540,66 +562,11 @@ fn cleanup_state_db(
         }
     }
 
-    if project_was_deleted {
-        if let Some(project_dir) = project_dir {
-            cleanup_project_tables(&tx, &table_names, project_dir)?;
-        }
-    }
     tx.commit()
         .map_err(|e| format!("提交 Codex 索引清理失败：{e}"))
 }
 
-fn cleanup_project_tables(
-    conn: &rusqlite::Transaction<'_>,
-    tables: &[String],
-    project_dir: &str,
-) -> Result<(), String> {
-    if !tables.iter().any(|name| name == "project_roots")
-        || !tables.iter().any(|name| name == "projects")
-    {
-        return Ok(());
-    }
-    let target = normalized_path(project_dir);
-    let mut stmt = conn
-        .prepare("SELECT project_id, position, path FROM project_roots")
-        .map_err(|e| e.to_string())?;
-    let matches: Vec<(String, i64)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
-        })
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .filter(|(_, _, path)| normalized_path(path) == target)
-        .map(|(id, position, _)| (id, position))
-        .collect();
-    drop(stmt);
-    for (project_id, position) in matches {
-        conn.execute(
-            "DELETE FROM project_roots WHERE project_id=?1 AND position=?2",
-            rusqlite::params![project_id, position],
-        )
-        .map_err(|e| e.to_string())?;
-        let remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM project_roots WHERE project_id=?1",
-                [&project_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if remaining == 0 {
-            conn.execute("DELETE FROM projects WHERE id=?1", [&project_id])
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_global_state(
-    path: &Path,
-    session_id: &str,
-    project_dir: Option<&str>,
-    project_was_deleted: bool,
-) -> Result<(), String> {
+fn cleanup_global_state(path: &Path, session_id: &str) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
@@ -631,11 +598,6 @@ fn cleanup_global_state(
         ids.retain(|item| item.as_str() != Some(session_id));
     }
 
-    if project_was_deleted {
-        if let Some(project_dir) = project_dir {
-            remove_global_project(root, project_dir);
-        }
-    }
     let text = serde_json::to_string(&value).map_err(|e| e.to_string())? + "\n";
     atomic_write(path, text, &original)
 }
@@ -673,51 +635,6 @@ fn remove_thread_references(value: &mut Value, session_id: &str) {
         }
         _ => {}
     }
-}
-
-fn remove_global_project(root: &mut serde_json::Map<String, Value>, project_dir: &str) {
-    let target = normalized_path(project_dir);
-    let mut removed = Vec::new();
-    if let Some(projects) = root
-        .get_mut("local-projects")
-        .and_then(Value::as_object_mut)
-    {
-        for (id, project) in projects.iter_mut() {
-            if let Some(paths) = project.get_mut("rootPaths").and_then(Value::as_array_mut) {
-                let before = paths.len();
-                paths.retain(|path| {
-                    path.as_str()
-                        .is_none_or(|path| normalized_path(path) != target)
-                });
-                if before > 0 && paths.is_empty() {
-                    removed.push(id.clone());
-                }
-            }
-        }
-        for id in &removed {
-            projects.remove(id);
-        }
-    }
-    if let Some(order) = root.get_mut("project-order").and_then(Value::as_array_mut) {
-        order.retain(|id| {
-            id.as_str()
-                .is_none_or(|id| !removed.iter().any(|item| item == id))
-        });
-    }
-    for key in ["project-appearances", "sidebar-project-thread-orders"] {
-        if let Some(map) = root.get_mut(key).and_then(Value::as_object_mut) {
-            for id in &removed {
-                map.remove(id);
-            }
-        }
-    }
-}
-
-fn normalized_path(value: &str) -> String {
-    value
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
 }
 
 fn atomic_write(path: &Path, text: String, expected: &str) -> Result<(), String> {
@@ -759,14 +676,15 @@ fn scan_sessions_in_roots_with_context(
     }
 
     let files = preferred_rollout_files(files);
-    let descriptors = files
-        .iter()
-        .filter_map(|path| read_rollout_descriptor(path).ok())
-        .collect::<Vec<_>>();
-
-    let mut sessions = Vec::new();
-    for path in &files {
-        if let Some(mut meta) = parse_session_with_titles(path, thread_titles) {
+    let parsed = PARSE_CACHE.scan(files, parse_codex_file);
+    let mut descriptors = Vec::with_capacity(parsed.len());
+    let mut sessions = Vec::with_capacity(parsed.len());
+    for entry in parsed {
+        if let Some(descriptor) = entry.descriptor {
+            descriptors.push(descriptor);
+        }
+        if let Some(raw) = entry.session {
+            let mut meta = raw.into_session_meta(thread_titles);
             meta.sidebar_section = project_context
                 .thread_sections
                 .get(&meta.session_id)
@@ -965,14 +883,29 @@ fn descriptor_rollout_length(path: &Path) -> Result<u64, String> {
     rollout_length(path, MAX_MESSAGES_FILE_BYTES)
 }
 
-fn rollout_head_tail(path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+struct RolloutHeadTail {
+    head: Vec<String>,
+    tail: Vec<String>,
+    known_len: Option<u64>,
+}
+
+fn rollout_head_tail_with_len(path: &Path) -> Result<RolloutHeadTail, String> {
     if !is_compressed_rollout(path) {
-        return read_head_tail_lines(path, 10, 300).map_err(|e| e.to_string());
+        let len = path
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| e.to_string())?;
+        let (head, tail) = read_head_tail_lines(path, 10, 300).map_err(|e| e.to_string())?;
+        return Ok(RolloutHeadTail {
+            head,
+            tail,
+            known_len: Some(len),
+        });
     }
     let mut reader = BufReader::new(open_rollout(path)?.take(MAX_MESSAGES_FILE_BYTES + 1));
     let mut head = Vec::new();
     let mut tail = std::collections::VecDeque::new();
-    let mut total = 0;
+    let mut total = 0u64;
     loop {
         let mut line = String::new();
         let n = reader
@@ -996,14 +929,20 @@ fn rollout_head_tail(path: &Path) -> Result<(Vec<String>, Vec<String>), String> 
             tail.pop_front();
         }
     }
-    Ok((head, tail.into_iter().collect()))
+    Ok(RolloutHeadTail {
+        head,
+        tail: tail.into_iter().collect(),
+        known_len: Some(total),
+    })
 }
 
-fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
-    let reader = BufReader::new(open_rollout(path)?.take(4 * 1024 * 1024));
-
-    for line in reader.lines().take(10) {
-        let line = line.map_err(|error| error.to_string())?;
+fn parse_descriptor_from_head_lines<'a>(
+    path: &Path,
+    lines: impl IntoIterator<Item = Result<std::borrow::Cow<'a, str>, String>>,
+    known_len: Option<u64>,
+) -> Result<RolloutDescriptor, String> {
+    for line in lines {
+        let line = line?;
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(_) => continue,
@@ -1048,7 +987,10 @@ fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
                 })
             }
         };
-        let file_len = descriptor_rollout_length(path)?;
+        let file_len = match known_len {
+            Some(len) => len,
+            None => descriptor_rollout_length(path)?,
+        };
         let rollout_id = rollout_instance_id(path, &session_id);
         return Ok(RolloutDescriptor {
             path: path.to_path_buf(),
@@ -1062,6 +1004,18 @@ fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
     }
 
     Err(format!("无法识别 Codex 会话元数据：{}", path.display()))
+}
+
+fn read_rollout_descriptor(path: &Path) -> Result<RolloutDescriptor, String> {
+    let reader = BufReader::new(open_rollout(path)?.take(4 * 1024 * 1024));
+    parse_descriptor_from_head_lines(
+        path,
+        reader
+            .lines()
+            .take(10)
+            .map(|line| line.map(std::borrow::Cow::Owned).map_err(|e| e.to_string())),
+        None,
+    )
 }
 
 fn rollout_instance_id(path: &Path, session_id: &str) -> String {
@@ -1511,12 +1465,15 @@ fn load_thread_titles_from_paths(
     db_paths: &[PathBuf],
 ) -> HashMap<String, String> {
     let mut titles = HashMap::new();
+    let mut explicit_batches = Vec::with_capacity(db_paths.len());
     for db_path in db_paths {
-        titles.extend(load_thread_titles_from_db(db_path));
+        let (auto, explicit) = load_thread_titles_from_db_pair(db_path);
+        titles.extend(auto);
+        explicit_batches.push(explicit);
     }
     titles.extend(load_thread_titles_from_session_index(session_index_path));
-    for db_path in db_paths {
-        titles.extend(load_thread_titles_from_db_mode(db_path, true));
+    for explicit in explicit_batches {
+        titles.extend(explicit);
     }
     titles
 }
@@ -1557,13 +1514,18 @@ fn load_thread_titles_from_session_index(index_path: &Path) -> HashMap<String, S
     titles
 }
 
+#[cfg(test)]
 fn load_thread_titles_from_db(db_path: &Path) -> HashMap<String, String> {
-    load_thread_titles_from_db_mode(db_path, false)
+    let (mut titles, explicit) = load_thread_titles_from_db_pair(db_path);
+    titles.extend(explicit);
+    titles
 }
 
-fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<String, String> {
+fn load_thread_titles_from_db_pair(
+    db_path: &Path,
+) -> (HashMap<String, String>, HashMap<String, String>) {
     if !db_path.exists() {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
 
     let conn = match Connection::open_with_flags(
@@ -1576,7 +1538,7 @@ fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<
                 "Failed to open Codex state database {}: {err}",
                 db_path.display()
             );
-            return HashMap::new();
+            return (HashMap::new(), HashMap::new());
         }
     };
     // Codex keeps this DB open and write-locked while running; without a busy
@@ -1586,7 +1548,7 @@ fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<
             "Failed to set Codex state database busy timeout for {}: {err}",
             db_path.display()
         );
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
 
     // Mirror Codex's own `distinct_thread_metadata_title`: keep a title only
@@ -1607,20 +1569,15 @@ fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<
     } else {
         "NULLIF(TRIM(title), '')"
     };
-    let expression = if names_only {
-        if columns.contains("name") {
-            "NULLIF(TRIM(name), '')".to_string()
-        } else {
-            // 旧 schema 只有 title；有效的显式标题仍高于旧 JSON 索引。
-            // 新 schema 的 title 是自动标题，只有 name 才是显式覆盖。
-            generated.to_string()
-        }
-    } else if columns.contains("name") {
-        format!("COALESCE(NULLIF(TRIM(name), ''), {generated})")
+    let query = if columns.contains("name") {
+        format!(
+            "SELECT id, {generated}, NULLIF(TRIM(name), '') FROM threads WHERE ({generated}) IS NOT NULL OR NULLIF(TRIM(name), '') IS NOT NULL"
+        )
     } else {
-        generated.to_string()
+        // 旧 schema 只有 title；有效的显式标题仍高于旧 JSON 索引。
+        // 新 schema 的 title 是自动标题，只有 name 才是显式覆盖。
+        format!("SELECT id, NULL, {generated} FROM threads WHERE ({generated}) IS NOT NULL")
     };
-    let query = format!("SELECT id, {expression} FROM threads WHERE {expression} IS NOT NULL");
     let mut stmt = match conn.prepare(&query) {
         Ok(stmt) => stmt,
         Err(err) => {
@@ -1628,14 +1585,15 @@ fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<
                 "Failed to prepare Codex thread title query for {}: {err}",
                 db_path.display()
             );
-            return HashMap::new();
+            return (HashMap::new(), HashMap::new());
         }
     };
 
     let rows = match stmt.query_map([], |row| {
         let id: String = row.get(0)?;
-        let title: String = row.get(1)?;
-        Ok((id, title))
+        let auto_title: Option<String> = row.get(1)?;
+        let explicit_name: Option<String> = row.get(2)?;
+        Ok((id, auto_title, explicit_name))
     }) {
         Ok(rows) => rows,
         Err(err) => {
@@ -1643,21 +1601,33 @@ fn load_thread_titles_from_db_mode(db_path: &Path, names_only: bool) -> HashMap<
                 "Failed to query Codex thread titles from {}: {err}",
                 db_path.display()
             );
-            return HashMap::new();
+            return (HashMap::new(), HashMap::new());
         }
     };
 
-    rows.flatten()
-        .filter_map(|(id, title)| {
-            let id = id.trim();
-            let title = title.trim();
-            if id.is_empty() || title.is_empty() {
-                None
-            } else {
-                Some((id.to_string(), title.to_string()))
-            }
-        })
-        .collect()
+    let mut auto = HashMap::new();
+    let mut explicit = HashMap::new();
+    for (id, auto_title, explicit_name) in rows.flatten() {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(title) = auto_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            auto.insert(id.to_string(), title.to_string());
+        }
+        if let Some(name) = explicit_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            explicit.insert(id.to_string(), name.to_string());
+        }
+    }
+    (auto, explicit)
 }
 
 /// 正文实际依赖的文件：分页历史链的每一段，以及该段只读到哪个字节偏移
@@ -1811,13 +1781,41 @@ pub fn validate_delete(path: &Path, session_id: &str) -> Result<(), String> {
 /// A selected child must be deleted before a selected parent. Unselected
 /// dependants are still protected by the normal preflight at execution time.
 pub fn deletion_order(requests: &[DeleteSessionRequest]) -> Vec<usize> {
-    let descriptors = requests
+    let codex_paths = requests
         .iter()
-        .filter(|request| request.provider_id == "codex")
-        .flat_map(|request| rollout_descriptors_for_path(Path::new(&request.source_path)))
-        .map(|descriptor| descriptor.path)
-        .collect();
-    deletion_order_with_descriptors(requests, &descriptors_for_files(descriptors))
+        .filter(|request| request.provider_id == PROVIDER_ID)
+        .map(|request| Path::new(&request.source_path))
+        .collect::<Vec<_>>();
+    if codex_paths.is_empty() {
+        return (0..requests.len()).collect();
+    }
+    let mut roots = session_roots();
+    let mut canonical_roots = roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect::<Vec<_>>();
+    for path in codex_paths {
+        let canonical_path = path.canonicalize().ok();
+        if !canonical_roots.iter().any(|root| {
+            canonical_path
+                .as_ref()
+                .is_some_and(|resolved| resolved.starts_with(root))
+        }) {
+            if let Some(parent) = path.parent().map(Path::to_path_buf) {
+                if let Ok(resolved) = parent.canonicalize() {
+                    canonical_roots.push(resolved);
+                }
+                if !roots.contains(&parent) {
+                    roots.push(parent);
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for root in roots {
+        collect_jsonl_files(&root, &mut files);
+    }
+    deletion_order_with_descriptors(requests, &descriptors_for_files(files))
 }
 
 fn deletion_order_with_descriptors(
@@ -2163,13 +2161,21 @@ pub(crate) fn prepare_deletion_plan(
 }
 
 pub(crate) fn validate_deletion_plan(plan: &DeletionPlan, roots: &[PathBuf]) -> Result<(), String> {
+    let descriptors = rollout_descriptors_checked(roots)?;
+    validate_deletion_plan_with_descriptors(plan, roots, &descriptors)
+}
+
+fn validate_deletion_plan_with_descriptors(
+    plan: &DeletionPlan,
+    roots: &[PathBuf],
+    descriptors: &[RolloutDescriptor],
+) -> Result<(), String> {
     if !is_safe_session_id(&plan.session_id)
         || plan.next_unit > plan.units.len()
         || plan.roots != roots
     {
         return Err("Codex saved deletion plan/root mismatch".into());
     }
-    let descriptors = rollout_descriptors_checked(roots)?;
     // An index-only plan froze absence, not permission to remove the index of
     // a valid transcript restored or created before a retry.
     if plan.units.is_empty() {
@@ -2238,7 +2244,7 @@ pub(crate) fn validate_deletion_plan(plan: &DeletionPlan, roots: &[PathBuf]) -> 
         .iter()
         .filter(|d| d.history_base.is_some() && !remaining.contains(&d.key))
     {
-        let chain = resolve_paginated_chain_from_descriptors(&descriptor.path, &descriptors)?;
+        let chain = resolve_paginated_chain_from_descriptors(&descriptor.path, descriptors)?;
         if chain
             .iter()
             .any(|segment| remaining.contains(&rollout_path_key(&segment.path)))
@@ -2265,9 +2271,8 @@ pub(crate) fn validate_deletion_index_decision(
     Ok(())
 }
 
-pub(crate) fn execute_deletion_plan<C, D, S>(
+pub(crate) fn execute_deletion_plan_validated<C, D, S>(
     plan: &mut DeletionPlan,
-    roots: &[PathBuf],
     mut cleanup: C,
     mut remove: D,
     mut save: S,
@@ -2277,7 +2282,6 @@ where
     D: FnMut(&Path) -> Result<(), String>,
     S: FnMut(&DeletionPlan) -> Result<(), String>,
 {
-    validate_deletion_plan(plan, roots)?;
     // index_done is a checkpoint, not proof about today's configured databases.
     // Cleanup resolves and rechecks the effective index each time; rerunning it
     // is idempotent and must precede even the remaining frozen file removals.
@@ -2299,6 +2303,23 @@ where
         save(plan)?;
     }
     Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn execute_deletion_plan<C, D, S>(
+    plan: &mut DeletionPlan,
+    roots: &[PathBuf],
+    cleanup: C,
+    remove: D,
+    save: S,
+) -> Result<(), String>
+where
+    C: FnMut(&str) -> Result<(), String>,
+    D: FnMut(&Path) -> Result<(), String>,
+    S: FnMut(&DeletionPlan) -> Result<(), String>,
+{
+    validate_deletion_plan(plan, roots)?;
+    execute_deletion_plan_validated(plan, cleanup, remove, save)
 }
 
 pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
@@ -2363,16 +2384,43 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_with_titles(path, &HashMap::new())
 }
 
+#[cfg(test)]
 fn parse_session_with_titles(
     path: &Path,
     thread_titles: &HashMap<String, String>,
 ) -> Option<SessionMeta> {
-    let (head, tail) = rollout_head_tail(path)
-        .map_err(|error| {
+    parse_codex_file(path)
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.session)
+        .map(|raw| raw.into_session_meta(thread_titles))
+}
+
+fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
+    let RolloutHeadTail {
+        head,
+        tail,
+        known_len,
+    } = match rollout_head_tail_with_len(path) {
+        Ok(parts) => parts,
+        Err(error) => {
             super::utils::scan_warning(format!("无法读取 {}：{error}", path.display()));
-            error
-        })
-        .ok()?;
+            return match read_rollout_descriptor(path) {
+                Ok(descriptor) => Ok(Some(CachedCodexFile {
+                    descriptor: Some(descriptor),
+                    session: None,
+                })),
+                Err(_) => Err(error),
+            };
+        }
+    };
+    let descriptor = parse_descriptor_from_head_lines(
+        path,
+        head.iter()
+            .map(|line| Ok(std::borrow::Cow::Borrowed(line.as_str()))),
+        known_len,
+    )
+    .ok();
 
     let mut session_id: Option<String> = None;
     let mut project_dir: Option<String> = None;
@@ -2391,7 +2439,10 @@ fn parse_session_with_titles(
         if value.get("type").and_then(Value::as_str) == Some("session_meta") {
             if let Some(payload) = value.get("payload") {
                 if is_subagent_source(payload.get("source")) {
-                    return None;
+                    return Ok(Some(CachedCodexFile {
+                        descriptor,
+                        session: None,
+                    }));
                 }
                 if session_id.is_none() {
                     session_id = payload
@@ -2470,44 +2521,26 @@ fn parse_session_with_titles(
         }
     }
 
-    let session_id = session_id.or_else(|| infer_session_id_from_filename(path));
-    let session_id = session_id?;
+    let Some(session_id) = session_id.or_else(|| infer_session_id_from_filename(path)) else {
+        return Ok(descriptor.map(|descriptor| CachedCodexFile {
+            descriptor: Some(descriptor),
+            session: None,
+        }));
+    };
 
-    // Codex's sidebar uses the stored thread title.  Keep the latest complete
-    // user message as the summary, but do not replace the visible sidebar title
-    // with it.
-    let title = thread_titles
-        .get(&session_id)
-        .cloned()
-        .or_else(|| latest_user_message.filter(|text| !text.trim().is_empty()))
-        .or_else(|| first_user_message.map(|t| truncate_summary(&t, TITLE_MAX_CHARS)))
-        .or_else(|| {
-            project_dir
-                .as_deref()
-                .and_then(path_basename)
-                .map(|v| v.to_string())
-        });
-
-    let summary = summary.map(|text| truncate_summary(&text, 160));
-
-    Some(SessionMeta {
-        provider_id: PROVIDER_ID.to_string(),
-        session_id: session_id.clone(),
-        residual: false,
-        parent_session_id: None,
-        archived: false,
-        cleanup_pending: false,
-        sidebar_section: None,
-        title,
-        summary,
-        project_dir,
-        project_name: None,
-        created_at,
-        last_active_at,
-        source_path: Some(path.to_string_lossy().to_string()),
-        resume_command: is_safe_session_id(&session_id)
-            .then(|| format!("codex resume {session_id}")),
-    })
+    Ok(Some(CachedCodexFile {
+        descriptor,
+        session: Some(RawCodexSession {
+            session_id,
+            project_dir,
+            created_at,
+            last_active_at,
+            first_user_message,
+            latest_user_message,
+            summary: summary.map(|text| truncate_summary(&text, 160)),
+            source_path: path.to_string_lossy().to_string(),
+        }),
+    }))
 }
 
 fn is_subagent_source(source: Option<&Value>) -> bool {
@@ -2809,7 +2842,7 @@ mod tests {
         let titles = load_thread_titles_from_paths(&index, std::slice::from_ref(&path));
         assert_eq!(titles["a"], "explicit");
         assert_eq!(titles["b"], "index b");
-        cleanup_state_db(&path, "a", None, false).unwrap();
+        cleanup_state_db(&path, "a").unwrap();
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM thread_spawn_edges", [], |r| r
                 .get::<_, i64>(0))
@@ -2839,7 +2872,7 @@ mod tests {
             "sqlite_home = {}",
             serde_json::to_string(&configured.to_string_lossy()).unwrap()
         );
-        cleanup_index_databases(temp.path(), &config, "same", None, false).unwrap();
+        cleanup_index_databases(temp.path(), &config, "same").unwrap();
         for (path, count) in [(&old, 1), (&current, 0)] {
             assert_eq!(
                 Connection::open(path)
@@ -3154,24 +3187,23 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cleanup_global_state_removes_thread_and_deleted_project() {
+    fn cleanup_global_state_removes_thread_assignment_and_keeps_project() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join(".codex-global-state.json");
         std::fs::write(
             &path,
-            r#"{"thread-project-assignments":{"thread-1":{"projectId":"project-1"}},"local-projects":{"project-1":{"rootPaths":["C:\\work\\gone"]}},"project-order":["project-1"]}"#,
+            r#"{"thread-project-assignments":{"thread-1":{"projectId":"project-1"}},"local-projects":{"project-1":{"rootPaths":["C:\\work\\kept"]}},"project-order":["project-1"]}"#,
         )
         .expect("write global state");
 
-        cleanup_global_state(&path, "thread-1", Some(r"C:\work\gone"), true)
-            .expect("clean global state");
+        cleanup_global_state(&path, "thread-1").expect("clean global state");
 
         let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert!(value["thread-project-assignments"]
             .get("thread-1")
             .is_none());
-        assert!(value["local-projects"].get("project-1").is_none());
-        assert_eq!(value["project-order"].as_array().unwrap().len(), 0);
+        assert!(value["local-projects"].get("project-1").is_some());
+        assert_eq!(value["project-order"], serde_json::json!(["project-1"]));
     }
 
     #[test]
@@ -3209,8 +3241,7 @@ mod tests {
         )
         .expect("write global state");
 
-        cleanup_global_state(&path, "thread-1", Some(r"C:\work\kept"), false)
-            .expect("clean global state");
+        cleanup_global_state(&path, "thread-1").expect("clean global state");
 
         let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let serialized = serde_json::to_string(&value).unwrap();
@@ -3288,8 +3319,7 @@ mod tests {
             .expect("seed desktop database");
         drop(desktop);
 
-        cleanup_index_databases(temp.path(), "", "thread-1", None, false)
-            .expect("clean Codex indexes");
+        cleanup_index_databases(temp.path(), "", "thread-1").expect("clean Codex indexes");
 
         let state = Connection::open(state_path).expect("reopen state database");
         let remaining_threads: Vec<String> = state

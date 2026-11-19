@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -9,7 +10,8 @@ use serde_json::Value;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    extract_text, parse_timestamp_to_ms, path_basename, truncate_summary, TITLE_MAX_CHARS,
+    extract_text, order_selected_children, parse_timestamp_to_ms, path_basename, truncate_summary,
+    FileParseCache, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "pi";
@@ -73,6 +75,14 @@ struct SessionSummary {
     explicit_name: Option<Option<String>>,
     last_active_at: Option<i64>,
 }
+
+#[derive(Clone)]
+struct CachedPiSession {
+    meta: SessionMeta,
+    parent_session: Option<String>,
+}
+
+static PARSE_CACHE: LazyLock<FileParseCache<CachedPiSession>> = LazyLock::new(FileParseCache::new);
 
 /// Pi keeps a relative `sessionDir` relative through SessionManager creation;
 /// its file operations therefore depend on the launching process cwd. A global
@@ -231,40 +241,39 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 fn scan_sessions_in_root(root: &Path, layout: SessionLayout) -> Vec<SessionMeta> {
     let mut files = Vec::new();
     collect_jsonl_files(root, layout, &mut files, true);
-    let mut sessions: Vec<_> = files
-        .into_iter()
-        .filter_map(|path| match parse_session(&path) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                super::utils::scan_warning(error.clone());
-                log::debug!("Skipping invalid Pi session {}: {error}", path.display());
-                None
-            }
-        })
-        .collect();
+    let parsed = PARSE_CACHE.scan(files, |path| match parse_session_with_provenance(path) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) => {
+            super::utils::scan_warning(error.clone());
+            log::debug!("Skipping invalid Pi session {}: {error}", path.display());
+            Err(error)
+        }
+    });
     // parentSession is provenance, not a runtime dependency. Resolve lineage
     // only against files already discovered within this root; never open it.
     let lineage_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let by_path: HashMap<_, _> = sessions
+    let by_path: HashMap<_, _> = parsed
         .iter()
-        .filter_map(|session| {
-            session
+        .filter_map(|entry| {
+            entry
+                .meta
                 .source_path
                 .as_deref()
-                .map(|source| (PathBuf::from(source), session.session_id.clone()))
+                .map(|source| (PathBuf::from(source), entry.meta.session_id.clone()))
         })
         .collect();
-    for session in &mut sessions {
-        if let Some(source) = session.source_path.as_deref() {
-            session.parent_session_id = read_session_header(Path::new(source))
-                .ok()
-                .and_then(|header| header.parent_session)
-                .and_then(|parent| lineage_path(&parent, &lineage_root))
+    parsed
+        .into_iter()
+        .map(|mut entry| {
+            entry.meta.parent_session_id = entry
+                .parent_session
+                .as_deref()
+                .and_then(|parent| lineage_path(parent, &lineage_root))
                 .and_then(|parent| by_path.get(&parent).cloned())
-                .filter(|parent| parent != &session.session_id);
-        }
-    }
-    sessions
+                .filter(|parent| parent != &entry.meta.session_id);
+            entry.meta
+        })
+        .collect()
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -385,44 +394,37 @@ fn deletion_order_with_descriptors(
     initial: &[usize],
     descriptors: &[SessionDescriptor],
 ) -> Vec<usize> {
+    let parent_by_path = descriptors
+        .iter()
+        .filter_map(|descriptor| {
+            descriptor
+                .parent_path
+                .as_ref()
+                .map(|parent| (descriptor.path.as_path(), parent))
+        })
+        .collect::<HashMap<_, _>>();
     let selected = requests
         .iter()
         .enumerate()
         .filter(|(_, request)| request.provider_id == PROVIDER_ID)
         .filter_map(|(index, request)| {
-            Path::new(&request.source_path)
-                .canonicalize()
-                .ok()
-                .map(|path| (path, index))
+            let path = Path::new(&request.source_path).canonicalize().ok()?;
+            let parent = parent_by_path
+                .get(path.as_path())
+                .map(|parent| parent.to_string_lossy().into_owned());
+            Some((index, path.to_string_lossy().into_owned(), parent))
         })
-        .collect::<HashMap<_, _>>();
-    let mut remaining = initial.to_vec();
-    let mut ordered = Vec::with_capacity(initial.len());
-    while !remaining.is_empty() {
-        let ready = remaining.iter().position(|candidate| {
-            let Some(parent_path) = requests
-                .get(*candidate)
-                .and_then(|request| Path::new(&request.source_path).canonicalize().ok())
-            else {
-                return true;
-            };
-            !descriptors.iter().any(|child| {
-                child.parent_path.as_deref() == Some(parent_path.as_path())
-                    && selected
-                        .get(&child.path)
-                        .is_some_and(|child_index| remaining.contains(child_index))
-            })
-        });
-        let Some(position) = ready else {
-            ordered.extend(remaining);
-            break;
-        };
-        ordered.push(remaining.remove(position));
-    }
-    ordered
+        .collect::<Vec<_>>();
+    order_selected_children(&selected, initial)
 }
 
 pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> Vec<usize> {
+    if !requests
+        .iter()
+        .any(|request| request.provider_id == PROVIDER_ID)
+    {
+        return initial.to_vec();
+    }
     let SessionRootResolution::Available { root, layout } = resolve_session_root() else {
         return initial.to_vec();
     };
@@ -476,7 +478,7 @@ fn layout_for_current_root(root: &Path) -> Result<SessionLayout, String> {
     Ok(layout)
 }
 
-fn parse_session(path: &Path) -> Result<SessionMeta, String> {
+fn parse_session_with_provenance(path: &Path) -> Result<CachedPiSession, String> {
     let source = path
         .canonicalize()
         .map_err(|error| format!("Failed to resolve Pi session {}: {error}", path.display()))?;
@@ -511,29 +513,38 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         .map(|message| truncate_summary(message, 160))
         .filter(|message| !message.is_empty());
     let residual = false; // parentSession is fork provenance, even when missing.
-    Ok(SessionMeta {
-        provider_id: PROVIDER_ID.to_string(),
-        session_id: header.id,
-        residual,
-        // Scan resolves this provenance path to an ID only within discovered files.
-        parent_session_id: None,
-        archived: false,
-        cleanup_pending: false,
-        sidebar_section: None,
-        title,
-        summary: summary_text,
-        project_dir: (!header.cwd.trim().is_empty()).then(|| header.cwd.clone()),
-        project_name: None,
-        created_at: header.timestamp,
-        last_active_at: summary.last_active_at.or(header.timestamp),
-        source_path: Some(source_path.clone()),
-        resume_command: (!residual).then(|| {
-            format!(
-                "pi --session {}",
-                crate::session_manager::terminal::shell_escape(&source_path)
-            )
-        }),
+    let parent_session = header.parent_session;
+    Ok(CachedPiSession {
+        meta: SessionMeta {
+            provider_id: PROVIDER_ID.to_string(),
+            session_id: header.id,
+            residual,
+            // Scan resolves this provenance path to an ID only within discovered files.
+            parent_session_id: None,
+            archived: false,
+            cleanup_pending: false,
+            sidebar_section: None,
+            title,
+            summary: summary_text,
+            project_dir: (!header.cwd.trim().is_empty()).then(|| header.cwd.clone()),
+            project_name: None,
+            created_at: header.timestamp,
+            last_active_at: summary.last_active_at.or(header.timestamp),
+            source_path: Some(source_path.clone()),
+            resume_command: (!residual).then(|| {
+                format!(
+                    "pi --session {}",
+                    crate::session_manager::terminal::shell_escape(&source_path)
+                )
+            }),
+        },
+        parent_session,
     })
+}
+
+#[cfg(test)]
+fn parse_session(path: &Path) -> Result<SessionMeta, String> {
+    parse_session_with_provenance(path).map(|entry| entry.meta)
 }
 
 /// Header-only fallback for oversized files: never consume the body. A bounded

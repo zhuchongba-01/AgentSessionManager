@@ -69,6 +69,8 @@ async fn get_message_content(
     .map_err(|error| format!("读取消息失败：{error}"))?
 }
 
+static STREAM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 分块流式读取会话：依次下发 `Header` → 若干 `Messages` → `Done`。
 ///
 /// 大会话不再一次性序列化成单个 IPC 负载，前端可以边到边渲染。读取失败时先发一个
@@ -79,13 +81,24 @@ async fn stream_session_messages(
     #[allow(non_snake_case)] sourcePath: String,
     #[allow(non_snake_case)] onChunk: tauri::ipc::Channel<session_manager::wire::TranscriptChunk>,
 ) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+
+    let generation = STREAM_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     tauri::async_runtime::spawn_blocking(move || {
         use session_manager::cache::chunk_ranges;
         use session_manager::wire::{wire_range, TranscriptChunk};
 
+        let is_superseded = || STREAM_GENERATION.load(Ordering::SeqCst) != generation;
+        if is_superseded() {
+            return Err("会话读取已取消".to_string());
+        }
+
         let transcript = match session_manager::load_transcript(&providerId, &sourcePath) {
             Ok(transcript) => transcript,
             Err(message) => {
+                if is_superseded() {
+                    return Err("会话读取已取消".to_string());
+                }
                 let _ = onChunk.send(TranscriptChunk::Error {
                     message: message.clone(),
                 });
@@ -94,6 +107,9 @@ async fn stream_session_messages(
         };
 
         let send = |chunk: TranscriptChunk| {
+            if is_superseded() {
+                return Err("会话读取已取消".to_string());
+            }
             onChunk
                 .send(chunk)
                 .map_err(|error| format!("下发会话分块失败：{error}"))

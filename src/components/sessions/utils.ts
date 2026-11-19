@@ -33,7 +33,14 @@ const getCodexRequestHeadingPayload = (lineText: string) => {
   return suffix.replace(/^[:：\-—\s]+/, "").trim();
 };
 
-const extractCodexPromptFromIdeContext = (content: string) => {
+export interface SplitCodexIdeContext {
+  context: string;
+  prompt: string;
+}
+
+export const splitCodexIdeContext = (
+  content: string,
+): SplitCodexIdeContext | null => {
   const trimmed = content.trim();
   if (!trimmed.startsWith(CODEX_IDE_CONTEXT_PREFIX)) {
     return null;
@@ -45,25 +52,34 @@ const extractCodexPromptFromIdeContext = (content: string) => {
   // Trade-off: if the request body itself repeats the heading, the preview
   // truncates to its trailing part (rare; see sessionUtils.test.ts).
   const lines = trimmed.replace(/\r\n/g, "\n").split("\n");
-  let prompt: string | null = null;
+  let match: { lineIndex: number; inlinePrompt: string } | null = null;
   for (const [index, line] of lines.entries()) {
     const inlinePrompt = getCodexRequestHeadingPayload(line.trim());
-    if (inlinePrompt === null) continue;
-
-    if (inlinePrompt) {
-      prompt = inlinePrompt;
-      continue;
+    if (inlinePrompt !== null) {
+      match = { lineIndex: index, inlinePrompt };
     }
-
-    const followingPrompt = lines
-      .slice(index + 1)
-      .join("\n")
-      .trim();
-    prompt = followingPrompt || null;
   }
+  if (!match) return null;
 
-  return prompt;
+  const prompt = match.inlinePrompt
+    ? match.inlinePrompt
+    : lines
+        .slice(match.lineIndex + 1)
+        .join("\n")
+        .trim();
+  if (!prompt) return null;
+
+  const contextLines = match.inlinePrompt
+    ? lines.slice(0, match.lineIndex)
+    : lines.slice(0, match.lineIndex + 1);
+  const context = contextLines.join("\n").trim();
+  if (!context) return null;
+
+  return { context, prompt };
 };
+
+const extractCodexPromptFromIdeContext = (content: string) =>
+  splitCodexIdeContext(content)?.prompt ?? null;
 
 export const getSessionKey = (session: SessionMeta) =>
   `${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`;

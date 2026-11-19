@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import type { SessionMeta } from "@/types";
 import { Button } from "@/components/ui/button";
 
@@ -12,6 +13,7 @@ export function SessionRows({
   sessions: SessionMeta[];
   renderItem: (session: SessionMeta) => ReactNode;
 }) {
+  const { t } = useTranslation();
   const [page, setPage] = useState(0);
   const lastPage = Math.max(0, Math.ceil(sessions.length / PAGE_SIZE) - 1);
   const visiblePage = Math.min(page, lastPage);
@@ -23,7 +25,9 @@ export function SessionRows({
         .map(renderItem)}
       {lastPage > 0 && (
         <nav
-          aria-label="会话分页"
+          aria-label={t("sessionManager.paginationNav", {
+            defaultValue: "会话分页",
+          })}
           className="flex items-center justify-between gap-2 p-2 text-xs"
         >
           <Button
@@ -32,10 +36,15 @@ export function SessionRows({
             disabled={visiblePage === 0}
             onClick={() => setPage(visiblePage - 1)}
           >
-            上一页
+            {t("sessionManager.prevPage", { defaultValue: "上一页" })}
           </Button>
           <span>
-            {visiblePage + 1} / {lastPage + 1} 页 · {sessions.length} 条
+            {t("sessionManager.paginationStatus", {
+              defaultValue: "{{current}} / {{total}} 页 · {{count}} 条",
+              current: visiblePage + 1,
+              total: lastPage + 1,
+              count: sessions.length,
+            })}
           </span>
           <Button
             size="sm"
@@ -43,7 +52,7 @@ export function SessionRows({
             disabled={visiblePage === lastPage}
             onClick={() => setPage(visiblePage + 1)}
           >
-            下一页
+            {t("sessionManager.nextPage", { defaultValue: "下一页" })}
           </Button>
         </nav>
       )}
