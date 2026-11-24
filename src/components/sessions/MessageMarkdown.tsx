@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { Check, Copy } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { EMPTY_HIGHLIGHT_TERMS, highlightText } from "./highlightText";
@@ -18,6 +19,8 @@ const HR_RE = /^ {0,3}(?:---+|___+|\*\*\*+)\s*$/;
 const QUOTE_RE = /^ {0,3}>\s?(.*)$/;
 const UNORDERED_LIST_RE = /^ {0,3}[-*+]\s+(.+)$/;
 const ORDERED_LIST_RE = /^ {0,3}\d+[.)]\s+(.+)$/;
+const TABLE_SEP_CELL_RE = /^:?-{3,}:?$/;
+const TASK_ITEM_RE = /^\[([ xX])\]\s+(.+)$/;
 
 const RICH_MARKDOWN_PATTERNS = [
   /^ {0,3}(?:`{3,}|~{3,})/m,
@@ -27,6 +30,9 @@ const RICH_MARKDOWN_PATTERNS = [
   /^ {0,3}(?:---+|___+|\*\*\*+)\s*$/m,
   /(`+)[^`\n].*?\1/,
   /\*\*[^*\n]+?\*\*/,
+  /~~[^~\n]+?~~/,
+  /\[[^\]\n]+\]\(https:\/\/[^)\s]+\)/,
+  /^ {0,3}\|.*\|.*\n {0,3}\|?[\s:-]+\|/m,
 ];
 
 export function hasRichMarkdown(content: string): boolean {
@@ -77,6 +83,40 @@ function matchInlineCode(
   return { unmatchedEnd: openEnd };
 }
 
+function matchMarkdownLink(
+  text: string,
+  pos: number,
+): { label: string; url: string; nextPos: number } | null {
+  if (text[pos] !== "[") return null;
+  let bracketClose = pos + 1;
+  while (bracketClose < text.length && text[bracketClose] !== "]") {
+    if (text[bracketClose] === "\n" || text[bracketClose] === "[") return null;
+    bracketClose += 1;
+  }
+  if (bracketClose >= text.length || text[bracketClose + 1] !== "(") {
+    return null;
+  }
+  const label = text.slice(pos + 1, bracketClose).trim();
+  if (!label) return null;
+
+  const urlStart = bracketClose + 2;
+  let urlEnd = urlStart;
+  while (urlEnd < text.length && text[urlEnd] !== ")") {
+    if (/\s/.test(text[urlEnd])) return null;
+    urlEnd += 1;
+  }
+  if (urlEnd >= text.length) return null;
+  const rawUrl = text.slice(urlStart, urlEnd).trim();
+  if (!rawUrl.startsWith("https://")) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:") return null;
+  } catch {
+    return null;
+  }
+  return { label, url: rawUrl, nextPos: urlEnd + 1 };
+}
+
 function renderInlineCodeOnly(text: string, terms: string[]): ReactNode {
   if (!text.includes("`")) {
     return highlightText(text, terms);
@@ -116,8 +156,17 @@ function renderInlineCodeOnly(text: string, terms: string[]): ReactNode {
   return nodes.length === 1 ? nodes[0] : nodes;
 }
 
-function renderInline(text: string, terms: string[]): ReactNode {
-  if (!text.includes("`") && !text.includes("**")) {
+function renderInline(
+  text: string,
+  terms: string[],
+  onOpenUrl?: (url: string) => void,
+): ReactNode {
+  if (
+    !text.includes("`") &&
+    !text.includes("*") &&
+    !text.includes("~~") &&
+    !text.includes("[")
+  ) {
     return highlightText(text, terms);
   }
 
@@ -164,12 +213,140 @@ function renderInline(text: string, terms: string[]): ReactNode {
       }
     }
 
+    if (text.startsWith("~~", pos)) {
+      const close = text.indexOf("~~", pos + 2);
+      if (close > pos + 2 && !text.slice(pos + 2, close).includes("\n")) {
+        flushPlain();
+        nodes.push(
+          <del key={`s-${key++}`} className="asm-md-del">
+            {renderInlineCodeOnly(text.slice(pos + 2, close), terms)}
+          </del>,
+        );
+        pos = close + 2;
+        continue;
+      }
+    }
+
+    if (
+      text[pos] === "*" &&
+      text[pos + 1] !== "*" &&
+      text[pos + 1] !== undefined &&
+      !/\s/.test(text[pos + 1])
+    ) {
+      let close = pos + 2;
+      let found = -1;
+      while (close < text.length && text[close] !== "\n") {
+        if (
+          text[close] === "*" &&
+          text[close - 1] !== "*" &&
+          text[close + 1] !== "*" &&
+          !/\s/.test(text[close - 1])
+        ) {
+          found = close;
+          break;
+        }
+        close += 1;
+      }
+      if (found > pos + 1) {
+        flushPlain();
+        nodes.push(
+          <em key={`i-${key++}`}>
+            {renderInlineCodeOnly(text.slice(pos + 1, found), terms)}
+          </em>,
+        );
+        pos = found + 1;
+        continue;
+      }
+    }
+
+    if (text[pos] === "[") {
+      const linkMatch = matchMarkdownLink(text, pos);
+      if (linkMatch) {
+        flushPlain();
+        const targetUrl = linkMatch.url;
+        nodes.push(
+          <a
+            key={`l-${key++}`}
+            href={targetUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="asm-md-link"
+            onClick={(event) => {
+              event.preventDefault();
+              if (onOpenUrl) {
+                onOpenUrl(targetUrl);
+              } else {
+                void openUrl(targetUrl).catch(() => undefined);
+              }
+            }}
+          >
+            {renderInlineCodeOnly(linkMatch.label, terms)}
+          </a>,
+        );
+        pos = linkMatch.nextPos;
+        continue;
+      }
+    }
+
     plain += text[pos];
     pos += 1;
   }
 
   flushPlain();
   return nodes.length === 1 ? nodes[0] : nodes;
+}
+
+function splitTableRow(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) return null;
+  let inner = trimmed;
+  if (inner.startsWith("|")) inner = inner.slice(1);
+  if (inner.endsWith("|") && !inner.endsWith("\\|")) inner = inner.slice(0, -1);
+
+  const cells: string[] = [];
+  let current = "";
+  let inCode = false;
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i];
+    if (ch === "\\" && inner[i + 1] === "|") {
+      current += "|";
+      i += 1;
+      continue;
+    }
+    if (ch === "`") {
+      inCode = !inCode;
+      current += ch;
+      continue;
+    }
+    if (ch === "|" && !inCode) {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+export type TableAlign = "left" | "center" | "right" | null;
+
+function parseTableSeparator(
+  line: string,
+  expectedCols: number,
+): TableAlign[] | null {
+  const cells = splitTableRow(line);
+  if (!cells || cells.length !== expectedCols) return null;
+  const aligns: TableAlign[] = [];
+  for (const cell of cells) {
+    if (!TABLE_SEP_CELL_RE.test(cell)) return null;
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+    aligns.push(
+      left && right ? "center" : right ? "right" : left ? "left" : null,
+    );
+  }
+  return aligns;
 }
 
 function CodeBlock({
@@ -311,6 +488,12 @@ export type MarkdownBlock =
   | { kind: "hr" }
   | { kind: "quote"; lines: string[] }
   | { kind: "list"; ordered: boolean; items: string[] }
+  | {
+      kind: "table";
+      headers: string[];
+      aligns: TableAlign[];
+      rows: string[][];
+    }
   | { kind: "paragraph"; text: string };
 
 export function parseBlocks(content: string): MarkdownBlock[] {
@@ -376,6 +559,36 @@ export function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
+    if (index + 1 < lines.length) {
+      const headerCells = splitTableRow(line);
+      const aligns = headerCells
+        ? parseTableSeparator(lines[index + 1], headerCells.length)
+        : null;
+      if (headerCells && aligns) {
+        const rows: string[][] = [];
+        index += 2;
+        while (index < lines.length) {
+          const rowLine = lines[index];
+          if (!rowLine.trim() || FENCE_OPEN_RE.test(rowLine)) break;
+          const rowCells = splitTableRow(rowLine);
+          if (!rowCells) break;
+          const normalized = Array.from(
+            { length: headerCells.length },
+            (_, col) => rowCells[col] ?? "",
+          );
+          rows.push(normalized);
+          index += 1;
+        }
+        blocks.push({
+          kind: "table",
+          headers: headerCells,
+          aligns,
+          rows,
+        });
+        continue;
+      }
+    }
+
     if (UNORDERED_LIST_RE.test(line)) {
       const items: string[] = [];
       while (index < lines.length) {
@@ -403,6 +616,14 @@ export function parseBlocks(content: string): MarkdownBlock[] {
     const paragraphLines: string[] = [];
     while (index < lines.length) {
       const current = lines[index];
+      const startsTable =
+        index + 1 < lines.length &&
+        (() => {
+          const hc = splitTableRow(current);
+          return hc
+            ? Boolean(parseTableSeparator(lines[index + 1], hc.length))
+            : false;
+        })();
       if (
         !current.trim() ||
         FENCE_OPEN_RE.test(current) ||
@@ -410,7 +631,8 @@ export function parseBlocks(content: string): MarkdownBlock[] {
         HEADING_RE.test(current) ||
         QUOTE_RE.test(current) ||
         UNORDERED_LIST_RE.test(current) ||
-        ORDERED_LIST_RE.test(current)
+        ORDERED_LIST_RE.test(current) ||
+        startsTable
       ) {
         break;
       }
@@ -456,11 +678,13 @@ export const MessageMarkdown = memo(function MessageMarkdown({
   collapsed = false,
   highlightTerms = EMPTY_HIGHLIGHT_TERMS,
   onCopyCode,
+  onOpenUrl,
 }: {
   content: string;
   collapsed?: boolean;
   highlightTerms?: string[];
   onCopyCode: (code: string, blockIndex: number) => Promise<void> | void;
+  onOpenUrl?: (url: string) => void;
 }) {
   const blocks = useMemo(() => parseBlocks(content), [content]);
 
@@ -496,7 +720,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
                 key={index}
                 className={cn("asm-md-heading", `is-h${block.level}`)}
               >
-                {renderInline(block.text, highlightTerms)}
+                {renderInline(block.text, highlightTerms, onOpenUrl)}
                 {isLastCollapsed && "…"}
               </div>
             );
@@ -507,13 +731,59 @@ export const MessageMarkdown = memo(function MessageMarkdown({
               <blockquote key={index} className="asm-md-quote">
                 {block.lines.map((line, lineIndex) => (
                   <p key={lineIndex} className="asm-md-p">
-                    {line ? renderInline(line, highlightTerms) : "\u200b"}
+                    {line
+                      ? renderInline(line, highlightTerms, onOpenUrl)
+                      : "\u200b"}
                     {isLastCollapsed &&
                       lineIndex === block.lines.length - 1 &&
                       "…"}
                   </p>
                 ))}
               </blockquote>
+            );
+          case "table":
+            return (
+              <div key={index} className="asm-md-table-wrap">
+                <table className="asm-md-table">
+                  <thead>
+                    <tr>
+                      {block.headers.map((header, colIdx) => (
+                        <th
+                          key={colIdx}
+                          style={
+                            block.aligns[colIdx]
+                              ? { textAlign: block.aligns[colIdx] ?? undefined }
+                              : undefined
+                          }
+                        >
+                          {renderInline(header, highlightTerms, onOpenUrl)}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {block.rows.map((row, rowIdx) => (
+                      <tr key={rowIdx}>
+                        {row.map((cell, colIdx) => (
+                          <td
+                            key={colIdx}
+                            style={
+                              block.aligns[colIdx]
+                                ? {
+                                    textAlign:
+                                      block.aligns[colIdx] ?? undefined,
+                                  }
+                                : undefined
+                            }
+                          >
+                            {renderInline(cell, highlightTerms, onOpenUrl)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             );
           case "list": {
             const ListTag = block.ordered ? "ol" : "ul";
@@ -522,21 +792,52 @@ export const MessageMarkdown = memo(function MessageMarkdown({
                 key={index}
                 className={cn("asm-md-list", block.ordered && "is-ordered")}
               >
-                {block.items.map((item, itemIndex) => (
-                  <li key={itemIndex}>
-                    {renderInline(item, highlightTerms)}
-                    {isLastCollapsed &&
-                      itemIndex === block.items.length - 1 &&
-                      "…"}
-                  </li>
-                ))}
+                {block.items.map((item, itemIndex) => {
+                  const taskMatch = !block.ordered
+                    ? item.match(TASK_ITEM_RE)
+                    : null;
+                  if (taskMatch) {
+                    const checked = taskMatch[1].toLowerCase() === "x";
+                    return (
+                      <li key={itemIndex} className="asm-md-task-item">
+                        <span
+                          className={cn(
+                            "asm-md-task-box",
+                            checked && "is-checked",
+                          )}
+                          aria-hidden="true"
+                        >
+                          {checked ? "✓" : ""}
+                        </span>
+                        <span>
+                          {renderInline(
+                            taskMatch[2],
+                            highlightTerms,
+                            onOpenUrl,
+                          )}
+                          {isLastCollapsed &&
+                            itemIndex === block.items.length - 1 &&
+                            "…"}
+                        </span>
+                      </li>
+                    );
+                  }
+                  return (
+                    <li key={itemIndex}>
+                      {renderInline(item, highlightTerms, onOpenUrl)}
+                      {isLastCollapsed &&
+                        itemIndex === block.items.length - 1 &&
+                        "…"}
+                    </li>
+                  );
+                })}
               </ListTag>
             );
           }
           case "paragraph":
             return (
               <p key={index} className="asm-md-p">
-                {renderInline(block.text, highlightTerms)}
+                {renderInline(block.text, highlightTerms, onOpenUrl)}
                 {isLastCollapsed && "…"}
               </p>
             );

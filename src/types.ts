@@ -41,3 +41,32 @@ export interface SessionMessage {
    */
   contentIdentity?: string;
 }
+
+export interface ContentHighlight {
+  start: number;
+  end: number;
+}
+
+export interface ContentSnippet {
+  messageIndex: number;
+  text: string;
+  highlights: ContentHighlight[];
+}
+
+export interface SessionContentHit {
+  providerId: string;
+  sourcePath: string;
+  snippets: ContentSnippet[];
+  matchCount: number;
+}
+
+export interface SessionIndexStatus {
+  running: boolean;
+  processed: number;
+  total: number;
+}
+
+export interface ContentSearchResult {
+  hits: SessionContentHit[];
+  status: SessionIndexStatus;
+}

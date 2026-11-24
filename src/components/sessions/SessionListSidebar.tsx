@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Boxes,
+  CalendarClock,
   CheckSquare,
   ChevronDown,
   ChevronRight,
   ChevronsDownUp,
   ChevronsUpDown,
+  FileSearch,
   FolderOpen,
   MessageSquare,
   RefreshCw,
@@ -33,7 +35,11 @@ import {
 } from "@/components/ui/tooltip";
 import { isMac } from "@/lib/platform";
 import { cn } from "@/lib/utils";
-import type { SessionMeta } from "@/types";
+import type {
+  SessionContentHit,
+  SessionIndexStatus,
+  SessionMeta,
+} from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { AgentIcon } from "./AgentIcon";
 import { EMPTY_HIGHLIGHT_TERMS } from "./highlightText";
@@ -46,6 +52,7 @@ import {
   type SessionListViewMode,
   type SessionStatusFilter,
 } from "./types";
+import { getContentHitKey } from "./useSessionContentSearch";
 import {
   getProviderIconName,
   getProviderLabel,
@@ -53,12 +60,16 @@ import {
   resolveParentLabel,
   type SessionDirectoryGroup,
   type SessionProviderGroup,
+  type SessionTimeGroup,
 } from "./utils";
+
+const EMPTY_CONTENT_HITS = new Map<string, SessionContentHit>();
 
 interface SessionListSidebarProps {
   sessions: SessionMeta[];
   filteredSessions: SessionMeta[];
   groupedSessions: SessionProviderGroup[];
+  timeGroupedSessions: SessionTimeGroup[];
   providerFilter: ProviderFilter;
   onProviderFilterChange: (value: ProviderFilter) => void;
   providerFilterLabel: string;
@@ -82,6 +93,13 @@ interface SessionListSidebarProps {
   onSearchQueryChange: (value: string) => void;
   searchTerms: string[];
   isSearching: boolean;
+  contentSearchEnabled?: boolean;
+  onContentSearchEnabledChange?: (enabled: boolean) => void;
+  contentHits?: Map<string, SessionContentHit>;
+  contentIndexStatus?: SessionIndexStatus | null;
+  isContentSearching?: boolean;
+  contentSearchError?: string | null;
+  onRetryContentSearch?: () => void;
   statusFilter: SessionStatusFilter;
   onStatusFilterChange: (value: SessionStatusFilter) => void;
   statusCounts: {
@@ -101,6 +119,7 @@ interface SessionListSidebarProps {
   selectedSessionKeys: Set<string>;
   sessionTitles: Map<string, string>;
   onSelectSession: (key: string) => void;
+  onSelectSnippet?: (key: string, messageIndex: number) => void;
   onToggleSessionChecked: (session: SessionMeta, checked: boolean) => void;
   onToggleSessionGroupChecked: (
     groupSessions: SessionMeta[],
@@ -114,6 +133,7 @@ export function SessionListSidebar({
   sessions,
   filteredSessions,
   groupedSessions,
+  timeGroupedSessions,
   providerFilter,
   onProviderFilterChange,
   providerFilterLabel,
@@ -137,6 +157,13 @@ export function SessionListSidebar({
   onSearchQueryChange,
   searchTerms,
   isSearching,
+  contentSearchEnabled = false,
+  onContentSearchEnabledChange,
+  contentHits = EMPTY_CONTENT_HITS,
+  contentIndexStatus = null,
+  isContentSearching = false,
+  contentSearchError = null,
+  onRetryContentSearch,
   statusFilter,
   onStatusFilterChange,
   statusCounts,
@@ -150,6 +177,7 @@ export function SessionListSidebar({
   selectedSessionKeys,
   sessionTitles,
   onSelectSession,
+  onSelectSnippet,
   onToggleSessionChecked,
   onToggleSessionGroupChecked,
   updatedAtLabel,
@@ -199,6 +227,11 @@ export function SessionListSidebar({
     (session: SessionMeta) => {
       const sessionKey = getSessionKey(session);
       const isSelected = selectedKey !== null && sessionKey === selectedKey;
+      const contentHit = contentSearchEnabled
+        ? contentHits.get(
+            getContentHitKey(session.providerId, session.sourcePath),
+          )
+        : undefined;
 
       return (
         <SessionItem
@@ -210,14 +243,19 @@ export function SessionListSidebar({
           isCheckDisabled={!session.sourcePath}
           parentLabel={resolveParentLabel(session, sessionTitles)}
           highlightTerms={activeHighlightTerms}
+          contentHit={contentHit}
           onSelect={onSelectSession}
+          onSelectSnippet={onSelectSnippet}
           onToggleChecked={onToggleSessionChecked}
         />
       );
     },
     [
       activeHighlightTerms,
+      contentHits,
+      contentSearchEnabled,
       onSelectSession,
+      onSelectSnippet,
       onToggleSessionChecked,
       selectedKey,
       selectedSessionKeys,
@@ -299,7 +337,7 @@ export function SessionListSidebar({
       statusCounts.archived +
       statusCounts.child >
       0 || statusFilter !== "all";
-  const paginationResetKey = `${providerFilter}\u0000${statusFilter}\u0000${searchTerms.join(" ")}\u0000${listViewMode}`;
+  const paginationResetKey = `${providerFilter}\u0000${statusFilter}\u0000${searchTerms.join(" ")}\u0000${listViewMode}\u0000${contentSearchEnabled}`;
 
   return (
     <div className="asm-list" onContextMenu={(event) => event.preventDefault()}>
@@ -444,6 +482,19 @@ export function SessionListSidebar({
               defaultValue: "分类",
             })}
           </button>
+          <button
+            type="button"
+            className="asm-list-view-option"
+            aria-pressed={listViewMode === "time"}
+            aria-label={t("sessionManager.viewModeTime", {
+              defaultValue: "时间",
+            })}
+            onClick={() => onListViewModeChange("time")}
+          >
+            {t("sessionManager.viewModeTime", {
+              defaultValue: "时间",
+            })}
+          </button>
         </div>
         {listViewMode === "grouped" && groupedSessions.length > 0 && (
           <Tooltip>
@@ -555,8 +606,6 @@ export function SessionListSidebar({
               })}
             </Button>
           )}
-          {/* 此处不放删除按钮：删除入口统一在右侧详情面板
-              （批量模式下它显示「删除已勾选的 N 条」）。 */}
         </div>
       )}
       <div className="asm-search" role="search">
@@ -567,9 +616,15 @@ export function SessionListSidebar({
           aria-label={t("sessionManager.searchSessions", {
             defaultValue: "搜索会话",
           })}
-          placeholder={t("sessionManager.searchPlaceholder", {
-            defaultValue: "搜索标题、项目、摘要或 ID",
-          })}
+          placeholder={
+            contentSearchEnabled
+              ? t("sessionManager.searchContentPlaceholder", {
+                  defaultValue: "搜索标题或消息正文…",
+                })
+              : t("sessionManager.searchPlaceholder", {
+                  defaultValue: "搜索标题、目录或 ID",
+                })
+          }
           value={searchQuery}
           onChange={(event) => onSearchQueryChange(event.target.value)}
           onKeyDown={(event) => {
@@ -579,6 +634,7 @@ export function SessionListSidebar({
         {searchQuery ? (
           <button
             type="button"
+            className="asm-search-clear-btn"
             aria-label={t("sessionManager.clearSearch", {
               defaultValue: "清空搜索",
             })}
@@ -591,7 +647,69 @@ export function SessionListSidebar({
             {isMac() ? "⌘K" : "Ctrl K"}
           </kbd>
         )}
+        {onContentSearchEnabledChange && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  "asm-content-search-toggle",
+                  contentSearchEnabled && "is-active",
+                )}
+                aria-pressed={contentSearchEnabled}
+                aria-label={t("sessionManager.searchContentToggleLabel", {
+                  defaultValue: "搜索消息正文",
+                })}
+                onClick={() =>
+                  onContentSearchEnabledChange(!contentSearchEnabled)
+                }
+              >
+                <FileSearch className="size-3 shrink-0" aria-hidden="true" />
+                <span>
+                  {t("sessionManager.searchContentToggle", {
+                    defaultValue: "正文",
+                  })}
+                </span>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-xs">
+              {t("sessionManager.searchContentTooltip", {
+                defaultValue:
+                  "开启后建立本地 FTS5 索引并检索全部会话正文；关闭即删除索引缓存",
+              })}
+            </TooltipContent>
+          </Tooltip>
+        )}
       </div>
+      {contentSearchEnabled && contentIndexStatus?.running && (
+        <div className="asm-index-progress" aria-live="polite">
+          <RefreshCw
+            className="size-3 shrink-0 animate-spin"
+            aria-hidden="true"
+          />
+          <span>
+            {t("sessionManager.indexingProgress", {
+              defaultValue: "正在建立正文索引 ({{processed}}/{{total}})",
+              processed: contentIndexStatus.processed,
+              total: contentIndexStatus.total,
+            })}
+          </span>
+        </div>
+      )}
+      {contentSearchEnabled && contentSearchError && (
+        <div className="asm-index-error">
+          <span className="truncate">{contentSearchError}</span>
+          {onRetryContentSearch && (
+            <button
+              type="button"
+              className="asm-index-retry"
+              onClick={onRetryContentSearch}
+            >
+              {t("sessionManager.retryScan", { defaultValue: "重试" })}
+            </button>
+          )}
+        </div>
+      )}
       {hasStatusOptions && (
         <div
           className="asm-status-filters"
@@ -683,10 +801,18 @@ export function SessionListSidebar({
       )}
       {isSearching && (
         <div className="asm-search-summary" role="status">
-          {t("sessionManager.searchResultsCount", {
-            defaultValue: "找到 {{count}} 条会话",
-            count: filteredSessions.length,
-          })}
+          <span>
+            {t("sessionManager.searchResultsCount", {
+              defaultValue: "找到 {{count}} 条会话",
+              count: filteredSessions.length,
+            })}
+          </span>
+          {isContentSearching && (
+            <RefreshCw
+              className="size-3 shrink-0 animate-spin text-muted-foreground"
+              aria-hidden="true"
+            />
+          )}
         </div>
       )}
       <div className="asm-list-scroll">
@@ -889,6 +1015,52 @@ export function SessionListSidebar({
                     })}
                   </CollapsibleContent>
                 </Collapsible>
+              );
+            })}
+          </div>
+        ) : listViewMode === "time" ? (
+          <div>
+            {scanWarnings.length > 0 && (
+              <div role="alert" className="asm-scan-warning mx-2 my-2">
+                {scanWarningText}
+              </div>
+            )}
+            {timeGroupedSessions.map((timeGroup) => {
+              const timeSelectionState = getGroupSelectionState(
+                timeGroup.sessions,
+              );
+              return (
+                <div key={timeGroup.key} className="asm-time-group">
+                  <div className="asm-time-group-header">
+                    {selectionMode && (
+                      <Checkbox
+                        checked={timeSelectionState.checked}
+                        disabled={timeSelectionState.selectableCount === 0}
+                        aria-label={`选择 ${timeGroup.label} 时间段内会话`}
+                        onCheckedChange={() =>
+                          onToggleSessionGroupChecked(
+                            timeGroup.sessions,
+                            !timeSelectionState.isSelected,
+                          )
+                        }
+                      />
+                    )}
+                    <CalendarClock className="size-3.5 shrink-0 text-muted-foreground/75" />
+                    <span className="asm-group-name">{timeGroup.label}</span>
+                    {renderGroupSelectionBadge(
+                      timeSelectionState,
+                      timeGroup.sessions.length,
+                    )}
+                  </div>
+                  <div className="asm-time-group-items">
+                    <SessionRows
+                      sessions={timeGroup.sessions}
+                      selectedKey={selectedKey}
+                      resetKey={paginationResetKey}
+                      renderItem={renderSessionItem}
+                    />
+                  </div>
+                </div>
               );
             })}
           </div>

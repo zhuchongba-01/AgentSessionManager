@@ -158,6 +158,10 @@ describe("SessionManagerPage", () => {
     toastInfoMock.mockReset();
     Element.prototype.scrollIntoView = vi.fn();
     window.localStorage.removeItem("agent-session-manager.listViewMode");
+    window.localStorage.removeItem(
+      "agent-session-manager.contentSearchEnabled",
+    );
+    window.localStorage.removeItem("agent-session-manager.outlineOpen");
     window.localStorage.removeItem(GROUP_EXPANSION_STORAGE_KEY);
 
     const sessions: SessionMeta[] = [
@@ -1217,21 +1221,52 @@ describe("SessionManagerPage", () => {
     ).toBeEnabled();
   });
 
-  it("does not expose a resume command action", async () => {
+  it("exposes an OS-aware resume command action on active sessions and hides it on residual sessions", async () => {
+    const clipboardSpy = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, "clipboard", {
+      value: { writeText: clipboardSpy },
+      configurable: true,
+    });
+
     setSessionFixtures(
       [
         {
           providerId: "codex",
-          sessionId: "resume-1",
-          title: "Resume Session",
-          sourcePath: "/mock/resume.jsonl",
-          resumeCommand: "codex resume resume-1",
+          sessionId: "resume-active",
+          title: "Resume Active Session",
+          projectDir: "/mock/project",
+          sourcePath: "/mock/resume-active.jsonl",
+          lastActiveAt: 200,
+          resumeCommand: "codex resume resume-active",
+        },
+        {
+          providerId: "codex",
+          sessionId: "resume-residual",
+          title: "Resume Residual Session",
+          residual: true,
+          sourcePath: "/mock/resume-residual.jsonl",
+          lastActiveAt: 100,
+          resumeCommand: "codex resume resume-residual",
         },
       ],
       {},
     );
     renderPage();
-    await screen.findByRole("heading", { name: "Resume Session" });
+    await screen.findByRole("heading", { name: "Resume Active Session" });
+
+    const resumeBtn = screen.getByRole("button", { name: "复制恢复命令" });
+    fireEvent.click(resumeBtn);
+    await waitFor(() => expect(clipboardSpy).toHaveBeenCalledTimes(1));
+    expect(clipboardSpy.mock.calls[0][0]).toContain(
+      "codex resume resume-active",
+    );
+    expect(clipboardSpy.mock.calls[0][0]).toContain("/mock/project");
+
+    // 残留会话不允许展示恢复命令按钮
+    fireEvent.click(
+      screen.getByRole("button", { name: /Resume Residual Session/ }),
+    );
+    await screen.findByRole("heading", { name: "Resume Residual Session" });
     expect(
       screen.queryByRole("button", { name: "复制恢复命令" }),
     ).not.toBeInTheDocument();
@@ -1887,5 +1922,120 @@ describe("SessionManagerPage", () => {
     await screen.findByRole("heading", { name: "Alpha Session" });
     expect(document.querySelector(".asm-window-controls")).not.toBeNull();
     uaSpy.mockRestore();
+  });
+
+  it("supports time grouping, cross-session content search snippet jump, turn timeline collapse, and reader view filters", async () => {
+    const now = Date.now();
+    setSessionFixtures(
+      [
+        {
+          providerId: "claude",
+          sessionId: "turn-session-1",
+          title: "Multi Step Session",
+          projectDir: "/mock/claude",
+          sourcePath: "/mock/claude/multi.jsonl",
+          lastActiveAt: now,
+        },
+        {
+          providerId: "gemini",
+          sessionId: "gemini-session-1",
+          title: "Gemini Deep Session",
+          projectDir: "/mock/gemini",
+          sourcePath: "/mock/gemini/session-1.jsonl",
+          lastActiveAt: 1000,
+        },
+      ],
+      {
+        "claude:/mock/claude/multi.jsonl": [
+          { role: "user", content: "修复登录鉴权", ts: now - 30 },
+          { role: "thinking", content: "先检查中间件", ts: now - 25 },
+          { role: "tool", content: "[Tool: Read]\nsrc/auth.ts", ts: now - 20 },
+          {
+            role: "tool",
+            content: "[Tool: Edit]\n```diff\n-old\n+new\n```",
+            ts: now - 15,
+          },
+          { role: "assistant", content: "已完成登录鉴权修复", ts: now - 10 },
+        ],
+        "gemini:/mock/gemini/session-1.jsonl": [
+          { role: "user", content: "排查连接池配置", ts: 900 },
+          {
+            role: "assistant",
+            content: "定位到独特的关键词 unicorn_pool_fix_42 并已更新配置",
+            ts: 950,
+          },
+        ],
+      },
+    );
+
+    renderPage("all");
+    await screen.findByRole("heading", { name: "Multi Step Session" });
+
+    // 多步执行过程默认收纳为「执行过程 · 3 步」摘要条，并标注 1 处改动
+    const timelineBar = await screen.findByRole("button", {
+      name: /执行过程 · 3 步/,
+    });
+    expect(timelineBar).toHaveAttribute("aria-expanded", "false");
+    expect(timelineBar).toHaveTextContent("1 处改动");
+    expect(screen.queryByText(/src\/auth\.ts/)).not.toBeInTheDocument();
+
+    // 点击摘要条展开中间步骤
+    fireEvent.click(timelineBar);
+    expect(screen.getByText(/src\/auth\.ts/)).toBeInTheDocument();
+
+    // 切换到「对话」视图仅保留提问与最终回复
+    fireEvent.click(screen.getByRole("button", { name: "对话" }));
+    expect(screen.getByText("修复登录鉴权")).toBeInTheDocument();
+    expect(screen.getByText("已完成登录鉴权修复")).toBeInTheDocument();
+    expect(screen.queryByText(/src\/auth\.ts/)).not.toBeInTheDocument();
+
+    // 切换到「改动」视图仅展示含文件修改的步骤与行号 Diff 视图
+    fireEvent.click(screen.getByRole("button", { name: "改动" }));
+    expect(screen.getByText("+1")).toBeInTheDocument();
+    expect(screen.getByText("−1")).toBeInTheDocument();
+    expect(
+      document.querySelector(".asm-ccs-diff-row.is-add .asm-ccs-diff-code"),
+    ).toHaveTextContent("new");
+    expect(
+      document.querySelector(".asm-ccs-diff-row.is-del .asm-ccs-diff-code"),
+    ).toHaveTextContent("old");
+    expect(screen.queryByText(/src\/auth\.ts/)).not.toBeInTheDocument();
+
+    // 切换右侧 cc-switch 风格「对话目录」抽屉并校验问答预览卡片
+    const outlineToggle = screen.getByRole("button", { name: "切换对话目录" });
+    expect(outlineToggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(outlineToggle);
+    expect(outlineToggle).toHaveAttribute("aria-pressed", "true");
+    const outlineNav = screen.getByRole("navigation", { name: "对话目录" });
+    expect(outlineNav).toHaveClass("asm-ccs-outline");
+    expect(within(outlineNav).getByText("修复登录鉴权")).toBeInTheDocument();
+    expect(
+      within(outlineNav).getByText("已完成登录鉴权修复"),
+    ).toBeInTheDocument();
+    fireEvent.click(outlineToggle);
+    expect(outlineToggle).toHaveAttribute("aria-pressed", "false");
+
+    // 左侧切换为「时间」分组（今天 / 更早）
+    fireEvent.click(screen.getByRole("button", { name: "时间" }));
+    expect(screen.getByText("今天")).toBeInTheDocument();
+    expect(screen.getByText("更早")).toBeInTheDocument();
+
+    // 开启「搜索消息正文」，检索标题中不存在但正文中包含的关键词，并点击摘录跳转
+    fireEvent.click(screen.getByRole("button", { name: "搜索消息正文" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索会话" }), {
+      target: { value: "unicorn_pool_fix_42" },
+    });
+
+    const snippetBtn = await screen.findByRole("button", {
+      name: /unicorn_pool_fix_42/,
+    });
+    fireEvent.click(snippetBtn);
+
+    expect(
+      await screen.findByRole("heading", { name: "Gemini Deep Session" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("searchbox", { name: "在当前会话中搜索" }),
+    ).toHaveValue("unicorn_pool_fix_42");
   });
 });

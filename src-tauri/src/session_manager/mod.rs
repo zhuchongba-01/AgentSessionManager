@@ -1,6 +1,7 @@
 pub mod cache;
 mod deletion;
 pub mod providers;
+pub mod search_index;
 pub mod terminal;
 pub mod wire;
 
@@ -8,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use providers::{claude, codex, deepseek, grokbuild, opencode, pi, workbuddy, zcode};
+use providers::{
+    claude, codebuddy, codex, copilot, deepseek, gemini, grokbuild, kimi, openclaw, opencode, pi,
+    workbuddy, zcode,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,38 +115,40 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
     scan_report().sessions
 }
 
+type ProviderScanFn = fn() -> Vec<SessionMeta>;
+
 fn scan_report() -> SessionScanReport {
-    let (r1, r2, r3, r4, r5, r6, r7, r8) = std::thread::scope(|s| {
-        let h1 = s.spawn(|| providers::utils::scan_with_diagnostics("codex", codex::scan_sessions));
-        let h2 =
-            s.spawn(|| providers::utils::scan_with_diagnostics("claude", claude::scan_sessions));
-        let h3 = s
-            .spawn(|| providers::utils::scan_with_diagnostics("opencode", opencode::scan_sessions));
-        let h4 = s.spawn(|| {
-            providers::utils::scan_with_diagnostics("grokbuild", grokbuild::scan_sessions)
-        });
-        let h5 = s.spawn(|| providers::utils::scan_with_diagnostics("pi", pi::scan_sessions));
-        let h6 = s.spawn(|| providers::utils::scan_with_diagnostics("zcode", zcode::scan_sessions));
-        let h7 = s
-            .spawn(|| providers::utils::scan_with_diagnostics("deepseek", deepseek::scan_sessions));
-        let h8 = s.spawn(|| {
-            providers::utils::scan_with_diagnostics("workbuddy", workbuddy::scan_sessions)
-        });
-        (
-            join_scan_results(h1),
-            join_scan_results(h2),
-            join_scan_results(h3),
-            join_scan_results(h4),
-            join_scan_results(h5),
-            join_scan_results(h6),
-            join_scan_results(h7),
-            join_scan_results(h8),
-        )
+    let results = std::thread::scope(|s| {
+        let specs: &[(&str, ProviderScanFn)] = &[
+            ("codex", codex::scan_sessions),
+            ("claude", claude::scan_sessions),
+            ("gemini", gemini::scan_sessions),
+            ("copilot", copilot::scan_sessions),
+            ("opencode", opencode::scan_sessions),
+            ("grokbuild", grokbuild::scan_sessions),
+            ("pi", pi::scan_sessions),
+            ("zcode", zcode::scan_sessions),
+            ("deepseek", deepseek::scan_sessions),
+            ("workbuddy", workbuddy::scan_sessions),
+            ("codebuddy", codebuddy::scan_sessions),
+            ("kimi", kimi::scan_sessions),
+            ("openclaw", openclaw::scan_sessions),
+        ];
+        let handles: Vec<_> = specs
+            .iter()
+            .map(|&(name, scan_fn)| {
+                s.spawn(move || providers::utils::scan_with_diagnostics(name, scan_fn))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(join_scan_results)
+            .collect::<Vec<_>>()
     });
 
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    for (items, issues) in [r1, r2, r3, r4, r5, r6, r7, r8] {
+    for (items, issues) in results {
         sessions.extend(items);
         warnings.extend(issues);
     }
@@ -265,7 +271,10 @@ fn validated_file_source(provider_id: &str, source_path: &str) -> Result<PathBuf
     } else {
         raw_path.to_path_buf()
     };
-    if matches!(provider_id, "pi" | "claude" | "workbuddy") {
+    if matches!(
+        provider_id,
+        "pi" | "claude" | "workbuddy" | "gemini" | "copilot" | "codebuddy" | "kimi" | "openclaw"
+    ) {
         let raw_meta = std::fs::symlink_metadata(&physical)
             .map_err(|_| format!("session source not found: {}", physical.display()))?;
         if providers::utils::is_reparse_or_symlink(&raw_meta) {
@@ -317,11 +326,16 @@ fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessag
     match provider_id {
         "codex" => codex::load_messages(path),
         "claude" => claude::load_messages(path),
+        "gemini" => gemini::load_messages(path),
+        "copilot" => copilot::load_messages(path),
         "opencode" => opencode::load_messages(path),
         "grokbuild" => grokbuild::load_messages(path),
         "pi" => pi::load_messages(path),
         "deepseek" => deepseek::load_messages(path),
         "workbuddy" => workbuddy::load_messages(path),
+        "codebuddy" => codebuddy::load_messages(path),
+        "kimi" => kimi::load_messages(path),
+        "openclaw" => openclaw::load_messages(path),
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
 }
@@ -342,6 +356,11 @@ fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessag
 fn transcript_cache_sources(provider_id: &str, path: &Path) -> Option<cache::TranscriptSources> {
     match provider_id {
         "claude" | "deepseek" | "pi" | "workbuddy" => Some(vec![(path.to_path_buf(), None)]),
+        "gemini" => gemini::transcript_sources(path).ok(),
+        "copilot" => copilot::transcript_sources(path).ok(),
+        "codebuddy" => codebuddy::transcript_sources(path).ok(),
+        "kimi" => kimi::transcript_sources(path).ok(),
+        "openclaw" => openclaw::transcript_sources(path).ok(),
         "grokbuild" => grokbuild::transcript_sources(path).ok(),
         // 链解析失败时不缓存，交给正文读取去报真正的错误
         "codex" => codex::transcript_sources(path).ok(),
@@ -399,6 +418,21 @@ fn checked_sqlite_source(
         ));
     }
     Ok(Some(kind))
+}
+
+pub(crate) fn index_sources(
+    provider_id: &str,
+    source_path: &str,
+) -> Option<cache::TranscriptSources> {
+    if let Some(kind) = checked_sqlite_source(provider_id, source_path).ok()? {
+        return match kind {
+            SqliteSourceKind::OpenCode => opencode::sqlite_transcript_sources(source_path),
+            SqliteSourceKind::ZCode => zcode::transcript_sources(source_path),
+            SqliteSourceKind::WorkBuddy => workbuddy::sqlite_transcript_sources(source_path),
+        };
+    }
+    let path = validated_file_source(provider_id, source_path).ok()?;
+    transcript_cache_sources(provider_id, &path)
 }
 
 /// 读取会话正文：校验来源后按指纹复用上次解析结果。
@@ -524,6 +558,7 @@ pub fn delete_session_checked(
     };
     // 删除会级联清理同 ID 的历史副本与索引，正文缓存整体作废
     cache::global().clear();
+    let _ = search_index::remove_indexed_sources(&[(provider_id, source_path)]);
     reply
 }
 
@@ -620,6 +655,46 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
             workbuddy::preflight_delete_in_roots(&roots, Path::new(source), &item.session_id)?;
         }
     }
+    for item in plan.iter().filter(|item| item.provider_id == "gemini") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("gemini")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("Gemini CLI 会话根目录不存在")?;
+        gemini::preflight_delete(&root, path, &item.session_id)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "copilot") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("copilot")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("GitHub Copilot 会话根目录不存在")?;
+        copilot::preflight_delete(&root, path, &item.session_id)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "codebuddy") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("codebuddy")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("CodeBuddy 会话根目录不存在")?;
+        codebuddy::preflight_delete(&root, path, &item.session_id)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "kimi") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("kimi")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("Kimi CLI 会话根目录不存在")?;
+        kimi::preflight_delete(&root, path, &item.session_id)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "openclaw") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("openclaw")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("OpenClaw 会话根目录不存在")?;
+        openclaw::preflight_delete(&root, path, &item.session_id)?;
+    }
     Ok(())
 }
 
@@ -704,8 +779,11 @@ where
     // retries) finish index/sidecar cleanup even after the primary `.jsonl`
     // source is gone, so they must reach `delete_session_record`.
     let missing_file = matches!(provider_id, "codex" | "pi") && !Path::new(source_path).exists();
-    let unexpectedly_missing = (provider_id == "claude"
-        || (provider_id == "workbuddy" && !source_path.starts_with("sqlite-workbuddy:")))
+    let unexpectedly_missing = (matches!(
+        provider_id,
+        "claude" | "gemini" | "copilot" | "codebuddy" | "kimi" | "openclaw"
+    ) || (provider_id == "workbuddy"
+        && !source_path.starts_with("sqlite-workbuddy:")))
         && !Path::new(source_path).exists()
         && !selected.is_some_and(|item| item.cleanup_pending || item.residual);
     let deleted = if unexpectedly_missing {
@@ -882,6 +960,11 @@ where
     outcomes.sort_by_key(|(index, _)| *index);
     // 批量删除会级联清理同 ID 的历史副本与索引，正文缓存整体作废
     cache::global().clear();
+    let deleted_sources: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|req| (req.provider_id.as_str(), req.source_path.as_str()))
+        .collect();
+    let _ = search_index::remove_indexed_sources(&deleted_sources);
     outcomes.into_iter().map(|(_, outcome)| outcome).collect()
 }
 
@@ -930,6 +1013,29 @@ fn delete_session_with_roots(
 
     if provider_id == "workbuddy" {
         return workbuddy::delete_session_in_roots(roots, source_path, session_id);
+    }
+
+    if matches!(
+        provider_id,
+        "gemini" | "copilot" | "codebuddy" | "kimi" | "openclaw"
+    ) {
+        let root = roots.iter().find(|root| root.exists()).ok_or_else(|| {
+            format!(
+                "Session root not found for provider {provider_id}: {}",
+                roots
+                    .first()
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            )
+        })?;
+        return match provider_id {
+            "gemini" => gemini::delete_session(root, source_path, session_id),
+            "copilot" => copilot::delete_session(root, source_path, session_id),
+            "codebuddy" => codebuddy::delete_session(root, source_path, session_id),
+            "kimi" => kimi::delete_session(root, source_path, session_id),
+            "openclaw" => openclaw::delete_session(root, source_path, session_id),
+            _ => unreachable!(),
+        };
     }
 
     // Reject symlinked Pi session paths before `canonicalize_existing_path`
@@ -1029,6 +1135,8 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
     let roots = match provider_id {
         "codex" => codex::session_roots(),
         "claude" => vec![crate::session_paths::claude_config_dir().join("projects")],
+        "gemini" => gemini::session_roots(),
+        "copilot" => copilot::session_roots(),
         "opencode" => vec![opencode::get_opencode_data_dir()],
         "grokbuild" => grokbuild::session_roots(),
         "pi" => pi::session_roots(),
@@ -1038,6 +1146,9 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
             .ok_or("Invalid ZCode database path")?
             .to_path_buf()],
         "workbuddy" => workbuddy::session_roots(),
+        "codebuddy" => codebuddy::session_roots(),
+        "kimi" => kimi::session_roots(),
+        "openclaw" => openclaw::session_roots(),
         _ => return Err(format!("Unsupported provider: {provider_id}")),
     };
 

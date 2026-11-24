@@ -2272,3 +2272,1126 @@ html.dark {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ── 跨会话正文检索开关、进度与摘录预览 ── */
+.asm-search .asm-content-search-toggle {
+  display: inline-flex;
+  height: 22px;
+  min-width: auto;
+  min-height: 22px;
+  align-items: center;
+  gap: 3.5px;
+  padding: 0 7px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--shell-bg) / 0.7);
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 1;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.asm-search .asm-content-search-toggle:hover {
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--card));
+  color: hsl(var(--foreground));
+}
+
+.asm-search .asm-content-search-toggle.is-active {
+  border-color: hsl(var(--primary) / 0.5);
+  background: hsl(var(--primary) / 0.14);
+  color: hsl(var(--primary));
+  font-weight: 600;
+}
+
+.asm-index-progress,
+.asm-index-error {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  margin: -2px 8px 7px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-index-progress {
+  border: 1px solid hsl(var(--primary) / 0.2);
+  background: hsl(var(--primary) / 0.06);
+  color: hsl(var(--muted-foreground));
+}
+
+.asm-index-error {
+  border: 1px solid hsl(var(--destructive) / 0.28);
+  background: hsl(var(--destructive) / 0.08);
+  color: hsl(var(--destructive));
+}
+
+.asm-index-retry {
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid hsl(var(--destructive) / 0.35);
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.asm-search-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.asm-session-item.has-snippets {
+  height: auto;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 7px 9px;
+}
+
+.asm-session-snippets {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-left: 22px;
+}
+
+.asm-session-snippet {
+  display: block;
+  width: 100%;
+  padding: 3.5px 7px;
+  border: 1px solid hsl(var(--border) / 0.6);
+  border-radius: 6px;
+  background: hsl(var(--shell-bg) / 0.65);
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.asm-session-snippet:hover {
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--primary) / 0.07);
+  color: hsl(var(--foreground));
+}
+
+.asm-session-snippet-text {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
+.asm-session-snippet-more {
+  padding-left: 4px;
+  font-size: 10.5px;
+  color: hsl(var(--muted-foreground) / 0.78);
+}
+
+/* ── 时间维度分组视图 ── */
+.asm-time-group {
+  margin-bottom: 8px;
+}
+
+.asm-time-group-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: hsl(var(--shell-bg) / 0.92);
+  backdrop-filter: blur(6px);
+}
+
+.asm-time-group-items {
+  margin-top: 2px;
+}
+
+/* ── 阅读器视图切换与轮次执行过程时间线 ── */
+.asm-reader-view-switch {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 2px;
+  border: 1px solid hsl(var(--border) / 0.85);
+  border-radius: 7px;
+  background: hsl(var(--shell-bg) / 0.75);
+}
+
+.asm-turn-timeline {
+  display: flex;
+  width: 100%;
+  min-height: 36px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border: 1px dashed hsl(var(--border) / 0.95);
+  border-radius: 10px;
+  background: hsl(var(--shell-bg) / 0.55);
+  color: hsl(var(--foreground) / 0.86);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.asm-turn-timeline:hover {
+  border-style: solid;
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--primary) / 0.055);
+}
+
+.asm-turn-timeline.is-expanded {
+  border-style: solid;
+  border-color: hsl(var(--primary) / 0.3);
+  background: hsl(var(--primary) / 0.045);
+}
+
+.asm-turn-timeline-title {
+  font-weight: 600;
+  color: hsl(var(--foreground) / 0.9);
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-turn-timeline-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-left: 2px;
+}
+
+.asm-turn-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3.5px;
+  height: 20px;
+  padding: 0 6.5px;
+  border: 1px solid hsl(var(--border) / 0.8);
+  border-radius: 999px;
+  background: hsl(var(--card) / 0.85);
+  color: hsl(var(--muted-foreground));
+  font-family:
+    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
+    monospace;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-turn-chip.is-change {
+  border-color: hsl(152 55% 42% / 0.35);
+  background: hsl(152 55% 42% / 0.1);
+  color: hsl(152 62% 32%);
+  font-family: inherit;
+  font-weight: 550;
+}
+
+.dark .asm-turn-chip.is-change {
+  color: hsl(152 65% 66%);
+}
+
+.asm-turn-chip.is-error {
+  border-color: hsl(var(--destructive) / 0.38);
+  background: hsl(var(--destructive) / 0.1);
+  color: hsl(var(--destructive));
+  font-family: inherit;
+  font-weight: 550;
+}
+
+.asm-step-message-wrap {
+  margin-left: 10px;
+  padding-left: 12px;
+  border-left: 2px solid hsl(var(--border) / 0.85);
+}
+
+/* ── 恢复命令按钮与路径定位按钮组 ── */
+.asm-resume-btn {
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--card));
+  color: hsl(var(--foreground) / 0.9);
+  font-weight: 550;
+}
+
+.asm-resume-btn:hover {
+  border-color: hsl(var(--primary) / 0.4);
+  background: hsl(var(--primary) / 0.08);
+  color: hsl(var(--primary));
+}
+
+.asm-chip-group {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+}
+
+.asm-chip.has-reveal-sibling {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: 0;
+}
+
+.asm-chip-reveal {
+  display: inline-flex;
+  height: 24px;
+  width: 23px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid hsl(var(--border) / 0.85);
+  border-radius: 0 7px 7px 0;
+  background: hsl(var(--shell-bg) / 0.65);
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.asm-chip-reveal:hover {
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--primary) / 0.1);
+  color: hsl(var(--primary));
+}
+
+/* ── GFM 表格、任务列表、链接与删除线 ── */
+.asm-md-table-wrap {
+  margin: 8px 0;
+  overflow-x: auto;
+  border: 1px solid hsl(var(--border) / 0.85);
+  border-radius: 9px;
+  background: hsl(var(--card) / 0.7);
+}
+
+.asm-md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.asm-md-table th,
+.asm-md-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid hsl(var(--border) / 0.65);
+  border-right: 1px solid hsl(var(--border) / 0.45);
+  text-align: left;
+  vertical-align: top;
+}
+
+.asm-md-table th:last-child,
+.asm-md-table td:last-child {
+  border-right: 0;
+}
+
+.asm-md-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.asm-md-table th {
+  background: hsl(var(--shell-bg) / 0.75);
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.asm-md-list li.asm-md-task-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  list-style: none;
+  margin-left: -14px;
+}
+
+.asm-md-task-box {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid hsl(var(--border));
+  border-radius: 4px;
+  background: hsl(var(--card));
+  color: hsl(var(--primary-foreground));
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  transform: translateY(1px);
+}
+
+.asm-md-task-box.is-checked {
+  border-color: hsl(var(--primary));
+  background: hsl(var(--primary));
+}
+
+.asm-md-link {
+  color: hsl(var(--primary));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.asm-md-link:hover {
+  opacity: 0.85;
+}
+
+.asm-md-del {
+  color: hsl(var(--muted-foreground));
+  text-decoration: line-through;
+}
+
+/* ── cc-switch 对话式阅读器（左右对话流 + 原生步骤行 + 行号 Diff + 对话目录） ── */
+.asm-detail-scroll-stage {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.asm-ccs-stream-inner {
+  width: 100%;
+  max-width: 840px;
+  margin: 0 auto;
+}
+
+.asm-ccs-turn-divider {
+  height: 1px;
+  margin: 14px 0;
+  background: hsl(var(--border) / 0.65);
+}
+
+.asm-ccs-question-row {
+  display: flex;
+  width: 100%;
+  justify-content: flex-end;
+  border-radius: 12px;
+  transition: background 180ms ease;
+}
+
+.asm-ccs-question-row.is-active-row,
+.asm-ccs-agent-lane.is-active-row {
+  background: hsl(var(--primary) / 0.065);
+}
+
+.asm-ccs-question-wrap {
+  display: flex;
+  max-width: 76%;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  padding-bottom: 10px;
+}
+
+.asm-ccs-question-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 3px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.asm-ccs-question-meta .asm-ccs-hover-icon {
+  opacity: 0;
+}
+
+.asm-ccs-question-row:hover .asm-ccs-question-meta .asm-ccs-hover-icon,
+.asm-ccs-question-row:focus-within .asm-ccs-question-meta .asm-ccs-hover-icon {
+  opacity: 1;
+}
+
+.asm-ccs-question-bubble {
+  max-width: 100%;
+  padding: 9px 14px;
+  border: 1px solid
+    color-mix(
+      in srgb,
+      var(--reader-accent, hsl(var(--primary))) 22%,
+      hsl(var(--border))
+    );
+  border-radius: 16px 4px 16px 16px;
+  background: color-mix(
+    in srgb,
+    var(--reader-accent, hsl(var(--primary))) 12%,
+    hsl(var(--secondary))
+  );
+  color: hsl(var(--foreground));
+  font-size: 14px;
+  line-height: 1.72;
+  overflow-wrap: anywhere;
+}
+
+.dark .asm-ccs-question-bubble {
+  border-color: color-mix(
+    in srgb,
+    var(--reader-accent, hsl(var(--primary))) 30%,
+    hsl(var(--border))
+  );
+  background: color-mix(
+    in srgb,
+    var(--reader-accent, hsl(var(--primary))) 17%,
+    hsl(var(--secondary))
+  );
+}
+
+.asm-ccs-question-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.asm-ccs-agent-lane {
+  position: relative;
+  padding-left: 40px;
+  padding-right: 8px;
+  border-radius: 10px;
+  transition: background 180ms ease;
+}
+
+.asm-ccs-avatar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--card));
+  box-shadow: 0 1px 2px hsl(224 25% 10% / 0.05);
+}
+
+.asm-ccs-agent-header {
+  display: flex;
+  height: 28px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  margin-bottom: 2px;
+}
+
+.asm-ccs-agent-name {
+  font-size: 13px;
+  font-weight: 650;
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-time {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-ccs-timeline-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.asm-ccs-row-btn {
+  display: flex;
+  height: 32px;
+  width: 100%;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--foreground) / 0.86);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.asm-ccs-row-btn.is-static {
+  cursor: default;
+}
+
+.asm-ccs-row-btn:not(.is-static):hover {
+  background: hsl(var(--muted) / 0.65);
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-chevron {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: hsl(var(--muted-foreground));
+  transition: transform 140ms ease;
+}
+
+.asm-ccs-chevron.is-subtle {
+  opacity: 0.72;
+}
+
+.asm-ccs-chevron.is-rotated {
+  transform: rotate(90deg);
+}
+
+.asm-ccs-glyph {
+  width: 14px;
+  flex: none;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+}
+
+.asm-ccs-timeline-summary {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: hsl(var(--muted-foreground));
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-ccs-timeline-main {
+  font-weight: 600;
+  color: hsl(var(--foreground) / 0.88);
+}
+
+.asm-ccs-dot {
+  padding: 0 6px;
+  color: hsl(var(--muted-foreground) / 0.55);
+}
+
+.asm-ccs-tone-success {
+  color: hsl(152 62% 33%);
+  font-weight: 550;
+}
+
+.dark .asm-ccs-tone-success {
+  color: hsl(152 65% 65%);
+}
+
+.asm-ccs-tone-danger {
+  color: hsl(var(--destructive));
+  font-weight: 550;
+}
+
+.asm-ccs-in-timeline {
+  margin-left: 12px;
+  padding-left: 8px;
+  border-left: 1px solid hsl(var(--border) / 0.85);
+}
+
+.asm-ccs-step-meta {
+  margin-left: auto;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-ccs-step-details {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 6px 8px 10px;
+}
+
+.asm-ccs-connector {
+  width: 14px;
+  flex: none;
+  padding-top: 4px;
+  color: hsl(var(--muted-foreground) / 0.72);
+  font-family:
+    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
+    monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  user-select: none;
+}
+
+.asm-ccs-tool-pre {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 8px 11px;
+  border: 1px solid hsl(var(--border) / 0.85);
+  border-radius: 8px;
+  background: hsl(var(--muted) / 0.42);
+  color: hsl(var(--foreground) / 0.88);
+  font-family:
+    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
+    monospace;
+  font-size: 12px;
+  line-height: 1.58;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.dark .asm-ccs-tool-pre {
+  background: hsl(225 22% 8%);
+}
+
+.asm-ccs-tool-pre.is-error {
+  border-color: hsl(var(--destructive) / 0.35);
+  background: hsl(var(--destructive) / 0.06);
+}
+
+.asm-ccs-thinking-body {
+  padding: 4px 8px 8px 28px;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+  line-height: 1.68;
+  font-style: italic;
+}
+
+.asm-ccs-note {
+  padding: 4px 6px;
+  color: hsl(var(--foreground) / 0.9);
+  font-size: 13.5px;
+  line-height: 1.72;
+}
+
+.asm-ccs-note.is-in-timeline {
+  margin-left: 12px;
+  padding-left: 14px;
+  border-left: 1px solid hsl(var(--border) / 0.85);
+}
+
+/* ── 行号 Unified Diff 视图 ── */
+.asm-ccs-diff {
+  overflow-x: auto;
+  border: 1px solid hsl(var(--border) / 0.85);
+  border-radius: 8px;
+  background: hsl(var(--card) / 0.85);
+  font-family:
+    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
+    monospace;
+  font-size: 12px;
+  line-height: 1.56;
+}
+
+.dark .asm-ccs-diff {
+  background: hsl(225 22% 7.8%);
+}
+
+.asm-ccs-diff-file {
+  padding: 5px 10px;
+  border-bottom: 1px solid hsl(var(--border) / 0.7);
+  background: hsl(var(--muted) / 0.52);
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  font-weight: 550;
+}
+
+.asm-ccs-diff-gap {
+  padding: 2px 10px;
+  background: hsl(var(--muted) / 0.35);
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  text-align: center;
+  user-select: none;
+}
+
+.asm-ccs-diff-row {
+  display: flex;
+  min-width: max-content;
+  align-items: stretch;
+  padding: 0 8px 0 4px;
+}
+
+.asm-ccs-diff-row.is-add {
+  background: hsl(142 71% 45% / 0.13);
+  color: hsl(142 64% 25%);
+}
+
+.asm-ccs-diff-row.is-del {
+  background: hsl(0 72% 51% / 0.13);
+  color: hsl(0 65% 36%);
+}
+
+.dark .asm-ccs-diff-row.is-add {
+  background: hsl(142 70% 45% / 0.16);
+  color: hsl(142 70% 74%);
+}
+
+.dark .asm-ccs-diff-row.is-del {
+  background: hsl(0 72% 55% / 0.16);
+  color: hsl(0 82% 77%);
+}
+
+.asm-ccs-diff-ln {
+  width: 34px;
+  flex: none;
+  padding-right: 6px;
+  color: hsl(var(--muted-foreground) / 0.58);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  user-select: none;
+}
+
+.asm-ccs-diff-sign {
+  width: 16px;
+  flex: none;
+  text-align: center;
+  user-select: none;
+}
+
+.asm-ccs-diff-code {
+  flex: 1;
+  white-space: pre;
+}
+
+/* ── 最终回复无框文档流 ── */
+.asm-ccs-final {
+  position: relative;
+  padding: 4px 6px 6px;
+}
+
+.asm-ccs-final-actions {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.asm-ccs-final:hover .asm-ccs-final-actions,
+.asm-ccs-final:focus-within .asm-ccs-final-actions {
+  opacity: 1;
+}
+
+.asm-ccs-final-body {
+  min-width: 0;
+  padding-right: 28px;
+  font-size: 14px;
+  line-height: 1.78;
+  overflow-wrap: anywhere;
+}
+
+.asm-ccs-hover-icon {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+}
+
+.asm-ccs-hover-icon:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-hover-pill {
+  display: inline-flex;
+  height: 23px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.asm-ccs-hover-pill:hover,
+.asm-ccs-hover-pill[aria-pressed="true"] {
+  border-color: hsl(var(--border));
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-inline-expand {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: hsl(var(--primary));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.asm-ccs-inline-expand:hover {
+  text-decoration: underline;
+}
+
+.asm-ccs-muted-num {
+  color: hsl(var(--muted-foreground));
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 底部悬浮「↓ 最新」按钮 ── */
+.asm-ccs-jump-latest {
+  position: absolute;
+  right: 22px;
+  bottom: 16px;
+  z-index: 12;
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--card) / 0.94);
+  backdrop-filter: blur(8px);
+  box-shadow:
+    0 6px 18px hsl(224 30% 8% / 0.14),
+    0 1px 3px hsl(224 30% 8% / 0.08);
+  color: hsl(var(--foreground));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition:
+    transform 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.asm-ccs-jump-latest:hover {
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--card));
+  transform: translateY(-1px);
+}
+
+/* ── 右侧对话目录抽屉（SessionOutline） ── */
+.asm-ccs-outline {
+  display: flex;
+  width: 236px;
+  flex: none;
+  min-height: 0;
+  flex-direction: column;
+  border-left: 1px solid hsl(var(--border) / 0.85);
+  background: hsl(var(--shell-bg) / 0.36);
+}
+
+.asm-ccs-outline-head {
+  display: flex;
+  height: 34px;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  border-bottom: 1px solid hsl(var(--border) / 0.65);
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.asm-ccs-outline-count {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  color: hsl(var(--muted-foreground));
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-ccs-outline-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.asm-ccs-outline-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 8px;
+  border-radius: 9px;
+  transition: background 120ms ease;
+}
+
+.asm-ccs-outline-item:hover {
+  background: hsl(var(--muted) / 0.45);
+}
+
+.asm-ccs-outline-item.is-active {
+  background: hsl(var(--primary) / 0.07);
+}
+
+.asm-ccs-outline-bar {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 2.5px;
+  border-radius: 999px;
+  background: hsl(var(--primary));
+}
+
+.asm-ccs-outline-q {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2.5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: right;
+  cursor: pointer;
+}
+
+.asm-ccs-outline-q-meta {
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-ccs-outline-q-bubble {
+  display: -webkit-box;
+  max-width: 92%;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  padding: 4px 8px;
+  border-radius: 10px 3px 10px 10px;
+  background: color-mix(
+    in srgb,
+    var(--reader-accent, hsl(var(--primary))) 14%,
+    hsl(var(--secondary))
+  );
+  color: hsl(var(--foreground));
+  font-size: 11.5px;
+  line-height: 1.42;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.asm-ccs-outline-a {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 2px 0 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.asm-ccs-outline-avatar {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--card));
+}
+
+.asm-ccs-outline-steps {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 1px;
+  color: hsl(var(--muted-foreground));
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.asm-ccs-outline-err-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: hsl(var(--destructive));
+}
+
+.asm-ccs-outline-a-text {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+
+.asm-ccs-outline-a-text.is-empty {
+  font-style: italic;
+  opacity: 0.72;
+}
+
+@media (max-width: 980px) {
+  .asm-ccs-outline {
+    display: none;
+  }
+  .asm-ccs-question-wrap {
+    max-width: 86%;
+  }
+}

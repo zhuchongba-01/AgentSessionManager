@@ -132,4 +132,67 @@ export const handlers = [
     success({ status: "available" }),
   ),
   http.post(`${TAURI_ENDPOINT}/set_window_theme`, () => success(null)),
+  http.post(`${TAURI_ENDPOINT}/sync_session_index`, () => {
+    const total = listSessions().length;
+    return success({ running: false, processed: total, total });
+  }),
+  http.post(`${TAURI_ENDPOINT}/search_session_content`, async ({ request }) => {
+    const { query = "", providerId } = await readJson<{
+      query?: string;
+      providerId?: string | null;
+    }>(request);
+    const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    const allSessions = listSessions();
+    const hits = allSessions
+      .filter((s) => !providerId || s.providerId === providerId)
+      .flatMap((session) => {
+        if (!session.sourcePath || terms.length === 0) return [];
+        const msgs = getSessionMessages(session.providerId, session.sourcePath);
+        const snippets: Array<{
+          messageIndex: number;
+          text: string;
+          highlights: Array<{ start: number; end: number }>;
+        }> = [];
+        let matchCount = 0;
+        msgs.forEach((msg, idx) => {
+          if (msg.role !== "user" && msg.role !== "assistant") return;
+          const lower = msg.content.toLocaleLowerCase();
+          if (!terms.every((term) => lower.includes(term))) return;
+          matchCount += 1;
+          if (snippets.length < 3) {
+            const firstTerm = terms[0];
+            const start = lower.indexOf(firstTerm);
+            const highlights =
+              start >= 0 ? [{ start, end: start + firstTerm.length }] : [];
+            snippets.push({
+              messageIndex: idx,
+              text: msg.content,
+              highlights,
+            });
+          }
+        });
+        if (matchCount === 0) return [];
+        return [
+          {
+            providerId: session.providerId,
+            sourcePath: session.sourcePath,
+            snippets,
+            matchCount,
+          },
+        ];
+      });
+    return success({
+      hits,
+      status: {
+        running: false,
+        processed: allSessions.length,
+        total: allSessions.length,
+      },
+    });
+  }),
+  http.post(`${TAURI_ENDPOINT}/cancel_session_content_search`, () =>
+    success(null),
+  ),
+  http.post(`${TAURI_ENDPOINT}/clear_session_index`, () => success(null)),
+  http.post(`${TAURI_ENDPOINT}/reveal_session_path`, () => success(null)),
 ];

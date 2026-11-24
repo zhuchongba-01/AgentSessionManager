@@ -9,6 +9,11 @@ describe("AgentIcon", () => {
         <AgentIcon icon="openai" name="Codex" size={16} />
         <AgentIcon icon="deepseek" name="DeepSeek Harness" size={16} />
         <AgentIcon icon="workbuddy" name="WorkBuddy" size={16} />
+        <AgentIcon icon="gemini" name="Gemini CLI" size={16} />
+        <AgentIcon icon="copilot" name="GitHub Copilot" size={16} />
+        <AgentIcon icon="codebuddy" name="CodeBuddy" size={16} />
+        <AgentIcon icon="kimi" name="Kimi CLI" size={16} />
+        <AgentIcon icon="openclaw" name="OpenClaw" size={16} />
         <AgentIcon icon="pi" name="Pi" size={16} />
       </>,
     );
@@ -16,6 +21,11 @@ describe("AgentIcon", () => {
       screen.getByTitle("Codex"),
       screen.getByTitle("DeepSeek Harness"),
       screen.getByTitle("WorkBuddy"),
+      screen.getByTitle("Gemini CLI"),
+      screen.getByTitle("GitHub Copilot"),
+      screen.getByTitle("CodeBuddy"),
+      screen.getByTitle("Kimi CLI"),
+      screen.getByTitle("OpenClaw"),
       screen.getByTitle("Pi"),
     ]) {
       expect(icon).toHaveStyle({ width: "16px", height: "16px" });

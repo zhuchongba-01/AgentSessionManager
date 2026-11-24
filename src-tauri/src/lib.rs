@@ -192,6 +192,112 @@ async fn get_pi_session_discovery(
 }
 
 #[tauri::command]
+async fn sync_session_index(
+    app: tauri::AppHandle,
+) -> Result<session_manager::search_index::IndexStatus, String> {
+    use tauri::Emitter;
+    tauri::async_runtime::spawn_blocking(move || {
+        session_manager::search_index::sync_index(|status| {
+            let _ = app.emit("session-index-status", status);
+        })
+    })
+    .await
+    .map_err(|error| format!("同步正文索引失败：{error}"))?
+}
+
+#[tauri::command]
+async fn search_session_content(
+    query: String,
+    #[allow(non_snake_case)] providerId: Option<String>,
+    limit: Option<usize>,
+    #[allow(non_snake_case)] searchId: Option<String>,
+) -> Result<session_manager::search_index::ContentSearchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        session_manager::search_index::search_content(
+            &query,
+            providerId.as_deref(),
+            limit,
+            searchId.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("正文搜索失败：{error}"))?
+}
+
+#[tauri::command]
+fn cancel_session_content_search(#[allow(non_snake_case)] searchId: String) {
+    session_manager::search_index::cancel_search(&searchId);
+}
+
+#[tauri::command]
+async fn clear_session_index() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(session_manager::search_index::clear_index)
+        .await
+        .map_err(|error| format!("清理正文索引失败：{error}"))?
+}
+
+fn resolve_reveal_target(raw: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path, PathBuf};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("路径不能为空".into());
+    }
+    let candidate = Path::new(trimmed);
+    if !candidate.is_absolute() {
+        return Err(format!("仅支持打开本地绝对路径：{trimmed}"));
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!("路径不能包含上级目录组件（..）：{trimmed}"));
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = candidate.components().next() {
+            if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) {
+                return Err(format!("不支持定位网络共享或设备路径：{trimmed}"));
+            }
+        }
+    }
+
+    let existing = if candidate.exists() {
+        candidate.to_path_buf()
+    } else if let Some(parent) = candidate.parent().filter(|p| p.exists()) {
+        parent.to_path_buf()
+    } else {
+        return Err(format!("目标路径不存在：{trimmed}"));
+    };
+
+    let canonical = existing
+        .canonicalize()
+        .map_err(|e| format!("无法解析路径 {}：{e}", existing.display()))?;
+    #[cfg(windows)]
+    {
+        let text = canonical.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix("\\\\?\\") {
+            if !stripped.starts_with("UNC\\") {
+                return Ok(PathBuf::from(stripped));
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+#[tauri::command]
+async fn reveal_session_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = resolve_reveal_target(&path)?;
+        tauri_plugin_opener::reveal_item_in_dir(&target)
+            .map_err(|error| format!("无法在文件管理器中定位 {}：{error}", target.display()))
+    })
+    .await
+    .map_err(|error| format!("定位路径失败：{error}"))?
+}
+
+#[tauri::command]
 fn set_window_theme(window: tauri::Window, theme: String) -> Result<(), String> {
     let theme = match theme.as_str() {
         "light" => Some(Theme::Light),
@@ -268,6 +374,11 @@ pub fn run() {
             delete_session,
             delete_sessions,
             get_pi_session_discovery,
+            sync_session_index,
+            search_session_content,
+            cancel_session_content_search,
+            clear_session_index,
+            reveal_session_path,
             set_window_theme,
         ])
         .run(tauri::generate_context!())

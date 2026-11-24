@@ -21,12 +21,17 @@ struct PendingDeletion {
 const KNOWN_PROVIDERS: &[&str] = &[
     "codex",
     "claude",
+    "gemini",
+    "copilot",
     "opencode",
     "zcode",
     "grokbuild",
     "pi",
     "deepseek",
     "workbuddy",
+    "codebuddy",
+    "kimi",
+    "openclaw",
 ];
 
 fn directory() -> Result<PathBuf, String> {
@@ -1066,6 +1071,15 @@ fn process_matches(executable: &str, provider: &str) -> bool {
                 )
                 || name.starts_with("workbuddy-")
         }
+        "gemini" => matches_alias(name, &["gemini", "gemini-cli"]),
+        "copilot" => matches_alias(name, &["copilot", "github-copilot-cli"]),
+        "codebuddy" => {
+            matches_alias(name, &["codebuddy", "codebuddy-cli"]) || name.starts_with("codebuddy-")
+        }
+        "kimi" => matches_alias(name, &["kimi", "kimi-cli"]),
+        "openclaw" => {
+            matches_alias(name, &["openclaw", "openclaw-gateway"]) || name.starts_with("openclaw-")
+        }
         _ => false,
     }
 }
@@ -1159,6 +1173,14 @@ fn scoped_package_matches(scope: &str, pkg: &str, provider: &str) -> bool {
             matches!(scope, "@tencent" | "@codebuddy" | "@workbuddy")
                 && (pkg == "workbuddy" || pkg.starts_with("workbuddy-"))
         }
+        "gemini" => scope == "@google" && matches!(pkg, "gemini-cli" | "gemini"),
+        "copilot" => scope == "@github" && matches!(pkg, "copilot" | "copilot-cli"),
+        "codebuddy" => {
+            matches!(scope, "@tencent-ai" | "@tencent" | "@codebuddy")
+                && (pkg == "codebuddy-code" || pkg == "codebuddy" || pkg.starts_with("codebuddy-"))
+        }
+        "kimi" => matches!(scope, "@moonshot-ai" | "@kimi") && matches!(pkg, "kimi" | "kimi-cli"),
+        "openclaw" => scope == "@openclaw" && (pkg == "openclaw" || pkg.starts_with("openclaw-")),
         _ => false,
     }
 }
@@ -1180,6 +1202,16 @@ fn package_or_bin_segment_matches(segment: &str, provider: &str) -> bool {
             matches!(pkg, "workbuddy" | "workbuddy-ai" | "workbuddy-cli")
                 || pkg.starts_with("workbuddy-")
         }
+        "gemini" => matches!(pkg, "gemini" | "gemini-cli"),
+        "copilot" => matches!(pkg, "copilot" | "github-copilot-cli"),
+        "codebuddy" => {
+            matches!(pkg, "codebuddy" | "codebuddy-code" | "codebuddy-cli")
+                || pkg.starts_with("codebuddy-")
+        }
+        "kimi" => matches!(pkg, "kimi" | "kimi-cli"),
+        "openclaw" => {
+            matches!(pkg, "openclaw" | "openclaw-gateway") || pkg.starts_with("openclaw-")
+        }
         _ => false,
     }
 }
@@ -1198,6 +1230,11 @@ fn unambiguous_package_dir_matches(segment: &str, provider: &str) -> bool {
             pkg,
             "workbuddy-ai" | "workbuddy-cli" | ".workbuddy-ai" | ".workbuddy"
         ),
+        "gemini" => pkg == "gemini-cli",
+        "copilot" => pkg == "github-copilot-cli",
+        "codebuddy" => matches!(pkg, "codebuddy-code" | "codebuddy-cli"),
+        "kimi" => pkg == "kimi-cli",
+        "openclaw" => matches!(pkg, "openclaw" | "openclaw-gateway"),
         _ => false,
     }
 }
@@ -1240,6 +1277,11 @@ fn script_process_matches_tokens(
         "pi" => &["pi", "pi-coding-agent"],
         "deepseek" => &["dsh", "deepseek-harness"],
         "workbuddy" => &["workbuddy", "workbuddy-ai", "workbuddy-cli"],
+        "gemini" => &["gemini", "gemini-cli"],
+        "copilot" => &["copilot", "github-copilot-cli"],
+        "codebuddy" => &["codebuddy", "codebuddy-code", "codebuddy-cli"],
+        "kimi" => &["kimi", "kimi-cli"],
+        "openclaw" => &["openclaw", "openclaw-gateway"],
         _ => &[],
     };
     inspected.iter().any(|arg| {

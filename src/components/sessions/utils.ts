@@ -177,12 +177,17 @@ export const getProviderLabel = (
   const labels: Record<string, string> = {
     codex: "Codex",
     claude: "Claude Code",
+    gemini: "Gemini CLI",
+    copilot: "GitHub Copilot",
     opencode: "OpenCode",
     zcode: "ZCode",
     grokbuild: "Grok Build",
     pi: "Pi",
     deepseek: "DeepSeek Harness",
     workbuddy: "WorkBuddy",
+    codebuddy: "CodeBuddy",
+    kimi: "Kimi CLI",
+    openclaw: "OpenClaw",
   };
   const key = `apps.${normalized}`;
   const translated = t(key);
@@ -504,3 +509,119 @@ export const formatSessionMessagePreview = (
  */
 export const shouldShowSessionMinimap = (userTurnCount: number) =>
   userTurnCount > 0;
+
+export interface SessionTimeGroup {
+  key: "today" | "yesterday" | "thisWeek" | "older";
+  label: string;
+  sessions: SessionMeta[];
+}
+
+export const groupSessionsByTime = (
+  sessions: SessionMeta[],
+  labels: {
+    today: string;
+    yesterday: string;
+    thisWeek: string;
+    older: string;
+  },
+  nowMs = Date.now(),
+): SessionTimeGroup[] => {
+  const now = new Date(nowMs);
+  const todayStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
+  const yesterdayStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() - 1,
+  ).getTime();
+  const weekStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() - 6,
+  ).getTime();
+
+  const buckets: Record<SessionTimeGroup["key"], SessionMeta[]> = {
+    today: [],
+    yesterday: [],
+    thisWeek: [],
+    older: [],
+  };
+
+  for (const session of sessions) {
+    const ts = session.lastActiveAt ?? session.createdAt ?? 0;
+    if (ts >= todayStart) {
+      buckets.today.push(session);
+    } else if (ts >= yesterdayStart) {
+      buckets.yesterday.push(session);
+    } else if (ts >= weekStart) {
+      buckets.thisWeek.push(session);
+    } else {
+      buckets.older.push(session);
+    }
+  }
+
+  const order: Array<{ key: SessionTimeGroup["key"]; label: string }> = [
+    { key: "today", label: labels.today },
+    { key: "yesterday", label: labels.yesterday },
+    { key: "thisWeek", label: labels.thisWeek },
+    { key: "older", label: labels.older },
+  ];
+
+  return order
+    .filter(({ key }) => buckets[key].length > 0)
+    .map(({ key, label }) => ({
+      key,
+      label,
+      sessions: buckets[key],
+    }));
+};
+
+export const extractRevealableLocalPath = (
+  raw?: string | null,
+): string | null => {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+
+  for (const prefix of ["sqlite-zcode:", "sqlite-workbuddy:", "sqlite:"]) {
+    if (trimmed.startsWith(prefix)) {
+      const rest = trimmed.slice(prefix.length);
+      const separator = rest.lastIndexOf(":");
+      if (separator <= 0 || (separator === 1 && /^[a-z]$/i.test(rest[0]))) {
+        return null;
+      }
+      const dbPath = rest.slice(0, separator).trim();
+      return dbPath || null;
+    }
+  }
+
+  if (
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("\\\\") ||
+    /^[a-z]:[/\\]/i.test(trimmed)
+  ) {
+    return trimmed;
+  }
+
+  return null;
+};
+
+export const buildResumeShellCommand = (
+  resumeCommand: string,
+  projectDir?: string | null,
+  windows?: boolean,
+): string => {
+  const cmd = resumeCommand.trim();
+  const dir = projectDir?.trim();
+  if (!dir) return cmd;
+
+  const isWin =
+    windows ??
+    (typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent));
+  if (isWin) {
+    return `Set-Location -LiteralPath '${dir.replace(/'/g, "''")}'; ${cmd}`;
+  }
+  return `cd '${dir.replace(/'/g, "'\\''")}' && ${cmd}`;
+};

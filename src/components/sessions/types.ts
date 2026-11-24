@@ -1,13 +1,18 @@
 export type ProviderFilter =
   | "all"
   | "codex"
-  | "grokbuild"
   | "claude"
-  | "opencode"
-  | "pi"
+  | "gemini"
+  | "copilot"
   | "deepseek"
+  | "grokbuild"
+  | "workbuddy"
+  | "codebuddy"
+  | "kimi"
+  | "openclaw"
+  | "opencode"
   | "zcode"
-  | "workbuddy";
+  | "pi";
 
 export type SessionStatusFilter =
   | "all"
@@ -16,7 +21,9 @@ export type SessionStatusFilter =
   | "archived"
   | "child";
 
-export type SessionListViewMode = "flat" | "grouped";
+export type SessionListViewMode = "flat" | "grouped" | "time";
+
+export type SessionReaderViewMode = "all" | "dialogue" | "changes";
 
 export interface GroupSelectionState {
   checked: boolean | "indeterminate";
@@ -33,10 +40,15 @@ export interface SessionGroupExpansionState {
 
 export const PROVIDER_FILTER_ORDER = [
   "codex",
+  "claude",
+  "gemini",
+  "copilot",
   "deepseek",
   "grokbuild",
-  "claude",
   "workbuddy",
+  "codebuddy",
+  "kimi",
+  "openclaw",
   "opencode",
   "zcode",
   "pi",

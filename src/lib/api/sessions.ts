@@ -1,5 +1,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { SessionMessage, SessionMeta } from "@/types";
+import type {
+  ContentSearchResult,
+  SessionIndexStatus,
+  SessionMessage,
+  SessionMeta,
+} from "@/types";
 
 export interface DeleteSessionOptions {
   providerId: string;
@@ -248,5 +253,45 @@ export const sessionsApi = {
     items: DeleteSessionOptions[],
   ): Promise<DeleteSessionResult[]> {
     return await invoke("delete_sessions", { items });
+  },
+
+  async syncContentIndex(): Promise<SessionIndexStatus> {
+    return await invoke<SessionIndexStatus>("sync_session_index");
+  },
+
+  async searchContent(
+    query: string,
+    providerId?: string | null,
+    signal?: AbortSignal,
+    limit = 200,
+  ): Promise<ContentSearchResult> {
+    if (signal?.aborted) {
+      throw new DOMException("正文搜索已取消", "AbortError");
+    }
+    const searchId = `search-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const onAbort = () => {
+      void invoke("cancel_session_content_search", { searchId }).catch(
+        () => undefined,
+      );
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      return await invoke<ContentSearchResult>("search_session_content", {
+        query,
+        providerId: providerId && providerId !== "all" ? providerId : undefined,
+        limit,
+        searchId,
+      });
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
+  },
+
+  async clearContentIndex(): Promise<void> {
+    await invoke("clear_session_index");
+  },
+
+  async revealPath(path: string): Promise<void> {
+    await invoke("reveal_session_path", { path });
   },
 };

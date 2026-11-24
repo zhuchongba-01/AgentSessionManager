@@ -143,4 +143,41 @@ describe("MessageMarkdown", () => {
       screen.getByText("普通回复文本，没有任何格式标记"),
     ).toBeInTheDocument();
   });
+
+  it("renders GFM tables, task lists, italic, strikethrough, and safe HTTPS links", () => {
+    const onOpenUrl = vi.fn();
+    const { container } = render(
+      <MessageMarkdown
+        content={[
+          "| 功能 | 状态 |",
+          "| :--- | :---: |",
+          "| 全文搜索 | *已支持* |",
+          "| 旧版接口 | ~~已废弃~~ |",
+          "",
+          "- [x] 完成 FTS5 索引",
+          "- [ ] 待验证安装包",
+          "",
+          "参考 [官方文档](https://example.com/docs) 与 [不安全链接](javascript:alert(1))",
+        ].join("\n")}
+        onCopyCode={vi.fn()}
+        onOpenUrl={onOpenUrl}
+      />,
+    );
+
+    expect(container.querySelector("table.asm-md-table")).toBeTruthy();
+    expect(container.querySelector("em")).toHaveTextContent("已支持");
+    expect(container.querySelector("del.asm-md-del")).toHaveTextContent(
+      "已废弃",
+    );
+    expect(container.querySelectorAll("li.asm-md-task-item")).toHaveLength(2);
+    expect(
+      container.querySelectorAll(".asm-md-task-box.is-checked"),
+    ).toHaveLength(1);
+
+    const links = container.querySelectorAll("a.asm-md-link");
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveTextContent("官方文档");
+    fireEvent.click(links[0]);
+    expect(onOpenUrl).toHaveBeenCalledWith("https://example.com/docs");
+  });
 });

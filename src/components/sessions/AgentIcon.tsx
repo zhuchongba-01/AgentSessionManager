@@ -1,17 +1,24 @@
 import openaiIcon from "@/icons/extracted/openai.svg?url";
 import claudeIcon from "@/icons/extracted/claude.svg?url";
+import geminiIcon from "@/icons/extracted/gemini.svg?url";
+import copilotIcon from "@/icons/extracted/copilot.svg?url";
 import grokIcon from "@/icons/extracted/grok.svg?url";
 import opencodeIcon from "@/icons/extracted/opencode-logo-light.svg?url";
 import zcodeIcon from "@/icons/extracted/zcode.png?url";
 import piIcon from "@/icons/extracted/pi.svg?url";
 import deepseekIcon from "@/icons/extracted/deepseek.svg?url";
 import workbuddyIcon from "@/icons/extracted/workbuddy.svg?url";
+import codebuddyIcon from "@/icons/extracted/codebuddy.svg?url";
+import kimiIcon from "@/icons/extracted/kimi.svg?url";
+import openclawIcon from "@/icons/extracted/openclaw.svg?url";
 import { cn } from "@/lib/utils";
 
 const icons: Record<string, string> = {
   codex: openaiIcon,
   openai: openaiIcon,
   claude: claudeIcon,
+  gemini: geminiIcon,
+  copilot: copilotIcon,
   grok: grokIcon,
   grokbuild: grokIcon,
   opencode: opencodeIcon,
@@ -19,26 +26,32 @@ const icons: Record<string, string> = {
   pi: piIcon,
   deepseek: deepseekIcon,
   workbuddy: workbuddyIcon,
+  codebuddy: codebuddyIcon,
+  kimi: kimiIcon,
+  openclaw: openclawIcon,
 };
 
 // 纯黑的单色 logo：亮色主题直接用，暗色主题由 CSS 反色成白，
 // 否则黑标贴在暗背景上不可见。
-const monoIcons = new Set([openaiIcon, grokIcon]);
+const monoIcons = new Set([openaiIcon, grokIcon, copilotIcon]);
 
 // 各家 logo 在自身画布里的占比差异很大（pi 的标记只占约六成，
 // zcode/opencode 是满幅方块），按倍率做光学补偿，让实际观感一致：
 // 名义 16px 时所有图标的视觉高度都对齐在 ~14px。
 const opticalScale: Record<string, number> = {
-  // 基准 = codex（OpenAI 标 1.1 时视觉约 16px）；各品牌按标记占画布比例
-  // 换算到同一视觉高度，保证列表里所有行图标观感一致
   openai: 1.1,
   claude: 1.1,
+  gemini: 1.08,
+  copilot: 1.08,
   grok: 1.15,
   opencode: 1.0,
   zcode: 1.1,
   pi: 1.55,
   deepseek: 1.08,
   workbuddy: 1.0,
+  codebuddy: 1.0,
+  kimi: 1.0,
+  openclaw: 1.08,
 };
 
 export function AgentIcon({

@@ -101,6 +101,9 @@ fn scan_sessions_at(home: &Path) -> Vec<SessionMeta> {
     for session in &mut sessions {
         let assignment = catalog.assignments.get(&session.session_id);
         session.archived = catalog.archived.contains(&session.session_id);
+        if session.archived || session.residual {
+            session.resume_command = None;
+        }
         session.project_name = assignment.and_then(|workspace| workspace.project_name.clone());
         session.project_dir = assignment.map(|workspace| workspace.project_dir.clone());
     }
@@ -336,7 +339,106 @@ fn read_header_from(reader: impl Read, path: &Path) -> Result<Value, String> {
     }
 }
 
-fn read_session(path: &Path) -> Result<DecodedSession, String> {
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+fn is_incomplete_zstd_frame_prefix(frame: &[u8]) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    if frame.len() < ZSTD_FRAME_MAGIC.len() {
+        ZSTD_FRAME_MAGIC.starts_with(frame)
+    } else {
+        frame.starts_with(&ZSTD_FRAME_MAGIC)
+    }
+}
+
+/// Decode concatenated independent zstd frames. If a non-first trailing frame is
+/// incomplete due to an interrupted write, keep all earlier complete frames; still
+/// fail closed if byte 0 is invalid/incomplete or if trailing bytes are non-zstd garbage.
+fn decode_zstd_frames(compressed: &[u8], path: &Path) -> Result<Vec<u8>, String> {
+    if compressed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    let mut offset = 0usize;
+    while offset < compressed.len() {
+        let frame = &compressed[offset..];
+        let size = match zstd::zstd_safe::find_frame_compressed_size(frame) {
+            Ok(0) => {
+                return Err(format!(
+                    "无法解压 DeepSeek Harness 会话 {}：空压缩帧无效",
+                    path.display()
+                ))
+            }
+            Ok(size) => size,
+            Err(_) if offset > 0 && is_incomplete_zstd_frame_prefix(frame) => break,
+            Err(code) => {
+                let detail = zstd::zstd_safe::get_error_name(code);
+                return Err(format!(
+                    "无法解压 DeepSeek Harness 会话 {}：{detail}",
+                    path.display()
+                ));
+            }
+        };
+        let decoder = zstd::stream::read::Decoder::new(&frame[..size]).map_err(|error| {
+            format!("无法解压 DeepSeek Harness 会话 {}：{error}", path.display())
+        })?;
+        let remaining_budget = (MAX_MESSAGES_FILE_BYTES + 1).saturating_sub(output.len() as u64);
+        decoder
+            .take(remaining_budget)
+            .read_to_end(&mut output)
+            .map_err(|error| {
+                format!("无法读取 DeepSeek Harness 会话 {}：{error}", path.display())
+            })?;
+        if output.len() as u64 > MAX_MESSAGES_FILE_BYTES {
+            return Err(format!(
+                "DeepSeek Harness 会话 {} 解压后超过 {} MB 读取上限",
+                path.display(),
+                MAX_MESSAGES_FILE_BYTES / 1024 / 1024
+            ));
+        }
+        offset += size;
+    }
+    Ok(output)
+}
+
+fn read_session_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    if path.extension().and_then(|value| value.to_str()) == Some("zstd") {
+        let file = File::open(path).map_err(|error| {
+            format!("无法打开 DeepSeek Harness 会话 {}：{error}", path.display())
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            format!("无法检查 DeepSeek Harness 会话 {}：{error}", path.display())
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "DeepSeek Harness 会话不是普通文件：{}",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_MESSAGES_FILE_BYTES {
+            return Err(format!(
+                "DeepSeek Harness 会话 {} 超过 {} MB 读取上限",
+                path.display(),
+                MAX_MESSAGES_FILE_BYTES / 1024 / 1024
+            ));
+        }
+        let mut compressed = Vec::new();
+        file.take(MAX_MESSAGES_FILE_BYTES + 1)
+            .read_to_end(&mut compressed)
+            .map_err(|error| {
+                format!("无法读取 DeepSeek Harness 会话 {}：{error}", path.display())
+            })?;
+        if compressed.len() as u64 > MAX_MESSAGES_FILE_BYTES {
+            return Err(format!(
+                "DeepSeek Harness 会话 {} 超过 {} MB 读取上限",
+                path.display(),
+                MAX_MESSAGES_FILE_BYTES / 1024 / 1024
+            ));
+        }
+        return decode_zstd_frames(&compressed, path);
+    }
+
     let mut reader = open_session_reader(path)?;
     let mut bytes = Vec::new();
     reader
@@ -351,6 +453,11 @@ fn read_session(path: &Path) -> Result<DecodedSession, String> {
             MAX_MESSAGES_FILE_BYTES / 1024 / 1024
         ));
     }
+    Ok(bytes)
+}
+
+fn read_session(path: &Path) -> Result<DecodedSession, String> {
+    let bytes = read_session_bytes(path)?;
     let mut lines = bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty());
@@ -788,6 +895,10 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
         (created, prompt) => prompt.or(created),
     };
 
+    let residual = is_subagent || hidden_dependency;
+    let resume_command =
+        (!residual && !has_parent && is_safe_session_id(&id)).then(|| format!("dsh --resume {id}"));
+
     Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: id,
@@ -795,7 +906,7 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
         // workspace conversation list. Surface them as residuals here so a
         // parent dependency can be resolved deliberately instead of making
         // the parent permanently undeletable.
-        residual: is_subagent || hidden_dependency,
+        residual,
         parent_session_id,
         archived: false,
         cleanup_pending: false,
@@ -809,7 +920,7 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
         created_at,
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
-        resume_command: None,
+        resume_command,
     }))
 }
 
@@ -3012,5 +3123,111 @@ mod tests {
                 ("user", "imported question"),
             ]
         );
+    }
+
+    #[test]
+    fn tolerates_incomplete_trailing_zstd_frame_while_rejecting_corrupt_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("sessions/project/zstd-tail/session.v4.jsonl.zstd");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let header = json!({
+            "type": "session", "version": 4, "id": "zstd-tail",
+            "createdAt": 1_700_000_000_000_i64, "cwd": "C:/work/demo"
+        });
+        let turn_start = json!({"type":"turn/start","seq":0,"time":1700000000010_i64,"data":{}});
+        let user_msg = json!({
+            "type": "user/message", "seq": 1, "time": 1_700_000_000_100_i64,
+            "surfaceOp": "append", "data": {"role": "user", "source": {"kind": "user"},
+            "content": [{"type": "text", "text": "completed frame prompt"}]}
+        });
+        let pending_msg = json!({
+            "type": "assistant/message", "seq": 2, "time": 1_700_000_000_200_i64,
+            "surfaceOp": "append", "data": {"message": {"role": "assistant",
+            "content": [{"type": "text", "text": "half flushed frame"}]}}
+        });
+
+        let frame0 = zstd::stream::encode_all(format!("{header}\n").as_bytes(), 1).unwrap();
+        let frame1 =
+            zstd::stream::encode_all(format!("{turn_start}\n{user_msg}\n").as_bytes(), 1).unwrap();
+        let frame2 = zstd::stream::encode_all(format!("{pending_msg}\n").as_bytes(), 1).unwrap();
+
+        // 1. Mid-frame truncation on frame 2 still decodes frame 0 + frame 1 cleanly
+        let mut truncated_mid = Vec::new();
+        truncated_mid.extend_from_slice(&frame0);
+        truncated_mid.extend_from_slice(&frame1);
+        truncated_mid.extend_from_slice(&frame2[..frame2.len() / 2]);
+        fs::write(&path, &truncated_mid).unwrap();
+
+        let msgs = load_messages(&path).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "completed frame prompt");
+
+        let scanned = scan_sessions_at(temp.path());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].title.as_deref(), Some("completed frame prompt"));
+        assert_eq!(
+            scanned[0].resume_command.as_deref(),
+            Some("dsh --resume zstd-tail")
+        );
+
+        // 2. Partial 2-byte zstd magic prefix at tail also decodes earlier complete frames
+        let mut truncated_magic = Vec::new();
+        truncated_magic.extend_from_slice(&frame0);
+        truncated_magic.extend_from_slice(&frame1);
+        truncated_magic.extend_from_slice(&ZSTD_FRAME_MAGIC[..2]);
+        fs::write(&path, &truncated_magic).unwrap();
+        assert_eq!(load_messages(&path).unwrap().len(), 1);
+
+        // 3. Truncated first frame (0 complete frames) MUST fail
+        fs::write(&path, &frame0[..frame0.len() / 2]).unwrap();
+        assert!(load_messages(&path).is_err());
+
+        // 4. Corrupt non-zstd trailing garbage MUST fail
+        let mut corrupt_tail = Vec::new();
+        corrupt_tail.extend_from_slice(&frame0);
+        corrupt_tail.extend_from_slice(&frame1);
+        corrupt_tail.extend_from_slice(b"corrupt-raw-garbage");
+        fs::write(&path, &corrupt_tail).unwrap();
+        assert!(load_messages(&path).is_err());
+    }
+
+    #[test]
+    fn resume_command_only_populated_for_active_root_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("sessions/project/s-root/session.v4.jsonl");
+        let arch_path = temp.path().join("sessions/project/s-arch/session.v4.jsonl");
+        let branch_path = temp
+            .path()
+            .join("sessions/project/s-branch/session.v4.jsonl");
+        let sub_path = temp.path().join("sessions/project/s-sub/session.v4.jsonl");
+
+        write_plain_session(&root_path, "s-root", None, None);
+        write_plain_session(&arch_path, "s-arch", None, None);
+        write_plain_session(&branch_path, "s-branch", Some("s-root"), None);
+        write_plain_session(&sub_path, "s-sub", Some("s-root"), Some("subagent"));
+        write_index(
+            temp.path(),
+            &["s-root", "s-arch", "s-branch", "s-sub"],
+            &["s-arch"],
+        );
+
+        let sessions = scan_sessions_at(temp.path());
+        let by_id: HashMap<_, _> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s))
+            .collect();
+
+        assert_eq!(
+            by_id["s-root"].resume_command.as_deref(),
+            Some("dsh --resume s-root")
+        );
+        assert!(by_id["s-arch"].archived);
+        assert!(by_id["s-arch"].resume_command.is_none());
+        assert!(by_id["s-branch"].resume_command.is_none());
+        assert!(by_id["s-sub"].residual);
+        assert!(by_id["s-sub"].resume_command.is_none());
     }
 }

@@ -33,7 +33,14 @@ import {
 import { useTheme } from "@/components/theme-provider";
 import { AppTitleBar } from "./AppTitleBar";
 import { SessionListSidebar } from "./SessionListSidebar";
-import { SessionDetailPane } from "./SessionDetailPane";
+import {
+  SessionDetailPane,
+  type PendingSnippetJump,
+} from "./SessionDetailPane";
+import {
+  getContentHitKey,
+  useSessionContentSearch,
+} from "./useSessionContentSearch";
 import { useSessionDeletion } from "./useSessionDeletion";
 import type {
   ProviderFilter,
@@ -49,6 +56,7 @@ import {
   getSessionDirectoryGroupKey,
   getSessionKey,
   groupSessionsByProviderAndDirectory,
+  groupSessionsByTime,
 } from "./utils";
 
 const SESSION_LIST_VIEW_MODE_STORAGE_KEY = "agent-session-manager.listViewMode";
@@ -90,7 +98,9 @@ const readInitialSidebarWidth = (): number => {
 
 const readInitialSessionListViewMode = (): SessionListViewMode => {
   const stored = safeLocalStorageGet(SESSION_LIST_VIEW_MODE_STORAGE_KEY);
-  return stored === "grouped" || stored === "flat" ? stored : "grouped";
+  return stored === "grouped" || stored === "flat" || stored === "time"
+    ? stored
+    : "grouped";
 };
 
 const readInitialSessionGroupExpansionState =
@@ -177,6 +187,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     data,
     isLoading,
     isFetching,
+    isSuccess: sessionsIsSuccess,
     refetch,
     dataUpdatedAt,
     error: sessionsError,
@@ -202,6 +213,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     appId as ProviderFilter,
   );
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [pendingJumpTarget, setPendingJumpTarget] =
+    useState<PendingSnippetJump | null>(null);
   const [listViewMode, setListViewMode] = useState<SessionListViewMode>(
     readInitialSessionListViewMode,
   );
@@ -242,6 +255,13 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const sidebarWidthRef = useRef(sidebarWidth);
   sidebarWidthRef.current = sidebarWidth;
   const resizeCleanupRef = useRef<(() => void) | null>(null);
+
+  const contentSearch = useSessionContentSearch({
+    query: searchQuery,
+    providerFilter,
+    listIsSuccess: sessionsIsSuccess,
+    listUpdatedAt: dataUpdatedAt,
+  });
 
   useEffect(() => {
     return () => {
@@ -401,7 +421,15 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         } else if (statusFilter === "child") {
           if (!session.parentSessionId) return false;
         }
-        return searchTerms.every((term) => haystack.includes(term));
+        if (searchTerms.length === 0) return true;
+        const metaMatch = searchTerms.every((term) => haystack.includes(term));
+        if (metaMatch) return true;
+        if (contentSearch.enabled) {
+          return contentSearch.hits.has(
+            getContentHitKey(session.providerId, session.sourcePath),
+          );
+        }
+        return false;
       })
       .map(({ session }) => session);
     return list.sort(
@@ -409,7 +437,13 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         (b.lastActiveAt ?? b.createdAt ?? 0) -
         (a.lastActiveAt ?? a.createdAt ?? 0),
     );
-  }, [providerScopedIndex, searchTerms, statusFilter]);
+  }, [
+    contentSearch.enabled,
+    contentSearch.hits,
+    providerScopedIndex,
+    searchTerms,
+    statusFilter,
+  ]);
 
   const groupedSessions = useMemo(
     () =>
@@ -422,6 +456,17 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           defaultValue: "未分组",
         }),
       ),
+    [filteredSessions, t],
+  );
+
+  const timeGroupedSessions = useMemo(
+    () =>
+      groupSessionsByTime(filteredSessions, {
+        today: t("sessionManager.timeToday", { defaultValue: "今天" }),
+        yesterday: t("sessionManager.timeYesterday", { defaultValue: "昨天" }),
+        thisWeek: t("sessionManager.timeThisWeek", { defaultValue: "本周" }),
+        older: t("sessionManager.timeOlder", { defaultValue: "更早" }),
+      }),
     [filteredSessions, t],
   );
 
@@ -496,6 +541,9 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   }, [isLoading, sessions.length, validGroupExpansionKeys]);
 
   const navigableSessions = useMemo(() => {
+    if (listViewMode === "time") {
+      return timeGroupedSessions.flatMap((group) => group.sessions);
+    }
     if (listViewMode !== "grouped") {
       return filteredSessions;
     }
@@ -514,6 +562,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     filteredSessions,
     groupedSessions,
     listViewMode,
+    timeGroupedSessions,
   ]);
 
   const prevOrderedKeysRef = useRef<string[]>([]);
@@ -533,7 +582,9 @@ export function SessionManagerPage({ appId }: { appId: string }) {
               (directoryGroup) => directoryGroup.sessions,
             ),
           )
-        : filteredSessions;
+        : listViewMode === "time"
+          ? timeGroupedSessions.flatMap((group) => group.sessions)
+          : filteredSessions;
     const currentOrderKeys = visualOrder.map(getSessionKey);
     const currentKeySet = new Set(currentOrderKeys);
     const exists = selectedKey ? currentKeySet.has(selectedKey) : false;
@@ -575,6 +626,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     listViewMode,
     navigableSessions,
     selectedKey,
+    timeGroupedSessions,
   ]);
 
   useEffect(() => {
@@ -598,12 +650,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   }, [filteredSessions, selectedKey]);
   const isCodexSession = selectedSession?.providerId === "codex";
 
-  /**
-   * 当前打开会话的子会话数量。
-   *
-   * 详情面板的删除按钮据此把它的实际范围说清楚：有子会话时它不再是「仅删除此会话」，
-   * 而是会连带清理整条子会话链（范围仍可在确认框里改动）。
-   */
   const selectedSessionChildCount = useMemo(
     () =>
       selectedSession
@@ -612,7 +658,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [selectedSession, sessions],
   );
 
-  /** 父会话显示名：详情面板的归属徽标与删除按钮共用同一张表。 */
   const sessionTitles = useMemo(
     () => buildSessionTitleIndex(sessions),
     [sessions],
@@ -702,7 +747,47 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     [handleCopy, t],
   );
 
-  // 仅保留当前会话、当前读取批次的全文；进行中的请求也共用。
+  const handleRevealPath = useCallback(
+    async (path: string) => {
+      try {
+        await sessionsApi.revealPath(path);
+      } catch (error) {
+        toast.error(
+          t("sessionManager.revealFailed", {
+            defaultValue: "无法在文件管理器中定位：{{error}}",
+            error: extractErrorMessage(error),
+          }),
+        );
+      }
+    },
+    [t],
+  );
+
+  const handleNotifyExport = useCallback(
+    (filename: string) => {
+      toast.success(
+        t("sessionManager.markdownExported", {
+          defaultValue: "已导出 {{filename}}",
+          filename,
+        }),
+      );
+    },
+    [t],
+  );
+
+  const handleSelectSnippet = useCallback(
+    (sessionKey: string, transcriptIndex: number) => {
+      setSelectedKey(sessionKey);
+      setPendingJumpTarget({
+        sessionKey,
+        transcriptIndex,
+        query: searchQuery.trim(),
+        nonce: Date.now(),
+      });
+    },
+    [searchQuery],
+  );
+
   const fullContentCache = useMemo(
     () => new Map<string, Promise<string>>(),
     [selectedKey, messageRevision],
@@ -719,8 +804,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       }
 
       const contentChars = message.contentChars ?? message.content.length;
-      // 摘要也要进缓存键：会话改写后同一下标、同一长度会换出另一条消息，
-      // 只按 (index, chars) 复用会把上一条的全文交给这一条。
       const cacheKey = `${message.index}\u0000${contentChars}\u0000${message.contentIdentity ?? ""}`;
       const cached = fullContentCache.get(cacheKey);
       if (cached !== undefined) return cached;
@@ -734,7 +817,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           message.contentIdentity,
         )
         .catch((error) => {
-          // 失败不缓存；已切走的会话不再弹出迟到错误。
           fullContentCache.delete(cacheKey);
           if (currentFullContentCache.current === fullContentCache) {
             toast.error(
@@ -798,6 +880,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     () => new Set(sessions.map((session) => session.providerId)).size,
     [sessions],
   );
+
   const providerSessionCounts = useMemo(
     () =>
       sessions.reduce<Record<string, number>>((counts, session) => {
@@ -929,13 +1012,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     });
   }, [allFilteredSelected, deletableFilteredSessions]);
 
-  /**
-   * 当前是否处于「已勾选了要批量删除的会话」状态。
-   *
-   * 详情面板里的删除按钮据此切换语义：有勾选项时它就是批量删除，没有时才是
-   * 「只删右侧这一条」。两处删除入口共用同一个判断，避免用户在批量管理里多选
-   * 之后点到详情按钮、结果只删掉一条。
-   */
   const hasBatchSelection =
     selectionMode && selectedDeletableSessions.length > 0;
 
@@ -1161,6 +1237,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 sessions={sessions}
                 filteredSessions={filteredSessions}
                 groupedSessions={groupedSessions}
+                timeGroupedSessions={timeGroupedSessions}
                 providerFilter={providerFilter}
                 onProviderFilterChange={setProviderFilter}
                 providerFilterLabel={providerFilterLabel}
@@ -1184,6 +1261,13 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 onSearchQueryChange={setSearchQuery}
                 searchTerms={searchTerms}
                 isSearching={isSearching}
+                contentSearchEnabled={contentSearch.enabled}
+                onContentSearchEnabledChange={contentSearch.setEnabled}
+                contentHits={contentSearch.hits}
+                contentIndexStatus={contentSearch.status}
+                isContentSearching={contentSearch.isSearching}
+                contentSearchError={contentSearch.error}
+                onRetryContentSearch={contentSearch.retry}
                 statusFilter={statusFilter}
                 onStatusFilterChange={setStatusFilter}
                 statusCounts={statusCounts}
@@ -1197,6 +1281,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 selectedSessionKeys={selectedSessionKeys}
                 sessionTitles={sessionTitles}
                 onSelectSession={setSelectedKey}
+                onSelectSnippet={handleSelectSnippet}
                 onToggleSessionChecked={toggleSessionChecked}
                 onToggleSessionGroupChecked={toggleSessionGroupChecked}
                 updatedAtLabel={updatedAtLabel}
@@ -1240,6 +1325,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 onCopy={(text, message) => void handleCopy(text, message)}
                 onCopyMessage={handleCopyMessage}
                 onCopyCode={handleCopyCode}
+                onOpenUrl={handleOpenUrl}
+                onRevealPath={(path) => void handleRevealPath(path)}
+                onNotifyExport={handleNotifyExport}
+                pendingJumpTarget={pendingJumpTarget}
+                onConsumeJumpTarget={() => setPendingJumpTarget(null)}
               />
             </div>
           </div>
@@ -1252,8 +1342,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           message={deletion.dialogMessage}
           details={deletion.deleteConfirmDetails?.items}
           detailsOverflowLabel={deletion.deleteConfirmDetails?.overflowLabel}
-          // 勾选项由页面持有状态：范围（是否连带子会话）和「已核对未列出的条目」都在
-          // 这里说清楚，勾选与否则回传给页面，不靠组件内部副作用同步。
           checkboxes={deletion.deleteDialogCheckboxes}
           confirmText={deletion.dialogConfirmText}
           cancelText={t("common.cancel", { defaultValue: "取消" })}

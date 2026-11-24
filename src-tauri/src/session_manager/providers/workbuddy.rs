@@ -524,7 +524,7 @@ fn parse_jsonl_meta(path: &Path) -> Result<Option<ParsedJsonlMeta>, String> {
                 }
             }
             "message" => {
-                if is_compaction_summary(&val) {
+                if is_meta_entry(&val) || is_compaction_summary(&val) {
                     continue;
                 }
                 let role = val.get("role").and_then(Value::as_str).unwrap_or("");
@@ -651,6 +651,14 @@ fn load_db_sessions(db_path: &Path) -> Result<HashMap<String, DbSessionRow>, Str
     Ok(map)
 }
 
+fn is_meta_entry(entry: &Value) -> bool {
+    entry
+        .pointer("/providerData/isMeta")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || entry.get("isMeta").and_then(Value::as_bool) == Some(true)
+}
+
 fn is_compaction_summary(entry: &Value) -> bool {
     let Some(pd) = entry.get("providerData") else {
         return false;
@@ -752,24 +760,67 @@ fn reconstruct_chain(entries: &[Value]) -> Vec<(&Value, bool)> {
     chain
 }
 
+fn unwrap_user_query(raw: &str) -> String {
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
+    if let Some(start) = raw.rfind(OPEN) {
+        let rest = &raw[start + OPEN.len()..];
+        let end = rest.find(CLOSE).unwrap_or(rest.len());
+        return rest[..end].trim().to_string();
+    }
+    if raw.contains("<system-reminder>") {
+        return strip_system_reminders(raw).trim().to_string();
+    }
+    raw.to_string()
+}
+
+fn strip_system_reminders(raw: &str) -> String {
+    const REM_OPEN: &str = "<system-reminder>";
+    const REM_CLOSE: &str = "</system-reminder>";
+    let mut current = raw;
+    let mut out = String::new();
+    while let Some(start) = current.find(REM_OPEN) {
+        out.push_str(&current[..start]);
+        let after_open = &current[start + REM_OPEN.len()..];
+        if let Some(end) = after_open.find(REM_CLOSE) {
+            current = &after_open[end + REM_CLOSE.len()..];
+        } else {
+            current = "";
+            break;
+        }
+    }
+    out.push_str(current);
+    out
+}
+
 fn extract_workbuddy_message_text(entry: &Value) -> String {
+    let is_user_prompt =
+        entry.get("role").and_then(Value::as_str) == Some("user") && !is_compaction_summary(entry);
     let Some(content) = entry.get("content") else {
         return String::new();
     };
     match content {
-        Value::String(s) => s.clone(),
+        Value::String(s) => {
+            if is_user_prompt {
+                unwrap_user_query(s)
+            } else {
+                s.clone()
+            }
+        }
         Value::Array(items) => items
             .iter()
-            .filter_map(extract_workbuddy_content_item)
+            .filter_map(|item| extract_workbuddy_content_item(item, is_user_prompt))
             .filter(|s| !s.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
-        Value::Object(_) => extract_workbuddy_content_item(content).unwrap_or_default(),
+        Value::Object(_) => {
+            extract_workbuddy_content_item(content, is_user_prompt).unwrap_or_default()
+        }
         _ => String::new(),
     }
 }
 
-fn extract_workbuddy_content_item(item: &Value) -> Option<String> {
+fn extract_workbuddy_content_item(item: &Value, is_user_prompt: bool) -> Option<String> {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     match item_type {
         "thinking" | "reasoning" | "redacted_thinking" | "summary_text" | "reasoning_text" => None,
@@ -786,15 +837,27 @@ fn extract_workbuddy_content_item(item: &Value) -> Option<String> {
                 Some("[Image]".to_string())
             }
         }
-        "input_text" | "output_text" | "text" => item
-            .get("text")
-            .or_else(|| item.get("input_text"))
-            .or_else(|| item.get("output_text"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        "input_text" | "output_text" | "text" => {
+            let raw = item
+                .get("text")
+                .or_else(|| item.get("input_text"))
+                .or_else(|| item.get("output_text"))
+                .and_then(Value::as_str)?;
+            let cleaned = if is_user_prompt {
+                unwrap_user_query(raw)
+            } else {
+                raw.to_string()
+            };
+            (!cleaned.trim().is_empty()).then_some(cleaned)
+        }
         _ => {
             let fallback = extract_text(item);
-            (!fallback.trim().is_empty()).then_some(fallback)
+            let cleaned = if is_user_prompt {
+                unwrap_user_query(&fallback)
+            } else {
+                fallback
+            };
+            (!cleaned.trim().is_empty()).then_some(cleaned)
         }
     }
 }
@@ -945,6 +1008,9 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                 }
             }
             "message" => {
+                if is_meta_entry(entry) {
+                    continue;
+                }
                 if is_compaction_summary(entry) {
                     if logical_parent_resolved {
                         continue;
@@ -2075,6 +2141,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edge_count, 0);
+    }
+
+    #[test]
+    fn unwraps_user_query_and_skips_is_meta_entries_across_scan_and_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".workbuddy-ai");
+        let proj = home.join("projects").join("e-proj");
+        fs::create_dir_all(&proj).unwrap();
+
+        let id = "66666666-6666-4666-8666-666666666666";
+        let jsonl = proj.join(format!("{id}.jsonl"));
+        let lines = [
+            json!({
+                "id": "m_meta_head",
+                "parentId": null,
+                "type": "message",
+                "role": "user",
+                "timestamp": 1000,
+                "providerData": {"isMeta": true},
+                "content": [{"type": "input_text", "text": "<system-reminder>internal boot reminder</system-reminder>"}]
+            }),
+            json!({
+                "id": "u1",
+                "parentId": "m_meta_head",
+                "type": "message",
+                "role": "user",
+                "timestamp": 1001,
+                "content": [
+                    {"type": "input_text", "text": "<system-reminder>cwd context</system-reminder>\n<user_query>list txt files</user_query>"},
+                    {"type": "image_blob_ref", "original_filename": "shot.png"}
+                ]
+            }),
+            json!({
+                "id": "m_meta_mid",
+                "parentId": "u1",
+                "type": "message",
+                "role": "user",
+                "timestamp": 1002,
+                "providerData": {"isMeta": true},
+                "content": [{"type": "input_text", "text": "<system-reminder>use task tools</system-reminder>"}]
+            }),
+            json!({
+                "id": "a1",
+                "parentId": "m_meta_mid",
+                "type": "message",
+                "role": "assistant",
+                "timestamp": 1003,
+                "content": [{"type": "output_text", "text": "Found 2 files."}]
+            }),
+        ];
+        fs::write(
+            &jsonl,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let cache = FileParseCache::new();
+        let scanned = scan_sessions_in_homes(std::slice::from_ref(&home), &cache);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].title.as_deref(),
+            Some("list txt files\n[Image: shot.png]")
+        );
+        assert_eq!(scanned[0].summary.as_deref(), Some("Found 2 files."));
+        assert!(scanned[0].resume_command.is_none());
+
+        let msgs = load_messages(&jsonl).unwrap();
+        let pairs: Vec<(&str, &str)> = msgs
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("user", "list txt files\n[Image: shot.png]"),
+                ("assistant", "Found 2 files."),
+            ]
+        );
     }
 
     #[test]

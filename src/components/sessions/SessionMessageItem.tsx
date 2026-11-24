@@ -46,6 +46,7 @@ interface SessionMessageItemProps {
   isActiveSearchMatch?: boolean;
   onCopy: (content: string) => void;
   onCopyCode?: (code: string) => Promise<void> | void;
+  onOpenUrl?: (url: string) => void;
   /**
    * 取回被截断消息的全文。后端只下发预览的消息必须靠它才能展开/复制完整内容；
    * 未提供时退化为只显示预览。
@@ -81,6 +82,7 @@ function SessionMessageContent({
   isActiveSearchMatch = false,
   onCopy,
   onCopyCode,
+  onOpenUrl,
   onLoadFullContent,
 }: SessionMessageItemProps) {
   const { t } = useTranslation();
@@ -481,6 +483,7 @@ function SessionMessageContent({
               collapsed={collapsed}
               highlightTerms={highlightTerms}
               onCopyCode={handleCodeCopy}
+              onOpenUrl={onOpenUrl}
             />
           ) : (
             highlightText(plainDisplayContent, highlightTerms)

@@ -441,12 +441,111 @@ mod compat_tests {
         std::env::remove_var("ASM_TEST_TRIM_EMPTY");
         std::env::remove_var("ASM_TEST_TRIM_PATH");
     }
+
+    #[test]
+    #[serial_test::serial]
+    #[allow(deprecated)]
+    fn new_provider_path_resolvers_respect_env_overrides_and_defaults() {
+        let vars = [
+            "GEMINI_CLI_HOME",
+            "COPILOT_HOME",
+            "CODEBUDDY_CONFIG_DIR",
+            "KIMI_SHARE_DIR",
+            "KIMI_CODE_HOME",
+            "OPENCLAW_STATE_DIR",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            vars.iter().map(|&k| (k, std::env::var_os(k))).collect();
+        for &k in &vars {
+            std::env::remove_var(k);
+        }
+
+        let home = home_dir();
+        assert_eq!(gemini_home(), home.join(".gemini"));
+        assert_eq!(copilot_home(), home.join(".copilot"));
+        assert_eq!(codebuddy_config_dir(), home.join(".codebuddy"));
+        assert_eq!(kimi_home(), home.join(".kimi"));
+        assert_eq!(openclaw_state_dir(), home.join(".openclaw"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let gemini_base = temp.path().join("gemini-user-home");
+        let copilot_custom = temp.path().join("copilot-custom");
+        let codebuddy_custom = temp.path().join("codebuddy-custom");
+        let kimi_share = temp.path().join("kimi-share");
+        let kimi_code = temp.path().join("kimi-code");
+        let openclaw_custom = temp.path().join("openclaw-state");
+
+        std::env::set_var("GEMINI_CLI_HOME", &gemini_base);
+        assert_eq!(gemini_home(), gemini_base.join(".gemini"));
+
+        std::env::set_var("COPILOT_HOME", &copilot_custom);
+        assert_eq!(copilot_home(), copilot_custom);
+
+        std::env::set_var("CODEBUDDY_CONFIG_DIR", &codebuddy_custom);
+        assert_eq!(codebuddy_config_dir(), codebuddy_custom);
+
+        std::env::set_var("KIMI_CODE_HOME", &kimi_code);
+        assert_eq!(kimi_home(), kimi_code);
+        std::env::set_var("KIMI_SHARE_DIR", &kimi_share);
+        assert_eq!(
+            kimi_home(),
+            kimi_share,
+            "KIMI_SHARE_DIR takes precedence over KIMI_CODE_HOME"
+        );
+        std::env::set_var("KIMI_SHARE_DIR", "   ");
+        assert_eq!(
+            kimi_home(),
+            kimi_code,
+            "blank KIMI_SHARE_DIR falls back to KIMI_CODE_HOME"
+        );
+
+        std::env::set_var("OPENCLAW_STATE_DIR", "~/custom-openclaw");
+        assert_eq!(openclaw_state_dir(), home.join("custom-openclaw"));
+        std::env::set_var("OPENCLAW_STATE_DIR", &openclaw_custom);
+        assert_eq!(openclaw_state_dir(), openclaw_custom);
+
+        for (k, val) in saved {
+            match val {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 }
 
 pub fn grok_config_dir() -> PathBuf {
     configured_dir("GROK_HOME")
         .or_else(|| configured_dir("GROK_CONFIG_DIR"))
         .unwrap_or_else(|| home_dir().join(".grok"))
+}
+
+#[allow(dead_code)]
+pub fn gemini_home() -> PathBuf {
+    configured_dir("GEMINI_CLI_HOME")
+        .map(|p| p.join(".gemini"))
+        .unwrap_or_else(|| home_dir().join(".gemini"))
+}
+
+#[allow(dead_code)]
+pub fn copilot_home() -> PathBuf {
+    configured_dir("COPILOT_HOME").unwrap_or_else(|| home_dir().join(".copilot"))
+}
+
+#[allow(dead_code)]
+pub fn codebuddy_config_dir() -> PathBuf {
+    configured_dir("CODEBUDDY_CONFIG_DIR").unwrap_or_else(|| home_dir().join(".codebuddy"))
+}
+
+#[allow(dead_code)]
+pub fn kimi_home() -> PathBuf {
+    configured_dir("KIMI_SHARE_DIR")
+        .or_else(|| configured_dir("KIMI_CODE_HOME"))
+        .unwrap_or_else(|| home_dir().join(".kimi"))
+}
+
+#[allow(dead_code)]
+pub fn openclaw_state_dir() -> PathBuf {
+    configured_dir("OPENCLAW_STATE_DIR").unwrap_or_else(|| home_dir().join(".openclaw"))
 }
 
 pub fn workbuddy_homes() -> Vec<PathBuf> {

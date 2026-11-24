@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -7,7 +7,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { SessionMeta } from "@/types";
+import type { ContentHighlight, SessionContentHit, SessionMeta } from "@/types";
 import { AgentIcon } from "./AgentIcon";
 import { EMPTY_HIGHLIGHT_TERMS, highlightText } from "./highlightText";
 import { SessionStatusBadges } from "./SessionStatusBadges";
@@ -19,6 +19,34 @@ import {
   getSessionKey,
 } from "./utils";
 
+function renderUtf16Snippet(
+  text: string,
+  highlights: ContentHighlight[],
+): ReactNode {
+  if (!highlights.length) return text;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  highlights.forEach((range, idx) => {
+    const start = Math.max(cursor, Math.min(text.length, range.start));
+    const end = Math.max(start, Math.min(text.length, range.end));
+    if (start > cursor) {
+      parts.push(text.slice(cursor, start));
+    }
+    if (end > start) {
+      parts.push(
+        <mark key={idx} className="asm-search-mark">
+          {text.slice(start, end)}
+        </mark>,
+      );
+    }
+    cursor = end;
+  });
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
+  return parts;
+}
+
 interface SessionItemProps {
   session: SessionMeta;
   isSelected: boolean;
@@ -28,7 +56,9 @@ interface SessionItemProps {
   /** 父会话显示名，由列表层解析后传入（见 `resolveParentLabel`） */
   parentLabel?: string;
   highlightTerms?: string[];
+  contentHit?: SessionContentHit;
   onSelect: (key: string) => void;
+  onSelectSnippet?: (key: string, messageIndex: number) => void;
   onToggleChecked: (session: SessionMeta, checked: boolean) => void;
 }
 
@@ -40,7 +70,9 @@ export const SessionItem = memo(function SessionItem({
   isCheckDisabled = false,
   parentLabel,
   highlightTerms = EMPTY_HIGHLIGHT_TERMS,
+  contentHit,
   onSelect,
+  onSelectSnippet,
   onToggleChecked,
 }: SessionItemProps) {
   const { t } = useTranslation();
@@ -48,50 +80,91 @@ export const SessionItem = memo(function SessionItem({
   const lastActive = session.lastActiveAt || session.createdAt || undefined;
   const sessionKey = getSessionKey(session);
   const providerLabel = getProviderLabel(session.providerId, t);
+  const hasSnippets = Boolean(contentHit && contentHit.snippets.length > 0);
 
   return (
-    <div className={cn("asm-session-item group", isSelected && "is-selected")}>
-      {selectionMode && (
-        <Checkbox
-          checked={isChecked}
-          disabled={isCheckDisabled}
-          aria-label={t("sessionManager.selectForBatch", {
-            defaultValue: "选择会话",
-          })}
-          onCheckedChange={(checked) =>
-            onToggleChecked(session, Boolean(checked))
-          }
-          className="shrink-0"
-        />
+    <div
+      className={cn(
+        "asm-session-item group",
+        isSelected && "is-selected",
+        hasSnippets && "has-snippets",
       )}
-      <button
-        type="button"
-        aria-current={isSelected ? "true" : undefined}
-        onClick={() => onSelect(sessionKey)}
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-      >
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="asm-provider-icon">
-              <AgentIcon
-                icon={getProviderIconName(session.providerId)}
-                name={providerLabel}
-                size={16}
-              />
+    >
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        {selectionMode && (
+          <Checkbox
+            checked={isChecked}
+            disabled={isCheckDisabled}
+            aria-label={t("sessionManager.selectForBatch", {
+              defaultValue: "选择会话",
+            })}
+            onCheckedChange={(checked) =>
+              onToggleChecked(session, Boolean(checked))
+            }
+            className="shrink-0"
+          />
+        )}
+        <button
+          type="button"
+          aria-current={isSelected ? "true" : undefined}
+          onClick={() => onSelect(sessionKey)}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+        >
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="asm-provider-icon">
+                <AgentIcon
+                  icon={getProviderIconName(session.providerId)}
+                  name={providerLabel}
+                  size={16}
+                />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              {getProviderLabel(session.providerId, t)}
+            </TooltipContent>
+          </Tooltip>
+          <span className="asm-session-title">
+            {highlightText(title, highlightTerms)}
+          </span>
+          <SessionStatusBadges session={session} parentLabel={parentLabel} />
+          <span className="asm-session-time">
+            {lastActive
+              ? formatRelativeTime(lastActive, t)
+              : t("common.unknown")}
+          </span>
+        </button>
+      </div>
+      {hasSnippets && contentHit && (
+        <div className="asm-session-snippets">
+          {contentHit.snippets.slice(0, 2).map((snippet) => (
+            <button
+              key={snippet.messageIndex}
+              type="button"
+              className="asm-session-snippet"
+              onClick={() => {
+                if (onSelectSnippet) {
+                  onSelectSnippet(sessionKey, snippet.messageIndex);
+                } else {
+                  onSelect(sessionKey);
+                }
+              }}
+            >
+              <span className="asm-session-snippet-text">
+                {renderUtf16Snippet(snippet.text, snippet.highlights)}
+              </span>
+            </button>
+          ))}
+          {contentHit.matchCount > 2 && (
+            <span className="asm-session-snippet-more">
+              {t("sessionManager.moreContentMatches", {
+                defaultValue: "共 {{count}} 条消息命中",
+                count: contentHit.matchCount,
+              })}
             </span>
-          </TooltipTrigger>
-          <TooltipContent>
-            {getProviderLabel(session.providerId, t)}
-          </TooltipContent>
-        </Tooltip>
-        <span className="asm-session-title">
-          {highlightText(title, highlightTerms)}
-        </span>
-        <SessionStatusBadges session={session} parentLabel={parentLabel} />
-        <span className="asm-session-time">
-          {lastActive ? formatRelativeTime(lastActive, t) : t("common.unknown")}
-        </span>
-      </button>
+          )}
+        </div>
+      )}
     </div>
   );
 });
