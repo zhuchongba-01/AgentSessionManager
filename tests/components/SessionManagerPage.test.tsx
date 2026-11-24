@@ -1712,22 +1712,22 @@ describe("SessionManagerPage", () => {
     renderPage("claude");
     await screen.findByRole("heading", { name: "Thinking Session" });
 
-    // 工具计数只算真正的 tool 消息，不含 thinking
+    // 工具计数只算真正的 tool 消息，不含 thinking；思考 + 工具共 2 步默认折叠为「执行过程 · 2 步」
     const hideToolsButton = await screen.findByRole("button", {
       name: "隐藏工具 (1)",
     });
     expect(
-      screen.getByRole("button", { name: "展开思考过程" }),
+      screen.getByRole("button", { name: /执行过程 · 2 步/ }),
     ).toHaveAttribute("aria-expanded", "false");
 
     fireEvent.click(hideToolsButton);
     expect(
       screen.getByRole("button", { name: "显示工具 (1)" }),
     ).toBeInTheDocument();
-    // 隐藏工具后思考过程仍然保留显示
+    // 隐藏工具后仅剩单条思考过程，直接平铺展示「展开思考过程」（不再包一层多余时间线）
     expect(
       screen.getByRole("button", { name: "展开思考过程" }),
-    ).toBeInTheDocument();
+    ).toHaveAttribute("aria-expanded", "false");
   });
 
   it("searches >4096-char server-truncated messages via IPC and advances Enter navigation after >2s pause", async () => {

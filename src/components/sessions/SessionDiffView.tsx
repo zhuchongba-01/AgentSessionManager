@@ -157,6 +157,11 @@ export const SessionDiffView = memo(function SessionDiffView({
 }) {
   const parsed = useMemo(() => parseUnifiedDiff(diffText), [diffText]);
   if (parsed.length === 0) return null;
+  const hasLineNumbers = parsed.some(
+    (line) =>
+      (line.type === "add" || line.type === "del" || line.type === "context") &&
+      (line.oldNo !== undefined || line.newNo !== undefined),
+  );
 
   return (
     <div className="asm-ccs-diff">
@@ -184,12 +189,16 @@ export const SessionDiffView = memo(function SessionDiffView({
               line.type === "del" && "is-del",
             )}
           >
-            <span className="asm-ccs-diff-ln" aria-hidden="true">
-              {line.oldNo ?? ""}
-            </span>
-            <span className="asm-ccs-diff-ln" aria-hidden="true">
-              {line.newNo ?? ""}
-            </span>
+            {hasLineNumbers && (
+              <>
+                <span className="asm-ccs-diff-ln" aria-hidden="true">
+                  {line.oldNo ?? ""}
+                </span>
+                <span className="asm-ccs-diff-ln" aria-hidden="true">
+                  {line.newNo ?? ""}
+                </span>
+              </>
+            )}
             <span className="asm-ccs-diff-sign" aria-hidden="true">
               {line.type === "add" ? "+" : line.type === "del" ? "−" : " "}
             </span>

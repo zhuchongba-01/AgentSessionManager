@@ -1,6 +1,7 @@
 pub mod cache;
 mod deletion;
 pub mod providers;
+pub mod reader_meta;
 pub mod search_index;
 pub mod terminal;
 pub mod wire;
@@ -57,13 +58,15 @@ pub struct SidebarSection {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMessage {
     pub role: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Box<reader_meta::MessageReaderMeta>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1925,16 +1928,19 @@ mod tests {
                 role: "user".into(),
                 content: "Fix Rust TranscriptCache race".into(),
                 ts: None,
+                meta: None,
             },
             SessionMessage {
                 role: "assistant".into(),
                 content: "Updated transcriptcache generation counter".into(),
                 ts: None,
+                meta: None,
             },
             SessionMessage {
                 role: "tool".into(),
                 content: "Cargo check passed".into(),
                 ts: None,
+                meta: None,
             },
         ];
         assert_eq!(

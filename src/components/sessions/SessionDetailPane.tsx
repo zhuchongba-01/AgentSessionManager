@@ -53,7 +53,10 @@ import {
 import { EMPTY_HIGHLIGHT_TERMS } from "./highlightText";
 import {
   ReaderAgentLane,
+  ReaderChapterRow,
+  ReaderEventRow,
   ReaderFinalReplyRow,
+  ReaderInjectedRow,
   ReaderQuestionRow,
   ReaderStepRow,
   ReaderTimelineRow,
@@ -81,10 +84,19 @@ import {
 } from "./utils";
 
 const OUTLINE_OPEN_STORAGE_KEY = "agent-session-manager.outlineOpen";
+const INCLUDE_THINKING_STORAGE_KEY = "agent-session-manager.includeThinking";
 
 function readInitialOutlineOpen(): boolean {
   try {
     return window.localStorage.getItem(OUTLINE_OPEN_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function readInitialIncludeThinking(): boolean {
+  try {
+    return window.localStorage.getItem(INCLUDE_THINKING_STORAGE_KEY) === "true";
   } catch {
     return false;
   }
@@ -170,6 +182,12 @@ export function SessionDetailPane({
   const [collapsedTurnKeys, setCollapsedTurnKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const [stepOverrides, setStepOverrides] = useState<Map<string, boolean>>(
+    () => new Map(),
+  );
+  const [includeThinking, setIncludeThinking] = useState(
+    readInitialIncludeThinking,
+  );
   const [detailSearchOpen, setDetailSearchOpen] = useState(false);
   const [detailSearchQuery, setDetailSearchQuery] = useState("");
   const [activeMatchCursor, setActiveMatchCursor] = useState(0);
@@ -187,6 +205,29 @@ export function SessionDetailPane({
       return next;
     });
   }, []);
+
+  const handleToggleIncludeThinking = useCallback(() => {
+    setIncludeThinking((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(INCLUDE_THINKING_STORAGE_KEY, String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  const handleToggleStep = useCallback(
+    (stepId: string, currentlyExpanded: boolean) => {
+      setStepOverrides((prev) => {
+        const next = new Map(prev);
+        next.set(stepId, !currentlyExpanded);
+        return next;
+      });
+    },
+    [],
+  );
 
   const sessionScopeKey = `${selectedKey ?? ""}\u0000${messageRevision}`;
   const currentSessionScopeRef = useRef(sessionScopeKey);
@@ -243,27 +284,46 @@ export function SessionDetailPane({
     [visibleMessages],
   );
 
-  const displayedMessages = useMemo(
-    () =>
-      hideToolMessages
-        ? visibleMessages.filter((message) => {
-            const role = message.role.toLowerCase();
-            return (
-              role === "user" || role === "assistant" || role === "thinking"
-            );
-          })
-        : visibleMessages,
-    [hideToolMessages, visibleMessages],
-  );
+  const displayedMessages = useMemo(() => {
+    if (!hideToolMessages) return visibleMessages;
+    const filtered: SessionMessage[] = [];
+    for (const message of visibleMessages) {
+      const role = message.role.toLowerCase();
+      if (role !== "user" && role !== "assistant" && role !== "thinking") {
+        continue;
+      }
+      if (role === "assistant" && message.meta?.blocks?.length) {
+        const nonToolBlocks = message.meta.blocks.filter(
+          (b) => b.type !== "tool_call" && b.type !== "tool_result",
+        );
+        if (nonToolBlocks.length === 0) continue;
+        if (nonToolBlocks.length !== message.meta.blocks.length) {
+          filtered.push({
+            ...message,
+            meta: { ...message.meta, blocks: nonToolBlocks },
+          });
+          continue;
+        }
+      }
+      filtered.push(message);
+    }
+    return filtered;
+  }, [hideToolMessages, visibleMessages]);
 
   const fullTurns = useMemo(
-    () => groupMessagesIntoTurns(visibleMessages),
-    [visibleMessages],
+    () => groupMessagesIntoTurns(visibleMessages, selectedSession?.providerId),
+    [selectedSession?.providerId, visibleMessages],
   );
 
   const displayedTurns = useMemo(
-    () => groupMessagesIntoTurns(displayedMessages),
-    [displayedMessages],
+    () =>
+      groupMessagesIntoTurns(displayedMessages, selectedSession?.providerId),
+    [displayedMessages, selectedSession?.providerId],
+  );
+
+  const hasAnyThinking = useMemo(
+    () => fullTurns.some((turn) => turn.thinkingCount > 0),
+    [fullTurns],
   );
 
   const hasAnyChanges = useMemo(
@@ -378,6 +438,7 @@ export function SessionDetailPane({
         expandAllTimelines,
         expandedTurnKeys,
         collapsedTurnKeys,
+        stepOverrides,
         matchedMessageSet: matchedSet,
       }),
     [
@@ -388,6 +449,7 @@ export function SessionDetailPane({
       expandedTurnKeys,
       matchedSet,
       readerViewMode,
+      stepOverrides,
     ],
   );
 
@@ -397,6 +459,8 @@ export function SessionDetailPane({
     estimateSize: (index) => {
       const kind = readerLayout.items[index]?.kind;
       if (kind === "divider") return 29;
+      if (kind === "event" || kind === "injected") return 30;
+      if (kind === "chapter") return 38;
       if (kind === "timeline" || kind === "step") return 34;
       if (kind === "question") return 76;
       return 140;
@@ -429,9 +493,13 @@ export function SessionDetailPane({
       if (
         row.kind === "question" ||
         row.kind === "step" ||
-        row.kind === "final"
+        row.kind === "final" ||
+        row.kind === "event" ||
+        row.kind === "injected"
       ) {
         visible.push(row.messageIndex);
+      } else if (row.kind === "chapter") {
+        visible.push(row.chapter.messageIndex);
       } else if (row.kind === "timeline") {
         visible.push(...row.turn.stepIndexes);
       }
@@ -481,6 +549,7 @@ export function SessionDetailPane({
     setActiveMessageIndex(null);
     setExpandedTurnKeys(new Set());
     setCollapsedTurnKeys(new Set());
+    setStepOverrides(new Map());
     setReaderViewMode("all");
     setDetailSearchOpen(false);
     setDetailSearchQuery("");
@@ -687,6 +756,7 @@ export function SessionDetailPane({
   const handleToggleExpandAllTimelines = useCallback(() => {
     setExpandedTurnKeys(new Set());
     setCollapsedTurnKeys(new Set());
+    setStepOverrides(new Map());
     setExpandAllTimelines((prev) => !prev);
   }, []);
 
@@ -697,7 +767,7 @@ export function SessionDetailPane({
       session: selectedSession,
       providerLabel,
       isCodexSession,
-      includeThinking: false,
+      includeThinking,
       expandedContents,
     });
     onCopy(
@@ -709,6 +779,7 @@ export function SessionDetailPane({
   }, [
     expandedContents,
     fullTurns,
+    includeThinking,
     isCodexSession,
     onCopy,
     selectedSession,
@@ -803,11 +874,19 @@ export function SessionDetailPane({
       const row = readerLayout.items[targetRow];
       const msgIdx =
         row &&
-        (row.kind === "question" || row.kind === "step" || row.kind === "final")
+        (row.kind === "question" ||
+          row.kind === "step" ||
+          row.kind === "final" ||
+          row.kind === "event" ||
+          row.kind === "injected")
           ? row.messageIndex
-          : row?.kind === "timeline"
-            ? (row.turn.finalAssistantIndex ?? row.turn.stepIndexes[0] ?? null)
-            : null;
+          : row?.kind === "chapter"
+            ? row.chapter.messageIndex
+            : row?.kind === "timeline"
+              ? (row.turn.finalAssistantIndex ??
+                row.turn.stepIndexes[0] ??
+                null)
+              : null;
       if (msgIdx !== null) {
         clearHighlightTimer();
         setActiveMessageIndex(msgIdx);
@@ -833,7 +912,7 @@ export function SessionDetailPane({
         session: selectedSession,
         providerLabel: selectedProviderLabel,
         isCodexSession,
-        includeThinking: false,
+        includeThinking,
         expandedContents,
       });
       if (!md) return;
@@ -847,6 +926,7 @@ export function SessionDetailPane({
     [
       displayedMessages,
       expandedContents,
+      includeThinking,
       isCodexSession,
       onCopy,
       selectedProviderLabel,
@@ -1009,6 +1089,35 @@ export function SessionDetailPane({
                   })}
             </span>
           </button>
+        )}
+        {selectedSession && hasAnyThinking && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="asm-detail-tool"
+                aria-pressed={includeThinking}
+                aria-label={t("sessionManager.copyIncludeThinking", {
+                  defaultValue: "复制时包含思考",
+                })}
+                onClick={handleToggleIncludeThinking}
+              >
+                <span aria-hidden="true" className="text-xs leading-none">
+                  ✻
+                </span>
+                <span>
+                  {t("sessionManager.includeThinkingShort", {
+                    defaultValue: "含思考",
+                  })}
+                </span>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {t("sessionManager.copyIncludeThinking", {
+                defaultValue: "复制时包含思考过程",
+              })}
+            </TooltipContent>
+          </Tooltip>
         )}
         {selectedSession && visibleMessages.length > 0 && (
           <>
@@ -1598,6 +1707,39 @@ export function SessionDetailPane({
                                   aria-hidden="true"
                                   className="asm-ccs-turn-divider"
                                 />
+                              ) : item.kind === "event" ? (
+                                <ReaderEventRow
+                                  event={item.event}
+                                  highlightTerms={detailSearchTerms}
+                                  onOpenUrl={onOpenUrl}
+                                />
+                              ) : item.kind === "injected" ? (
+                                <ReaderInjectedRow
+                                  message={item.message}
+                                  highlightTerms={detailSearchTerms}
+                                />
+                              ) : item.kind === "chapter" ? (
+                                <ReaderAgentLane
+                                  providerId={selectedSession.providerId}
+                                  providerLabel={selectedProviderLabel}
+                                  isAgentStart={item.isAgentStart}
+                                  agentStartTs={
+                                    turnsByIndex.get(item.turnIndex)
+                                      ?.agentStartTs
+                                  }
+                                  model={
+                                    turnsByIndex.get(item.turnIndex)?.model
+                                  }
+                                  isActive={
+                                    activeMessageIndex ===
+                                    item.chapter.messageIndex
+                                  }
+                                >
+                                  <ReaderChapterRow
+                                    chapter={item.chapter}
+                                    highlightTerms={detailSearchTerms}
+                                  />
+                                </ReaderAgentLane>
                               ) : item.kind === "question" ? (
                                 <ReaderQuestionRow
                                   message={item.message}
@@ -1626,6 +1768,7 @@ export function SessionDetailPane({
                                   providerLabel={selectedProviderLabel}
                                   isAgentStart={item.isAgentStart}
                                   agentStartTs={item.turn.agentStartTs}
+                                  model={item.turn.model}
                                   isActive={
                                     activeMessageIndex !== null &&
                                     item.turn.stepIndexes.includes(
@@ -1636,6 +1779,7 @@ export function SessionDetailPane({
                                   <ReaderTimelineRow
                                     turn={item.turn}
                                     expanded={item.expanded}
+                                    hiddenFailures={item.hiddenFailures}
                                     onToggle={() =>
                                       toggleTurnTimeline(
                                         item.turn,
@@ -1656,20 +1800,23 @@ export function SessionDetailPane({
                                     turnsByIndex.get(item.turnIndex)
                                       ?.agentStartTs
                                   }
+                                  model={
+                                    turnsByIndex.get(item.turnIndex)?.model
+                                  }
                                   isActive={
                                     activeMessageIndex === item.messageIndex
                                   }
                                 >
                                   <ReaderStepRow
-                                    message={item.message}
+                                    step={item.step}
                                     messageRevision={messageRevision}
                                     style={readerStyle}
                                     projectDir={selectedSession.projectDir}
+                                    depth={item.depth}
                                     inTimeline={item.inTimeline}
-                                    standaloneOpen={item.standaloneOpen}
-                                    isSearchMatch={matchedSet.has(
-                                      item.messageIndex,
-                                    )}
+                                    expanded={item.expanded}
+                                    previewLines={item.previewLines}
+                                    onToggleStep={handleToggleStep}
                                     isActiveSearchMatch={
                                       detailSearchOpen &&
                                       matchedMessageIndexes.length > 0 &&
@@ -1694,12 +1841,16 @@ export function SessionDetailPane({
                                     turnsByIndex.get(item.turnIndex)
                                       ?.agentStartTs
                                   }
+                                  model={
+                                    turnsByIndex.get(item.turnIndex)?.model
+                                  }
                                   isActive={
                                     activeMessageIndex === item.messageIndex
                                   }
                                 >
                                   <ReaderFinalReplyRow
                                     message={item.message}
+                                    overrideText={item.overrideText}
                                     messageRevision={messageRevision}
                                     isActiveSearchMatch={
                                       detailSearchOpen &&

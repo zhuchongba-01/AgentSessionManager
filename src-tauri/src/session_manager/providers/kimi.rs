@@ -589,6 +589,7 @@ fn emit_raw_chat_message(
                 role: "system".to_string(),
                 content,
                 ts,
+                meta: None,
             });
         }
         return;
@@ -613,6 +614,7 @@ fn emit_raw_chat_message(
                 role: "tool".to_string(),
                 content,
                 ts,
+                meta: None,
             });
         }
         return;
@@ -625,6 +627,7 @@ fn emit_raw_chat_message(
                 role: "thinking".to_string(),
                 content: think,
                 ts,
+                meta: None,
             });
         }
 
@@ -634,6 +637,7 @@ fn emit_raw_chat_message(
                 role: role.to_string(),
                 content: visible,
                 ts,
+                meta: None,
             });
         }
     }
@@ -652,6 +656,7 @@ fn emit_raw_chat_message(
                     role: "tool".to_string(),
                     content: formatted,
                     ts,
+                    meta: None,
                 });
             }
         }
@@ -748,6 +753,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "user".to_string(),
                                 content: text,
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -762,6 +768,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                     role: "thinking".to_string(),
                                     content: t.to_string(),
                                     ts,
+                                    meta: None,
                                 });
                             }
                         }
@@ -775,6 +782,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                     role: "assistant".to_string(),
                                     content: t.to_string(),
                                     ts,
+                                    meta: None,
                                 });
                             }
                         }
@@ -789,6 +797,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "tool".to_string(),
                                 content: formatted,
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -813,6 +822,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "tool".to_string(),
                                 content,
                                 ts,
+                                meta: None,
                             });
                         }
                     }

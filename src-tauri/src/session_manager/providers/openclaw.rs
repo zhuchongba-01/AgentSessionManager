@@ -466,6 +466,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "user".to_string(),
                                 content: cleaned.to_string(),
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -478,6 +479,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                     role: "thinking".to_string(),
                                     content: thinking,
                                     ts,
+                                    meta: None,
                                 });
                             }
 
@@ -488,6 +490,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                     role: "assistant".to_string(),
                                     content: visible,
                                     ts,
+                                    meta: None,
                                 });
                             }
 
@@ -512,6 +515,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                                 role: "tool".to_string(),
                                                 content: formatted,
                                                 ts,
+                                                meta: None,
                                             });
                                         }
                                     }
@@ -530,6 +534,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                     role: "assistant".to_string(),
                                     content: format!("[Error] {err}"),
                                     ts,
+                                    meta: None,
                                 });
                             }
                         }
@@ -558,6 +563,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "tool".to_string(),
                                 content,
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -570,6 +576,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "tool".to_string(),
                                 content: combined.trim().to_string(),
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -584,6 +591,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "system".to_string(),
                                 content: format!("[Compacted Summary]\n{s}"),
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -596,6 +604,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "system".to_string(),
                                 content: text,
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -613,6 +622,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "system".to_string(),
                         content: format!("[Compacted Summary]\n{s}"),
                         ts: entry_ts,
+                        meta: None,
                     });
                 }
             }
@@ -625,6 +635,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "system".to_string(),
                         content: text,
                         ts: entry_ts,
+                        meta: None,
                     });
                 }
             }

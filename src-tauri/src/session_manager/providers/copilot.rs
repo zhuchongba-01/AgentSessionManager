@@ -528,6 +528,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "user".to_string(),
                         content: text.to_string(),
                         ts,
+                        meta: None,
                     });
                 }
             }
@@ -541,6 +542,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "thinking".to_string(),
                         content: reasoning.to_string(),
                         ts,
+                        meta: None,
                     });
                 }
 
@@ -553,6 +555,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "assistant".to_string(),
                         content: text.to_string(),
                         ts,
+                        meta: None,
                     });
                 }
 
@@ -576,16 +579,33 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     if !call_id.is_empty() {
                         call_names.insert(call_id.to_string(), name.to_string());
                     }
+                    let raw_args_val = match call.get("arguments") {
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                            .unwrap_or_else(|_| Value::String(s.clone())),
+                        Some(other) => other.clone(),
+                        None => Value::Null,
+                    };
                     let args = format_tool_args(call.get("arguments"));
                     let content = if args.is_empty() {
                         format!("[Tool: {name}]")
                     } else {
                         format!("[Tool: {name}]\n{args}")
                     };
+                    let call_meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                        blocks: vec![crate::session_manager::reader_meta::build_tool_call_block(
+                            call_id,
+                            name,
+                            None,
+                            &raw_args_val,
+                        )],
+                        ..Default::default()
+                    }
+                    .into_boxed_option();
                     messages.push(SessionMessage {
                         role: "tool".to_string(),
                         content,
                         ts,
+                        meta: call_meta,
                     });
                 }
             }
@@ -625,10 +645,26 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     (false, true) => format!("[{label}]\n{trimmed_text}"),
                     (false, false) => format!("[{label}]"),
                 };
+                let line_count = trimmed_text.lines().count() as u32;
+                let res_meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                    blocks: vec![
+                        crate::session_manager::reader_meta::ReaderBlock::ToolResult {
+                            call_id: call_id.to_string(),
+                            status: if success { "success" } else { "error" }.to_string(),
+                            output: trimmed_text.to_string(),
+                            line_count,
+                            exit_code: None,
+                            duration_ms: None,
+                        },
+                    ],
+                    ..Default::default()
+                }
+                .into_boxed_option();
                 messages.push(SessionMessage {
                     role: "tool".to_string(),
                     content,
                     ts,
+                    meta: res_meta,
                 });
             }
             Some("session.compaction_complete") => {
@@ -647,6 +683,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "system".to_string(),
                         content,
                         ts,
+                        meta: None,
                     });
                 }
             }

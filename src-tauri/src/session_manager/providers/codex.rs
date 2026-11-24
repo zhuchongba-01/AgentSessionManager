@@ -2254,6 +2254,7 @@ fn load_segment_messages(
     let mut has_response_item_any = false;
     let mut has_response_item_chat = false;
     let mut has_replacement_chat = false;
+    let mut current_model: Option<String> = None;
 
     loop {
         let mut line = String::new();
@@ -2281,8 +2282,20 @@ fn load_segment_messages(
         };
 
         match item_type {
+            "turn_context" => {
+                if let Some(m) = payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    current_model = Some(m.to_string());
+                }
+            }
             "response_item" => {
-                if let Some(msg) = parse_response_item_payload(payload, ts) {
+                if let Some(msg) =
+                    parse_response_item_payload(payload, ts, current_model.as_deref())
+                {
                     has_response_item_any = true;
                     if matches!(msg.role.as_str(), "user" | "assistant") {
                         has_response_item_chat = true;
@@ -2297,16 +2310,29 @@ fn load_segment_messages(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
+                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                        blocks: vec![crate::session_manager::reader_meta::ReaderBlock::Event {
+                            kind: "compaction".to_string(),
+                            text: Some("上下文已压缩".to_string()),
+                            detail: Some(summary.to_string()),
+                            url: None,
+                        }],
+                        ..Default::default()
+                    }
+                    .into_boxed_option();
                     entries.push(SegmentEntry::Primary(SessionMessage {
                         role: "assistant".to_string(),
                         content: format!("[Compacted Summary]\n{summary}"),
                         ts,
+                        meta,
                     }));
                 }
                 if let Some(history) = payload.get("replacement_history").and_then(Value::as_array)
                 {
                     for item in history {
-                        if let Some(msg) = parse_response_item_payload(item, ts) {
+                        if let Some(msg) =
+                            parse_response_item_payload(item, ts, current_model.as_deref())
+                        {
                             if matches!(msg.role.as_str(), "user" | "assistant") {
                                 has_replacement_chat = true;
                             }
@@ -2317,6 +2343,17 @@ fn load_segment_messages(
             }
             "event_msg" => {
                 let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                if event_type == "thread_settings_applied" {
+                    if let Some(m) = payload
+                        .pointer("/thread_settings/model")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        current_model = Some(m.to_string());
+                    }
+                    continue;
+                }
                 let role = match event_type {
                     "user_message" => "user",
                     "agent_message" => "assistant",
@@ -2336,6 +2373,7 @@ fn load_segment_messages(
                     role: role.to_string(),
                     content,
                     ts,
+                    meta: None,
                 }));
             }
             _ => continue,
@@ -2362,8 +2400,18 @@ fn load_segment_messages(
     Ok(messages)
 }
 
-fn parse_response_item_payload(payload: &Value, ts: Option<i64>) -> Option<SessionMessage> {
+fn parse_response_item_payload(
+    payload: &Value,
+    ts: Option<i64>,
+    current_model: Option<&str>,
+) -> Option<SessionMessage> {
+    use crate::session_manager::reader_meta::{
+        build_tool_call_block, parse_codex_output_envelope, split_markdown_thinking_summary,
+        MessageReaderMeta, ReaderBlock,
+    };
+
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut rich_meta = MessageReaderMeta::default();
 
     let (role, content) = match payload_type {
         "message" => {
@@ -2377,10 +2425,69 @@ fn parse_response_item_payload(payload: &Value, ts: Option<i64>) -> Option<Sessi
             {
                 return None;
             }
+            if role == "assistant" {
+                rich_meta.model = current_model.map(str::to_string);
+            }
             (role.to_string(), content)
         }
         "reasoning" => {
+            let summary_raw = extract_codex_summary_only(payload);
+            let body_raw = payload
+                .get("content")
+                .map(extract_thinking_text)
+                .unwrap_or_default();
             let content = extract_codex_reasoning_text(payload);
+            if content.trim().is_empty() {
+                if payload
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    rich_meta.redacted = true;
+                    rich_meta.blocks.push(ReaderBlock::Thinking {
+                        text: String::new(),
+                        summary: None,
+                        redacted: true,
+                        duration_ms: None,
+                    });
+                    return Some(SessionMessage {
+                        role: "thinking".to_string(),
+                        content: "[Redacted Thinking]".to_string(),
+                        ts,
+                        meta: rich_meta.into_boxed_option(),
+                    });
+                }
+                return None;
+            }
+            let (summary, body) = if !summary_raw.trim().is_empty() {
+                let clean_summary = summary_raw
+                    .lines()
+                    .next()
+                    .unwrap_or(&summary_raw)
+                    .trim()
+                    .trim_start_matches("**")
+                    .trim_end_matches("**")
+                    .trim()
+                    .to_string();
+                let detail_body = if !body_raw.trim().is_empty() {
+                    body_raw
+                } else {
+                    summary_raw
+                };
+                (
+                    (!clean_summary.is_empty()).then_some(clean_summary),
+                    detail_body,
+                )
+            } else {
+                split_markdown_thinking_summary(&content)
+            };
+            rich_meta.thinking_summary = summary.clone();
+            rich_meta.blocks.push(ReaderBlock::Thinking {
+                text: body,
+                summary,
+                redacted: false,
+                duration_ms: None,
+            });
             ("thinking".to_string(), content)
         }
         "function_call" => {
@@ -2388,18 +2495,63 @@ fn parse_response_item_payload(payload: &Value, ts: Option<i64>) -> Option<Sessi
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let namespace = payload.get("namespace").and_then(Value::as_str);
+            let args_val = match payload.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
+                }
+                Some(other) => other.clone(),
+                None => Value::Null,
+            };
+            rich_meta
+                .blocks
+                .push(build_tool_call_block(call_id, name, namespace, &args_val));
             ("assistant".to_string(), format!("[Tool: {name}]"))
         }
-        "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => (
-            "tool".to_string(),
-            payload.get("output").map(extract_text).unwrap_or_default(),
-        ),
+        "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
+            let raw_out = payload.get("output").map(extract_text).unwrap_or_default();
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let parsed = parse_codex_output_envelope(&raw_out);
+            let line_count = parsed.body.lines().count() as u32;
+            rich_meta.blocks.push(ReaderBlock::ToolResult {
+                call_id,
+                status: if parsed.is_error { "error" } else { "success" }.to_string(),
+                output: parsed.body,
+                line_count,
+                exit_code: parsed.exit_code,
+                duration_ms: parsed.duration_ms,
+            });
+            ("tool".to_string(), raw_out)
+        }
         "custom_tool_call" => {
             let name = payload
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
+            let input_val = if input.is_empty() {
+                Value::Null
+            } else {
+                Value::String(input.to_string())
+            };
+            rich_meta
+                .blocks
+                .push(build_tool_call_block(call_id, name, None, &input_val));
             if input.is_empty() {
                 ("assistant".to_string(), format!("[Tool: {name}]"))
             } else {
@@ -2411,9 +2563,37 @@ fn parse_response_item_payload(payload: &Value, ts: Option<i64>) -> Option<Sessi
             if cmd.is_empty() {
                 return None;
             }
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args_val = serde_json::json!({ "command": cmd });
+            rich_meta.blocks.push(build_tool_call_block(
+                call_id,
+                "local_shell",
+                None,
+                &args_val,
+            ));
             ("tool".to_string(), format!("$ {cmd}"))
         }
-        "web_search_call" => ("tool".to_string(), format_web_search_call(payload)),
+        "web_search_call" => {
+            let formatted = format_web_search_call(payload);
+            let query = formatted.strip_prefix("[Web search]").unwrap_or("").trim();
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args_val = serde_json::json!({ "query": query });
+            rich_meta.blocks.push(build_tool_call_block(
+                call_id,
+                "web_search",
+                None,
+                &args_val,
+            ));
+            ("tool".to_string(), formatted)
+        }
         _ => return None,
     };
 
@@ -2421,7 +2601,29 @@ fn parse_response_item_payload(payload: &Value, ts: Option<i64>) -> Option<Sessi
         return None;
     }
 
-    Some(SessionMessage { role, content, ts })
+    Some(SessionMessage {
+        role,
+        content,
+        ts,
+        meta: rich_meta.into_boxed_option(),
+    })
+}
+
+fn extract_codex_summary_only(payload: &Value) -> String {
+    match payload.get("summary") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .or_else(|| item.get("text").and_then(Value::as_str))
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 fn extract_codex_reasoning_text(payload: &Value) -> String {

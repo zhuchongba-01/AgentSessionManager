@@ -3395,3 +3395,315 @@ html.dark {
     max-width: 86%;
   }
 }
+
+/* ── cc-switch 思维链 / 中间说明 / 工具参数与框线 / 章节与事件样式 ── */
+
+.asm-ccs-row-static {
+  display: flex;
+  height: 32px;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  font-size: 12.5px;
+}
+
+.asm-ccs-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family:
+    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
+    monospace;
+  font-size: 11.5px;
+  color: hsl(var(--muted-foreground));
+}
+
+.asm-ccs-chevron.is-hover-only {
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    transform 140ms ease;
+}
+
+.asm-ccs-row-btn:hover .asm-ccs-chevron.is-hover-only,
+.asm-ccs-row-btn:focus-visible .asm-ccs-chevron.is-hover-only,
+.asm-ccs-chevron.is-forced-visible {
+  opacity: 0.85;
+}
+
+.asm-ccs-tone-warning {
+  color: hsl(36 90% 38%);
+  font-weight: 550;
+}
+
+.dark .asm-ccs-tone-warning {
+  color: hsl(38 92% 65%);
+}
+
+/* 思维链展开区：次级斜体文本流，克制安静，不抢最终回复视觉重心 */
+.asm-ccs-thinking-region {
+  padding: 2px 6px 8px 28px;
+}
+
+.asm-ccs-thinking-pre {
+  margin: 0;
+  max-height: 440px;
+  overflow: auto;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.68;
+  font-style: italic;
+  color: hsl(var(--muted-foreground));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 中间过程说明行（◦ 符号 + 3 行底部渐隐折叠） */
+.asm-ccs-note-row {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 6px;
+}
+
+.asm-ccs-note-body {
+  position: relative;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: hsl(var(--foreground) / 0.82);
+  overflow-wrap: anywhere;
+}
+
+.asm-ccs-note-body.is-clamped {
+  max-height: 58px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 58%, transparent);
+  mask-image: linear-gradient(to bottom, #000 58%, transparent);
+}
+
+/* 合并步骤展开后的子步骤缩进 */
+.asm-ccs-child-step {
+  padding-left: 18px;
+}
+
+/* 工具详情三态外框：tree（Claude/Codex/OpenCode/Kimi）| box（Gemini）| stripe（Pi/OpenClaw） */
+.asm-ccs-step-details-frame {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.asm-ccs-step-details-frame.is-frame-tree {
+  padding: 3px 6px 8px 22px;
+}
+
+.asm-ccs-step-details-frame.is-frame-box {
+  margin: 2px 6px 8px 22px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border));
+  border-left-width: 2.5px;
+  border-radius: 8px;
+  background: hsl(var(--card) / 0.58);
+}
+
+.asm-ccs-step-details-frame.is-frame-stripe {
+  margin: 2px 6px 8px 22px;
+  padding: 4px 6px 8px 12px;
+  border-left: 2px solid hsl(var(--border));
+}
+
+.asm-ccs-step-details-frame.is-status-success {
+  border-left-color: hsl(152 60% 42%);
+}
+
+.asm-ccs-step-details-frame.is-status-error {
+  border-left-color: hsl(var(--destructive));
+}
+
+.asm-ccs-step-details-frame.is-status-warning {
+  border-left-color: hsl(38 90% 50%);
+}
+
+.asm-ccs-subsec-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+  padding: 2px 4px 2px 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.asm-ccs-subsec-btn:hover {
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-subsec-title {
+  margin-bottom: 4px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  font-weight: 550;
+}
+
+.asm-ccs-subtle-link {
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.asm-ccs-subtle-link:hover {
+  color: hsl(var(--foreground));
+  text-decoration: underline;
+}
+
+/* 章节书签行（mark_chapter） */
+.asm-ccs-chapter {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 6px 5px;
+  border-bottom: 1px solid hsl(var(--border) / 0.65);
+}
+
+.asm-ccs-chapter-title {
+  flex: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-chapter-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+/* 事件分隔行（── 上下文已压缩 ▸ ── / ── 已中断 ──） */
+.asm-ccs-event-divider-wrap {
+  padding: 6px 0;
+}
+
+.asm-ccs-event-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.asm-ccs-event-line {
+  height: 1px;
+  flex: 1;
+  background: hsl(var(--border) / 0.8);
+}
+
+.asm-ccs-event-label {
+  display: inline-flex;
+  max-width: 72%;
+  min-width: 0;
+  align-items: center;
+}
+
+.asm-ccs-event-inline {
+  display: flex;
+  height: 28px;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.asm-ccs-event-btn {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.asm-ccs-event-btn:hover {
+  background: hsl(var(--muted) / 0.65);
+  color: hsl(var(--foreground));
+}
+
+.asm-ccs-event-btn.is-link:hover {
+  text-decoration: underline;
+}
+
+.asm-ccs-event-detail {
+  margin: 4px 0 0;
+  max-height: 224px;
+  overflow: auto;
+  padding: 8px 11px;
+  border: 1px solid hsl(var(--border) / 0.85);
+  border-radius: 8px;
+  background: hsl(var(--muted) / 0.42);
+  color: hsl(var(--muted-foreground));
+  font-family:
+    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
+    monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.asm-ccs-event-detail.is-danger {
+  border-color: hsl(var(--destructive) / 0.35);
+  background: hsl(var(--destructive) / 0.06);
+  color: hsl(var(--destructive));
+}
+
+.asm-ccs-injected-btn {
+  display: flex;
+  height: 28px;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.asm-ccs-injected-btn:hover {
+  background: hsl(var(--muted) / 0.6);
+  color: hsl(var(--foreground));
+}

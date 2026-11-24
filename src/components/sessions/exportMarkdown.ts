@@ -4,7 +4,7 @@ import {
   formatTimestamp,
   splitCodexIdeContext,
 } from "./utils";
-import { extractToolName, type SessionTurnGroup } from "./turnGrouping";
+import type { SessionTurnGroup, TimelineStep, ToolStep } from "./turnGrouping";
 
 export interface ExportMarkdownOptions {
   session: SessionMeta;
@@ -29,19 +29,56 @@ function resolveMessageText(
   return raw;
 }
 
-function summarizeToolLine(content: string): string {
-  const lines = content
-    .trim()
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const toolName = extractToolName(content);
-  if (toolName) {
-    const detail = lines[1] ? ` — \`${lines[1].slice(0, 100)}\`` : "";
-    return `- ⏺ **${toolName}**${detail}`;
+function formatToolStepMarkdown(step: ToolStep): string {
+  const name = step.call?.rawName ?? "工具输出";
+  const target = step.call?.title
+    ? ` \`${step.call.title.slice(0, 120)}\``
+    : "";
+  const statusSuffix =
+    step.status === "error"
+      ? " *(失败)*"
+      : step.status === "interrupted"
+        ? " *(已中断)*"
+        : "";
+  return `- ⏺ **${name}**${target}${statusSuffix}`;
+}
+
+function formatTimelineStepMarkdown(
+  step: TimelineStep,
+  includeThinking: boolean,
+  isCodexSession: boolean,
+  expandedContents?: Map<number, string>,
+): string | null {
+  switch (step.kind) {
+    case "thinking": {
+      if (!includeThinking) return null;
+      if (step.redacted) {
+        return `> *思考内容不可见*`;
+      }
+      const full = resolveMessageText(
+        step.message,
+        isCodexSession,
+        expandedContents,
+      ).trim();
+      const text = full || step.summary || step.text;
+      if (!text) return null;
+      const quoted = text
+        .split(/\r?\n/)
+        .map((line) => `> ${line}`)
+        .join("\n");
+      return `> **思考过程**\n${quoted}`;
+    }
+    case "note":
+      return step.text.trim() || null;
+    case "tool":
+      return formatToolStepMarkdown(step);
+    case "merged":
+      return step.children.map(formatToolStepMarkdown).join("\n");
+    case "event":
+      return step.event.detail
+        ? `> *${step.event.label}*：${step.event.detail}`
+        : `> *${step.event.label}*`;
   }
-  const preview = (lines[0] ?? "工具输出").slice(0, 120);
-  return `- ⏺ 工具输出：\`${preview.replace(/`/g, "'")}\``;
 }
 
 export function turnToMarkdown(
@@ -71,30 +108,14 @@ export function turnToMarkdown(
   }
 
   const stepLines: string[] = [];
-  for (const idx of turn.stepIndexes) {
-    const msg = messages[idx];
-    if (!msg) continue;
-    const role = msg.role.toLowerCase();
-    const text = resolveMessageText(
-      msg,
+  for (const step of turn.steps) {
+    const formatted = formatTimelineStepMarkdown(
+      step,
+      includeThinking,
       isCodexSession,
       expandedContents,
-    ).trim();
-    if (!text) continue;
-
-    if (role === "thinking") {
-      if (includeThinking) {
-        const quoted = text
-          .split(/\r?\n/)
-          .map((line) => `> ${line}`)
-          .join("\n");
-        stepLines.push(`> **思考过程**\n${quoted}`);
-      }
-    } else if (role === "assistant") {
-      stepLines.push(text);
-    } else if (role !== "user") {
-      stepLines.push(summarizeToolLine(text));
-    }
+    );
+    if (formatted) stepLines.push(formatted);
   }
 
   if (stepLines.length > 0) {
@@ -104,13 +125,13 @@ export function turnToMarkdown(
   if (turn.finalAssistantIndex !== null && messages[turn.finalAssistantIndex]) {
     const aiMsg = messages[turn.finalAssistantIndex];
     const ts = aiMsg.ts ? ` · ${formatTimestamp(aiMsg.ts)}` : "";
-    const body = resolveMessageText(
-      aiMsg,
-      isCodexSession,
-      expandedContents,
+    const modelBadge = turn.model ? ` (${turn.model})` : "";
+    const body = (
+      turn.finalReplyText ??
+      resolveMessageText(aiMsg, isCodexSession, expandedContents)
     ).trim();
     if (body) {
-      sections.push(`### ${providerLabel}${ts}\n\n${body}`);
+      sections.push(`### ${providerLabel}${modelBadge}${ts}\n\n${body}`);
     }
   }
 

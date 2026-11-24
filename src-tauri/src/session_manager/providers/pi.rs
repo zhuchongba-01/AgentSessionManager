@@ -897,6 +897,7 @@ fn read_active_messages(path: &Path, tree: &SessionTree) -> Result<Vec<SessionMe
                                 role: "thinking".to_string(),
                                 content: thinking,
                                 ts: timestamp,
+                                meta: None,
                             });
                         }
                     }
@@ -906,6 +907,7 @@ fn read_active_messages(path: &Path, tree: &SessionTree) -> Result<Vec<SessionMe
                         role,
                         content,
                         ts: timestamp,
+                        meta: None,
                     });
                 }
             }
@@ -940,6 +942,7 @@ fn push_system(messages: &mut Vec<SessionMessage>, content: &str, ts: Option<i64
             role: "system".to_string(),
             content: content.to_string(),
             ts,
+            meta: None,
         });
     }
 }

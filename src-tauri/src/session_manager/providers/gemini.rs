@@ -392,33 +392,70 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     role: "user".to_string(),
                     content: text,
                     ts,
+                    meta: None,
                 });
             }
             Some("gemini") => {
+                let model = msg
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
                 if let Some(thoughts) = msg.get("thoughts").and_then(format_thoughts) {
                     if !thoughts.trim().is_empty() {
+                        let (summary, body) =
+                            crate::session_manager::reader_meta::split_markdown_thinking_summary(
+                                &thoughts,
+                            );
+                        let meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                            thinking_summary: summary.clone(),
+                            blocks: vec![
+                                crate::session_manager::reader_meta::ReaderBlock::Thinking {
+                                    text: if summary.is_some() {
+                                        body
+                                    } else {
+                                        thoughts.clone()
+                                    },
+                                    summary,
+                                    redacted: false,
+                                    duration_ms: None,
+                                },
+                            ],
+                            ..Default::default()
+                        }
+                        .into_boxed_option();
                         result.push(SessionMessage {
                             role: "thinking".to_string(),
                             content: thoughts,
                             ts,
+                            meta,
                         });
                     }
                 }
 
                 let text = content_text(msg.get("content"));
                 if !text.trim().is_empty() {
+                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                        model: model.clone(),
+                        ..Default::default()
+                    }
+                    .into_boxed_option();
                     result.push(SessionMessage {
                         role: "assistant".to_string(),
                         content: text,
                         ts,
+                        meta,
                     });
                 }
 
-                for call in msg
+                for (call_idx, call) in msg
                     .get("toolCalls")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
+                    .enumerate()
                 {
                     let Some(name) = call
                         .get("name")
@@ -428,11 +465,30 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     else {
                         continue;
                     };
+                    let call_id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("gemini_call_{}_{call_idx}", result.len()));
+                    let args_val = call.get("args").unwrap_or(&Value::Null);
                     let call_content = format_tool_call(name, call.get("args"));
+                    let call_meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                        model: model.clone(),
+                        blocks: vec![crate::session_manager::reader_meta::build_tool_call_block(
+                            call_id.clone(),
+                            name,
+                            None,
+                            args_val,
+                        )],
+                        ..Default::default()
+                    }
+                    .into_boxed_option();
                     result.push(SessionMessage {
                         role: "tool".to_string(),
                         content: call_content,
                         ts,
+                        meta: call_meta,
                     });
 
                     let output = extract_tool_output(call);
@@ -440,10 +496,26 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     if !trimmed_out.is_empty() {
                         let is_err = call.get("status").and_then(Value::as_str) == Some("error");
                         let label = if is_err { "Error" } else { "Result" };
+                        let line_count = trimmed_out.lines().count() as u32;
+                        let res_meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                            blocks: vec![
+                                crate::session_manager::reader_meta::ReaderBlock::ToolResult {
+                                    call_id,
+                                    status: if is_err { "error" } else { "success" }.to_string(),
+                                    output: trimmed_out.to_string(),
+                                    line_count,
+                                    exit_code: None,
+                                    duration_ms: None,
+                                },
+                            ],
+                            ..Default::default()
+                        }
+                        .into_boxed_option();
                         result.push(SessionMessage {
                             role: "tool".to_string(),
                             content: format!("[{label}: {name}]\n{trimmed_out}"),
                             ts,
+                            meta: res_meta,
                         });
                     }
                 }
@@ -463,6 +535,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     role: "system".to_string(),
                     content: formatted,
                     ts,
+                    meta: None,
                 });
             }
             _ => {}

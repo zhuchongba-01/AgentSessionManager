@@ -61,16 +61,22 @@ export const SessionOutline = memo(function SessionOutline({
           turn.finalAssistantIndex !== null
             ? messages[turn.finalAssistantIndex]
             : undefined;
+        const rawReply = turn.finalReplyText ?? replyMsg?.content ?? "";
+        const stepCount = turn.steps.reduce(
+          (sum, s) => sum + (s.kind === "merged" ? s.children.length : 1),
+          0,
+        );
         return {
           turn,
+          stepCount,
           questionText:
             rawQuestion !== undefined
               ? cleanMarkdownSnippet(rawQuestion)
               : undefined,
           questionTs: userMsg?.ts,
-          replyText: replyMsg ? cleanMarkdownSnippet(replyMsg.content) : "",
+          replyText: rawReply ? cleanMarkdownSnippet(rawReply) : "",
           hasReplyTarget:
-            turn.finalAssistantIndex !== null || turn.stepIndexes.length > 0,
+            turn.finalAssistantIndex !== null || turn.steps.length > 0,
         };
       }),
     [isCodexSession, messages, turns],
@@ -155,11 +161,19 @@ export const SessionOutline = memo(function SessionOutline({
                     />
                   </span>
                   <span className="min-w-0 flex-1">
-                    {entry.turn.stepIndexes.length > 0 && (
+                    {(entry.stepCount > 0 || entry.turn.aborted) && (
                       <span className="asm-ccs-outline-steps">
-                        {entry.turn.stepIndexes.length} 步
+                        {entry.stepCount > 0 && `${entry.stepCount} 步`}
                         {entry.turn.errorCount > 0 && (
-                          <span className="asm-ccs-outline-err-dot" />
+                          <span
+                            className="asm-ccs-outline-err-dot"
+                            title="有失败步骤"
+                          />
+                        )}
+                        {entry.turn.aborted && (
+                          <span className="text-amber-600 dark:text-amber-400">
+                            · 已中断
+                          </span>
                         )}
                       </span>
                     )}
@@ -170,9 +184,11 @@ export const SessionOutline = memo(function SessionOutline({
                       )}
                     >
                       {entry.replyText ||
-                        t("sessionManager.noReplyYet", {
-                          defaultValue: "（暂无最终回复）",
-                        })}
+                        (entry.turn.aborted
+                          ? "已中断"
+                          : t("sessionManager.noReplyYet", {
+                              defaultValue: "（暂无最终回复）",
+                            }))}
                     </span>
                   </span>
                 </button>

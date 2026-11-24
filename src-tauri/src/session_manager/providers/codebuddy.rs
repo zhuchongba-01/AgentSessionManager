@@ -595,6 +595,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "thinking".to_string(),
                         content: thinking,
                         ts,
+                        meta: None,
                     });
                 }
             }
@@ -607,6 +608,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "tool".to_string(),
                         content: formatted,
                         ts,
+                        meta: None,
                     });
                 }
             }
@@ -616,6 +618,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                         role: "tool".to_string(),
                         content: formatted,
                         ts,
+                        meta: None,
                     });
                 }
             }
@@ -636,6 +639,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                             role: "system".to_string(),
                             content,
                             ts,
+                            meta: None,
                         });
                     }
                     continue;
@@ -650,6 +654,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                                 role: "thinking".to_string(),
                                 content: inline_thinking,
                                 ts,
+                                meta: None,
                             });
                         }
                     }
@@ -661,6 +666,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                             role: role.to_string(),
                             content,
                             ts,
+                            meta: None,
                         });
                     }
                 }

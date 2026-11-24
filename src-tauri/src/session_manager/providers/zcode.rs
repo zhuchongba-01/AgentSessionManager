@@ -827,11 +827,17 @@ fn read_messages_from_connection(
                 role: "thinking".to_string(),
                 content: thinking,
                 ts,
+                meta: None,
             });
         }
         let content = parts.visible.join("\n");
         if !content.trim().is_empty() {
-            output.push(SessionMessage { role, content, ts });
+            output.push(SessionMessage {
+                role,
+                content,
+                ts,
+                meta: None,
+            });
         }
     }
 

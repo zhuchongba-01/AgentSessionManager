@@ -434,6 +434,7 @@ mod tests {
             role: "user".to_string(),
             content: content.to_string(),
             ts: None,
+            meta: None,
         }])
     }
 
@@ -568,11 +569,13 @@ mod tests {
                     role: "user".into(),
                     content: content.clone(),
                     ts: None,
+                    meta: None,
                 },
                 SessionMessage {
                     role: "assistant".into(),
                     content: content.clone(),
                     ts: None,
+                    meta: None,
                 },
             ])
         };
@@ -761,11 +764,13 @@ mod tests {
                 role: "user".to_string(),
                 content: "a".to_string(),
                 ts: None,
+                meta: None,
             },
             SessionMessage {
                 role: "assistant".to_string(),
                 content: "bb".to_string(),
                 ts: Some(1),
+                meta: None,
             },
         ]);
 

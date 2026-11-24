@@ -56,6 +56,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         }
     }
     let mut messages = Vec::new();
+    let mut bash_call_times: HashMap<String, i64> = HashMap::new();
 
     for value in conversation_chain(&entries) {
         if !is_main_entry(value)
@@ -77,13 +78,60 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
 
         if role == "assistant" {
+            let thinking_ms = value
+                .pointer("/thinkingMetadata/durationMs")
+                .or_else(|| value.get("thinkingDurationMs"))
+                .and_then(Value::as_u64);
+
             if let Some(content_val) = message.get("content") {
                 let thinking = extract_thinking_text(content_val);
                 if !thinking.trim().is_empty() {
+                    let (summary, body) =
+                        crate::session_manager::reader_meta::split_markdown_thinking_summary(
+                            &thinking,
+                        );
+                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                        thinking_summary: summary.clone(),
+                        duration_ms: thinking_ms,
+                        blocks: vec![crate::session_manager::reader_meta::ReaderBlock::Thinking {
+                            text: if summary.is_some() && body.is_empty() {
+                                String::new()
+                            } else if summary.is_some() {
+                                body
+                            } else {
+                                thinking.clone()
+                            },
+                            summary,
+                            redacted: false,
+                            duration_ms: thinking_ms,
+                        }],
+                        ..Default::default()
+                    }
+                    .into_boxed_option();
                     messages.push(SessionMessage {
                         role: "thinking".to_string(),
                         content: thinking,
                         ts,
+                        meta,
+                    });
+                } else if has_redacted_claude_thinking(content_val) {
+                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
+                        redacted: true,
+                        duration_ms: thinking_ms,
+                        blocks: vec![crate::session_manager::reader_meta::ReaderBlock::Thinking {
+                            text: String::new(),
+                            summary: None,
+                            redacted: true,
+                            duration_ms: thinking_ms,
+                        }],
+                        ..Default::default()
+                    }
+                    .into_boxed_option();
+                    messages.push(SessionMessage {
+                        role: "thinking".to_string(),
+                        content: "[Redacted Thinking]".to_string(),
+                        ts,
+                        meta,
                     });
                 }
             }
@@ -105,16 +153,201 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         }
         let mut content = message.get("content").map(extract_text).unwrap_or_default();
         if !content.trim().is_empty() {
+            let mut rich_meta = crate::session_manager::reader_meta::MessageReaderMeta::default();
+
             if role == "user"
                 && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-                && !content.starts_with("[Compacted Summary]")
             {
-                content = format!("[Compacted Summary]\n{content}");
+                let raw_summary = content
+                    .strip_prefix("[Compacted Summary]\n")
+                    .unwrap_or(&content)
+                    .trim()
+                    .to_string();
+                rich_meta
+                    .blocks
+                    .push(crate::session_manager::reader_meta::ReaderBlock::Event {
+                        kind: "compaction".to_string(),
+                        text: Some("上下文已压缩".to_string()),
+                        detail: (!raw_summary.is_empty()).then_some(raw_summary),
+                        url: None,
+                    });
+                if !content.starts_with("[Compacted Summary]") {
+                    content = format!("[Compacted Summary]\n{content}");
+                }
+            } else if role == "assistant" {
+                rich_meta.model = message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty() && *m != "<synthetic>")
+                    .map(str::to_string);
+                if let Some(usage) = message.get("usage") {
+                    let input_tok = usage
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let output_tok = usage
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let total = input_tok.saturating_add(output_tok);
+                    if total > 0 {
+                        rich_meta.tokens = Some(total);
+                    }
+                }
+                if let Some(Value::Array(items)) = message.get("content") {
+                    rich_meta.blocks =
+                        build_claude_assistant_blocks(items, ts, &mut bash_call_times);
+                }
+            } else if role == "tool" {
+                if let Some(Value::Array(items)) = message.get("content") {
+                    rich_meta.blocks =
+                        build_claude_tool_result_blocks(value, items, ts, &bash_call_times);
+                }
             }
-            messages.push(SessionMessage { role, content, ts });
+
+            messages.push(SessionMessage {
+                role,
+                content,
+                ts,
+                meta: rich_meta.into_boxed_option(),
+            });
         }
     }
     Ok(messages)
+}
+
+fn has_redacted_claude_thinking(content: &Value) -> bool {
+    let Some(items) = content.as_array() else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        kind == "redacted_thinking"
+            || (kind == "thinking"
+                && item
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .is_none_or(|t| t.trim().is_empty())
+                && item
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty()))
+    })
+}
+
+fn build_claude_assistant_blocks(
+    items: &[Value],
+    ts: Option<i64>,
+    bash_call_times: &mut HashMap<String, i64>,
+) -> Vec<crate::session_manager::reader_meta::ReaderBlock> {
+    use crate::session_manager::reader_meta::{build_tool_call_block, ReaderBlock};
+    let mut blocks = Vec::new();
+    let mut last_srv_id = String::new();
+    for (idx, item) in items.iter().enumerate() {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "text" => {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    blocks.push(ReaderBlock::Text {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            "tool_use" | "server_tool_use" | "mcp_tool_use" => {
+                let raw_name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("claude_call_{idx}"));
+                if kind == "server_tool_use" {
+                    last_srv_id = id.clone();
+                }
+                if raw_name == "Bash" {
+                    if let Some(t) = ts {
+                        bash_call_times.insert(id.clone(), t);
+                    }
+                }
+                let input = item.get("input").unwrap_or(&Value::Null);
+                blocks.push(build_tool_call_block(id, raw_name, None, input));
+            }
+            "web_search_tool_result" => {
+                let formatted = extract_text(item);
+                let is_err = item.get("error").is_some_and(|e| !e.is_null());
+                let line_count = formatted.lines().count() as u32;
+                blocks.push(ReaderBlock::ToolResult {
+                    call_id: std::mem::take(&mut last_srv_id),
+                    status: if is_err { "error" } else { "success" }.to_string(),
+                    output: formatted,
+                    line_count,
+                    exit_code: None,
+                    duration_ms: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+fn build_claude_tool_result_blocks(
+    entry: &Value,
+    items: &[Value],
+    ts: Option<i64>,
+    bash_call_times: &HashMap<String, i64>,
+) -> Vec<crate::session_manager::reader_meta::ReaderBlock> {
+    use crate::session_manager::reader_meta::{parse_codex_output_envelope, ReaderBlock};
+    let single = items.len() == 1;
+    let entry_interrupted = single
+        && entry
+            .pointer("/toolUseResult/interrupted")
+            .and_then(Value::as_bool)
+            == Some(true);
+    let mut blocks = Vec::new();
+    for item in items {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(kind, "tool_result" | "mcp_tool_result") {
+            continue;
+        }
+        let call_id = item
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let raw_out = item.get("content").map(extract_text).unwrap_or_default();
+        let parsed = parse_codex_output_envelope(&raw_out);
+        let is_err = item.get("is_error").and_then(Value::as_bool) == Some(true) || parsed.is_error;
+        let status = if entry_interrupted {
+            "interrupted"
+        } else if is_err {
+            "error"
+        } else {
+            "success"
+        };
+        let duration_ms = match (bash_call_times.get(&call_id).copied(), ts) {
+            (Some(start), Some(end)) if end > start => Some((end - start) as u64),
+            _ => parsed.duration_ms,
+        };
+        let line_count = parsed.body.lines().count() as u32;
+        blocks.push(ReaderBlock::ToolResult {
+            call_id,
+            status: status.to_string(),
+            output: parsed.body,
+            line_count,
+            exit_code: parsed.exit_code,
+            duration_ms,
+        });
+    }
+    blocks
 }
 
 fn is_main_entry(entry: &Value) -> bool {

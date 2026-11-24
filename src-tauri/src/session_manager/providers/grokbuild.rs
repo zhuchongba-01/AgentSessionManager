@@ -203,6 +203,7 @@ fn conversation_message(value: &Value) -> Option<SessionMessage> {
             .get("timestamp")
             .or_else(|| value.get("ts"))
             .and_then(parse_timestamp_to_ms),
+        meta: None,
     })
 }
 

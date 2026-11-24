@@ -435,6 +435,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                 role: "thinking".to_string(),
                 content: thinking,
                 ts: msg_ts,
+                meta: None,
             });
         }
         if !content.trim().is_empty() {
@@ -442,6 +443,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                 role,
                 content,
                 ts: msg_ts,
+                meta: None,
             });
         }
     }
@@ -586,6 +588,7 @@ fn load_messages_connection(
                 role: "thinking".to_string(),
                 content: thinking,
                 ts: Some(ts),
+                meta: None,
             });
         }
 
@@ -595,6 +598,7 @@ fn load_messages_connection(
                 role,
                 content,
                 ts: Some(ts),
+                meta: None,
             });
         }
     }
@@ -654,6 +658,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                         role: role.into(),
                         content,
                         ts: Some(ts),
+                        meta: None,
                     });
                 }
             }
@@ -709,6 +714,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                         role: "thinking".into(),
                         content: thinking,
                         ts: Some(ts),
+                        meta: None,
                     });
                 }
                 let content = visible_parts.join("\n");
@@ -717,6 +723,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                         role: "assistant".into(),
                         content,
                         ts: Some(ts),
+                        meta: None,
                     });
                 }
             }
@@ -737,6 +744,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                         role: "tool".into(),
                         content,
                         ts: Some(ts),
+                        meta: None,
                     });
                 }
             }
@@ -763,6 +771,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                         role: "system".into(),
                         content,
                         ts: Some(ts),
+                        meta: None,
                     });
                 }
             }
@@ -777,6 +786,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                             .unwrap_or("unknown")
                     ),
                     ts: Some(ts),
+                    meta: None,
                 });
             }
             "model-switched" => {
@@ -784,6 +794,7 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                     role: "system".into(),
                     content: format_model_switched(&value),
                     ts: Some(ts),
+                    meta: None,
                 });
             }
             _ => {

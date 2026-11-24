@@ -1,6 +1,6 @@
 {
   "name": "agent-session-manager",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Standalone local session manager for coding agents",
   "homepage": "https://github.com/zhuchongba-01/AgentSessionManager",
   "repository": {

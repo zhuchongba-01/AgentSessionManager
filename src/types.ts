@@ -22,10 +22,64 @@ export interface SessionMeta {
   resumeCommand?: string;
 }
 
+export type ReaderBlock =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "thinking";
+      text: string;
+      summary?: string;
+      redacted?: boolean;
+      durationMs?: number;
+    }
+  | {
+      type: "tool_call";
+      id: string;
+      rawName: string;
+      server?: string;
+      title: string;
+      detail?: string;
+      inputPreview?: string;
+      inputTruncated?: boolean;
+      diffAdded?: number;
+      diffRemoved?: number;
+      diffText?: string;
+    }
+  | {
+      type: "tool_result";
+      callId: string;
+      status: "success" | "error" | "interrupted" | string;
+      output: string;
+      lineCount: number;
+      exitCode?: number;
+      durationMs?: number;
+    }
+  | {
+      type: "event";
+      kind: string;
+      text?: string;
+      detail?: string;
+      url?: string;
+    };
+
+export interface MessageReaderMeta {
+  model?: string;
+  thinkingSummary?: string;
+  redacted?: boolean;
+  durationMs?: number;
+  tokens?: number;
+  costUsd?: number;
+  injected?: boolean;
+  blocks?: ReaderBlock[];
+}
+
 export interface SessionMessage {
   role: string;
   content: string;
   ts?: number;
+  meta?: MessageReaderMeta;
   /** 正文被截断时用于取回全文的下标（在会话正文里的绝对位置） */
   index?: number;
   /** 该条消息在后端完整会话记录中的绝对下标（0..total-1），用于会话内全文搜索定位 */

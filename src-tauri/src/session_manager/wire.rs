@@ -10,6 +10,7 @@
 
 use serde::Serialize;
 
+use super::reader_meta::MessageReaderMeta;
 use super::SessionMessage;
 
 /// 超过这个字符数的正文才截断
@@ -26,6 +27,8 @@ pub struct SessionMessageWire {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Box<MessageReaderMeta>>,
     /// 截断时用于取回全文的下标（在会话正文里的绝对位置）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
@@ -136,6 +139,7 @@ pub fn wire_message(
             role: message.role.clone(),
             content: message.content.clone(),
             ts: message.ts,
+            meta: message.meta.clone(),
             index: None,
             truncated: false,
             content_chars: None,
@@ -152,6 +156,7 @@ pub fn wire_message(
             .take(MESSAGE_PREVIEW_CHARS)
             .collect(),
         ts: message.ts,
+        meta: message.meta.clone(),
         index: Some(index),
         truncated: true,
         content_chars: Some(chars),
@@ -199,6 +204,7 @@ mod tests {
             role: role.to_string(),
             content: "中".repeat(chars),
             ts: Some(1),
+            meta: None,
         }
     }
 
@@ -207,6 +213,7 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
             ts: None,
+            meta: None,
         }
     }
 
