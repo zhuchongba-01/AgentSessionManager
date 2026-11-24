@@ -28,6 +28,8 @@ export interface SessionMessage {
   ts?: number;
   /** 正文被截断时用于取回全文的下标（在会话正文里的绝对位置） */
   index?: number;
+  /** 该条消息在后端完整会话记录中的绝对下标（0..total-1），用于会话内全文搜索定位 */
+  transcriptIndex?: number;
   /** 该条正文只下发了预览：展开或复制前需要先取回全文 */
   truncated?: boolean;
   /** 全文的字符数，用于提示大小 */

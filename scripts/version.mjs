@@ -3,10 +3,131 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Only explicit release metadata is edited. Dependency versions are never touched.
-const versionField = /("version"\s*:\s*")([^"\r\n]+)(")/g;
 const windowTitle = /("title"\s*:\s*"Agent会话管理\s+v)([^"\r\n]+)(")/g;
+
+/**
+ * Locate top-level `"version": "..."` string properties on a root JSON object
+ * (depth 1) without matching nested `"version"` keys inside child objects/arrays,
+ * while preserving exact surrounding formatting and line endings.
+ */
+function findTopLevelJsonVersionSpans(text, relativePath) {
+  try {
+    JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${relativePath}: invalid JSON (${error.message})`);
+  }
+
+  const spans = [];
+  const len = text.length;
+  let i = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let expectingKey = false;
+
+  const skipWhitespace = () => {
+    while (
+      i < len &&
+      (text[i] === " " ||
+        text[i] === "\t" ||
+        text[i] === "\r" ||
+        text[i] === "\n")
+    ) {
+      i++;
+    }
+  };
+
+  const readJsonString = () => {
+    const startQuote = i;
+    i++;
+    while (i < len) {
+      const ch = text[i];
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        const endQuote = i;
+        i++;
+        return {
+          raw: text.slice(startQuote, i),
+          valueStart: startQuote + 1,
+          valueEnd: endQuote,
+        };
+      }
+      i++;
+    }
+    throw new Error(`${relativePath}: unterminated JSON string`);
+  };
+
+  while (i < len) {
+    skipWhitespace();
+    if (i >= len) break;
+    const ch = text[i];
+
+    if (ch === "{") {
+      braceDepth++;
+      expectingKey = braceDepth === 1 && bracketDepth === 0;
+      i++;
+    } else if (ch === "}") {
+      braceDepth--;
+      expectingKey = false;
+      i++;
+    } else if (ch === "[") {
+      bracketDepth++;
+      expectingKey = false;
+      i++;
+    } else if (ch === "]") {
+      bracketDepth--;
+      expectingKey = false;
+      i++;
+    } else if (ch === ",") {
+      expectingKey = braceDepth === 1 && bracketDepth === 0;
+      i++;
+    } else if (ch === '"') {
+      const isTopLevelKey =
+        expectingKey && braceDepth === 1 && bracketDepth === 0;
+      const keyToken = readJsonString();
+      expectingKey = false;
+
+      if (isTopLevelKey) {
+        skipWhitespace();
+        if (text[i] === ":") {
+          i++;
+          skipWhitespace();
+          if (JSON.parse(keyToken.raw) === "version" && text[i] === '"') {
+            const valToken = readJsonString();
+            const rawInner = text.slice(valToken.valueStart, valToken.valueEnd);
+            if (!/[\r\n"]/.test(rawInner)) {
+              spans.push({
+                start: valToken.valueStart,
+                end: valToken.valueEnd,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      expectingKey = false;
+      i++;
+    }
+  }
+
+  return spans;
+}
+
+function replaceTopLevelJsonVersion(text, version, relativePath) {
+  const spans = findTopLevelJsonVersionSpans(text, relativePath);
+  if (spans.length !== 1) {
+    throw new Error(
+      `${relativePath}: expected exactly one release metadata field, found ${spans.length}`,
+    );
+  }
+  const [{ start, end }] = spans;
+  return `${text.slice(0, start)}${version}${text.slice(end)}`;
+}
+
 const targets = [
-  ["package.json", [versionField]],
+  ["package.json", [replaceTopLevelJsonVersion]],
   [
     "src-tauri/Cargo.toml",
     [
@@ -19,8 +140,9 @@ const targets = [
       /^(\[\[package\]\]\r?\nname = "agent-session-manager"\r?\nversion = ")([^"\r\n]+)(")/gm,
     ],
   ],
-  ["src-tauri/tauri.conf.json", [versionField, windowTitle]],
+  ["src-tauri/tauri.conf.json", [replaceTopLevelJsonVersion, windowTitle]],
   ["src-tauri/tauri.windows.conf.json", [windowTitle]],
+  ["src-tauri/tauri.macos.conf.json", [windowTitle]],
   [
     "installer/AgentSessionManager.iss",
     [/^(#define MyAppVersion ")([^"\r\n]+)(")/gm],
@@ -52,6 +174,10 @@ export function synchronizeVersion(root, { check = false, version } = {}) {
     const before = readFileSync(path, "utf8");
     let after = before;
     for (const pattern of patterns) {
+      if (typeof pattern === "function") {
+        after = pattern(after, version, relativePath);
+        continue;
+      }
       const matches = [...after.matchAll(pattern)];
       if (matches.length !== 1) {
         throw new Error(

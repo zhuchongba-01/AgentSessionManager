@@ -131,4 +131,38 @@ describe("SessionMinimap", () => {
     expect(tooltip).not.toHaveTextContent("# Context from my IDE setup:");
     expect(tooltip).not.toHaveTextContent("Active file: src/index.ts");
   });
+
+  it("clears hover card when messages change", () => {
+    const first: SessionMessage[] = [
+      { role: "user", content: "第一轮提问" },
+      { role: "assistant", content: "第一轮回答" },
+    ];
+    const second: SessionMessage[] = [
+      { role: "user", content: "切换后的提问" },
+      { role: "assistant", content: "切换后的回答" },
+    ];
+
+    const { rerender } = render(
+      <SessionMinimap
+        messages={first}
+        messageIndexes={[0]}
+        visibleMessageIndexes={[0]}
+        onTickClick={vi.fn()}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole("button"));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("第一轮提问");
+
+    rerender(
+      <SessionMinimap
+        messages={second}
+        messageIndexes={[0]}
+        visibleMessageIndexes={[0]}
+        onTickClick={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
 });

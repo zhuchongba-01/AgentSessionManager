@@ -1,14 +1,6 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
-  content: [
-    "./index.html",
-    "./src/App.tsx",
-    "./src/main.tsx",
-    "./src/components/ConfirmDialog.tsx",
-    "./src/components/theme-provider.tsx",
-    "./src/components/sessions/**/*.{ts,tsx}",
-    "./src/components/ui/**/*.{ts,tsx}",
-  ],
+  content: ["./src/index.html", "./src/**/*.{ts,tsx}"],
   darkMode: ["selector", ".dark"],
   theme: {
     extend: {
@@ -91,20 +83,23 @@ module.exports = {
       fontFamily: {
         // 使用与之前版本保持一致的系统字体栈
         sans: [
+          '"Inter"',
+          '"Segoe UI Variable Text"',
+          '"Segoe UI"',
           "-apple-system",
           "BlinkMacSystemFont",
-          '"Segoe UI"',
-          "Roboto",
-          '"Helvetica Neue"',
-          "Arial",
+          '"PingFang SC"',
+          '"Microsoft YaHei UI"',
+          '"Noto Sans SC"',
           "sans-serif",
         ],
         mono: [
+          '"JetBrains Mono"',
+          '"Cascadia Code"',
+          '"Cascadia Mono"',
           "ui-monospace",
           "SFMono-Regular",
-          '"SF Mono"',
           "Consolas",
-          '"Liberation Mono"',
           "Menlo",
           "monospace",
         ],
@@ -178,4 +173,3 @@ module.exports = {
   },
   plugins: [],
 };
-

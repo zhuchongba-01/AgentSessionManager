@@ -308,58 +308,107 @@ fn session_descriptors(
     root: &Path,
     layout: SessionLayout,
 ) -> Result<Vec<SessionDescriptor>, String> {
-    let root = root
+    let canonical_root = root
         .canonicalize()
         .map_err(|error| format!("Failed to resolve Pi session root: {error}"))?;
+    let root_meta = fs::metadata(&canonical_root).map_err(|error| {
+        format!(
+            "Failed to inspect Pi session root {}: {error}",
+            canonical_root.display()
+        )
+    })?;
+    if !root_meta.is_dir() {
+        return Err(format!(
+            "Pi session root is not a directory: {}",
+            canonical_root.display()
+        ));
+    }
+    fs::read_dir(&canonical_root)
+        .map_err(|error| format!("Failed to scan {}: {error}", canonical_root.display()))?;
+
     let mut files = Vec::new();
-    super::utils::collect_files_where_checked(
-        &root,
-        |path| {
-            path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-                && matches_session_layout(&root, path, layout)
-        },
-        &mut files,
-    )?;
+    collect_jsonl_files(&canonical_root, layout, &mut files, false);
     files.sort();
     let mut descriptors = Vec::with_capacity(files.len());
     for file in files {
-        let (_, path) = validate_source_under_root(&root, &file, layout)?;
-        let header = read_session_header(&path)?;
+        let Ok((_, path)) = validate_source_under_root(&canonical_root, &file, layout) else {
+            continue;
+        };
+        let Ok(header) = read_session_header(&path) else {
+            continue;
+        };
         let parent_path = header
             .parent_session
             .as_deref()
-            .and_then(|parent| lineage_path(parent, &root));
+            .and_then(|parent| lineage_path(parent, &canonical_root));
         descriptors.push(SessionDescriptor { path, parent_path });
     }
 
     Ok(descriptors)
 }
 
-fn lineage_path(value: &str, root: &Path) -> Option<PathBuf> {
+#[cfg(windows)]
+fn windows_lineage_prefix_allowed(path: &Path, canonical_root: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(path_prefix)) = path.components().next() else {
+        return false;
+    };
+    let Some(Component::Prefix(root_prefix)) = canonical_root.components().next() else {
+        return false;
+    };
+    match root_prefix.kind() {
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {
+            matches!(
+                path_prefix.kind(),
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_)
+            )
+        }
+        Prefix::UNC(srv1, share1) | Prefix::VerbatimUNC(srv1, share1) => match path_prefix.kind() {
+            Prefix::UNC(srv2, share2) | Prefix::VerbatimUNC(srv2, share2) => {
+                srv1.to_string_lossy()
+                    .eq_ignore_ascii_case(&srv2.to_string_lossy())
+                    && share1
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&share2.to_string_lossy())
+            }
+            _ => false,
+        },
+        Prefix::DeviceNS(d1) => matches!(
+            path_prefix.kind(),
+            Prefix::DeviceNS(d2) if d1.to_string_lossy().eq_ignore_ascii_case(&d2.to_string_lossy())
+        ),
+        Prefix::Verbatim(v1) => matches!(path_prefix.kind(), Prefix::Verbatim(v2) if v1 == v2),
+    }
+}
+
+fn lineage_path(value: &str, canonical_root: &Path) -> Option<PathBuf> {
     let path = if value.starts_with("file://") {
         tauri::Url::parse(value).ok()?.to_file_path().ok()?
     } else {
         PathBuf::from(value)
     };
-    // Do not stat/canonicalize external provenance. Prefix normalization below
-    // merely allows a normal Windows path to match an already-canonical root.
     if !path.is_absolute() {
         return None;
     }
-    #[cfg(windows)]
-    let path = if root.to_string_lossy().starts_with(r"\\?\")
-        && !path.to_string_lossy().starts_with(r"\\?\")
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
     {
-        let text = path.to_string_lossy().replace('/', "\\");
-        if let Some(unc) = text.strip_prefix(r"\\") {
-            PathBuf::from(format!(r"\\?\UNC\{unc}"))
-        } else {
-            PathBuf::from(format!(r"\\?\{text}"))
-        }
-    } else {
-        path
-    };
-    path.starts_with(root).then_some(path)
+        return None;
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    if !windows_lineage_prefix_allowed(&path, canonical_root) {
+        return None;
+    }
+    let resolved = path.canonicalize().ok()?;
+    resolved.starts_with(canonical_root).then_some(resolved)
 }
 
 fn preflight_delete_with_layout(
@@ -403,12 +452,33 @@ fn deletion_order_with_descriptors(
                 .map(|parent| (descriptor.path.as_path(), parent))
         })
         .collect::<HashMap<_, _>>();
+    let sample_root = descriptors.first().map(|d| d.path.as_path());
     let selected = requests
         .iter()
         .enumerate()
         .filter(|(_, request)| request.provider_id == PROVIDER_ID)
         .filter_map(|(index, request)| {
-            let path = Path::new(&request.source_path).canonicalize().ok()?;
+            let raw = Path::new(&request.source_path);
+            if !raw.is_absolute()
+                || raw
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return None;
+            }
+            #[cfg(windows)]
+            if let Some(root_ref) = sample_root {
+                if !windows_lineage_prefix_allowed(raw, root_ref) {
+                    return None;
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = sample_root;
+            let raw_meta = fs::symlink_metadata(raw).ok()?;
+            if super::utils::is_reparse_or_symlink(&raw_meta) {
+                return None;
+            }
+            let path = raw.canonicalize().ok()?;
             let parent = parent_by_path
                 .get(path.as_path())
                 .map(|parent| parent.to_string_lossy().into_owned());
@@ -573,6 +643,89 @@ fn read_session_header(path: &Path) -> Result<SessionHeader, String> {
     }
 }
 
+#[derive(Debug)]
+enum EntrySummaryKind {
+    SessionInfo(Option<String>),
+    UserMessage(String),
+    AssistantMessage(String),
+    ActivityOnly,
+}
+
+#[derive(Debug)]
+struct EntrySummaryItem {
+    ts: Option<i64>,
+    kind: EntrySummaryKind,
+}
+
+fn extract_entry_summary_item(value: &Value) -> Option<EntrySummaryItem> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("session_info") => {
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
+            Some(EntrySummaryItem {
+                ts,
+                kind: EntrySummaryKind::SessionInfo(name),
+            })
+        }
+        Some("compaction") | Some("branch_summary") | Some("bashExecution") => {
+            let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
+            Some(EntrySummaryItem {
+                ts,
+                kind: EntrySummaryKind::ActivityOnly,
+            })
+        }
+        Some("message") => {
+            let message = value.get("message")?;
+            let ts = message
+                .get("timestamp")
+                .and_then(parse_timestamp_to_ms)
+                .or_else(|| value.get("timestamp").and_then(parse_timestamp_to_ms));
+            let raw_role = message.get("role").and_then(Value::as_str);
+            if let Some((role, content)) = parse_message(message) {
+                match role.as_str() {
+                    "user" => Some(EntrySummaryItem {
+                        ts,
+                        kind: EntrySummaryKind::UserMessage(content),
+                    }),
+                    "assistant" => Some(EntrySummaryItem {
+                        ts,
+                        kind: EntrySummaryKind::AssistantMessage(content),
+                    }),
+                    _ if matches!(
+                        raw_role,
+                        Some("bashExecution" | "branchSummary" | "compactionSummary")
+                    ) =>
+                    {
+                        Some(EntrySummaryItem {
+                            ts,
+                            kind: EntrySummaryKind::ActivityOnly,
+                        })
+                    }
+                    _ => None,
+                }
+            } else if raw_role == Some("assistant")
+                && message
+                    .get("content")
+                    .map(super::utils::extract_thinking_text)
+                    .is_some_and(|thinking| !thinking.trim().is_empty())
+            {
+                Some(EntrySummaryItem {
+                    ts,
+                    kind: EntrySummaryKind::ActivityOnly,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn read_tree(path: &Path) -> Result<SessionTree, String> {
     validate_file_size(path)?;
     let reader = BufReader::new(
@@ -580,10 +733,11 @@ fn read_tree(path: &Path) -> Result<SessionTree, String> {
     );
     let mut header = None;
     let mut parents = HashMap::<String, (Option<String>, usize)>::new();
+    let mut entry_items = HashMap::<usize, EntrySummaryItem>::new();
+    let mut global_explicit_name: Option<Option<String>> = None;
     let mut latest_id = None;
     let mut legacy_previous_id = None;
     let mut entry_index = 0usize;
-    let mut summary = SessionSummary::default();
     for line in reader.lines() {
         let line = line.map_err(|error| format!("Failed to read Pi session: {error}"))?;
         if line.trim().is_empty() {
@@ -602,7 +756,6 @@ fn read_tree(path: &Path) -> Result<SessionTree, String> {
                 "Pi session exceeds the {MAX_TREE_ENTRIES}-entry safety limit"
             ));
         }
-        update_session_summary(&mut summary, &value);
         let version = header
             .as_ref()
             .map_or(1, |item: &SessionHeader| item.version);
@@ -611,6 +764,12 @@ fn read_tree(path: &Path) -> Result<SessionTree, String> {
         else {
             continue;
         };
+        if let Some(item) = extract_entry_summary_item(&value) {
+            if let EntrySummaryKind::SessionInfo(ref name) = item.kind {
+                global_explicit_name = Some(name.clone());
+            }
+            entry_items.insert(entry_index, item);
+        }
         if parents
             .insert(id.clone(), (parent_id, entry_index))
             .is_some()
@@ -636,51 +795,46 @@ fn read_tree(path: &Path) -> Result<SessionTree, String> {
         active_entry_indexes.insert(*entry_index);
         current = parent_id.clone();
     }
+
+    let mut ordered_active: Vec<usize> = active_entry_indexes.iter().copied().collect();
+    ordered_active.sort_unstable();
+    let mut summary = SessionSummary::default();
+    for index in ordered_active {
+        let Some(item) = entry_items.remove(&index) else {
+            continue;
+        };
+        if let Some(timestamp) = item.ts {
+            summary.last_active_at = Some(
+                summary
+                    .last_active_at
+                    .map_or(timestamp, |current| current.max(timestamp)),
+            );
+        }
+        match item.kind {
+            EntrySummaryKind::SessionInfo(name) => {
+                summary.explicit_name = Some(name);
+            }
+            EntrySummaryKind::UserMessage(content) => {
+                if summary.first_user_message.is_none() {
+                    summary.first_user_message = Some(content.clone());
+                }
+                summary.last_message = Some(content);
+            }
+            EntrySummaryKind::AssistantMessage(content) => {
+                summary.last_message = Some(content);
+            }
+            EntrySummaryKind::ActivityOnly => {}
+        }
+    }
+    if summary.explicit_name.is_none() {
+        summary.explicit_name = global_explicit_name;
+    }
+
     Ok(SessionTree {
         header,
         active_entry_indexes,
         summary,
     })
-}
-
-fn update_session_summary(summary: &mut SessionSummary, value: &Value) {
-    if value.get("type").and_then(Value::as_str) == Some("session_info") {
-        summary.explicit_name = Some(
-            value
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string),
-        );
-        return;
-    }
-    let Some((role, content)) = value
-        .get("message")
-        .filter(|_| value.get("type").and_then(Value::as_str) == Some("message"))
-        .and_then(parse_message)
-    else {
-        return;
-    };
-    if !matches!(role.as_str(), "user" | "assistant") {
-        return;
-    }
-    let timestamp = value
-        .get("message")
-        .and_then(|message| message.get("timestamp"))
-        .and_then(parse_timestamp_to_ms)
-        .or_else(|| value.get("timestamp").and_then(parse_timestamp_to_ms));
-    if let Some(timestamp) = timestamp {
-        summary.last_active_at = Some(
-            summary
-                .last_active_at
-                .map_or(timestamp, |current| current.max(timestamp)),
-        );
-    }
-    if role == "user" && summary.first_user_message.is_none() {
-        summary.first_user_message = Some(content.clone());
-    }
-    summary.last_message = Some(content);
 }
 
 fn read_active_messages(path: &Path, tree: &SessionTree) -> Result<Vec<SessionMessage>, String> {
@@ -728,19 +882,32 @@ fn read_active_messages(path: &Path, tree: &SessionTree) -> Result<Vec<SessionMe
         match value.get("type").and_then(Value::as_str) {
             Some("session_info") => {}
             Some("message") => {
-                let Some((role, content)) = value.get("message").and_then(parse_message) else {
+                let Some(message) = value.get("message") else {
                     continue;
                 };
-                let timestamp = value
-                    .get("message")
-                    .and_then(|message| message.get("timestamp"))
+                let timestamp = message
+                    .get("timestamp")
                     .and_then(parse_timestamp_to_ms)
                     .or(entry_timestamp);
-                messages.push(SessionMessage {
-                    role,
-                    content,
-                    ts: timestamp,
-                });
+                if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                    if let Some(msg_content) = message.get("content") {
+                        let thinking = super::utils::extract_thinking_text(msg_content);
+                        if !thinking.trim().is_empty() {
+                            messages.push(SessionMessage {
+                                role: "thinking".to_string(),
+                                content: thinking,
+                                ts: timestamp,
+                            });
+                        }
+                    }
+                }
+                if let Some((role, content)) = parse_message(message) {
+                    messages.push(SessionMessage {
+                        role,
+                        content,
+                        ts: timestamp,
+                    });
+                }
             }
             Some("compaction") | Some("branch_summary") => {
                 push_system(
@@ -838,10 +1005,25 @@ fn entry_identity(
 fn parse_message(message: &Value) -> Option<(String, String)> {
     let role = message.get("role").and_then(Value::as_str)?;
     let (display_role, content) = match role {
-        "user" | "assistant" => (
-            role.to_string(),
+        "user" => (
+            "user".to_string(),
             message.get("content").map(extract_text).unwrap_or_default(),
         ),
+        "assistant" => {
+            let text = message.get("content").map(extract_text).unwrap_or_default();
+            let content = if text.trim().is_empty() {
+                message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|err| !err.is_empty())
+                    .map(|err| format!("[Error] {err}"))
+                    .unwrap_or_default()
+            } else {
+                text
+            };
+            ("assistant".to_string(), content)
+        }
         "custom" | "hookMessage"
             if message.get("display").and_then(Value::as_bool) != Some(false) =>
         {
@@ -886,22 +1068,31 @@ fn validate_source_under_root(
     path: &Path,
     layout: SessionLayout,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let root = root.canonicalize().map_err(|error| {
+    let raw_meta = fs::symlink_metadata(path)
+        .map_err(|error| format!("Failed to inspect Pi session {}: {error}", path.display()))?;
+    if super::utils::is_reparse_or_symlink(&raw_meta) {
+        return Err(format!(
+            "Pi session source must not be a symlink or reparse point: {}",
+            path.display()
+        ));
+    }
+    let canonical_root = root.canonicalize().map_err(|error| {
         format!(
             "Failed to resolve Pi session root {}: {error}",
             root.display()
         )
     })?;
+    super::utils::checked_storage_child(root, path)?;
     let source = path
         .canonicalize()
         .map_err(|error| format!("Failed to resolve Pi session {}: {error}", path.display()))?;
-    if !source.starts_with(&root) {
+    if !source.starts_with(&canonical_root) {
         return Err(format!(
             "Pi session source is outside the session root: {}",
             path.display()
         ));
     }
-    if !matches_session_layout(&root, &source, layout) {
+    if !matches_session_layout(&canonical_root, &source, layout) {
         return Err(format!(
             "Pi session source does not match the active directory layout: {}",
             path.display()
@@ -909,12 +1100,13 @@ fn validate_source_under_root(
     }
     let metadata = fs::symlink_metadata(&source)
         .map_err(|error| format!("Failed to inspect Pi session {}: {error}", source.display()))?;
-    if !metadata.file_type().is_file()
+    if super::utils::is_reparse_or_symlink(&metadata)
+        || !metadata.file_type().is_file()
         || source.extension().and_then(|value| value.to_str()) != Some("jsonl")
     {
         return Err(format!("Invalid Pi session file: {}", source.display()));
     }
-    Ok((root, source))
+    Ok((canonical_root, source))
 }
 
 fn matches_session_layout(root: &Path, source: &Path, layout: SessionLayout) -> bool {
@@ -978,6 +1170,13 @@ fn collect_session_level(
                 continue;
             }
         };
+        let entry_path = entry.path();
+        let Ok(entry_meta) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if super::utils::is_reparse_or_symlink(&entry_meta) {
+            continue;
+        }
         if file_type.is_file() {
             push_jsonl_file(&entry, output, enforce_size_limit);
             continue;
@@ -985,9 +1184,12 @@ fn collect_session_level(
         if !file_type.is_dir() {
             continue;
         }
-        let forks = entry.path().join("forks");
+        let forks = entry_path.join("forks");
         match fs::symlink_metadata(&forks) {
-            Ok(metadata) if metadata.file_type().is_dir() => {
+            Ok(metadata)
+                if metadata.file_type().is_dir()
+                    && !super::utils::is_reparse_or_symlink(&metadata) =>
+            {
                 collect_session_level(&forks, output, enforce_size_limit, depth + 1);
             }
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -1057,7 +1259,12 @@ fn collect_jsonl_files(
                 };
                 match entry.file_type() {
                     Ok(kind) if kind.is_dir() => {
-                        collect_session_level(&entry.path(), output, enforce_size_limit, 0);
+                        let child_path = entry.path();
+                        if fs::symlink_metadata(&child_path)
+                            .is_ok_and(|meta| !super::utils::is_reparse_or_symlink(&meta))
+                        {
+                            collect_session_level(&child_path, output, enforce_size_limit, 0);
+                        }
                     }
                     Err(error) => super::utils::scan_warning(format!(
                         "Failed to inspect {}: {error}",
@@ -1716,5 +1923,339 @@ mod tests {
             SessionLayout::ProjectDirectories
         )
         .expect("delete project session"));
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_file_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_dir_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+
+    #[test]
+    fn lineage_resolves_case_mismatched_symlinked_and_file_url_parents_without_external_probes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("SessionsRoot");
+        let parent = root.join("ParentSession.jsonl");
+        let child_case = root.join("child-case.jsonl");
+        let child_url = root.join("child-url.jsonl");
+        write_session_header(&parent, "parent-id");
+
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let canonical_parent = parent.canonicalize().expect("canonical parent");
+
+        let alt_parent_str = {
+            #[cfg(windows)]
+            {
+                let raw = parent.to_string_lossy().replace('\\', "/");
+                let mut chars = raw.chars();
+                match chars.next() {
+                    Some(first) if first.is_ascii_uppercase() => {
+                        format!(
+                            "{}{}",
+                            first.to_ascii_lowercase(),
+                            chars.as_str().to_uppercase()
+                        )
+                    }
+                    Some(first) => {
+                        format!(
+                            "{}{}",
+                            first.to_ascii_uppercase(),
+                            chars.as_str().to_lowercase()
+                        )
+                    }
+                    None => raw,
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                parent.to_string_lossy().into_owned()
+            }
+        };
+
+        fs::write(
+            &child_case,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": "child-case-id",
+                    "cwd": "/work",
+                    "parentSession": alt_parent_str,
+                })
+            ),
+        )
+        .expect("write child_case");
+
+        let parent_uri = tauri::Url::from_file_path(&parent).unwrap().to_string();
+        fs::write(
+            &child_url,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": "child-url-id",
+                    "cwd": "/work",
+                    "parentSession": parent_uri,
+                })
+            ),
+        )
+        .expect("write child_url");
+
+        let alias_dir = temp.path().join("alias-link");
+        if create_dir_symlink(&root, &alias_dir).is_ok() {
+            let via_symlink = alias_dir.join("ParentSession.jsonl");
+            assert_eq!(
+                lineage_path(&via_symlink.to_string_lossy(), &canonical_root),
+                Some(canonical_parent.clone())
+            );
+        }
+
+        let sessions = scan_sessions_in_root(&root, SessionLayout::Flat);
+        for child_id in ["child-case-id", "child-url-id"] {
+            let found = sessions
+                .iter()
+                .find(|s| s.session_id == child_id)
+                .expect("child discovered");
+            assert_eq!(found.parent_session_id.as_deref(), Some("parent-id"));
+        }
+
+        let descriptors = session_descriptors(&root, SessionLayout::Flat).expect("descriptors");
+        let requests = vec![
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "parent-id".into(),
+                source_path: parent.to_string_lossy().into_owned(),
+                include_project: false,
+            },
+            DeleteSessionRequest {
+                provider_id: PROVIDER_ID.into(),
+                session_id: "child-case-id".into(),
+                source_path: child_case.to_string_lossy().into_owned(),
+                include_project: false,
+            },
+        ];
+        assert_eq!(
+            deletion_order_with_descriptors(&requests, &[0, 1], &descriptors),
+            vec![1, 0]
+        );
+
+        // Reject relative, parent-traversal, non-jsonl, and external paths
+        let external = temp.path().join("outside.jsonl");
+        write_session_header(&external, "outside-id");
+        assert_eq!(
+            lineage_path(&external.to_string_lossy(), &canonical_root),
+            None
+        );
+        assert_eq!(lineage_path("relative/parent.jsonl", &canonical_root), None);
+        assert_eq!(
+            lineage_path(
+                &root
+                    .join("..")
+                    .join("SessionsRoot")
+                    .join("ParentSession.jsonl")
+                    .to_string_lossy(),
+                &canonical_root
+            ),
+            None
+        );
+        assert_eq!(
+            lineage_path(&root.join("notes.txt").to_string_lossy(), &canonical_root),
+            None
+        );
+
+        #[cfg(windows)]
+        {
+            for hostile in [
+                r"\\198.51.100.1\share\evil.jsonl",
+                r"\\?\UNC\198.51.100.1\share\evil.jsonl",
+                "file://198.51.100.1/share/evil.jsonl",
+                r"\\.\PIPE\evil.jsonl",
+                r"\\?\GLOBALROOT\Device\HarddiskVolume1\evil.jsonl",
+            ] {
+                assert_eq!(lineage_path(hostile, &canonical_root), None);
+            }
+            let unc_root = Path::new(r"\\?\UNC\nas.local\team_share\pi\sessions");
+            assert!(windows_lineage_prefix_allowed(
+                Path::new(r"\\NAS.LOCAL\TEAM_SHARE\pi\sessions\a.jsonl"),
+                unc_root
+            ));
+            assert!(!windows_lineage_prefix_allowed(
+                Path::new(r"\\other.local\team_share\pi\sessions\a.jsonl"),
+                unc_root
+            ));
+        }
+    }
+
+    #[test]
+    fn session_descriptors_skips_malformed_and_artifact_subdirs_and_rejects_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let project = root.join("proj");
+        let parent = project.join("parent.jsonl");
+        let child = project.join("parent").join("forks").join("child.jsonl");
+        write_session_header(&parent, "parent-id");
+        write_fork_header(&child, "child-id", &parent);
+
+        // Malformed sibling .jsonl and non-session subagent-artifacts directory must not abort descriptors
+        fs::write(project.join("corrupt.jsonl"), "{broken json\n").unwrap();
+        let artifacts = project.join("subagent-artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(artifacts.join("trace.jsonl"), "not-a-pi-session\n").unwrap();
+
+        let descriptors =
+            session_descriptors(&root, SessionLayout::ProjectDirectories).expect("descriptors");
+        assert_eq!(descriptors.len(), 2);
+
+        let link_session = project.join("evil-link.jsonl");
+        if create_file_symlink(&parent, &link_session).is_ok() {
+            assert!(validate_source_under_root(
+                &root,
+                &link_session,
+                SessionLayout::ProjectDirectories
+            )
+            .is_err());
+            assert!(delete_session_with_layout(
+                &root,
+                &link_session,
+                "parent-id",
+                SessionLayout::ProjectDirectories
+            )
+            .is_err());
+            assert!(parent.exists(), "real target session must remain untouched");
+        }
+    }
+
+    #[test]
+    fn thinking_blocks_and_assistant_error_turns_are_preserved_in_pi_messages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rich.jsonl");
+        let lines = [
+            serde_json::json!({"type":"session","version":3,"id":"rich-session","cwd":"/work"}),
+            serde_json::json!({
+                "type":"message","id":"m1","parentId":null,"timestamp":1700000000000i64,
+                "message":{"role":"user","content":[{"type":"image"}]}
+            }),
+            serde_json::json!({
+                "type":"message","id":"m2","parentId":"m1","timestamp":1700000001000i64,
+                "message":{"role":"assistant","content":[{"type":"thinking","thinking":"only thinking"}]}
+            }),
+            serde_json::json!({
+                "type":"message","id":"m3","parentId":"m2","timestamp":1700000002000i64,
+                "message":{
+                    "role":"assistant",
+                    "content":[
+                        {"type":"thinking","thinking":"plan step"},
+                        {"type":"text","text":"visible reply"}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type":"message","id":"m4","parentId":"m3","timestamp":1700000003000i64,
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"429 rate limit exceeded"
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let messages = load_messages_with_layout(&root, &path, SessionLayout::Flat).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "[Image]"),
+                ("thinking", "only thinking"),
+                ("thinking", "plan step"),
+                ("assistant", "visible reply"),
+                ("assistant", "[Error] 429 rate limit exceeded"),
+            ]
+        );
+
+        let meta = parse_session(&path).unwrap();
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some("[Error] 429 rate limit exceeded")
+        );
+        assert_eq!(meta.last_active_at, Some(1_700_000_003_000));
+    }
+
+    #[test]
+    fn active_branch_summary_excludes_abandoned_tree_branches_and_tracks_activity_timestamps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("branched.jsonl");
+        let lines = [
+            serde_json::json!({"type":"session","version":3,"id":"branched-session","cwd":"/work","timestamp":1700000000000i64}),
+            // Abandoned root branch
+            serde_json::json!({"type":"message","id":"dead-root","parentId":null,"timestamp":1700000001000i64,"message":{"role":"user","content":"dead first question"}}),
+            serde_json::json!({"type":"session_info","id":"dead-info","parentId":"dead-root","timestamp":1700000099000i64,"name":"Dead Branch Title"}),
+            serde_json::json!({"type":"message","id":"dead-reply","parentId":"dead-info","timestamp":1700000099500i64,"message":{"role":"assistant","content":"dead summary"}}),
+            // Active root branch (re-rooted via /tree)
+            serde_json::json!({"type":"message","id":"live-root","parentId":null,"timestamp":1700000002000i64,"message":{"role":"user","content":"active first question"}}),
+            // Clear name on active branch so Dead Branch Title does not leak, and record compaction + bashExecution timestamps
+            serde_json::json!({"type":"session_info","id":"live-clear","parentId":"live-root","timestamp":1700000003000i64,"name":""}),
+            serde_json::json!({"type":"message","id":"live-bash","parentId":"live-clear","timestamp":1700000004000i64,"message":{"role":"bashExecution","command":"cargo test","output":"ok","timestamp":1700000005000i64}}),
+            serde_json::json!({"type":"compaction","id":"live-compact","parentId":"live-bash","timestamp":1700000006000i64,"summary":"compacted context"}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let meta = parse_session(&path).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("active first question"));
+        assert_eq!(meta.summary.as_deref(), Some("active first question"));
+        assert_eq!(meta.last_active_at, Some(1_700_000_006_000));
     }
 }

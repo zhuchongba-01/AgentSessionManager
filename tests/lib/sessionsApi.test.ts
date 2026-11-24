@@ -87,7 +87,10 @@ describe("sessionsApi.streamMessages", () => {
 
     expect(result).toHaveLength(320);
     expect(result[0].content).toBe("message-0");
+    expect(result[0].transcriptIndex).toBe(0);
+    expect(result[150].transcriptIndex).toBe(150);
     expect(result[319].content).toBe("message-319");
+    expect(result[319].transcriptIndex).toBe(319);
     // 每块最多 150 条：320 条分三块，进度必须单调递增且以全量收尾
     expect(progress).toEqual([150, 300, 320]);
   });
@@ -158,7 +161,7 @@ describe("sessionsApi.streamMessages transport completion", () => {
     expect(progress).not.toHaveBeenCalled();
     transport.send(1, block);
     const snapshot = await result;
-    expect(snapshot).toEqual([message]);
+    expect(snapshot).toEqual([{ ...message, transcriptIndex: 0 }]);
     expect(snapshot).not.toBe(progress.mock.calls[0][0]);
     transport.send(3, { kind: "messages", start: 1, messages: [message] });
     expect(snapshot).toHaveLength(1);
@@ -179,7 +182,9 @@ describe("sessionsApi.streamMessages transport completion", () => {
       expect(settled).not.toHaveBeenCalled();
       if (outcome === "resolve") {
         transport.resolve();
-        await expect(result).resolves.toEqual([message]);
+        await expect(result).resolves.toEqual([
+          { ...message, transcriptIndex: 0 },
+        ]);
       } else {
         const error = new Error("invoke failed after Done");
         transport.reject(error);
@@ -428,5 +433,43 @@ describe("sessionsApi.getMessageContent", () => {
         contentIdentityHex({ role: "tool", content, ts: 200 }),
       ),
     ).resolves.toBe(content);
+  });
+});
+
+describe("sessionsApi.searchMessages", () => {
+  it("searches full un-truncated messages on the backend and returns transcript indices", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "search-full-1",
+          sourcePath: SOURCE_PATH,
+        },
+      ],
+      {
+        [`codex:${SOURCE_PATH}`]: [
+          { role: "user", content: "short question" },
+          {
+            role: "assistant",
+            content: `${"prefix ".repeat(800)}deep_tail_token alpha`,
+          },
+          { role: "assistant", content: "alpha only" },
+        ],
+      },
+    );
+
+    await expect(
+      sessionsApi.searchMessages("codex", SOURCE_PATH, "deep_tail_token alpha"),
+    ).resolves.toEqual([1]);
+  });
+
+  it("returns null gracefully when search_session_messages is unavailable", async () => {
+    vi.spyOn(core, "invoke").mockRejectedValueOnce(
+      new Error("unknown command"),
+    );
+
+    await expect(
+      sessionsApi.searchMessages("codex", SOURCE_PATH, "needle"),
+    ).resolves.toBeNull();
   });
 });

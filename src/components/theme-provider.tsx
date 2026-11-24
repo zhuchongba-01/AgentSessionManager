@@ -6,6 +6,7 @@ import React, {
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/utils";
 
 type Theme = "light" | "dark" | "system";
 
@@ -35,7 +36,7 @@ export function ThemeProvider({
       return defaultTheme;
     }
 
-    const stored = window.localStorage.getItem(storageKey) as Theme | null;
+    const stored = safeLocalStorageGet(storageKey) as Theme | null;
     if (stored === "light" || stored === "dark" || stored === "system") {
       return stored;
     }
@@ -57,7 +58,7 @@ export function ThemeProvider({
       return;
     }
 
-    window.localStorage.setItem(storageKey, theme);
+    safeLocalStorageSet(storageKey, theme);
   }, [theme, storageKey]);
 
   useEffect(() => {

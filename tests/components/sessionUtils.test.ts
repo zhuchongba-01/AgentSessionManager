@@ -7,6 +7,7 @@ import {
   formatSessionMessagePreview,
   getProviderIconName,
   getProviderLabel,
+  getRoleLabel,
   getSessionDirectoryGroupKey,
   getSessionKey,
   getVisibleSessionMessages,
@@ -47,6 +48,17 @@ describe("session utils", () => {
     expect(resolveParentLabel(mainChild, titles)).toBe("main.db");
     expect(resolveParentLabel(devChild, titles)).toBe("dev.db");
     expect(resolveParentLabel(legacy, titles)).toBe("ses_pare");
+
+    // Non-ses_ session IDs in sqlite: paths also isolate by database path
+    const uuidParent = row("main.db", "uuid-parent-01");
+    const uuidChild = row("main.db", "uuid-child-01", "uuid-parent-01");
+    const otherDbUuidChild = row("dev.db", "uuid-child-01", "uuid-parent-01");
+    expect(
+      collectSessionDescendants(
+        [uuidParent, uuidChild, otherDbUuidChild],
+        [uuidParent],
+      ),
+    ).toEqual([uuidChild]);
   });
 
   it("keeps legacy OpenCode trees local and unknown sources isolated", () => {
@@ -167,9 +179,11 @@ describe("session utils", () => {
     expect(getProviderLabel("grokbuild", untranslated)).toBe("Grok Build");
     expect(getProviderLabel("pi", untranslated)).toBe("Pi");
     expect(getProviderLabel("deepseek", untranslated)).toBe("DeepSeek Harness");
+    expect(getProviderLabel("workbuddy", untranslated)).toBe("WorkBuddy");
     expect(getProviderIconName("Codex")).toBe("openai");
     expect(getProviderIconName("GROKBUILD")).toBe("grok");
     expect(getProviderIconName("DeepSeek")).toBe("deepseek");
+    expect(getProviderIconName("WorkBuddy")).toBe("workbuddy");
   });
 
   it("hides Codex internal context from the readable transcript", () => {
@@ -190,6 +204,21 @@ describe("session utils", () => {
       { role: "assistant", content: "助手真正显示的回答" },
     ]);
     expect(getVisibleSessionMessages(messages, false)).toBe(messages);
+
+    const withThinking: SessionMessage[] = [
+      ...messages,
+      { role: "thinking", content: "模型内部推理步骤" },
+    ];
+    expect(getVisibleSessionMessages(withThinking, true)).toContainEqual({
+      role: "thinking",
+      content: "模型内部推理步骤",
+    });
+    expect(
+      getRoleLabel(
+        "thinking",
+        (_key, options) => (options?.defaultValue as string) ?? _key,
+      ),
+    ).toBe("思考过程");
   });
 
   it("extracts Codex VS Code prompts after the request marker", () => {

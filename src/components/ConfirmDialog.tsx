@@ -71,8 +71,11 @@ export function ConfirmDialog({
 }: ConfirmDialogProps) {
   const { t } = useTranslation();
   const IconComponent = variant === "info" ? Info : AlertTriangle;
-  const iconClass =
-    variant === "info" ? "h-5 w-5 text-blue-500" : "h-5 w-5 text-destructive";
+  const iconBadgeClass =
+    variant === "info"
+      ? "bg-primary/10 text-primary"
+      : "bg-destructive/10 text-destructive";
+  const iconClass = "h-4 w-4 shrink-0";
   const checkboxItems = checkboxes ?? [];
   const confirmBlocked = checkboxItems.some(
     (item) => item.required && !item.checked,
@@ -89,12 +92,22 @@ export function ConfirmDialog({
     >
       <DialogContent
         data-testid="confirm-dialog"
-        className={cn(details && details.length > 0 ? "max-w-lg" : "max-w-sm")}
+        className={cn(
+          "rounded-xl border-border/90 bg-card shadow-xl",
+          details && details.length > 0 ? "max-w-lg" : "max-w-sm",
+        )}
         zIndex={zIndex}
       >
         <DialogHeader className="space-y-3 border-b-0 bg-transparent pb-0">
-          <DialogTitle className="flex items-center gap-2 text-lg font-semibold">
-            <IconComponent className={iconClass} />
+          <DialogTitle className="flex items-center gap-2.5 text-base font-semibold tracking-tight">
+            <span
+              className={cn(
+                "inline-grid size-8 shrink-0 place-items-center rounded-lg",
+                iconBadgeClass,
+              )}
+            >
+              <IconComponent className={iconClass} />
+            </span>
             {title}
           </DialogTitle>
           <DialogDescription className="whitespace-pre-line text-sm leading-relaxed">

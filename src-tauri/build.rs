@@ -1,16 +1,11 @@
 fn main() {
     tauri_build::build();
 
-    // Windows: Embed Common Controls v6 manifest for test binaries
+    // Windows: Embed Common Controls v6 manifest for unit test binaries
     //
-    // When running `cargo test`, the generated test executables don't include
-    // the standard Tauri application manifest. Without Common Controls v6,
-    // `tauri::test` calls fail with STATUS_ENTRYPOINT_NOT_FOUND.
-    //
-    // This workaround:
-    // 1. Embeds the manifest into test binaries via /MANIFEST:EMBED
-    // 2. Uses /MANIFEST:NO for the main binary to avoid duplicate resources
-    //    (Tauri already handles manifest embedding for the app binary)
+    // Unit tests live in `--lib` (no separate `tests/` target exists), so Cargo's
+    // `rustc-link-arg-tests` cannot be used. Apply to non-bin/non-cdylib link targets
+    // and override `/MANIFEST:NO` on `bins` (which already get Tauri's manifest) and `cdylib`.
     #[cfg(target_os = "windows")]
     {
         let manifest_path = std::path::PathBuf::from(
@@ -21,8 +16,8 @@ fn main() {
 
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg={}", manifest_arg);
-        // Avoid duplicate manifest resources in binary builds.
         println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
+        println!("cargo:rustc-link-arg-cdylib=/MANIFEST:NO");
         println!("cargo:rerun-if-changed={}", manifest_path.display());
     }
 }

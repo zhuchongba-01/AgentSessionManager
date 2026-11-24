@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
+import zh from "@/i18n/session-zh.json";
 import { server } from "./msw/server";
 import { resetProviderState } from "./msw/state";
 import "./msw/tauriMocks";
@@ -13,7 +14,7 @@ beforeAll(async () => {
     lng: "zh",
     fallbackLng: "zh",
     resources: {
-      zh: { translation: {} },
+      zh: { translation: zh },
       en: { translation: {} },
     },
     interpolation: {

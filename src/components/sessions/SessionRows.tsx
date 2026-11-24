@@ -1,23 +1,53 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { SessionMeta } from "@/types";
 import { Button } from "@/components/ui/button";
+import { getSessionKey } from "./utils";
 
 const PAGE_SIZE = 100;
 
 /** Bound DOM size even when a provider has years of session history. */
 export function SessionRows({
   sessions,
+  selectedKey,
+  resetKey,
   renderItem,
 }: {
   sessions: SessionMeta[];
+  selectedKey?: string | null;
+  resetKey?: string;
   renderItem: (session: SessionMeta) => ReactNode;
 }) {
   const { t } = useTranslation();
   const [page, setPage] = useState(0);
+  const [prevResetKey, setPrevResetKey] = useState(resetKey);
+  const [prevSelectedKey, setPrevSelectedKey] = useState(selectedKey);
+
+  if (resetKey !== prevResetKey) {
+    setPrevResetKey(resetKey);
+    if (page !== 0) {
+      setPage(0);
+    }
+  }
+
+  if (selectedKey !== prevSelectedKey) {
+    setPrevSelectedKey(selectedKey);
+    if (selectedKey) {
+      const selectedIndex = sessions.findIndex(
+        (session) => getSessionKey(session) === selectedKey,
+      );
+      if (selectedIndex >= 0) {
+        const targetPage = Math.floor(selectedIndex / PAGE_SIZE);
+        if (page !== targetPage) {
+          setPage(targetPage);
+        }
+      }
+    }
+  }
+
   const lastPage = Math.max(0, Math.ceil(sessions.length / PAGE_SIZE) - 1);
   const visiblePage = Math.min(page, lastPage);
-  useEffect(() => setPage(0), [sessions]);
+
   return (
     <>
       {sessions

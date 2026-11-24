@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,21 +12,23 @@ use serde_json::Value;
 
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 use crate::session_paths::{
-    codex_config_dir, codex_state_db_paths, read_codex_config_text,
-    CODEX_THREAD_HISTORY_DB_FILENAME,
+    codex_cleanup_db_paths, codex_config_dir, codex_sqlite_home_dir, codex_state_db_paths,
+    discover_numbered_sqlite_dbs, read_codex_config_text, CODEX_THREAD_HISTORY_DB_FILENAME,
 };
 
 use super::utils::{
     checked_storage_child, collect_files_where, collect_files_where_checked, extract_text,
-    is_safe_session_id, parse_timestamp_to_ms, path_basename, quote_sqlite_identifier,
-    read_head_tail_lines, sqlite_table_names, truncate_summary, FileParseCache,
-    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
+    extract_thinking_text, is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms,
+    path_basename, quote_sqlite_identifier, read_head_tail_lines, remove_path_if_exists,
+    sqlite_table_names, truncate_summary, FileParseCache, MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "codex";
 const CODEX_SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const VSCODE_CONTEXT_PREFIX: &str = "# Context from my IDE setup:";
 const CODEX_REQUEST_MARKER: &str = "my request for codex";
+const MAX_INDEX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SUBAGENT_CLEANUP_NODES: usize = 256;
 
 static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -94,20 +96,24 @@ impl RawCodexSession {
     fn into_session_meta(self, thread_titles: &HashMap<String, String>) -> SessionMeta {
         let title = thread_titles
             .get(&self.session_id)
-            .cloned()
+            .filter(|text| !text.trim().is_empty())
+            .map(|t| truncate_summary(t, TITLE_MAX_CHARS))
             .or_else(|| {
                 self.latest_user_message
                     .filter(|text| !text.trim().is_empty())
+                    .map(|t| truncate_summary(&t, TITLE_MAX_CHARS))
             })
             .or_else(|| {
                 self.first_user_message
+                    .filter(|text| !text.trim().is_empty())
                     .map(|t| truncate_summary(&t, TITLE_MAX_CHARS))
             })
             .or_else(|| {
                 self.project_dir
                     .as_deref()
                     .and_then(path_basename)
-                    .map(|v| v.to_string())
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|t| truncate_summary(&t, TITLE_MAX_CHARS))
             });
         let resume_command = is_safe_session_id(&self.session_id)
             .then(|| format!("codex resume {}", self.session_id));
@@ -162,46 +168,12 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
         .as_ref()
         .map(|items| items.keys().cloned().collect::<HashSet<_>>());
     if let Some(indexed) = indexed {
-        for (id, source) in indexed {
-            if let Some(item) = sessions.iter_mut().find(|item| {
-                item.session_id == id
-                    && item.source_path.as_deref().is_some_and(|path| {
-                        normalized_rollout_path(path) == normalized_rollout_path(&source)
-                    })
-            }) {
-                if native_rollouts
-                    .as_ref()
-                    .is_some_and(|active| !active.contains_key(&id))
-                {
-                    item.archived = true;
-                    item.residual = false;
-                    item.resume_command = None;
-                }
-            } else if rollout_is_missing(Path::new(&source)) {
-                sessions.push(SessionMeta {
-                    provider_id: PROVIDER_ID.into(),
-                    session_id: id.clone(),
-                    residual: false,
-                    parent_session_id: None,
-                    archived: native_rollouts
-                        .as_ref()
-                        .is_some_and(|active| !active.contains_key(&id)),
-                    cleanup_pending: true,
-                    sidebar_section: None,
-                    title: thread_titles
-                        .get(&id)
-                        .cloned()
-                        .or_else(|| Some(format!("缺少日志的任务 {id}"))),
-                    summary: Some("索引仍存在，但日志文件已消失；可继续清理索引".into()),
-                    project_dir: None,
-                    project_name: None,
-                    created_at: None,
-                    last_active_at: None,
-                    source_path: Some(source),
-                    resume_command: None,
-                });
-            }
-        }
+        reconcile_indexed_rollouts(
+            &mut sessions,
+            indexed,
+            native_rollouts.as_ref(),
+            &thread_titles,
+        );
     }
     match desktop_catalog_ids() {
         Ok(ids) => {
@@ -224,7 +196,10 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                     archived: false,
                     cleanup_pending: true,
                     sidebar_section: None,
-                    title: Some(format!("仅剩侧边栏索引的任务 {id}")),
+                    title: Some(truncate_summary(
+                        &format!("仅剩侧边栏索引的任务 {id}"),
+                        TITLE_MAX_CHARS,
+                    )),
                     summary: Some(
                         "侧边栏索引存在，但没有找到对应日志；请退出 Codex 后继续清理".into(),
                     ),
@@ -240,6 +215,72 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
         Err(error) => super::utils::scan_warning(error),
     }
     sessions
+}
+
+fn reconcile_indexed_rollouts(
+    sessions: &mut Vec<SessionMeta>,
+    indexed: HashMap<String, String>,
+    native_rollouts: Option<&HashMap<String, String>>,
+    thread_titles: &HashMap<String, String>,
+) {
+    for (id, source) in indexed {
+        let source_key = rollout_path_key(Path::new(&source));
+        if let Some(item) = sessions.iter_mut().find(|item| {
+            item.session_id == id
+                && item
+                    .source_path
+                    .as_deref()
+                    .is_some_and(|path| rollout_path_key(Path::new(path)) == source_key)
+        }) {
+            let is_archived_file = item.source_path.as_deref().is_some_and(is_archived_rollout);
+            if is_archived_file || native_rollouts.is_some_and(|active| !active.contains_key(&id)) {
+                item.archived = true;
+                item.residual = false;
+                item.resume_command = None;
+            }
+        } else if rollout_is_missing(Path::new(&source)) {
+            // If the rollout was moved into `archived_sessions/` while `threads.rollout_path`
+            // still points to the old `sessions/` path, reconcile the archived rollout instead
+            // of emitting a duplicate `缺少日志的任务` ghost.
+            if let Some(archived_item) = sessions.iter_mut().find(|item| {
+                item.session_id == id
+                    && (item.archived
+                        || item.source_path.as_deref().is_some_and(is_archived_rollout))
+            }) {
+                archived_item.archived = true;
+                archived_item.residual = false;
+                archived_item.resume_command = None;
+                continue;
+            }
+            sessions.push(SessionMeta {
+                provider_id: PROVIDER_ID.into(),
+                session_id: id.clone(),
+                residual: false,
+                parent_session_id: None,
+                archived: native_rollouts.is_some_and(|active| !active.contains_key(&id))
+                    || is_archived_rollout(&source),
+                cleanup_pending: true,
+                sidebar_section: None,
+                title: thread_titles
+                    .get(&id)
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| truncate_summary(t, TITLE_MAX_CHARS))
+                    .or_else(|| {
+                        Some(truncate_summary(
+                            &format!("缺少日志的任务 {id}"),
+                            TITLE_MAX_CHARS,
+                        ))
+                    }),
+                summary: Some("索引仍存在，但日志文件已消失；可继续清理索引".into()),
+                project_dir: None,
+                project_name: None,
+                created_at: None,
+                last_active_at: None,
+                source_path: Some(source),
+                resume_command: None,
+            });
+        }
+    }
 }
 
 fn desktop_catalog_ids() -> Result<HashSet<String>, String> {
@@ -267,7 +308,10 @@ fn desktop_catalog_ids() -> Result<HashSet<String>, String> {
 }
 
 pub fn session_roots() -> Vec<PathBuf> {
-    let config_dir = codex_config_dir();
+    session_roots_for_config_dir(&codex_config_dir())
+}
+
+fn session_roots_for_config_dir(config_dir: &Path) -> Vec<PathBuf> {
     vec![
         config_dir.join("sessions"),
         config_dir.join("archived_sessions"),
@@ -280,11 +324,27 @@ pub fn should_cleanup_index_after_delete(
     session_id: &str,
     source_path: &str,
 ) -> Result<bool, String> {
-    Ok(load_indexed_rollouts()?.is_none_or(|rollouts| {
-        rollouts.get(session_id).is_none_or(|path| {
-            normalized_rollout_path(path) == normalized_rollout_path(source_path)
+    let indexed = load_indexed_rollouts()?;
+    Ok(should_cleanup_index_from_rollouts(
+        session_id,
+        source_path,
+        indexed.as_ref(),
+    ))
+}
+
+fn should_cleanup_index_from_rollouts(
+    session_id: &str,
+    source_path: &str,
+    indexed: Option<&HashMap<String, String>>,
+) -> bool {
+    indexed.is_none_or(|rollouts| {
+        rollouts.get(session_id).is_none_or(|indexed_path| {
+            rollout_path_key(Path::new(indexed_path)) == rollout_path_key(Path::new(source_path))
+                || (is_archived_rollout(source_path)
+                    && !is_archived_rollout(indexed_path)
+                    && rollout_is_missing(Path::new(indexed_path)))
         })
-    }))
+    })
 }
 
 fn load_indexed_rollouts() -> Result<Option<HashMap<String, String>>, String> {
@@ -317,7 +377,7 @@ fn load_indexed_rollouts_from_paths(
         for row in rows {
             let (id, source) = row.map_err(|e| e.to_string())?;
             if let Some(previous) = rollouts.insert(id, source.clone()) {
-                if normalized_rollout_path(&previous) != normalized_rollout_path(&source) {
+                if rollout_path_key(Path::new(&previous)) != rollout_path_key(Path::new(&source)) {
                     return Err("多个 Codex 索引对同一任务指向不同日志，已停止清理".into());
                 }
             }
@@ -332,23 +392,28 @@ fn load_indexed_rollouts_from_paths(
 /// sidebar from keeping a grey, empty project entry.
 pub fn cleanup_after_delete(session_id: &str) -> Result<(), String> {
     let config_dir = codex_config_dir();
-    let mut errors = Vec::new();
-    if let Err(error) =
-        rewrite_session_index(&config_dir.join(CODEX_SESSION_INDEX_FILENAME), session_id)
-    {
-        errors.push(error);
-    }
-
     // 读不到 config.toml 时不能退化成「用默认库路径」：用户可能通过 `sqlite_home`
     // 把索引库挪到了别处，那样清理会落到错误的库上、同时漏掉真正要清的那一个。
     // 这里在读配置失败时直接报错；调用方在本函数之后才删 log，所以失败是安全的。
     let config_text = read_codex_config_text()?;
-    if let Err(error) = cleanup_index_databases(&config_dir, &config_text, session_id) {
+    let mut errors = Vec::new();
+
+    let (subagent_ids, db_errors) =
+        cleanup_index_databases_inner(&config_dir, &config_text, session_id);
+    errors.extend(db_errors);
+
+    let mut all_ids = Vec::with_capacity(1 + subagent_ids.len());
+    all_ids.extend(subagent_ids);
+    all_ids.push(session_id.to_string());
+
+    if let Err(error) =
+        rewrite_session_index_ids(&config_dir.join(CODEX_SESSION_INDEX_FILENAME), &all_ids)
+    {
         errors.push(error);
     }
 
     if let Err(error) =
-        cleanup_global_state(&config_dir.join(".codex-global-state.json"), session_id)
+        cleanup_global_state_ids(&config_dir.join(".codex-global-state.json"), &all_ids)
     {
         errors.push(error);
     }
@@ -365,22 +430,64 @@ pub fn cleanup_after_delete(session_id: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn cleanup_index_databases(
     config_dir: &Path,
     config_text: &str,
     session_id: &str,
 ) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for state_db_path in codex_state_db_paths(config_dir, config_text) {
-        if let Err(error) = cleanup_state_db(&state_db_path, session_id) {
-            errors.push(error);
-        }
+    let (_, errors) = cleanup_index_databases_inner(config_dir, config_text, session_id);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
 
-        // Codex keeps the rendered conversation projection in a separate DB.
-        // Leaving these rows behind after deleting the rollout produces a
-        // ghost entry that opens with "no rollout found for thread id ...".
-        let history_db_path = state_db_path.with_file_name(CODEX_THREAD_HISTORY_DB_FILENAME);
-        if let Err(error) = cleanup_state_db(&history_db_path, session_id) {
+fn cleanup_index_databases_inner(
+    config_dir: &Path,
+    config_text: &str,
+    session_id: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let sqlite_dir = codex_sqlite_home_dir(config_dir, config_text);
+    let db_paths = codex_cleanup_db_paths(&sqlite_dir);
+    let roots = session_roots_for_config_dir(config_dir);
+
+    let mut subagent_ids = Vec::new();
+    let mut subagent_id_set = HashSet::new();
+    let mut subagent_files = Vec::new();
+    let mut subagent_file_set = HashSet::new();
+
+    for db_path in &db_paths {
+        let is_state_db = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("state"));
+        if !is_state_db {
+            continue;
+        }
+        let (found_ids, found_files) = discover_hidden_subagents_in_db(db_path, session_id, &roots);
+        for id in found_ids {
+            if subagent_id_set.insert(id.clone()) {
+                subagent_ids.push(id);
+            }
+        }
+        for file in found_files {
+            if subagent_file_set.insert(file.clone()) {
+                subagent_files.push(file);
+            }
+        }
+    }
+
+    // Order deepest spawned children first, parent `session_id` last.
+    subagent_ids.reverse();
+    let mut ids_to_clean = Vec::with_capacity(subagent_ids.len() + 1);
+    ids_to_clean.extend(subagent_ids.iter().cloned());
+    ids_to_clean.push(session_id.to_string());
+
+    for db_path in &db_paths {
+        if let Err(error) = cleanup_state_db_ids(db_path, &ids_to_clean) {
             errors.push(error);
         }
     }
@@ -388,7 +495,7 @@ fn cleanup_index_databases(
     match codex_desktop_db_paths(config_dir) {
         Ok(paths) => {
             for path in paths {
-                if let Err(error) = cleanup_desktop_catalog_db(&path, session_id) {
+                if let Err(error) = cleanup_desktop_catalog_db(&path, &ids_to_clean) {
                     errors.push(error);
                 }
             }
@@ -396,11 +503,235 @@ fn cleanup_index_databases(
         Err(error) => errors.push(error),
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("；"))
+    for subagent_file in subagent_files {
+        if let Err(error) = remove_path_if_exists(&subagent_file) {
+            errors.push(format!(
+                "清理 Codex 子代理日志 {} 失败：{error}",
+                subagent_file.display()
+            ));
+        }
     }
+
+    (subagent_ids, errors)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn codex_primary_thread_history_db_path(sqlite_dir: &Path) -> PathBuf {
+    discover_numbered_sqlite_dbs(
+        sqlite_dir,
+        "thread_history",
+        CODEX_THREAD_HISTORY_DB_FILENAME,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| sqlite_dir.join(CODEX_THREAD_HISTORY_DB_FILENAME))
+}
+
+fn discover_hidden_subagents_in_db(
+    db_path: &Path,
+    root_session_id: &str,
+    roots: &[PathBuf],
+) -> (Vec<String>, Vec<PathBuf>) {
+    if !db_path.is_file() || !is_safe_session_id(root_session_id) {
+        return (Vec::new(), Vec::new());
+    }
+    let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+
+    let Ok(table_names) = sqlite_table_names(&conn) else {
+        return (Vec::new(), Vec::new());
+    };
+    if !table_names.iter().any(|t| t == "thread_spawn_edges")
+        || !table_names.iter().any(|t| t == "threads")
+    {
+        return (Vec::new(), Vec::new());
+    }
+
+    let edge_cols: HashSet<String> = conn
+        .prepare("PRAGMA table_info(\"thread_spawn_edges\")")
+        .ok()
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(1))
+                .ok()
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    if !edge_cols.contains("parent_thread_id") || !edge_cols.contains("child_thread_id") {
+        return (Vec::new(), Vec::new());
+    }
+
+    let thread_cols: HashSet<String> = conn
+        .prepare("PRAGMA table_info(\"threads\")")
+        .ok()
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(1))
+                .ok()
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    if !thread_cols.contains("id") || !thread_cols.contains("rollout_path") {
+        return (Vec::new(), Vec::new());
+    }
+    let has_source_col = thread_cols.contains("source");
+
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    visited.insert(root_session_id.to_string());
+    queue.push_back(root_session_id.to_string());
+
+    let mut subagent_ids = Vec::new();
+    let mut subagent_files = Vec::new();
+
+    while let Some(parent_id) = queue.pop_front() {
+        if subagent_ids.len() >= MAX_SUBAGENT_CLEANUP_NODES {
+            break;
+        }
+        let Ok(mut edge_stmt) = conn
+            .prepare("SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ?1")
+        else {
+            break;
+        };
+        let child_ids: Vec<String> = edge_stmt
+            .query_map([parent_id.as_str()], |row| row.get::<_, String>(0))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+
+        for child_id in child_ids {
+            let child_id = child_id.trim().to_string();
+            if !is_safe_session_id(&child_id) || !visited.insert(child_id.clone()) {
+                continue;
+            }
+
+            let row_info: Option<(String, Option<String>)> = if has_source_col {
+                conn.query_row(
+                    "SELECT rollout_path, source FROM threads WHERE id = ?1",
+                    [child_id.as_str()],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .ok()
+            } else {
+                conn.query_row(
+                    "SELECT rollout_path FROM threads WHERE id = ?1",
+                    [child_id.as_str()],
+                    |r| Ok((r.get::<_, String>(0)?, None)),
+                )
+                .ok()
+            };
+
+            let Some((rollout_path, db_source)) = row_info else {
+                continue;
+            };
+            let rollout_trimmed = rollout_path.trim();
+            if rollout_trimmed.is_empty() {
+                continue;
+            }
+
+            let raw_path = Path::new(rollout_trimmed);
+            let plain = plain_rollout_path(raw_path);
+            let mut matched_files = Vec::new();
+            let mut confirmed_subagent = false;
+            let mut rejected = false;
+
+            for candidate in [plain.with_extension("jsonl.zst"), plain.clone()] {
+                let meta = match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        rejected = true;
+                        break;
+                    }
+                };
+                if !meta.is_file() || is_reparse_or_symlink(&meta) {
+                    rejected = true;
+                    break;
+                }
+                let Some(validated) = roots
+                    .iter()
+                    .filter(|r| r.exists())
+                    .find_map(|root| checked_storage_child(root, &candidate).ok())
+                else {
+                    rejected = true;
+                    break;
+                };
+                if !is_codex_subagent_rollout(&validated)
+                    || read_subagent_rollout_id(&validated).as_deref() != Some(child_id.as_str())
+                {
+                    rejected = true;
+                    break;
+                }
+                confirmed_subagent = true;
+                matched_files.push(validated);
+            }
+
+            if rejected {
+                continue;
+            }
+
+            if !confirmed_subagent
+                && rollout_is_missing(raw_path)
+                && db_source.as_deref().is_some_and(is_subagent_db_source)
+                && roots
+                    .iter()
+                    .any(|root| checked_missing_rollout(root, &plain).is_ok())
+            {
+                confirmed_subagent = true;
+            }
+
+            if confirmed_subagent {
+                subagent_ids.push(child_id.clone());
+                subagent_files.extend(matched_files);
+                queue.push_back(child_id);
+            }
+        }
+    }
+
+    (subagent_ids, subagent_files)
+}
+
+fn is_subagent_db_source(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("subagent") || trimmed.starts_with("subagent:") {
+        return true;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .is_some_and(|v| is_subagent_source(Some(&v)))
+}
+
+fn is_codex_subagent_rollout(path: &Path) -> bool {
+    read_subagent_rollout_id(path).is_some()
+}
+
+fn read_subagent_rollout_id(path: &Path) -> Option<String> {
+    let physical = physical_rollout_path(path).ok()?;
+    let reader = BufReader::new(open_rollout(&physical).ok()?.take(4 * 1024 * 1024));
+    for line in reader.lines().take(10) {
+        let line = line.ok()?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let payload = value.get("payload")?;
+        if !is_subagent_source(payload.get("source")) {
+            return None;
+        }
+        let id = payload
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| is_safe_session_id(id))?;
+        return Some(id.to_string());
+    }
+    None
 }
 
 fn codex_desktop_db_paths(config_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -423,7 +754,10 @@ fn codex_desktop_db_paths(config_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
-fn cleanup_desktop_catalog_db(path: &Path, session_id: &str) -> Result<(), String> {
+fn cleanup_desktop_catalog_db(path: &Path, session_ids: &[String]) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
     let mut conn = Connection::open(path).map_err(|error| {
         format!(
             "Codex 桌面索引被占用或无法写入（{}）：{error}",
@@ -432,8 +766,9 @@ fn cleanup_desktop_catalog_db(path: &Path, session_id: &str) -> Result<(), Strin
     })?;
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|error| format!("无法设置 Codex 桌面索引等待时间：{error}"))?;
+    let _ = conn.pragma_update(None, "foreign_keys", "ON");
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("无法开始清理 Codex 桌面索引：{error}"))?;
 
     let table_names: HashSet<String> = sqlite_table_names(&tx)?.into_iter().collect();
@@ -448,13 +783,13 @@ fn cleanup_desktop_catalog_db(path: &Path, session_id: &str) -> Result<(), Strin
             continue;
         }
         let quoted = quote_sqlite_identifier(table);
-        let changed = tx
-            .execute(
-                &format!("DELETE FROM {quoted} WHERE thread_id = ?1"),
-                [session_id],
-            )
-            .map_err(|error| format!("清理 Codex 桌面表 {table} 失败：{error}"))?;
-        catalog_changed |= table == "local_thread_catalog" && changed > 0;
+        let sql = format!("DELETE FROM {quoted} WHERE thread_id = ?1");
+        for session_id in session_ids {
+            let changed = tx
+                .execute(&sql, [session_id.as_str()])
+                .map_err(|error| format!("清理 Codex 桌面表 {table} 失败：{error}"))?;
+            catalog_changed |= table == "local_thread_catalog" && changed > 0;
+        }
     }
 
     if catalog_changed && table_names.contains("local_thread_catalog_metadata") {
@@ -469,12 +804,44 @@ fn cleanup_desktop_catalog_db(path: &Path, session_id: &str) -> Result<(), Strin
         .map_err(|error| format!("提交 Codex 桌面索引清理失败：{error}"))
 }
 
+fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<String, String> {
+    let file = File::open(path).map_err(|e| format!("无法读取 {label}：{e}"))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("无法读取 {label} 元数据：{e}"))?
+        .len();
+    if len > max_bytes {
+        return Err(format!(
+            "{label}（{}）超过 {} MB 大小上限",
+            path.display(),
+            max_bytes / 1024 / 1024
+        ));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("无法读取 {label}：{e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{label}（{}）超过 {} MB 大小上限",
+            path.display(),
+            max_bytes / 1024 / 1024
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("无法解析 {label} UTF-8：{e}"))
+}
+
+#[cfg(test)]
 fn rewrite_session_index(path: &Path, session_id: &str) -> Result<(), String> {
-    if !path.is_file() {
+    rewrite_session_index_ids(path, &[session_id.to_string()])
+}
+
+fn rewrite_session_index_ids(path: &Path, session_ids: &[String]) -> Result<(), String> {
+    if !path.is_file() || session_ids.is_empty() {
         return Ok(());
     }
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("无法读取 Codex 会话索引：{e}"))?;
+    let remove_set: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
+    let text = read_bounded_text(path, MAX_INDEX_FILE_BYTES, "Codex 会话索引")?;
     let kept = text
         .lines()
         .filter(|line| {
@@ -486,7 +853,7 @@ fn rewrite_session_index(path: &Path, session_id: &str) -> Result<(), String> {
                         .or_else(|| value.get("session_id"))
                         .or_else(|| value.get("sessionId"))
                         .and_then(Value::as_str)
-                        .map(|id| id != session_id)
+                        .map(|id| !remove_set.contains(id))
                 })
                 .unwrap_or(true)
         })
@@ -503,22 +870,58 @@ fn rewrite_session_index(path: &Path, session_id: &str) -> Result<(), String> {
     )
 }
 
+#[cfg(test)]
 fn cleanup_state_db(path: &Path, session_id: &str) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
+    let roots = path
+        .parent()
+        .map(session_roots_for_config_dir)
+        .unwrap_or_else(session_roots);
+    let (mut subagent_ids, subagent_files) =
+        discover_hidden_subagents_in_db(path, session_id, &roots);
+    subagent_ids.reverse();
+    let mut ids_to_clean = Vec::with_capacity(subagent_ids.len() + 1);
+    ids_to_clean.extend(subagent_ids);
+    ids_to_clean.push(session_id.to_string());
+
+    cleanup_state_db_ids(path, &ids_to_clean)?;
+    for subagent_file in subagent_files {
+        remove_path_if_exists(&subagent_file).map_err(|e| {
+            format!(
+                "清理 Codex 子代理日志 {} 失败：{e}",
+                subagent_file.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn cleanup_state_db_ids(path: &Path, session_ids: &[String]) -> Result<(), String> {
+    if !path.is_file() || session_ids.is_empty() {
+        return Ok(());
+    }
     let mut conn = Connection::open(path)
         .map_err(|e| format!("Codex 数据库被占用或无法写入（{}）：{e}", path.display()))?;
-    // Codex 运行时常持有状态库写锁；清理是删除成功后的尽力而为步骤，
-    // 稍长一点的等待能避免频繁超时。
+    // Codex 运行时常持有状态库写锁；启用 Immediate 事务可在加写锁阶段遵守 busy_timeout，
+    // 避免 DEFERRED 事务从读升级写时直接报 SQLITE_BUSY。
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| format!("无法设置 Codex 数据库等待时间：{e}"))?;
+    let _ = conn.pragma_update(None, "foreign_keys", "ON");
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("无法开始清理 Codex 数据库：{e}"))?;
 
-    let table_names = sqlite_table_names(&tx)?;
+    let mut table_names = sqlite_table_names(&tx)?;
+    // Ensure child/edge tables are cleaned BEFORE entity tables (`threads`, `session`)
+    // so foreign keys referencing `threads(id)` or `session(id)` do not block deletion.
+    table_names.sort_by_key(|name| matches!(name.as_str(), "threads" | "session"));
+
     for table in &table_names {
+        if table.starts_with("sqlite_") {
+            continue;
+        }
         let quoted = quote_sqlite_identifier(table);
         let columns: Vec<String> = {
             let mut stmt = tx
@@ -531,34 +934,53 @@ fn cleanup_state_db(path: &Path, session_id: &str) -> Result<(), String> {
                 .collect();
             rows
         };
-        for column in [
-            "thread_id",
-            "session_id",
-            "parent_session_id",
-            "child_session_id",
-        ] {
-            if columns.iter().any(|item| item == column) {
-                tx.execute(
-                    &format!("DELETE FROM {quoted} WHERE \"{column}\" = ?1"),
-                    [session_id],
-                )
-                .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
-            }
-        }
-        if table == "thread_spawn_edges" {
-            for column in ["parent_thread_id", "child_thread_id"] {
+
+        let is_entity_table = matches!(table.as_str(), "threads" | "session");
+        if !is_entity_table {
+            for column in ["thread_id", "session_id"] {
                 if columns.iter().any(|item| item == column) {
-                    tx.execute(
-                        &format!("DELETE FROM {quoted} WHERE \"{column}\" = ?1"),
-                        [session_id],
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let sql = format!("DELETE FROM {quoted} WHERE \"{column}\" = ?1");
+                    for session_id in session_ids {
+                        tx.execute(&sql, [session_id.as_str()])
+                            .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
+                    }
                 }
             }
         }
-        if (table == "threads" || table == "session") && columns.iter().any(|item| item == "id") {
-            tx.execute(&format!("DELETE FROM {quoted} WHERE id = ?1"), [session_id])
-                .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
+
+        if table == "thread_spawn_edges" {
+            for column in [
+                "parent_thread_id",
+                "child_thread_id",
+                "parent_session_id",
+                "child_session_id",
+            ] {
+                if columns.iter().any(|item| item == column) {
+                    let sql = format!("DELETE FROM {quoted} WHERE \"{column}\" = ?1");
+                    for session_id in session_ids {
+                        tx.execute(&sql, [session_id.as_str()])
+                            .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
+                    }
+                }
+            }
+        }
+
+        if (table == "agent_job_items" || table.starts_with("agent_job"))
+            && columns.iter().any(|item| item == "assigned_thread_id")
+        {
+            let sql = format!("DELETE FROM {quoted} WHERE \"assigned_thread_id\" = ?1");
+            for session_id in session_ids {
+                tx.execute(&sql, [session_id.as_str()])
+                    .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
+            }
+        }
+
+        if is_entity_table && columns.iter().any(|item| item == "id") {
+            let sql = format!("DELETE FROM {quoted} WHERE id = ?1");
+            for session_id in session_ids {
+                tx.execute(&sql, [session_id.as_str()])
+                    .map_err(|e| format!("清理 Codex 表 {table} 失败：{e}"))?;
+            }
         }
     }
 
@@ -566,21 +988,28 @@ fn cleanup_state_db(path: &Path, session_id: &str) -> Result<(), String> {
         .map_err(|e| format!("提交 Codex 索引清理失败：{e}"))
 }
 
+#[cfg(test)]
 fn cleanup_global_state(path: &Path, session_id: &str) -> Result<(), String> {
-    if !path.is_file() {
+    cleanup_global_state_ids(path, &[session_id.to_string()])
+}
+
+fn cleanup_global_state_ids(path: &Path, session_ids: &[String]) -> Result<(), String> {
+    if !path.is_file() || session_ids.is_empty() {
         return Ok(());
     }
-    let original =
-        std::fs::read_to_string(path).map_err(|e| format!("无法读取 Codex 全局状态：{e}"))?;
+    let original = read_bounded_text(path, MAX_INDEX_FILE_BYTES, "Codex 全局状态")?;
     let mut value: Value =
         serde_json::from_str(&original).map_err(|e| format!("Codex 全局状态格式无效：{e}"))?;
     if !value.is_object() {
         return Ok(());
     }
-    remove_thread_references(&mut value, session_id);
+    for session_id in session_ids {
+        remove_thread_references(&mut value, session_id);
+    }
     let Some(root) = value.as_object_mut() else {
         return Ok(());
     };
+    let remove_set: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
     for key in [
         "thread-project-assignments",
         "thread-writable-roots",
@@ -588,14 +1017,16 @@ fn cleanup_global_state(path: &Path, session_id: &str) -> Result<(), String> {
         "thread-workspace-root-hints",
     ] {
         if let Some(map) = root.get_mut(key).and_then(Value::as_object_mut) {
-            map.remove(session_id);
+            for session_id in session_ids {
+                map.remove(session_id);
+            }
         }
     }
     if let Some(ids) = root
         .get_mut("projectless-thread-ids")
         .and_then(Value::as_array_mut)
     {
-        ids.retain(|item| item.as_str() != Some(session_id));
+        ids.retain(|item| item.as_str().is_none_or(|id| !remove_set.contains(id)));
     }
 
     let text = serde_json::to_string(&value).map_err(|e| e.to_string())? + "\n";
@@ -646,7 +1077,7 @@ fn atomic_write(path: &Path, text: String, expected: &str) -> Result<(), String>
     temp.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     temp.flush().map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
-    if std::fs::read_to_string(path).map_err(|e| e.to_string())? != expected {
+    if read_bounded_text(path, MAX_INDEX_FILE_BYTES, "Codex 索引")? != expected {
         return Err("Codex 索引在清理期间发生变化，已停止覆盖；请退出 Agent 后重试".into());
     }
     temp.persist(path)
@@ -727,7 +1158,7 @@ fn collapse_paginated_history(
     for continuation in continuations {
         match resolve_paginated_chain_from_descriptors(&continuation.path, descriptors) {
             Ok(chain) => {
-                let leaf_path = normalized_rollout_path(&continuation.path.to_string_lossy());
+                let leaf_key = continuation.key.clone();
                 let earliest = chain
                     .iter()
                     .filter(|segment| segment.session_id == continuation.session_id)
@@ -740,7 +1171,7 @@ fn collapse_paginated_history(
                     .min();
                 if let Some(earliest) = earliest {
                     chain_created_at
-                        .entry(leaf_path)
+                        .entry(leaf_key)
                         .and_modify(|existing| *existing = (*existing).min(earliest))
                         .or_insert(earliest);
                 }
@@ -749,7 +1180,7 @@ fn collapse_paginated_history(
                     .take(chain.len().saturating_sub(1))
                     .filter(|segment| segment.session_id == continuation.session_id)
                 {
-                    hidden_paths.insert(normalized_rollout_path(&segment.path.to_string_lossy()));
+                    hidden_paths.insert(rollout_path_key(&segment.path));
                 }
             }
             Err(error) => {
@@ -761,17 +1192,14 @@ fn collapse_paginated_history(
                 super::utils::scan_warning(error);
                 let keep = native_rollouts
                     .and_then(|rollouts| rollouts.get(&continuation.session_id))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        normalized_rollout_path(&continuation.path.to_string_lossy())
-                    });
+                    .map(|path| rollout_path_key(Path::new(path)))
+                    .unwrap_or_else(|| continuation.key.clone());
                 for descriptor in descriptors
                     .iter()
                     .filter(|item| item.session_id == continuation.session_id)
                 {
-                    let path = normalized_rollout_path(&descriptor.path.to_string_lossy());
-                    if path != keep {
-                        hidden_paths.insert(path);
+                    if descriptor.key != keep {
+                        hidden_paths.insert(descriptor.key.clone());
                     }
                 }
             }
@@ -782,13 +1210,13 @@ fn collapse_paginated_history(
         session
             .source_path
             .as_deref()
-            .is_none_or(|path| !hidden_paths.contains(&normalized_rollout_path(path)))
+            .is_none_or(|path| !hidden_paths.contains(&rollout_path_key(Path::new(path))))
     });
     for session in sessions {
         let Some(path) = session.source_path.as_deref() else {
             continue;
         };
-        if let Some(created_at) = chain_created_at.get(&normalized_rollout_path(path)) {
+        if let Some(created_at) = chain_created_at.get(&rollout_path_key(Path::new(path))) {
             session.created_at = Some(session.created_at.unwrap_or(*created_at).min(*created_at));
         }
     }
@@ -810,7 +1238,7 @@ pub(crate) fn physical_rollout_path(path: &Path) -> Result<PathBuf, String> {
     let plain = plain_rollout_path(path);
     for candidate in [plain.clone(), plain.with_extension("jsonl.zst")] {
         match std::fs::symlink_metadata(&candidate) {
-            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => return Ok(candidate),
+            Ok(meta) if meta.is_file() && !is_reparse_or_symlink(&meta) => return Ok(candidate),
             Ok(_) => return Err("Codex rollout is not a regular file".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
@@ -1041,8 +1469,7 @@ fn rollout_instance_id(path: &Path, session_id: &str) -> String {
 }
 
 fn same_rollout_path(left: &Path, right: &Path) -> bool {
-    normalized_rollout_path(&left.to_string_lossy())
-        == normalized_rollout_path(&right.to_string_lossy())
+    rollout_path_key(left) == rollout_path_key(right)
 }
 
 /// 路径比较键：先解析为真实路径，再按平台规范化。
@@ -1137,11 +1564,19 @@ fn resolve_paginated_chain_from_descriptors(
     Ok(reversed)
 }
 
+#[cfg(test)]
+thread_local! {
+    static PAGINATED_DIR_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn rollout_descriptors_for_path(path: &Path) -> Vec<RolloutDescriptor> {
     rollout_descriptors_in_roots(path, session_roots())
 }
 
 fn rollout_descriptors_in_roots(path: &Path, mut roots: Vec<PathBuf>) -> Vec<RolloutDescriptor> {
+    #[cfg(test)]
+    PAGINATED_DIR_SCANS.with(|scans| scans.set(scans.get() + 1));
+
     // canonicalize() adds the Windows extended-length prefix. Compare paths in
     // the same representation before deciding to scan an additional root.
     let canonical_path = path.canonicalize().ok();
@@ -1191,26 +1626,89 @@ fn rollout_descriptors_checked(roots: &[PathBuf]) -> Result<Vec<RolloutDescripto
 }
 
 fn resolve_paginated_chain(path: &Path) -> Result<Vec<HistorySegment>, String> {
-    let descriptors = rollout_descriptors_for_path(path);
-    resolve_paginated_chain_from_descriptors(path, &descriptors)
+    let physical = physical_rollout_path(path)?;
+    let descriptor = read_rollout_descriptor(&physical)?;
+    if descriptor.history_base.is_none() {
+        return Ok(vec![HistorySegment {
+            path: descriptor.path,
+            session_id: descriptor.session_id,
+            end_byte_offset: None,
+        }]);
+    }
+    let descriptors = rollout_descriptors_for_path(&physical);
+    resolve_paginated_chain_from_descriptors(&physical, &descriptors)
 }
 
 fn mark_residual_rollouts(
     sessions: &mut [SessionMeta],
     native_rollouts: Option<&HashMap<String, String>>,
 ) {
+    for session in sessions.iter_mut() {
+        if session
+            .source_path
+            .as_deref()
+            .is_some_and(is_archived_rollout)
+        {
+            session.archived = true;
+            session.resume_command = None;
+        }
+    }
+
     if let Some(native_rollouts) = native_rollouts {
-        for session in sessions {
-            session.residual =
-                native_rollouts
-                    .get(&session.session_id)
-                    .is_none_or(|current_path| {
-                        session
-                            .source_path
-                            .as_deref()
-                            .is_none_or(|path| normalized_rollout_path(path) != *current_path)
-                    });
-            if session.residual {
+        let mut active_present_ids = HashSet::new();
+        for session in sessions.iter() {
+            if session.archived {
+                continue;
+            }
+            if let Some(current_path) = native_rollouts.get(&session.session_id) {
+                let current_key = rollout_path_key(Path::new(current_path));
+                if session
+                    .source_path
+                    .as_deref()
+                    .is_some_and(|path| rollout_path_key(Path::new(path)) == current_key)
+                {
+                    active_present_ids.insert(session.session_id.clone());
+                }
+            }
+        }
+        for (id, current_path) in native_rollouts {
+            if !is_archived_rollout(current_path) && !rollout_is_missing(Path::new(current_path)) {
+                active_present_ids.insert(id.clone());
+            }
+        }
+
+        let mut primary_archived_by_id: HashMap<String, usize> = HashMap::new();
+        for (index, candidate) in sessions.iter().enumerate() {
+            if !candidate.archived || active_present_ids.contains(&candidate.session_id) {
+                continue;
+            }
+            let replace = primary_archived_by_id
+                .get(&candidate.session_id)
+                .is_none_or(|existing_index| {
+                    is_newer_rollout(candidate, &sessions[*existing_index])
+                });
+            if replace {
+                primary_archived_by_id.insert(candidate.session_id.clone(), index);
+            }
+        }
+
+        for (index, session) in sessions.iter_mut().enumerate() {
+            if session.archived {
+                session.residual =
+                    primary_archived_by_id.get(&session.session_id).copied() != Some(index);
+            } else {
+                session.residual =
+                    native_rollouts
+                        .get(&session.session_id)
+                        .is_none_or(|current_path| {
+                            let current_key = rollout_path_key(Path::new(current_path));
+                            session
+                                .source_path
+                                .as_deref()
+                                .is_none_or(|path| rollout_path_key(Path::new(path)) != current_key)
+                        });
+            }
+            if session.residual || session.archived {
                 session.resume_command = None;
             }
         }
@@ -1222,11 +1720,7 @@ fn mark_residual_rollouts(
     // expose every other file as residual rather than hiding it.
     let mut current_by_id: HashMap<String, usize> = HashMap::new();
     for (index, candidate) in sessions.iter().enumerate() {
-        if candidate
-            .source_path
-            .as_deref()
-            .is_some_and(is_archived_rollout)
-        {
+        if candidate.archived {
             continue;
         }
         let replace = current_by_id
@@ -1236,16 +1730,24 @@ fn mark_residual_rollouts(
             current_by_id.insert(candidate.session_id.clone(), index);
         }
     }
+    let mut primary_archived_by_id: HashMap<String, usize> = HashMap::new();
+    for (index, candidate) in sessions.iter().enumerate() {
+        if !candidate.archived || current_by_id.contains_key(&candidate.session_id) {
+            continue;
+        }
+        let replace = primary_archived_by_id
+            .get(&candidate.session_id)
+            .is_none_or(|existing_index| is_newer_rollout(candidate, &sessions[*existing_index]));
+        if replace {
+            primary_archived_by_id.insert(candidate.session_id.clone(), index);
+        }
+    }
     for (index, session) in sessions.iter_mut().enumerate() {
-        session.residual = current_by_id.get(&session.session_id).copied() != Some(index);
-        if !current_by_id.contains_key(&session.session_id)
-            && session
-                .source_path
-                .as_deref()
-                .is_some_and(is_archived_rollout)
-        {
-            session.archived = true;
-            session.residual = false;
+        if session.archived {
+            session.residual =
+                primary_archived_by_id.get(&session.session_id).copied() != Some(index);
+        } else {
+            session.residual = current_by_id.get(&session.session_id).copied() != Some(index);
         }
         if session.residual || session.archived {
             session.resume_command = None;
@@ -1284,10 +1786,11 @@ fn normalized_rollout_path(path: &str) -> String {
     #[cfg(target_os = "windows")]
     {
         let path = path.replace('/', "\\");
-        path.strip_prefix("\\\\?\\")
-            .unwrap_or(&path)
-            .trim_end_matches('\\')
-            .to_lowercase()
+        let without_prefix = path
+            .strip_prefix("\\\\?\\UNC\\")
+            .map(|unc| format!("\\\\{unc}"))
+            .unwrap_or_else(|| path.strip_prefix("\\\\?\\").unwrap_or(&path).to_string());
+        without_prefix.trim_end_matches('\\').to_lowercase()
     }
 }
 
@@ -1295,19 +1798,25 @@ fn normalized_rollout_path(path: &str) -> String {
 /// rollout's `cwd` can point at a temporary worktree, so it is not a reliable
 /// project identity and must not be used for grouping when this mapping exists.
 fn load_project_context() -> CodexProjectContext {
-    let path = codex_config_dir().join(".codex-global-state.json");
-    let mut context = std::fs::read_to_string(&path)
+    let config_dir = codex_config_dir();
+    let config_text = read_codex_config_text().unwrap_or_default();
+    load_project_context_in(&config_dir, &config_text)
+}
+
+fn load_project_context_in(config_dir: &Path, config_text: &str) -> CodexProjectContext {
+    let path = config_dir.join(".codex-global-state.json");
+    let mut context = read_bounded_text(&path, MAX_INDEX_FILE_BYTES, "Codex 全局状态")
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .map(|root| project_context_from_value(&root))
         .unwrap_or_default();
-    let config_text = read_codex_config_text().unwrap_or_default();
-    for db_path in codex_state_db_paths(&codex_config_dir(), &config_text) {
+    for db_path in codex_state_db_paths(config_dir, config_text) {
         let Ok(conn) =
             Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         else {
             continue;
         };
+        let _ = conn.busy_timeout(Duration::from_secs(2));
         context.thread_sections.extend(read_sidebar_sections(&conn));
     }
     context
@@ -1397,16 +1906,27 @@ fn project_context_from_value(root: &Value) -> CodexProjectContext {
 fn load_thread_titles() -> HashMap<String, String> {
     let config_dir = codex_config_dir();
     let config_text = read_codex_config_text().unwrap_or_default();
-    let db_paths = codex_state_db_paths(&config_dir, &config_text);
+    load_thread_titles_in(&config_dir, &config_text)
+}
+
+fn load_thread_titles_in(config_dir: &Path, config_text: &str) -> HashMap<String, String> {
+    let db_paths = codex_state_db_paths(config_dir, config_text);
     load_thread_titles_from_paths(&config_dir.join(CODEX_SESSION_INDEX_FILENAME), &db_paths)
 }
 
 fn load_native_active_rollouts() -> Option<HashMap<String, String>> {
     let config_dir = codex_config_dir();
     let config_text = read_codex_config_text().unwrap_or_default();
+    load_native_active_rollouts_in(&config_dir, &config_text)
+}
+
+fn load_native_active_rollouts_in(
+    config_dir: &Path,
+    config_text: &str,
+) -> Option<HashMap<String, String>> {
     let mut loaded = false;
     let mut rollouts = HashMap::new();
-    for db_path in codex_state_db_paths(&config_dir, &config_text) {
+    for db_path in codex_state_db_paths(config_dir, config_text) {
         if let Some(items) = load_native_active_rollouts_from_db(&db_path) {
             loaded = true;
             rollouts.extend(items);
@@ -1454,7 +1974,7 @@ fn load_native_active_rollouts_from_db(db_path: &Path) -> Option<HashMap<String,
                 let id = id.trim();
                 let path = path.trim();
                 (!id.is_empty() && !path.is_empty())
-                    .then(|| (id.to_string(), normalized_rollout_path(path)))
+                    .then(|| (id.to_string(), rollout_path_key(Path::new(path))))
             })
             .collect(),
     )
@@ -1493,14 +2013,48 @@ fn load_thread_titles_from_session_index(index_path: &Path) -> HashMap<String, S
             return HashMap::new();
         }
     };
+    let len = match file.metadata() {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            log::warn!(
+                "Failed to stat Codex session index {}: {err}",
+                index_path.display()
+            );
+            return HashMap::new();
+        }
+    };
+    if len > MAX_INDEX_FILE_BYTES {
+        log::warn!(
+            "Skipping oversized Codex session index {} ({} bytes > {} bytes)",
+            index_path.display(),
+            len,
+            MAX_INDEX_FILE_BYTES
+        );
+        return HashMap::new();
+    }
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(MAX_INDEX_FILE_BYTES));
     let mut titles = HashMap::new();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
+    loop {
+        let mut line = String::new();
+        let count = match reader
+            .by_ref()
+            .take(4 * 1024 * 1024 + 1)
+            .read_line(&mut line)
+        {
+            Ok(count) => count,
+            Err(_) => break,
         };
+        if count == 0 {
+            break;
+        }
+        if count > 4 * 1024 * 1024 {
+            log::warn!(
+                "Skipping oversized record in Codex session index {}",
+                index_path.display()
+            );
+            break;
+        }
         let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(line.trim()) else {
             continue;
         };
@@ -1677,6 +2231,12 @@ fn load_history_segments(segments: Vec<HistorySegment>) -> Result<Vec<SessionMes
     Ok(messages)
 }
 
+enum SegmentEntry {
+    Primary(SessionMessage),
+    ReplacementHistory(SessionMessage),
+    EventFallback(SessionMessage),
+}
+
 fn load_segment_messages(
     path: &Path,
     end_byte_offset: Option<u64>,
@@ -1690,7 +2250,10 @@ fn load_segment_messages(
     }
     let mut reader = BufReader::new(open_rollout(path)?.take(segment_len));
     let mut consumed = 0u64;
-    let mut messages = Vec::new();
+    let mut entries = Vec::new();
+    let mut has_response_item_any = false;
+    let mut has_response_item_chat = false;
+    let mut has_replacement_chat = false;
 
     loop {
         let mut line = String::new();
@@ -1711,67 +2274,225 @@ fn load_segment_messages(
             Err(_) => continue,
         };
 
-        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
+        let item_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let Some(payload) = value.get("payload") else {
             continue;
-        }
-
-        let payload = match value.get("payload") {
-            Some(payload) => payload,
-            None => continue,
         };
 
-        let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
-
-        // Codex uses separate payload types for tool interactions
-        let (role, content) = match payload_type {
-            "message" => {
-                let role = payload
-                    .get("role")
+        match item_type {
+            "response_item" => {
+                if let Some(msg) = parse_response_item_payload(payload, ts) {
+                    has_response_item_any = true;
+                    if matches!(msg.role.as_str(), "user" | "assistant") {
+                        has_response_item_chat = true;
+                    }
+                    entries.push(SegmentEntry::Primary(msg));
+                }
+            }
+            "compacted" => {
+                if let Some(summary) = payload
+                    .get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let content = payload.get("content").map(extract_text).unwrap_or_default();
-                if !matches!(role, "user" | "assistant")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    entries.push(SegmentEntry::Primary(SessionMessage {
+                        role: "assistant".to_string(),
+                        content: format!("[Compacted Summary]\n{summary}"),
+                        ts,
+                    }));
+                }
+                if let Some(history) = payload.get("replacement_history").and_then(Value::as_array)
+                {
+                    for item in history {
+                        if let Some(msg) = parse_response_item_payload(item, ts) {
+                            if matches!(msg.role.as_str(), "user" | "assistant") {
+                                has_replacement_chat = true;
+                            }
+                            entries.push(SegmentEntry::ReplacementHistory(msg));
+                        }
+                    }
+                }
+            }
+            "event_msg" => {
+                let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                let role = match event_type {
+                    "user_message" => "user",
+                    "agent_message" => "assistant",
+                    _ => continue,
+                };
+                let content = payload
+                    .get("message")
+                    .or_else(|| payload.get("text"))
+                    .map(extract_text)
+                    .unwrap_or_default();
+                if content.trim().is_empty()
                     || (role == "user" && is_internal_user_context(payload, &content))
                 {
                     continue;
                 }
-                (role.to_string(), content)
-            }
-            "function_call" => {
-                let name = payload
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                ("assistant".to_string(), format!("[Tool: {name}]"))
-            }
-            "function_call_output" | "custom_tool_call_output" => (
-                "tool".to_string(),
-                payload.get("output").map(extract_text).unwrap_or_default(),
-            ),
-            "custom_tool_call" => {
-                let name = payload
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
-                ("assistant".to_string(), format!("[Tool: {name}]\n{input}"))
+                entries.push(SegmentEntry::EventFallback(SessionMessage {
+                    role: role.to_string(),
+                    content,
+                    ts,
+                }));
             }
             _ => continue,
-        };
-
-        if content.trim().is_empty() {
-            continue;
         }
-
-        let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
-
-        messages.push(SessionMessage { role, content, ts });
     }
 
     if consumed < segment_len {
         return Err("Codex history offset exceeds decompressed length".into());
     }
+
+    let include_replacement = !has_response_item_any;
+    let include_event_fallback =
+        !(has_response_item_chat || include_replacement && has_replacement_chat);
+    let messages = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            SegmentEntry::Primary(msg) => Some(msg),
+            SegmentEntry::ReplacementHistory(msg) if include_replacement => Some(msg),
+            SegmentEntry::EventFallback(msg) if include_event_fallback => Some(msg),
+            _ => None,
+        })
+        .collect();
+
     Ok(messages)
+}
+
+fn parse_response_item_payload(payload: &Value, ts: Option<i64>) -> Option<SessionMessage> {
+    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+
+    let (role, content) = match payload_type {
+        "message" => {
+            let role = payload
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let content = payload.get("content").map(extract_text).unwrap_or_default();
+            if !matches!(role, "user" | "assistant")
+                || (role == "user" && is_internal_user_context(payload, &content))
+            {
+                return None;
+            }
+            (role.to_string(), content)
+        }
+        "reasoning" => {
+            let content = extract_codex_reasoning_text(payload);
+            ("thinking".to_string(), content)
+        }
+        "function_call" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            ("assistant".to_string(), format!("[Tool: {name}]"))
+        }
+        "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => (
+            "tool".to_string(),
+            payload.get("output").map(extract_text).unwrap_or_default(),
+        ),
+        "custom_tool_call" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
+            if input.is_empty() {
+                ("assistant".to_string(), format!("[Tool: {name}]"))
+            } else {
+                ("assistant".to_string(), format!("[Tool: {name}]\n{input}"))
+            }
+        }
+        "local_shell_call" => {
+            let cmd = extract_shell_command(payload);
+            if cmd.is_empty() {
+                return None;
+            }
+            ("tool".to_string(), format!("$ {cmd}"))
+        }
+        "web_search_call" => ("tool".to_string(), format_web_search_call(payload)),
+        _ => return None,
+    };
+
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    Some(SessionMessage { role, content, ts })
+}
+
+fn extract_codex_reasoning_text(payload: &Value) -> String {
+    let extracted = extract_thinking_text(payload);
+    if !extracted.trim().is_empty() {
+        return extracted;
+    }
+    match payload.get("summary") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .or_else(|| item.get("text").and_then(Value::as_str))
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn extract_shell_command(payload: &Value) -> String {
+    match payload
+        .pointer("/action/command")
+        .or_else(|| payload.get("command"))
+    {
+        Some(Value::Array(args)) => args
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string(),
+        Some(Value::String(cmd)) => cmd.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn format_web_search_call(payload: &Value) -> String {
+    if let Some(query) = payload
+        .pointer("/action/query")
+        .or_else(|| payload.get("query"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        return format!("[Web search] {query}");
+    }
+    if let Some(queries) = payload.pointer("/action/queries").and_then(Value::as_array) {
+        let joined = queries
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !joined.is_empty() {
+            return format!("[Web search] {joined}");
+        }
+    }
+    if let Some(url) = payload
+        .pointer("/action/url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        return format!("[Web search] {url}");
+    }
+    "[Web search]".to_string()
 }
 
 pub fn validate_delete(path: &Path, session_id: &str) -> Result<(), String> {
@@ -1839,7 +2560,7 @@ fn deletion_order_with_descriptors(
             chain
                 .iter()
                 .filter(|segment| segment.session_id == request.session_id)
-                .map(|segment| normalized_rollout_path(&segment.path.to_string_lossy()))
+                .map(|segment| rollout_path_key(&segment.path))
                 .collect::<HashSet<_>>()
         })
         .collect::<Vec<_>>();
@@ -1851,8 +2572,7 @@ fn deletion_order_with_descriptors(
                 .filter(|parent| {
                     *parent != child
                         && chain.iter().any(|segment| {
-                            owned[*parent]
-                                .contains(&normalized_rollout_path(&segment.path.to_string_lossy()))
+                            owned[*parent].contains(&rollout_path_key(&segment.path))
                         })
                 })
                 .collect::<HashSet<_>>()
@@ -1923,13 +2643,11 @@ fn deletion_paths_for_plan(
 
     let owned_paths = owned_segments
         .iter()
-        .map(|segment| normalized_rollout_path(&segment.path.to_string_lossy()))
+        .map(|segment| rollout_path_key(&segment.path))
         .collect::<HashSet<_>>();
     let owned_rollout_ids = descriptors
         .iter()
-        .filter(|descriptor| {
-            owned_paths.contains(&normalized_rollout_path(&descriptor.path.to_string_lossy()))
-        })
+        .filter(|descriptor| owned_paths.contains(&descriptor.key))
         .map(|descriptor| descriptor.rollout_id.clone())
         .collect::<HashSet<_>>();
 
@@ -1937,16 +2655,15 @@ fn deletion_paths_for_plan(
         .iter()
         .filter(|descriptor| descriptor.history_base.is_some())
     {
-        let continuation_path = normalized_rollout_path(&continuation.path.to_string_lossy());
-        if owned_paths.contains(&continuation_path) || selected.contains(&continuation.key) {
+        if owned_paths.contains(&continuation.key) || selected.contains(&continuation.key) {
             continue;
         }
 
         match resolve_paginated_chain_from_descriptors(&continuation.path, descriptors) {
             Ok(chain)
-                if chain.iter().any(|segment| {
-                    owned_paths.contains(&normalized_rollout_path(&segment.path.to_string_lossy()))
-                }) =>
+                if chain
+                    .iter()
+                    .any(|segment| owned_paths.contains(&rollout_path_key(&segment.path))) =>
             {
                 if continuation.session_id == session_id {
                     return Err("该记录是当前会话依赖的分页历史，不能单独删除".into());
@@ -2225,7 +2942,7 @@ fn validate_deletion_plan_with_descriptors(
         match std::fs::symlink_metadata(&unit.path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.to_string()),
-            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+            Ok(meta) if !meta.is_file() || is_reparse_or_symlink(&meta) => {
                 return Err("Codex saved file was replaced".into())
             }
             Ok(_) => {}
@@ -2426,6 +3143,7 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
     let mut project_dir: Option<String> = None;
     let mut created_at: Option<i64> = None;
     let mut first_user_message: Option<String> = None;
+    let mut fallback_first_event_user: Option<String> = None;
 
     // Extract metadata and first user message from head lines
     for line in &head {
@@ -2436,7 +3154,8 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
         if created_at.is_none() {
             created_at = value.get("timestamp").and_then(parse_timestamp_to_ms);
         }
-        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+        let item_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if item_type == "session_meta" {
             if let Some(payload) = value.get("payload") {
                 if is_subagent_source(payload.get("source")) {
                     return Ok(Some(CachedCodexFile {
@@ -2462,9 +3181,7 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
             }
         }
         // Extract first user message as title candidate
-        if first_user_message.is_none()
-            && value.get("type").and_then(Value::as_str) == Some("response_item")
-        {
+        if first_user_message.is_none() && item_type == "response_item" {
             if let Some(payload) = value.get("payload") {
                 if payload.get("type").and_then(Value::as_str) == Some("message")
                     && payload.get("role").and_then(Value::as_str) == Some("user")
@@ -2472,7 +3189,23 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
                     let text = payload.get("content").map(extract_text).unwrap_or_default();
                     if !is_internal_user_context(payload, &text) {
                         if let Some(title) = title_candidate_from_user_message(&text) {
-                            first_user_message = Some(title);
+                            first_user_message = Some(truncate_summary(&title, TITLE_MAX_CHARS));
+                        }
+                    }
+                }
+            }
+        } else if fallback_first_event_user.is_none() && item_type == "event_msg" {
+            if let Some(payload) = value.get("payload") {
+                if payload.get("type").and_then(Value::as_str) == Some("user_message") {
+                    let text = payload
+                        .get("message")
+                        .or_else(|| payload.get("text"))
+                        .map(extract_text)
+                        .unwrap_or_default();
+                    if !is_internal_user_context(payload, &text) {
+                        if let Some(title) = title_candidate_from_user_message(&text) {
+                            fallback_first_event_user =
+                                Some(truncate_summary(&title, TITLE_MAX_CHARS));
                         }
                     }
                 }
@@ -2491,6 +3224,8 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
     let mut last_active_at: Option<i64> = None;
     let mut summary: Option<String> = None;
     let mut latest_user_message: Option<String> = None;
+    let mut fallback_latest_event_user: Option<String> = None;
+    let mut fallback_event_summary: Option<String> = None;
 
     for line in tail.iter().rev() {
         let value: Value = match serde_json::from_str(line) {
@@ -2500,7 +3235,8 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
         if last_active_at.is_none() {
             last_active_at = value.get("timestamp").and_then(parse_timestamp_to_ms);
         }
-        if value.get("type").and_then(Value::as_str) == Some("response_item") {
+        let item_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if item_type == "response_item" {
             if let Some(payload) = value.get("payload") {
                 if payload.get("type").and_then(Value::as_str) == Some("message") {
                     let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
@@ -2508,10 +3244,31 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
                     let visible = matches!(role, "user" | "assistant")
                         && !(role == "user" && is_internal_user_context(payload, &text));
                     if visible && latest_user_message.is_none() && role == "user" {
-                        latest_user_message = title_candidate_from_user_message(&text);
+                        latest_user_message = title_candidate_from_user_message(&text)
+                            .map(|title| truncate_summary(&title, TITLE_MAX_CHARS));
                     }
                     if visible && summary.is_none() && !text.trim().is_empty() {
                         summary = Some(text);
+                    }
+                }
+            }
+        } else if item_type == "event_msg" {
+            if let Some(payload) = value.get("payload") {
+                let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                if matches!(event_type, "user_message" | "agent_message") {
+                    let text = payload
+                        .get("message")
+                        .or_else(|| payload.get("text"))
+                        .map(extract_text)
+                        .unwrap_or_default();
+                    let is_user = event_type == "user_message";
+                    let visible = !(is_user && is_internal_user_context(payload, &text));
+                    if visible && is_user && fallback_latest_event_user.is_none() {
+                        fallback_latest_event_user = title_candidate_from_user_message(&text)
+                            .map(|title| truncate_summary(&title, TITLE_MAX_CHARS));
+                    }
+                    if visible && fallback_event_summary.is_none() && !text.trim().is_empty() {
+                        fallback_event_summary = Some(text);
                     }
                 }
             }
@@ -2519,6 +3276,12 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
         if last_active_at.is_some() && summary.is_some() && latest_user_message.is_some() {
             break;
         }
+    }
+
+    if first_user_message.is_none() && latest_user_message.is_none() && summary.is_none() {
+        first_user_message = fallback_first_event_user;
+        latest_user_message = fallback_latest_event_user;
+        summary = fallback_event_summary;
     }
 
     let Some(session_id) = session_id.or_else(|| infer_session_id_from_filename(path)) else {
@@ -2544,10 +3307,13 @@ fn parse_codex_file(path: &Path) -> Result<Option<CachedCodexFile>, String> {
 }
 
 fn is_subagent_source(source: Option<&Value>) -> bool {
-    source
-        .and_then(|value| value.as_object())
-        .map(|source| source.contains_key("subagent"))
-        .unwrap_or(false)
+    match source {
+        Some(Value::String(text)) => {
+            text.eq_ignore_ascii_case("subagent") || text.starts_with("subagent:")
+        }
+        Some(Value::Object(map)) => map.contains_key("subagent"),
+        _ => false,
+    }
 }
 
 fn is_internal_user_context(payload: &Value, text: &str) -> bool {
@@ -2933,9 +3699,18 @@ mod tests {
 
     // Test entry points carry only fixture-local roots, never ambient CODEX_HOME.
     fn resolve_paginated_chain(path: &Path) -> Result<Vec<HistorySegment>, String> {
+        let physical = physical_rollout_path(path)?;
+        let descriptor = read_rollout_descriptor(&physical)?;
+        if descriptor.history_base.is_none() {
+            return Ok(vec![HistorySegment {
+                path: descriptor.path,
+                session_id: descriptor.session_id,
+                end_byte_offset: None,
+            }]);
+        }
         resolve_paginated_chain_from_descriptors(
-            path,
-            &rollout_descriptors_checked(&[path.parent().unwrap().to_path_buf()])?,
+            &physical,
+            &rollout_descriptors_checked(&[physical.parent().unwrap().to_path_buf()])?,
         )
     }
     fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -4448,22 +5223,567 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_keeps_complete_latest_user_message() {
+    fn parse_session_truncates_long_titles_across_all_sources() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("session.jsonl");
-        let long_msg = "a".repeat(200);
+        let long_first = "f".repeat(200);
+        let long_latest = "a".repeat(200);
         std::fs::write(
             &path,
             format!(
                 "{{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"test-id\",\"cwd\":\"/tmp/p\"}}}}\n\
-                 {{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"{long_msg}\"}}}}\n",
+                 {{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"{long_first}\"}}}}\n\
+                 {{\"timestamp\":\"2026-03-06T21:50:14Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"{long_latest}\"}}}}\n",
             ),
         )
         .expect("write");
 
+        let expected_latest = truncate_summary(&long_latest, TITLE_MAX_CHARS);
+        assert_eq!(expected_latest.chars().count(), TITLE_MAX_CHARS + 3);
         let meta = parse_session(&path).unwrap();
-        let title = meta.title.unwrap();
-        assert_eq!(title, long_msg);
+        assert_eq!(meta.title.as_deref(), Some(expected_latest.as_str()));
+
+        // Verify `first_user_message` branch is also truncated when `latest_user_message` is None.
+        let raw_first_only = RawCodexSession {
+            session_id: "first-only".into(),
+            project_dir: None,
+            created_at: None,
+            last_active_at: None,
+            first_user_message: Some(long_first.clone()),
+            latest_user_message: None,
+            summary: None,
+            source_path: path.to_string_lossy().into_owned(),
+        };
+        let meta_first = raw_first_only.into_session_meta(&HashMap::new());
+        assert_eq!(
+            meta_first.title.as_deref(),
+            Some(truncate_summary(&long_first, TITLE_MAX_CHARS).as_str())
+        );
+
+        // Verify `thread_titles` branch is also truncated to TITLE_MAX_CHARS.
+        let long_saved = "t".repeat(200);
+        let mut titles = HashMap::new();
+        titles.insert("test-id".to_string(), long_saved.clone());
+        let meta_saved = parse_session_with_titles(&path, &titles).unwrap();
+        assert_eq!(
+            meta_saved.title.as_deref(),
+            Some(truncate_summary(&long_saved, TITLE_MAX_CHARS).as_str())
+        );
+    }
+
+    #[test]
+    fn state_6_sqlite_discovery_and_multi_generation_cleanup() {
+        let temp = tempdir().expect("tempdir");
+        let dir = temp.path();
+
+        // Create stale state_5.sqlite and newer state_6.sqlite
+        let state5 = dir.join("state_5.sqlite");
+        let state6 = dir.join("state_6.sqlite");
+        {
+            let conn5 = Connection::open(&state5).unwrap();
+            conn5
+                .execute_batch(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL, title TEXT, name TEXT, first_user_message TEXT, thread_section_id TEXT);
+                     CREATE TABLE thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                     INSERT INTO thread_sections VALUES ('sec-old', 'OldSection');
+                     INSERT INTO threads VALUES ('stale-only', 'C:\\stale.jsonl', 0, 'Stale title', 'Stale explicit', 'q', 'sec-old');
+                     INSERT INTO threads VALUES ('target-1', 'C:\\old_target.jsonl', 0, 'Old title', 'Old explicit', 'q', 'sec-old');
+                     INSERT INTO threads VALUES ('keep-1', 'C:\\keep.jsonl', 0, 'Keep', 'Keep', 'q', NULL);",
+                )
+                .unwrap();
+
+            let conn6 = Connection::open(&state6).unwrap();
+            conn6
+                .execute_batch(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL, title TEXT, name TEXT, first_user_message TEXT, thread_section_id TEXT);
+                     CREATE TABLE thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                     INSERT INTO thread_sections VALUES ('sec-6', 'Gen6Section');
+                     INSERT INTO threads VALUES ('target-1', 'C:\\gen6_target.jsonl', 0, 'Gen6 auto', 'Gen6 explicit', 'q', 'sec-6');
+                     INSERT INTO threads VALUES ('keep-1', 'C:\\gen6_keep.jsonl', 0, 'Keep auto', 'Keep explicit', 'q', NULL);",
+                )
+                .unwrap();
+        }
+
+        // Create numbered auxiliary DBs across generations
+        let th1 = dir.join("thread_history_1.sqlite");
+        let th2 = dir.join("thread_history_2.sqlite");
+        let logs2 = dir.join("logs_2.sqlite");
+        let mem1 = dir.join("memories_1.sqlite");
+        let goals1 = dir.join("goals_1.sqlite");
+        let queue1 = dir.join("queue_1.sqlite");
+
+        for aux in [&th1, &th2, &logs2, &mem1, &goals1, &queue1] {
+            let conn = Connection::open(aux).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (thread_id TEXT NOT NULL);
+                 INSERT INTO items VALUES ('target-1'), ('keep-1');",
+            )
+            .unwrap();
+        }
+
+        // Highest generation discovery for reading active rollouts, titles, sections, and thread_history
+        let config = format!(
+            "sqlite_home = {}",
+            serde_json::to_string(&dir.to_string_lossy()).unwrap()
+        );
+        let active = load_native_active_rollouts_in(dir, &config).expect("active rollouts");
+        assert!(!active.contains_key("stale-only"));
+        assert_eq!(
+            active.get("target-1"),
+            Some(&rollout_path_key(Path::new(r"C:\gen6_target.jsonl")))
+        );
+
+        let titles = load_thread_titles_in(dir, &config);
+        assert!(!titles.contains_key("stale-only"));
+        assert_eq!(
+            titles.get("target-1").map(String::as_str),
+            Some("Gen6 explicit")
+        );
+
+        let ctx = load_project_context_in(dir, &config);
+        assert!(!ctx.thread_sections.contains_key("stale-only"));
+        assert_eq!(ctx.thread_sections["target-1"].name, "Gen6Section");
+
+        assert_eq!(codex_primary_thread_history_db_path(dir), th2);
+
+        // Cleanup must purge target-1 from ALL existing generations & auxiliary SQLite DBs
+        cleanup_index_databases(dir, &config, "target-1").expect("cleanup all dbs");
+
+        for state_db in [&state5, &state6] {
+            let conn = Connection::open(state_db).unwrap();
+            let target_cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM threads WHERE id = 'target-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let keep_cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM threads WHERE id = 'keep-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(target_cnt, 0, "{} still had target-1", state_db.display());
+            assert_eq!(keep_cnt, 1, "{} lost keep-1", state_db.display());
+        }
+
+        for aux in [&th1, &th2, &logs2, &mem1, &goals1, &queue1] {
+            let conn = Connection::open(aux).unwrap();
+            let target_cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM items WHERE thread_id = 'target-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let keep_cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM items WHERE thread_id = 'keep-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(target_cnt, 0, "{} still had target-1", aux.display());
+            assert_eq!(keep_cnt, 1, "{} lost keep-1", aux.display());
+        }
+    }
+
+    #[test]
+    fn cleanup_state_db_preserves_child_parent_session_id_rows_and_honors_fk_order() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("state_6.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            // Create `threads` and `session` FIRST so `sqlite_master` lists them BEFORE child tables,
+            // proving `cleanup_state_db` sorts entity tables LAST and respects FK constraints!
+            conn.execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    parent_session_id TEXT,
+                    title TEXT
+                );
+                CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    parent_session_id TEXT
+                );
+                CREATE TABLE logs (
+                    id INTEGER PRIMARY KEY,
+                    thread_id TEXT NOT NULL REFERENCES threads(id)
+                );
+                CREATE TABLE stage1_outputs (
+                    thread_id TEXT PRIMARY KEY REFERENCES threads(id)
+                );
+                CREATE TABLE agent_job_items (
+                    id TEXT PRIMARY KEY,
+                    assigned_thread_id TEXT REFERENCES threads(id)
+                );
+                CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL REFERENCES threads(id),
+                    child_thread_id TEXT NOT NULL REFERENCES threads(id),
+                    parent_session_id TEXT,
+                    child_session_id TEXT
+                );
+                INSERT INTO threads VALUES ('parent-1', NULL, 'Parent'), ('child-1', 'parent-1', 'Child');
+                INSERT INTO session VALUES ('parent-1', NULL), ('child-1', 'parent-1');
+                INSERT INTO logs VALUES (1, 'parent-1'), (2, 'child-1');
+                INSERT INTO stage1_outputs VALUES ('parent-1'), ('child-1');
+                INSERT INTO agent_job_items VALUES ('job-1', 'parent-1'), ('job-2', 'child-1');
+                INSERT INTO thread_spawn_edges VALUES ('parent-1', 'child-1', 'parent-1', 'child-1');",
+            )
+            .unwrap();
+        }
+
+        cleanup_state_db(&db_path, "parent-1").expect("cleanup parent-1 with FK constraints");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let remaining_threads: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, parent_session_id FROM threads ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            remaining_threads,
+            vec![("child-1".to_string(), Some("parent-1".to_string()))],
+            "child session row in `threads` with parent_session_id='parent-1' must be preserved!"
+        );
+
+        let remaining_sessions: Vec<String> = conn
+            .prepare("SELECT id FROM session ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(remaining_sessions, vec!["child-1".to_string()]);
+
+        let edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_spawn_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0);
+
+        let job_ids: Vec<String> = conn
+            .prepare("SELECT id FROM agent_job_items")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(job_ids, vec!["job-2".to_string()]);
+    }
+
+    #[test]
+    fn cleanup_index_databases_removes_orphaned_hidden_subagent_rollouts_only() {
+        let temp = tempdir().expect("tempdir");
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_file = sessions_dir.join("parent.jsonl");
+        write_codex_session(&parent_file, "parent-1", "Parent task");
+
+        let sub1_file = sessions_dir.join("sub-1.jsonl");
+        std::fs::write(
+            &sub1_file,
+            "{\"timestamp\":\"2026-04-28T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sub-1\",\"cwd\":\"/tmp/project\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent-1\",\"depth\":1}}}}}\n",
+        )
+        .unwrap();
+
+        let sub2_file = sessions_dir.join("sub-2.jsonl");
+        std::fs::write(
+            &sub2_file,
+            "{\"timestamp\":\"2026-04-28T10:01:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sub-2\",\"cwd\":\"/tmp/project\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"sub-1\",\"depth\":2}}}}}\n",
+        )
+        .unwrap();
+
+        // Non-subagent child rollout must NEVER be deleted by hidden subagent cleanup
+        let visible_child_file = sessions_dir.join("visible-child.jsonl");
+        write_codex_session(&visible_child_file, "visible-child", "User branch");
+
+        // Subagent file outside configured `sessions/` root must NEVER be deleted
+        let outside_dir = tempdir().expect("outside");
+        let outside_sub_file = outside_dir.path().join("outside-sub.jsonl");
+        std::fs::write(
+            &outside_sub_file,
+            "{\"timestamp\":\"2026-04-28T10:02:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"outside-sub\",\"cwd\":\"/tmp/project\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent-1\",\"depth\":1}}}}}\n",
+        )
+        .unwrap();
+
+        let state_path = temp.path().join("state_6.sqlite");
+        {
+            let conn = Connection::open(&state_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, source TEXT);
+                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL);",
+            )
+            .unwrap();
+            for (id, file, src) in [
+                ("parent-1", &parent_file, "cli"),
+                ("sub-1", &sub1_file, "{\"subagent\":{}}"),
+                ("sub-2", &sub2_file, "{\"subagent\":{}}"),
+                ("visible-child", &visible_child_file, "cli"),
+                ("outside-sub", &outside_sub_file, "{\"subagent\":{}}"),
+            ] {
+                conn.execute(
+                    "INSERT INTO threads VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, file.to_string_lossy().to_string(), src],
+                )
+                .unwrap();
+            }
+            for (p, c) in [
+                ("parent-1", "sub-1"),
+                ("sub-1", "sub-2"),
+                ("parent-1", "visible-child"),
+                ("parent-1", "outside-sub"),
+            ] {
+                conn.execute(
+                    "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                    rusqlite::params![p, c],
+                )
+                .unwrap();
+            }
+        }
+
+        let history_path = temp.path().join("thread_history_2.sqlite");
+        {
+            let conn = Connection::open(&history_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE thread_items (thread_id TEXT NOT NULL);
+                 INSERT INTO thread_items VALUES ('parent-1'), ('sub-1'), ('sub-2'), ('visible-child');",
+            )
+            .unwrap();
+        }
+
+        let config = format!(
+            "sqlite_home = {}",
+            serde_json::to_string(&temp.path().to_string_lossy()).unwrap()
+        );
+        cleanup_index_databases(temp.path(), &config, "parent-1").unwrap();
+
+        assert!(
+            !sub1_file.exists(),
+            "hidden subagent 1 rollout must be deleted"
+        );
+        assert!(
+            !sub2_file.exists(),
+            "nested hidden subagent 2 rollout must be deleted"
+        );
+        assert!(
+            visible_child_file.exists(),
+            "non-subagent rollout must remain intact"
+        );
+        assert!(
+            outside_sub_file.exists(),
+            "rollout outside session roots must remain intact"
+        );
+
+        let conn = Connection::open(&state_path).unwrap();
+        let remaining_threads: Vec<String> = conn
+            .prepare("SELECT id FROM threads ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            remaining_threads,
+            vec!["outside-sub".to_string(), "visible-child".to_string()]
+        );
+
+        let hconn = Connection::open(&history_path).unwrap();
+        let remaining_hist: Vec<String> = hconn
+            .prepare("SELECT thread_id FROM thread_items ORDER BY thread_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(remaining_hist, vec!["visible-child".to_string()]);
+    }
+
+    #[test]
+    fn archived_rollout_classification_and_stale_threads_path_reconciliation() {
+        let temp = tempdir().expect("tempdir");
+        let active_dir = temp.path().join("sessions");
+        let archived_dir = temp.path().join("archived_sessions");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(&archived_dir).unwrap();
+
+        let archived_file = archived_dir.join("rollout-arch.jsonl");
+        write_codex_session(&archived_file, "arch-1", "Archived conversation");
+
+        let stale_sessions_path = active_dir.join("rollout-arch.jsonl");
+        // Simulate `threads` row still pointing to old `sessions/` path after file moved to `archived_sessions/`
+        let native_rollouts = HashMap::from([(
+            "arch-1".to_string(),
+            stale_sessions_path.to_string_lossy().into_owned(),
+        )]);
+
+        let mut sessions = scan_sessions_in_roots_with_context(
+            &[active_dir.clone(), archived_dir.clone()],
+            &HashMap::new(),
+            &CodexProjectContext::default(),
+            Some(&native_rollouts),
+        );
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].archived);
+        assert!(!sessions[0].residual);
+        assert!(sessions[0].resume_command.is_none());
+
+        let indexed = HashMap::from([(
+            "arch-1".to_string(),
+            stale_sessions_path.to_string_lossy().into_owned(),
+        )]);
+        reconcile_indexed_rollouts(
+            &mut sessions,
+            indexed.clone(),
+            Some(&native_rollouts),
+            &HashMap::new(),
+        );
+        // Must reconcile instead of emitting a duplicate `缺少日志的任务` ghost!
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].archived);
+        assert!(!sessions[0].residual);
+        assert!(!sessions[0].cleanup_pending);
+        assert!(should_cleanup_index_from_rollouts(
+            "arch-1",
+            &archived_file.to_string_lossy(),
+            Some(&indexed),
+        ));
+    }
+
+    #[test]
+    fn resolve_paginated_chain_uses_o1_fast_path_for_non_paginated_rollouts() {
+        let temp = tempdir().expect("tempdir");
+        let standalone = temp.path().join("standalone.jsonl");
+        let base = temp.path().join("base.jsonl");
+        let leaf = temp.path().join("leaf.jsonl");
+        write_codex_session(&standalone, "standalone-id", "Quick open");
+        write_codex_session(&base, "paged-id", "Page 1");
+        write_paginated_session(&leaf, "paged-id", base.metadata().unwrap().len(), "Page 2");
+
+        let before = PAGINATED_DIR_SCANS.with(|s| s.get());
+        let single_chain = super::resolve_paginated_chain(&standalone).expect("O(1) chain");
+        let after_single = PAGINATED_DIR_SCANS.with(|s| s.get());
+        assert_eq!(single_chain.len(), 1);
+        assert_eq!(single_chain[0].session_id, "standalone-id");
+        assert_eq!(
+            after_single - before,
+            0,
+            "non-paginated rollout must NOT walk directories"
+        );
+
+        let paged_chain = super::resolve_paginated_chain(&leaf).expect("paginated chain");
+        let after_paged = PAGINATED_DIR_SCANS.with(|s| s.get());
+        assert_eq!(paged_chain.len(), 2);
+        assert_eq!(
+            after_paged - after_single,
+            1,
+            "paginated rollout scans roots once to resolve history_base"
+        );
+    }
+
+    #[test]
+    fn load_messages_supports_reasoning_shell_web_search_compacted_and_legacy_event_msg() {
+        let temp = tempdir().expect("tempdir");
+
+        // 1. Rich response_item types + compacted summary (with non-duplicated event_msg)
+        let rich = temp.path().join("rich.jsonl");
+        std::fs::write(
+            &rich,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"rich-id\",\"cwd\":\"/tmp\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"Check build\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Check build\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:14Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Analyzing Cargo.toml\"}]}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:15Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call\",\"action\":{\"type\":\"exec\",\"command\":[\"cargo\",\"check\",\"--locked\"]}}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:16Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"action\":{\"type\":\"search\",\"query\":\"rusqlite TransactionBehavior Immediate\"}}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:17Z\",\"type\":\"compacted\",\"payload\":{\"message\":\"Earlier context summarized\",\"replacement_history\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"Old prompt\"}]}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:18Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"All checks green.\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:18Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"All checks green.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let msgs = load_messages(&rich).expect("load rich messages");
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "Check build");
+        assert_eq!(msgs[1].role, "thinking");
+        assert_eq!(msgs[1].content, "Analyzing Cargo.toml");
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[2].content, "$ cargo check --locked");
+        assert_eq!(msgs[3].role, "tool");
+        assert_eq!(
+            msgs[3].content,
+            "[Web search] rusqlite TransactionBehavior Immediate"
+        );
+        assert_eq!(msgs[4].role, "assistant");
+        assert_eq!(
+            msgs[4].content,
+            "[Compacted Summary]\nEarlier context summarized"
+        );
+        assert_eq!(msgs[5].role, "assistant");
+        assert_eq!(msgs[5].content, "All checks green.");
+
+        // 2. Compacted-only rollout with `replacement_history` and zero `response_item` lines
+        let compacted_only = temp.path().join("compacted_only.jsonl");
+        std::fs::write(
+            &compacted_only,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T22:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"comp-id\",\"cwd\":\"/tmp\"}}\n",
+                "{\"timestamp\":\"2026-03-06T22:00:01Z\",\"type\":\"compacted\",\"payload\":{\"message\":\"\",\"replacement_history\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"Recovered user\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Recovered assistant\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let comp_msgs = load_messages(&compacted_only).expect("load compacted replacement_history");
+        assert_eq!(comp_msgs.len(), 2);
+        assert_eq!(comp_msgs[0].role, "user");
+        assert_eq!(comp_msgs[0].content, "Recovered user");
+        assert_eq!(comp_msgs[1].role, "assistant");
+        assert_eq!(comp_msgs[1].content, "Recovered assistant");
+
+        // 3. Legacy `event_msg`-only rollout
+        let legacy_exec = temp.path().join("legacy_exec.jsonl");
+        std::fs::write(
+            &legacy_exec,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T23:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"exec-id\",\"cwd\":\"/tmp\"}}\n",
+                "{\"timestamp\":\"2026-03-06T23:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Legacy exec prompt\"}}\n",
+                "{\"timestamp\":\"2026-03-06T23:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Legacy exec reply\"}}\n",
+            ),
+        )
+        .unwrap();
+        let exec_msgs = load_messages(&legacy_exec).expect("load legacy event_msg rollout");
+        assert_eq!(exec_msgs.len(), 2);
+        assert_eq!(exec_msgs[0].role, "user");
+        assert_eq!(exec_msgs[0].content, "Legacy exec prompt");
+        assert_eq!(exec_msgs[1].role, "assistant");
+        assert_eq!(exec_msgs[1].content, "Legacy exec reply");
+    }
+
+    #[test]
+    fn oversized_index_and_global_state_files_are_bounded() {
+        let temp = tempdir().expect("tempdir");
+        let huge_index = temp.path().join(CODEX_SESSION_INDEX_FILENAME);
+        File::create(&huge_index)
+            .unwrap()
+            .set_len(MAX_INDEX_FILE_BYTES + 1)
+            .unwrap();
+        assert!(load_thread_titles_from_session_index(&huge_index).is_empty());
+        assert!(rewrite_session_index(&huge_index, "thread-1").is_err());
+
+        let huge_global = temp.path().join(".codex-global-state.json");
+        File::create(&huge_global)
+            .unwrap()
+            .set_len(MAX_INDEX_FILE_BYTES + 1)
+            .unwrap();
+        assert!(cleanup_global_state(&huge_global, "thread-1").is_err());
+        let ctx = load_project_context_in(temp.path(), "");
+        assert!(ctx.thread_projects.is_empty());
     }
 
     #[test]

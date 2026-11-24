@@ -14,7 +14,7 @@ export function Toaster() {
       richColors
       theme={sonnerTheme}
       toastOptions={{
-        duration: 2000,
+        duration: 4000,
         classNames: {
           toast:
             "group rounded-md border bg-background text-foreground shadow-lg",

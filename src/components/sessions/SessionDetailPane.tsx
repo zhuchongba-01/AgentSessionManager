@@ -7,14 +7,10 @@ import {
   Clock,
   FileText,
   FolderOpen,
-  Github,
   Hash,
   MessageSquare,
-  Monitor,
-  Moon,
   RefreshCw,
   Search,
-  Sun,
   Trash2,
   Wrench,
   X,
@@ -25,7 +21,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { GITHUB_REPOSITORY_URL } from "@/lib/githubRelease";
+import { isMac } from "@/lib/platform";
+import { sessionsApi } from "@/lib/api/sessions";
 import { cn } from "@/lib/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -63,13 +60,9 @@ interface SessionDetailPaneProps {
   isDeleting: boolean;
   onBatchDelete: () => void;
   onSingleDelete: (session: SessionMeta) => void;
-  theme: "light" | "dark" | "system";
-  resolvedTheme: "light" | "dark";
-  onSetTheme: (theme: "light" | "dark" | "system") => void;
-  onOpenUrl: (url: string) => void;
   onCopy: (text: string, successMessage: string) => void;
   onCopyMessage: (content: string) => void;
-  onCopyCode: (code: string) => void;
+  onCopyCode: (code: string) => Promise<void> | void;
 }
 
 export function SessionDetailPane({
@@ -90,10 +83,6 @@ export function SessionDetailPane({
   isDeleting,
   onBatchDelete,
   onSingleDelete,
-  theme,
-  resolvedTheme,
-  onSetTheme,
-  onOpenUrl,
   onCopy,
   onCopyMessage,
   onCopyCode,
@@ -102,6 +91,7 @@ export function SessionDetailPane({
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const detailSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const navigatedCursorRef = useRef<number | null>(null);
   const [activeMessageIndex, setActiveMessageIndex] = useState<number | null>(
     null,
   );
@@ -110,11 +100,57 @@ export function SessionDetailPane({
   const [detailSearchQuery, setDetailSearchQuery] = useState("");
   const [activeMatchCursor, setActiveMatchCursor] = useState(0);
 
+  const sessionScopeKey = `${selectedKey ?? ""}\u0000${messageRevision}`;
+  const currentSessionScopeRef = useRef(sessionScopeKey);
+  currentSessionScopeRef.current = sessionScopeKey;
+
+  const [expandedContentState, setExpandedContentState] = useState<{
+    scope: string;
+    contents: Map<number, string>;
+  }>(() => ({ scope: sessionScopeKey, contents: new Map() }));
+
+  const expandedContents = useMemo(
+    () =>
+      expandedContentState.scope === sessionScopeKey
+        ? expandedContentState.contents
+        : new Map<number, string>(),
+    [expandedContentState, sessionScopeKey],
+  );
+
+  const handleLoadMessageFullContent = useCallback(
+    async (message: SessionMessage): Promise<string> => {
+      const scopeAtRequest = sessionScopeKey;
+      const fullText = await onLoadFullContent(message);
+      const tIdx = message.transcriptIndex ?? message.index;
+      if (
+        tIdx !== undefined &&
+        currentSessionScopeRef.current === scopeAtRequest
+      ) {
+        setExpandedContentState((prev) => {
+          const base =
+            prev.scope === scopeAtRequest
+              ? prev.contents
+              : new Map<number, string>();
+          if (base.get(tIdx) === fullText) {
+            return prev.scope === scopeAtRequest
+              ? prev
+              : { scope: scopeAtRequest, contents: base };
+          }
+          const next = new Map(base);
+          next.set(tIdx, fullText);
+          return { scope: scopeAtRequest, contents: next };
+        });
+      }
+      return fullText;
+    },
+    [onLoadFullContent, sessionScopeKey],
+  );
+
   const toolMessageCount = useMemo(
     () =>
       visibleMessages.filter((message) => {
         const role = message.role.toLowerCase();
-        return role !== "user" && role !== "assistant";
+        return role !== "user" && role !== "assistant" && role !== "thinking";
       }).length,
     [visibleMessages],
   );
@@ -124,7 +160,9 @@ export function SessionDetailPane({
       hideToolMessages
         ? visibleMessages.filter((message) => {
             const role = message.role.toLowerCase();
-            return role === "user" || role === "assistant";
+            return (
+              role === "user" || role === "assistant" || role === "thinking"
+            );
           })
         : visibleMessages,
     [hideToolMessages, visibleMessages],
@@ -142,17 +180,86 @@ export function SessionDetailPane({
     [detailSearchOpen, detailSearchQuery],
   );
 
+  const hasTruncatedMessages = useMemo(
+    () => displayedMessages.some((message) => Boolean(message.truncated)),
+    [displayedMessages],
+  );
+
+  const searchRequestScopeKey = `${sessionScopeKey}\u0000${detailSearchTerms.join(" ")}`;
+  const [serverSearchState, setServerSearchState] = useState<{
+    key: string;
+    indexes: Set<number>;
+  } | null>(null);
+
+  const providerId = selectedSession?.providerId;
+  const sourcePath = selectedSession?.sourcePath;
+
+  useEffect(() => {
+    if (
+      detailSearchTerms.length === 0 ||
+      !hasTruncatedMessages ||
+      !providerId ||
+      !sourcePath
+    ) {
+      return;
+    }
+    let cancelled = false;
+    void sessionsApi
+      .searchMessages(providerId, sourcePath, detailSearchQuery)
+      .then((indices) => {
+        if (cancelled || !indices) return;
+        setServerSearchState({
+          key: searchRequestScopeKey,
+          indexes: new Set(indices),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    detailSearchQuery,
+    detailSearchTerms.length,
+    hasTruncatedMessages,
+    providerId,
+    searchRequestScopeKey,
+    sourcePath,
+  ]);
+
+  const activeServerMatches =
+    serverSearchState?.key === searchRequestScopeKey
+      ? serverSearchState.indexes
+      : null;
+
   const matchedMessageIndexes = useMemo(() => {
     if (detailSearchTerms.length === 0) return [];
     const matches: number[] = [];
     displayedMessages.forEach((message, index) => {
-      const content = message.content.toLocaleLowerCase();
-      if (detailSearchTerms.every((term) => content.includes(term))) {
+      const tIdx = message.transcriptIndex ?? message.index;
+      const candidateText =
+        (tIdx !== undefined ? expandedContents.get(tIdx) : undefined) ??
+        message.content;
+      const content = candidateText.toLocaleLowerCase();
+      const localMatch = detailSearchTerms.every((term) =>
+        content.includes(term),
+      );
+      const serverMatch =
+        tIdx !== undefined && Boolean(activeServerMatches?.has(tIdx));
+      if (localMatch || serverMatch) {
         matches.push(index);
       }
     });
     return matches;
-  }, [detailSearchTerms, displayedMessages]);
+  }, [
+    activeServerMatches,
+    detailSearchTerms,
+    displayedMessages,
+    expandedContents,
+  ]);
+
+  const matchedSet = useMemo(
+    () => new Set(matchedMessageIndexes),
+    [matchedMessageIndexes],
+  );
 
   const safeMatchCursor =
     matchedMessageIndexes.length > 0
@@ -163,6 +270,9 @@ export function SessionDetailPane({
     count: displayedMessages.length,
     getScrollElement: () => scrollContainerRef.current,
     estimateSize: () => 120,
+    initialRect: { width: 800, height: 600 },
+    getItemKey: (index) =>
+      `${selectedKey}:${messageRevision}:${displayedMessages[index]?.transcriptIndex ?? displayedMessages[index]?.index ?? index}`,
     overscan: 5,
     gap: 18,
   });
@@ -190,6 +300,7 @@ export function SessionDetailPane({
 
   useEffect(() => {
     clearHighlightTimer();
+    navigatedCursorRef.current = null;
     setActiveMessageIndex(null);
     setDetailSearchOpen(false);
     setDetailSearchQuery("");
@@ -239,7 +350,7 @@ export function SessionDetailPane({
 
   const scrollToMessage = useCallback(
     (index: number) => {
-      virtualizer.scrollToIndex(index, { align: "center", behavior: "smooth" });
+      virtualizer.scrollToIndex(index, { align: "center", behavior: "auto" });
       clearHighlightTimer();
       setActiveMessageIndex(index);
       highlightTimerRef.current = setTimeout(() => {
@@ -255,6 +366,7 @@ export function SessionDetailPane({
       if (matchedMessageIndexes.length === 0) return;
       const count = matchedMessageIndexes.length;
       const nextCursor = (safeMatchCursor + delta + count) % count;
+      navigatedCursorRef.current = nextCursor;
       setActiveMatchCursor(nextCursor);
       scrollToMessage(matchedMessageIndexes[nextCursor]);
     },
@@ -262,10 +374,38 @@ export function SessionDetailPane({
   );
 
   const closeDetailSearch = useCallback(() => {
+    navigatedCursorRef.current = null;
     setDetailSearchOpen(false);
     setDetailSearchQuery("");
     setActiveMatchCursor(0);
   }, []);
+
+  useEffect(() => {
+    if (!detailSearchOpen) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (document.querySelector('[role="dialog"], [role="listbox"]')) {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        target !== detailSearchInputRef.current &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      closeDetailSearch();
+    };
+    window.addEventListener("keydown", handleEscape, true);
+    return () => window.removeEventListener("keydown", handleEscape, true);
+  }, [closeDetailSearch, detailSearchOpen]);
 
   // 缩略导航的显示条件只看「有没有用户提问」：此前用过的像素高度、正文字数两个
   // 判据都让用户看到「有时候有、有时候没有」——判据越多，越容易出现该出现却没出现。
@@ -277,7 +417,7 @@ export function SessionDetailPane({
     <div className="asm-detail">
       <div className="asm-detail-toolbar">
         {selectedSession ? (
-          <>
+          <div className="asm-detail-breadcrumb">
             <AgentIcon
               icon={getProviderIconName(selectedSession.providerId)}
               name={getProviderLabel(selectedSession.providerId, t)}
@@ -286,7 +426,18 @@ export function SessionDetailPane({
             <span className="asm-detail-provider">
               {getProviderLabel(selectedSession.providerId, t)}
             </span>
-          </>
+            {(selectedSession.projectName || selectedSession.projectDir) && (
+              <>
+                <span className="asm-detail-crumb-sep" aria-hidden="true">
+                  /
+                </span>
+                <span className="asm-detail-crumb-dir">
+                  {selectedSession.projectName ||
+                    getBaseName(selectedSession.projectDir)}
+                </span>
+              </>
+            )}
+          </div>
         ) : (
           <span className="asm-detail-provider">
             {t("sessionManager.sessionDetail", {
@@ -302,7 +453,9 @@ export function SessionDetailPane({
             aria-pressed={hideToolMessages}
             onClick={() => {
               clearHighlightTimer();
+              navigatedCursorRef.current = null;
               setActiveMessageIndex(null);
+              setActiveMatchCursor(0);
               setHideToolMessages((prev) => !prev);
             }}
           >
@@ -341,103 +494,39 @@ export function SessionDetailPane({
                   }
                 }}
               >
-                <Search className="size-4" />
+                <Search className="size-3.5" />
               </button>
             </TooltipTrigger>
             <TooltipContent>
               {t("sessionManager.searchInSession", {
                 defaultValue: "在当前会话中搜索",
-              })}
+              })}{" "}
+              ({isMac() ? "⌘F" : "Ctrl F"})
             </TooltipContent>
           </Tooltip>
         )}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className="asm-detail-tool"
-              aria-label={t("sessionManager.openProjectGitHub", {
-                defaultValue: "在 GitHub 查看项目",
-              })}
-              onClick={() => onOpenUrl(GITHUB_REPOSITORY_URL)}
-            >
-              <Github className="size-4" />
-              <span>GitHub</span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>
-            {t("sessionManager.openProjectGitHub", {
-              defaultValue: "在 GitHub 查看项目",
-            })}
-          </TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className={cn(
-                "asm-detail-icon-tool",
-                theme === "system" && "is-active",
-              )}
-              aria-label={t("sessionManager.followSystemTheme", {
-                defaultValue: "跟随系统外观",
-              })}
-              aria-pressed={theme === "system"}
-              onClick={() => onSetTheme("system")}
-            >
-              <Monitor className="size-4" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>
-            {theme === "system"
-              ? t("sessionManager.followingSystemTheme", {
-                  defaultValue: "当前已跟随系统外观",
-                })
-              : t("sessionManager.followSystemTheme", {
-                  defaultValue: "跟随系统外观",
-                })}
-          </TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className="asm-detail-icon-tool"
-              aria-label={
-                resolvedTheme === "dark"
-                  ? t("sessionManager.switchToLightTheme", {
-                      defaultValue: "切换到明亮主题",
-                    })
-                  : t("sessionManager.switchToDarkTheme", {
-                      defaultValue: "切换到暗色主题",
-                    })
-              }
-              onClick={() =>
-                onSetTheme(resolvedTheme === "dark" ? "light" : "dark")
-              }
-            >
-              {resolvedTheme === "dark" ? (
-                <Sun className="size-4" />
-              ) : (
-                <Moon className="size-4" />
-              )}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>
-            {resolvedTheme === "dark"
-              ? t("sessionManager.switchToLightTheme", {
-                  defaultValue: "切换到明亮主题",
-                })
-              : t("sessionManager.switchToDarkTheme", {
-                  defaultValue: "切换到暗色主题",
-                })}
-          </TooltipContent>
-        </Tooltip>
       </div>
       {!selectedSession ? (
-        <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-8">
-          <MessageSquare className="size-12 mb-3 opacity-30" />
-          <p className="text-sm">{t("sessionManager.selectSession")}</p>
+        <div className="asm-empty-studio">
+          <div className="asm-empty-orb" aria-hidden="true">
+            <MessageSquare className="size-6" />
+          </div>
+          <p className="text-sm font-medium text-foreground/85">
+            {t("sessionManager.selectSession")}
+          </p>
+          <div className="asm-empty-shortcuts" aria-hidden="true">
+            <span>
+              <kbd className="asm-search-kbd">↑ ↓</kbd> 切换会话
+            </span>
+            <span>
+              <kbd className="asm-search-kbd">{isMac() ? "⌘K" : "Ctrl K"}</kbd>{" "}
+              搜索列表
+            </span>
+            <span>
+              <kbd className="asm-search-kbd">{isMac() ? "⌘F" : "Ctrl F"}</kbd>{" "}
+              全文检索
+            </span>
+          </div>
         </div>
       ) : (
         <>
@@ -459,7 +548,7 @@ export function SessionDetailPane({
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="h-8 gap-1.5 rounded-md px-3 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+                      className="asm-delete-btn h-8 gap-1.5 px-3 text-xs"
                       // 批量管理模式下只要有选中项，这个按钮就必须和
                       // 「批量删除」同义：否则用户多选之后点这里，只会
                       // 删掉右侧当前打开的那一条（多选被静默忽略）。
@@ -644,11 +733,14 @@ export function SessionDetailPane({
                 })}
                 value={detailSearchQuery}
                 onChange={(event) => {
+                  navigatedCursorRef.current = null;
                   setDetailSearchQuery(event.target.value);
                   setActiveMatchCursor(0);
                 }}
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {
+                    event.preventDefault();
+                    event.stopPropagation();
                     closeDetailSearch();
                     return;
                   }
@@ -659,12 +751,10 @@ export function SessionDetailPane({
                     event.preventDefault();
                     if (event.shiftKey) {
                       navigateMatch(-1);
-                    } else if (
-                      activeMessageIndex ===
-                      matchedMessageIndexes[safeMatchCursor]
-                    ) {
+                    } else if (navigatedCursorRef.current === safeMatchCursor) {
                       navigateMatch(1);
                     } else {
+                      navigatedCursorRef.current = safeMatchCursor;
                       scrollToMessage(matchedMessageIndexes[safeMatchCursor]);
                     }
                   }
@@ -797,7 +887,7 @@ export function SessionDetailPane({
                   >
                     {virtualizer.getVirtualItems().map((virtualRow) => (
                       <div
-                        key={`${selectedKey}:${virtualRow.key}`}
+                        key={virtualRow.key}
                         data-index={virtualRow.index}
                         ref={virtualizer.measureElement}
                         style={{
@@ -813,9 +903,16 @@ export function SessionDetailPane({
                           messageRevision={messageRevision}
                           isCodexSession={isCodexSession}
                           highlightTerms={detailSearchTerms}
+                          isSearchMatch={matchedSet.has(virtualRow.index)}
+                          isActiveSearchMatch={
+                            detailSearchOpen &&
+                            matchedMessageIndexes.length > 0 &&
+                            matchedMessageIndexes[safeMatchCursor] ===
+                              virtualRow.index
+                          }
                           onCopy={onCopyMessage}
                           onCopyCode={onCopyCode}
-                          onLoadFullContent={onLoadFullContent}
+                          onLoadFullContent={handleLoadMessageFullContent}
                           isActive={activeMessageIndex === virtualRow.index}
                         />
                       </div>

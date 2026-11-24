@@ -5,4 +5,5 @@ pub mod grokbuild;
 pub mod opencode;
 pub mod pi;
 pub(crate) mod utils;
+pub mod workbuddy;
 pub mod zcode;

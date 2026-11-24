@@ -81,6 +81,11 @@ export function SessionMinimap({
   );
 
   useEffect(() => {
+    setHoveredTurnIndex(null);
+    setHoverCard(null);
+  }, [messages, messageIndexes]);
+
+  useEffect(() => {
     const element = containerRef.current;
     if (!element) return;
     const updateHeight = () => setContainerHeight(element.clientHeight);

@@ -46,7 +46,34 @@ export const sessionsApi = {
     providerId: string,
     sourcePath: string,
   ): Promise<SessionMessage[]> {
-    return await invoke("get_session_messages", { providerId, sourcePath });
+    const messages = await invoke<SessionMessage[]>("get_session_messages", {
+      providerId,
+      sourcePath,
+    });
+    return messages.map((msg, idx) => ({
+      ...msg,
+      transcriptIndex: msg.transcriptIndex ?? msg.index ?? idx,
+    }));
+  },
+
+  /**
+   * 在后端完整未截断会话记录中搜索匹配所有关键词的消息下标（0..total-1）。
+   * 若后端暂未提供该命令或调用失败，返回 `null` 以便前端无缝回退本地搜索。
+   */
+  async searchMessages(
+    providerId: string,
+    sourcePath: string,
+    query: string,
+  ): Promise<number[] | null> {
+    try {
+      return await invoke<number[]>("search_session_messages", {
+        providerId,
+        sourcePath,
+        query,
+      });
+    } catch {
+      return null;
+    }
   },
 
   /**
@@ -151,7 +178,15 @@ export const sessionsApi = {
               ) {
                 throw protocolError("messages start/total 不匹配");
               }
-              for (const message of chunk.messages) messages.push(message);
+              for (const [offset, message] of chunk.messages.entries()) {
+                messages.push({
+                  ...message,
+                  transcriptIndex:
+                    message.transcriptIndex ??
+                    message.index ??
+                    chunk.start + offset,
+                });
+              }
               onProgress?.(messages.slice());
               break;
             case "done":

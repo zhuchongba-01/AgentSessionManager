@@ -35,8 +35,17 @@ test("the shipped inline script hash matches the shipped CSP", () => {
 
 test("digests only inline scripts, ignoring src scripts", () => {
   const inline = "(function(){var a=1})()";
-  const html = `<script src="./main.tsx"></script><script>${inline}</script>`;
-  assert.deepEqual(inlineScriptDigests(html), [sha256(inline)]);
+  const inlineModule = "window.__boot = true;";
+  const html = [
+    '<script src="./main.tsx"></script>',
+    '<script type="module" src="./entry.tsx"></script>',
+    `<script>${inline}</script>`,
+    `<SCRIPT type="module" data-src="ignored">${inlineModule}</SCRIPT>`,
+  ].join("");
+  assert.deepEqual(inlineScriptDigests(html), [
+    sha256(inline),
+    sha256(inlineModule),
+  ]);
 });
 
 test("accepts a CSP that covers every inline script", (t) => {
@@ -72,6 +81,33 @@ test("fails closed when the CSP declares no sha256 source", (t) => {
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
   assert.throws(() => checkCspHashes(root), /no sha256 source/);
+});
+
+test("ignores sha256 hashes declared outside script-src", (t) => {
+  const inline = "(function(){var a=1})()";
+  const root = fixture({
+    html: `<script>${inline}</script>`,
+    csp: `default-src 'self'; style-src 'self' 'sha256-${sha256(inline)}'; script-src 'self'`,
+  });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  assert.throws(() => checkCspHashes(root), /no sha256 source/);
+});
+
+test("rejects extra stale sha256 hashes in script-src alongside valid ones", (t) => {
+  const inline = "(function(){var a=1})()";
+  const valid = sha256(inline);
+  const stale = sha256("obsolete()");
+  const root = fixture({
+    html: `<script type="module">${inline}</script>`,
+    csp: `default-src 'self'; script-src 'self' 'sha256-${valid}' 'sha256-${stale}'`,
+  });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const result = checkCspHashes(root);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.extra, [stale]);
 });
 
 test("CLI resolves the project from its own location and reports drift", (t) => {

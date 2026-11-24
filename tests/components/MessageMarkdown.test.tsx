@@ -7,12 +7,9 @@ describe("MessageMarkdown", () => {
     const onCopyCode = vi.fn();
     render(
       <MessageMarkdown
-        content={[
-          "Here is a fix:",
-          "```ts",
-          "const answer = 42;",
-          "```",
-        ].join("\n")}
+        content={["Here is a fix:", "```ts", "const answer = 42;", "```"].join(
+          "\n",
+        )}
         onCopyCode={onCopyCode}
       />,
     );
@@ -23,7 +20,63 @@ describe("MessageMarkdown", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "复制代码" }));
     expect(onCopyCode).toHaveBeenCalledTimes(1);
-    expect(onCopyCode).toHaveBeenCalledWith("const answer = 42;");
+    expect(onCopyCode).toHaveBeenCalledWith("const answer = 42;", 1);
+  });
+
+  it("awaits async onCopyCode before showing copied state", async () => {
+    let resolveCopy!: () => void;
+    const onCopyCode = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCopy = resolve;
+        }),
+    );
+
+    render(
+      <MessageMarkdown
+        content={["```ts", "const delayed = true;", "```"].join("\n")}
+        onCopyCode={onCopyCode}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "复制代码" }));
+    expect(screen.queryByRole("button", { name: "已复制" })).toBeNull();
+
+    resolveCopy();
+    expect(
+      await screen.findByRole("button", { name: "已复制" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not pollute unclosed collapsed code blocks with ellipsis inside code", () => {
+    const { container } = render(
+      <MessageMarkdown
+        content={["```ts", "const partial = 1;"].join("\n")}
+        collapsed
+        onCopyCode={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector("pre.asm-code-pre code")?.textContent).toBe(
+      "const partial = 1;",
+    );
+    expect(container.querySelector(".asm-code-truncated")).toHaveTextContent(
+      "…",
+    );
+  });
+
+  it("renders double-backtick inline code spans including nested backticks", () => {
+    const { container } = render(
+      <MessageMarkdown
+        content="Use ``double`` and `` `nested` `` inline code."
+        onCopyCode={vi.fn()}
+      />,
+    );
+
+    const codes = Array.from(
+      container.querySelectorAll("code.asm-inline-code"),
+    );
+    expect(codes.map((el) => el.textContent)).toEqual(["double", "`nested`"]);
   });
 
   it("applies diff line classes for diff code blocks", () => {

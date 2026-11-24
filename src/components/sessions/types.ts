@@ -6,7 +6,8 @@ export type ProviderFilter =
   | "opencode"
   | "pi"
   | "deepseek"
-  | "zcode";
+  | "zcode"
+  | "workbuddy";
 
 export type SessionStatusFilter =
   | "all"
@@ -35,6 +36,7 @@ export const PROVIDER_FILTER_ORDER = [
   "deepseek",
   "grokbuild",
   "claude",
+  "workbuddy",
   "opencode",
   "zcode",
   "pi",

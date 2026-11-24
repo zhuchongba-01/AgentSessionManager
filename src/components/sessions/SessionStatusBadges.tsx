@@ -8,7 +8,7 @@ import { useTranslation } from "react-i18next";
 import type { SessionMeta } from "@/types";
 
 const baseClass =
-  "h-[18px] shrink-0 px-1.5 py-0 text-[10px] font-medium leading-none";
+  "h-[18px] shrink-0 rounded-full px-2 py-0 text-[10px] font-medium leading-none";
 
 export function SessionStatusBadges({
   session,
@@ -32,7 +32,7 @@ export function SessionStatusBadges({
       {session.cleanupPending && (
         <Badge
           variant="outline"
-          className={`${baseClass} border-blue-500/45 text-blue-700 dark:border-blue-400/40 dark:bg-blue-500/10 dark:text-blue-300`}
+          className={`${baseClass} border-blue-500/40 bg-blue-500/[0.08] text-blue-700 dark:border-blue-400/40 dark:bg-blue-500/12 dark:text-blue-300`}
         >
           {t("sessionManager.cleanupPending", { defaultValue: "待清理" })}
         </Badge>
@@ -40,7 +40,7 @@ export function SessionStatusBadges({
       {session.archived && (
         <Badge
           variant="outline"
-          className={`${baseClass} text-muted-foreground`}
+          className={`${baseClass} bg-muted/60 text-muted-foreground`}
         >
           {t("sessionManager.archived", { defaultValue: "已归档" })}
         </Badge>
@@ -55,7 +55,7 @@ export function SessionStatusBadges({
               <Badge
                 variant="outline"
                 data-testid="session-parent-badge"
-                className={`${baseClass} max-w-[10rem] overflow-hidden border-sky-500/50 text-sky-700 dark:border-sky-500/40 dark:bg-sky-500/10 dark:text-sky-300`}
+                className={`${baseClass} max-w-[10rem] overflow-hidden border-sky-500/40 bg-sky-500/[0.08] text-sky-700 dark:border-sky-500/40 dark:bg-sky-500/12 dark:text-sky-300`}
               >
                 <span className="truncate">
                   {t("sessionManager.childOf", {
@@ -82,7 +82,7 @@ export function SessionStatusBadges({
             defaultValue:
               "本地文件仍存在，但该记录未显示在 Agent 的当前会话列表中",
           })}
-          className={`${baseClass} border-amber-500/50 text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300`}
+          className={`${baseClass} border-amber-500/45 bg-amber-500/[0.09] text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/12 dark:text-amber-300`}
         >
           {t("sessionManager.residual", { defaultValue: "残留" })}
         </Badge>

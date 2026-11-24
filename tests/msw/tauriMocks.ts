@@ -84,6 +84,9 @@ vi.mock("@tauri-apps/api/core", () => {
   return {
     Channel,
     invoke: async (command: string, payload: Record<string, unknown> = {}) => {
+      if (command === "search_session_messages") {
+        return callCommand("search_session_messages", payload);
+      }
       if (command !== "stream_session_messages") {
         return callCommand(command, payload);
       }

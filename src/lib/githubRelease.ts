@@ -45,7 +45,7 @@ const summarizeReleaseNotes = (value: unknown): string | null => {
 };
 
 const parseVersion = (value: string): number[] | null => {
-  const match = value.trim().match(/^v?(\d+(?:\.\d+)*)(?:[-+].*)?$/i);
+  const match = value.trim().match(/^v?(\d+(?:\.\d+)*)(?:\+.*)?$/i);
   if (!match) return null;
   return match[1].split(".").map(Number);
 };

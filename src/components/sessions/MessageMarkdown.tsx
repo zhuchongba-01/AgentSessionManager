@@ -25,12 +25,56 @@ const RICH_MARKDOWN_PATTERNS = [
   /^ {0,3}>\s?\S/m,
   /^ {0,3}(?:[-*+]|\d+[.)])\s+\S/m,
   /^ {0,3}(?:---+|___+|\*\*\*+)\s*$/m,
-  /`[^`\n]+`/,
+  /(`+)[^`\n].*?\1/,
   /\*\*[^*\n]+?\*\*/,
 ];
 
 export function hasRichMarkdown(content: string): boolean {
   return RICH_MARKDOWN_PATTERNS.some((pattern) => pattern.test(content));
+}
+
+function matchInlineCode(
+  text: string,
+  pos: number,
+): { content: string; nextPos: number } | { unmatchedEnd: number } {
+  let openEnd = pos;
+  while (openEnd < text.length && text[openEnd] === "`") {
+    openEnd += 1;
+  }
+  const tickLen = openEnd - pos;
+  let searchPos = openEnd;
+
+  while (searchPos < text.length) {
+    if (text[searchPos] === "\n") {
+      return { unmatchedEnd: openEnd };
+    }
+    if (text[searchPos] === "`") {
+      let closeEnd = searchPos;
+      while (closeEnd < text.length && text[closeEnd] === "`") {
+        closeEnd += 1;
+      }
+      if (closeEnd - searchPos === tickLen) {
+        let raw = text.slice(openEnd, searchPos);
+        if (
+          raw.length >= 2 &&
+          raw.startsWith(" ") &&
+          raw.endsWith(" ") &&
+          raw.trim().length > 0
+        ) {
+          raw = raw.slice(1, -1);
+        }
+        if (raw.length > 0) {
+          return { content: raw, nextPos: closeEnd };
+        }
+        return { unmatchedEnd: closeEnd };
+      }
+      searchPos = closeEnd;
+      continue;
+    }
+    searchPos += 1;
+  }
+
+  return { unmatchedEnd: openEnd };
 }
 
 function renderInlineCodeOnly(text: string, terms: string[]): ReactNode {
@@ -44,20 +88,23 @@ function renderInlineCodeOnly(text: string, terms: string[]): ReactNode {
 
   while (pos < text.length) {
     if (text[pos] === "`") {
-      const close = text.indexOf("`", pos + 1);
-      if (close > pos + 1) {
+      const matched = matchInlineCode(text, pos);
+      if ("content" in matched) {
         if (plain) {
           nodes.push(highlightText(plain, terms));
           plain = "";
         }
         nodes.push(
           <code key={key++} className="asm-inline-code">
-            {highlightText(text.slice(pos + 1, close), terms)}
+            {highlightText(matched.content, terms)}
           </code>,
         );
-        pos = close + 1;
+        pos = matched.nextPos;
         continue;
       }
+      plain += text.slice(pos, matched.unmatchedEnd);
+      pos = matched.unmatchedEnd;
+      continue;
     }
     plain += text[pos];
     pos += 1;
@@ -87,17 +134,20 @@ function renderInline(text: string, terms: string[]): ReactNode {
 
   while (pos < text.length) {
     if (text[pos] === "`") {
-      const close = text.indexOf("`", pos + 1);
-      if (close > pos + 1 && !text.slice(pos + 1, close).includes("\n")) {
+      const matched = matchInlineCode(text, pos);
+      if ("content" in matched) {
         flushPlain();
         nodes.push(
           <code key={`c-${key++}`} className="asm-inline-code">
-            {highlightText(text.slice(pos + 1, close), terms)}
+            {highlightText(matched.content, terms)}
           </code>,
         );
-        pos = close + 1;
+        pos = matched.nextPos;
         continue;
       }
+      plain += text.slice(pos, matched.unmatchedEnd);
+      pos = matched.unmatchedEnd;
+      continue;
     }
 
     if (text.startsWith("**", pos)) {
@@ -125,20 +175,28 @@ function renderInline(text: string, terms: string[]): ReactNode {
 function CodeBlock({
   lang,
   code,
+  blockIndex,
+  unclosed = false,
   highlightTerms,
   onCopyCode,
 }: {
   lang: string;
   code: string;
+  blockIndex: number;
+  unclosed?: boolean;
   highlightTerms: string[];
-  onCopyCode: (code: string) => void;
+  onCopyCode: (code: string, blockIndex: number) => Promise<void> | void;
 }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
+  const [isCopying, setIsCopying] = useState(false);
+  const mountedRef = useRef(true);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
       }
@@ -146,16 +204,40 @@ function CodeBlock({
   }, []);
 
   const handleCopy = useCallback(() => {
-    onCopyCode(code);
-    setCopied(true);
-    if (timerRef.current !== null) {
-      clearTimeout(timerRef.current);
+    if (isCopying) return;
+    let result: Promise<void> | void;
+    try {
+      result = onCopyCode(code, blockIndex);
+    } catch {
+      return;
     }
-    timerRef.current = setTimeout(() => {
-      setCopied(false);
-      timerRef.current = null;
-    }, 1500);
-  }, [code, onCopyCode]);
+
+    const markCopied = () => {
+      if (!mountedRef.current) return;
+      setCopied(true);
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+      }
+      timerRef.current = setTimeout(() => {
+        if (mountedRef.current) setCopied(false);
+        timerRef.current = null;
+      }, 1500);
+    };
+
+    if (result && typeof (result as Promise<void>).then === "function") {
+      setIsCopying(true);
+      void (result as Promise<void>)
+        .then(() => {
+          markCopied();
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (mountedRef.current) setIsCopying(false);
+        });
+    } else {
+      markCopied();
+    }
+  }, [blockIndex, code, isCopying, onCopyCode]);
 
   const normalizedLang = lang.trim().toLocaleLowerCase();
   const isDiff = normalizedLang === "diff" || normalizedLang === "patch";
@@ -168,6 +250,8 @@ function CodeBlock({
         <button
           type="button"
           className="asm-code-copy"
+          disabled={isCopying}
+          aria-busy={isCopying || undefined}
           aria-label={
             copied
               ? t("sessionManager.copied", { defaultValue: "已复制" })
@@ -212,19 +296,24 @@ function CodeBlock({
             : highlightText(code, highlightTerms)}
         </code>
       </pre>
+      {unclosed && (
+        <div className="asm-code-truncated" aria-hidden="true">
+          …
+        </div>
+      )}
     </div>
   );
 }
 
-type MarkdownBlock =
-  | { kind: "code"; lang: string; code: string }
+export type MarkdownBlock =
+  | { kind: "code"; lang: string; code: string; closed: boolean }
   | { kind: "heading"; level: number; text: string }
   | { kind: "hr" }
   | { kind: "quote"; lines: string[] }
   | { kind: "list"; ordered: boolean; items: string[] }
   | { kind: "paragraph"; text: string };
 
-function parseBlocks(content: string): MarkdownBlock[] {
+export function parseBlocks(content: string): MarkdownBlock[] {
   const lines = content.replace(/\r\n?/g, "\n").split("\n");
   const blocks: MarkdownBlock[] = [];
   let index = 0;
@@ -250,10 +339,11 @@ function parseBlocks(content: string): MarkdownBlock[] {
         codeLines.push(lines[index]);
         index += 1;
       }
-      if (index < lines.length) {
+      const closed = index < lines.length;
+      if (closed) {
         index += 1;
       }
-      blocks.push({ kind: "code", lang, code: codeLines.join("\n") });
+      blocks.push({ kind: "code", lang, code: codeLines.join("\n"), closed });
       continue;
     }
 
@@ -333,24 +423,60 @@ function parseBlocks(content: string): MarkdownBlock[] {
   return blocks;
 }
 
+export function extractFullCodeBlock(
+  fullText: string,
+  blockIndex: number,
+  previewCode: string,
+): string {
+  const blocks = parseBlocks(fullText);
+  const candidate = blocks[blockIndex];
+  if (
+    candidate?.kind === "code" &&
+    (!previewCode || candidate.code.startsWith(previewCode))
+  ) {
+    return candidate.code;
+  }
+  if (previewCode) {
+    const prefixMatch = blocks.find(
+      (block): block is Extract<MarkdownBlock, { kind: "code" }> =>
+        block.kind === "code" && block.code.startsWith(previewCode),
+    );
+    if (prefixMatch) {
+      return prefixMatch.code;
+    }
+  }
+  if (candidate?.kind === "code") {
+    return candidate.code;
+  }
+  return previewCode || fullText;
+}
+
 export const MessageMarkdown = memo(function MessageMarkdown({
   content,
+  collapsed = false,
   highlightTerms = EMPTY_HIGHLIGHT_TERMS,
   onCopyCode,
 }: {
   content: string;
+  collapsed?: boolean;
   highlightTerms?: string[];
-  onCopyCode: (code: string) => void;
+  onCopyCode: (code: string, blockIndex: number) => Promise<void> | void;
 }) {
   const blocks = useMemo(() => parseBlocks(content), [content]);
 
   if (blocks.length === 0) {
-    return <p className="asm-md-p">{highlightText(content, highlightTerms)}</p>;
+    return (
+      <p className="asm-md-p">
+        {highlightText(content, highlightTerms)}
+        {collapsed && "…"}
+      </p>
+    );
   }
 
   return (
     <div className="asm-md">
       {blocks.map((block, index) => {
+        const isLastCollapsed = collapsed && index === blocks.length - 1;
         switch (block.kind) {
           case "code":
             return (
@@ -358,6 +484,8 @@ export const MessageMarkdown = memo(function MessageMarkdown({
                 key={index}
                 lang={block.lang}
                 code={block.code}
+                blockIndex={index}
+                unclosed={isLastCollapsed && !block.closed}
                 highlightTerms={highlightTerms}
                 onCopyCode={onCopyCode}
               />
@@ -369,6 +497,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
                 className={cn("asm-md-heading", `is-h${block.level}`)}
               >
                 {renderInline(block.text, highlightTerms)}
+                {isLastCollapsed && "…"}
               </div>
             );
           case "hr":
@@ -379,6 +508,9 @@ export const MessageMarkdown = memo(function MessageMarkdown({
                 {block.lines.map((line, lineIndex) => (
                   <p key={lineIndex} className="asm-md-p">
                     {line ? renderInline(line, highlightTerms) : "\u200b"}
+                    {isLastCollapsed &&
+                      lineIndex === block.lines.length - 1 &&
+                      "…"}
                   </p>
                 ))}
               </blockquote>
@@ -391,7 +523,12 @@ export const MessageMarkdown = memo(function MessageMarkdown({
                 className={cn("asm-md-list", block.ordered && "is-ordered")}
               >
                 {block.items.map((item, itemIndex) => (
-                  <li key={itemIndex}>{renderInline(item, highlightTerms)}</li>
+                  <li key={itemIndex}>
+                    {renderInline(item, highlightTerms)}
+                    {isLastCollapsed &&
+                      itemIndex === block.items.length - 1 &&
+                      "…"}
+                  </li>
                 ))}
               </ListTag>
             );
@@ -400,6 +537,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
             return (
               <p key={index} className="asm-md-p">
                 {renderInline(block.text, highlightTerms)}
+                {isLastCollapsed && "…"}
               </p>
             );
         }

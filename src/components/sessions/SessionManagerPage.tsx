@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useTranslation } from "react-i18next";
@@ -23,7 +24,7 @@ import { sessionsApi } from "@/lib/api/sessions";
 import type { SessionMessage, SessionMeta } from "@/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
+import { cn, safeLocalStorageGet, safeLocalStorageSet } from "@/lib/utils";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import {
   checkForAvailableUpdate,
@@ -58,12 +59,29 @@ const DEFAULT_SIDEBAR_WIDTH = 320;
 const MIN_SIDEBAR_WIDTH = 240;
 const MAX_SIDEBAR_WIDTH = 520;
 
+const getEffectiveMaxSidebarWidth = () => {
+  if (
+    typeof window !== "undefined" &&
+    Number.isFinite(window.innerWidth) &&
+    window.innerWidth > 0 &&
+    window.innerWidth <= 1050
+  ) {
+    return Math.max(
+      MIN_SIDEBAR_WIDTH,
+      Math.min(MAX_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.42)),
+    );
+  }
+  return MAX_SIDEBAR_WIDTH;
+};
+
 const clampSidebarWidth = (width: number) =>
-  Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
+  Math.min(
+    getEffectiveMaxSidebarWidth(),
+    Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)),
+  );
 
 const readInitialSidebarWidth = (): number => {
-  if (typeof window === "undefined") return DEFAULT_SIDEBAR_WIDTH;
-  const raw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
+  const raw = safeLocalStorageGet(SIDEBAR_WIDTH_STORAGE_KEY);
   const parsed = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(parsed)
     ? clampSidebarWidth(parsed)
@@ -71,10 +89,7 @@ const readInitialSidebarWidth = (): number => {
 };
 
 const readInitialSessionListViewMode = (): SessionListViewMode => {
-  if (typeof window === "undefined") return "grouped";
-  const stored = window.localStorage.getItem(
-    SESSION_LIST_VIEW_MODE_STORAGE_KEY,
-  );
+  const stored = safeLocalStorageGet(SESSION_LIST_VIEW_MODE_STORAGE_KEY);
   return stored === "grouped" || stored === "flat" ? stored : "grouped";
 };
 
@@ -89,9 +104,7 @@ const readInitialSessionGroupExpansionState =
     }
 
     try {
-      const stored = window.localStorage.getItem(
-        SESSION_GROUP_EXPANSION_STORAGE_KEY,
-      );
+      const stored = safeLocalStorageGet(SESSION_GROUP_EXPANSION_STORAGE_KEY);
       const parsed = stored ? JSON.parse(stored) : null;
 
       if (!parsed || typeof parsed !== "object") {
@@ -242,7 +255,16 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       event.preventDefault();
       resizeCleanupRef.current?.();
       const startX = event.clientX;
-      const startWidth = sidebarWidthRef.current;
+      const sidebarElement =
+        (event.currentTarget.previousElementSibling as HTMLElement | null) ??
+        document.querySelector<HTMLElement>(".asm-list");
+      const renderedWidth = sidebarElement?.getBoundingClientRect().width;
+      const startWidth =
+        renderedWidth && renderedWidth > 0
+          ? clampSidebarWidth(renderedWidth)
+          : sidebarWidthRef.current;
+      sidebarWidthRef.current = startWidth;
+      setSidebarWidth(startWidth);
       setIsResizing(true);
 
       const handlePointerMove = (moveEvent: PointerEvent) => {
@@ -259,7 +281,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         window.removeEventListener("pointercancel", handlePointerUp);
         resizeCleanupRef.current = null;
         setIsResizing(false);
-        window.localStorage.setItem(
+        safeLocalStorageSet(
           SIDEBAR_WIDTH_STORAGE_KEY,
           String(sidebarWidthRef.current),
         );
@@ -278,13 +300,25 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   );
 
   const handleResizeReset = useCallback(() => {
-    setSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
-    sidebarWidthRef.current = DEFAULT_SIDEBAR_WIDTH;
-    window.localStorage.setItem(
-      SIDEBAR_WIDTH_STORAGE_KEY,
-      String(DEFAULT_SIDEBAR_WIDTH),
-    );
+    const resetWidth = clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+    setSidebarWidth(resetWidth);
+    sidebarWidthRef.current = resetWidth;
+    safeLocalStorageSet(SIDEBAR_WIDTH_STORAGE_KEY, String(resetWidth));
   }, []);
+
+  const handleResizeKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const step = event.shiftKey ? 32 : 16;
+      const delta = event.key === "ArrowRight" ? step : -step;
+      const nextWidth = clampSidebarWidth(sidebarWidthRef.current + delta);
+      sidebarWidthRef.current = nextWidth;
+      setSidebarWidth(nextWidth);
+      safeLocalStorageSet(SIDEBAR_WIDTH_STORAGE_KEY, String(nextWidth));
+    },
+    [],
+  );
 
   const searchTerms = useMemo(
     () =>
@@ -409,14 +443,11 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   );
 
   useEffect(() => {
-    window.localStorage.setItem(
-      SESSION_LIST_VIEW_MODE_STORAGE_KEY,
-      listViewMode,
-    );
+    safeLocalStorageSet(SESSION_LIST_VIEW_MODE_STORAGE_KEY, listViewMode);
   }, [listViewMode]);
 
   useEffect(() => {
-    window.localStorage.setItem(
+    safeLocalStorageSet(
       SESSION_GROUP_EXPANSION_STORAGE_KEY,
       serializeSessionGroupExpansionState(
         expandedProviderGroups,
@@ -424,6 +455,25 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       ),
     );
   }, [expandedDirectoryGroups, expandedProviderGroups]);
+
+  const wasSearchingRef = useRef(false);
+  useEffect(() => {
+    if (isSearching && !wasSearchingRef.current && groupedSessions.length > 0) {
+      setExpandedProviderGroups((current) => {
+        const next = new Set(current);
+        groupedSessions.forEach((group) => next.add(group.providerId));
+        return next;
+      });
+      setExpandedDirectoryGroups((current) => {
+        const next = new Set(current);
+        groupedSessions.forEach((group) =>
+          group.directories.forEach((dir) => next.add(dir.key)),
+        );
+        return next;
+      });
+    }
+    wasSearchingRef.current = isSearching;
+  }, [groupedSessions, isSearching]);
 
   useEffect(() => {
     if (isLoading) return;
@@ -445,20 +495,98 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     );
   }, [isLoading, sessions.length, validGroupExpansionKeys]);
 
+  const navigableSessions = useMemo(() => {
+    if (listViewMode !== "grouped") {
+      return filteredSessions;
+    }
+    const visible: SessionMeta[] = [];
+    for (const providerGroup of groupedSessions) {
+      if (!expandedProviderGroups.has(providerGroup.providerId)) continue;
+      for (const directoryGroup of providerGroup.directories) {
+        if (!expandedDirectoryGroups.has(directoryGroup.key)) continue;
+        visible.push(...directoryGroup.sessions);
+      }
+    }
+    return visible;
+  }, [
+    expandedDirectoryGroups,
+    expandedProviderGroups,
+    filteredSessions,
+    groupedSessions,
+    listViewMode,
+  ]);
+
+  const prevOrderedKeysRef = useRef<string[]>([]);
+  const keyboardNavigatedKeyRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (filteredSessions.length === 0) {
+      prevOrderedKeysRef.current = [];
       setSelectedKey(null);
       return;
     }
-    const exists = selectedKey
-      ? filteredSessions.some(
-          (session) => getSessionKey(session) === selectedKey,
-        )
-      : false;
+
+    const visualOrder =
+      listViewMode === "grouped"
+        ? groupedSessions.flatMap((providerGroup) =>
+            providerGroup.directories.flatMap(
+              (directoryGroup) => directoryGroup.sessions,
+            ),
+          )
+        : filteredSessions;
+    const currentOrderKeys = visualOrder.map(getSessionKey);
+    const currentKeySet = new Set(currentOrderKeys);
+    const exists = selectedKey ? currentKeySet.has(selectedKey) : false;
+
     if (!exists) {
-      setSelectedKey(getSessionKey(filteredSessions[0]));
+      let nextKey: string | null = null;
+      if (selectedKey) {
+        const prevKeys = prevOrderedKeysRef.current;
+        const oldIndex = prevKeys.indexOf(selectedKey);
+        if (oldIndex >= 0) {
+          for (let i = oldIndex + 1; i < prevKeys.length; i += 1) {
+            if (currentKeySet.has(prevKeys[i])) {
+              nextKey = prevKeys[i];
+              break;
+            }
+          }
+          if (!nextKey) {
+            for (let i = oldIndex - 1; i >= 0; i -= 1) {
+              if (currentKeySet.has(prevKeys[i])) {
+                nextKey = prevKeys[i];
+                break;
+              }
+            }
+          }
+        }
+      }
+      setSelectedKey(
+        nextKey ??
+          getSessionKey(
+            navigableSessions[0] ?? visualOrder[0] ?? filteredSessions[0],
+          ),
+      );
     }
-  }, [filteredSessions, selectedKey]);
+
+    prevOrderedKeysRef.current = currentOrderKeys;
+  }, [
+    filteredSessions,
+    groupedSessions,
+    listViewMode,
+    navigableSessions,
+    selectedKey,
+  ]);
+
+  useEffect(() => {
+    if (!selectedKey || keyboardNavigatedKeyRef.current !== selectedKey) {
+      return;
+    }
+    keyboardNavigatedKeyRef.current = null;
+    const selectedEl = document.querySelector<HTMLElement>(
+      ".asm-list .asm-session-item.is-selected",
+    );
+    selectedEl?.scrollIntoView?.({ block: "nearest" });
+  }, [selectedKey]);
 
   const selectedSession = useMemo(() => {
     if (!selectedKey) return null;
@@ -543,7 +671,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       } catch (error) {
         toast.error(
           extractErrorMessage(error) ||
-            t("common.error", { defaultValue: "Copy failed" }),
+            t("sessionManager.copyFailed", { defaultValue: "复制失败" }),
         );
       }
     },
@@ -564,7 +692,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
   const handleCopyCode = useCallback(
     (code: string) => {
-      void handleCopy(
+      return handleCopy(
         code,
         t("sessionManager.codeCopied", {
           defaultValue: "已复制代码片段",
@@ -632,6 +760,14 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const handleOpenUrl = useCallback(
     async (url: string) => {
       try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:") {
+          throw new Error(
+            t("sessionManager.unsupportedUrlProtocol", {
+              defaultValue: "仅允许打开 HTTPS 链接",
+            }),
+          );
+        }
         await openUrl(url);
       } catch (error) {
         toast.error(
@@ -873,23 +1009,27 @@ export function SessionManagerPage({ appId }: { appId: string }) {
       }
       if (
         (event.key === "ArrowDown" || event.key === "ArrowUp") &&
-        filteredSessions.length > 0
+        !target?.closest(".asm-detail") &&
+        target?.getAttribute("role") !== "separator" &&
+        navigableSessions.length > 0
       ) {
         event.preventDefault();
         const currentIndex = selectedKey
-          ? filteredSessions.findIndex(
+          ? navigableSessions.findIndex(
               (session) => getSessionKey(session) === selectedKey,
             )
           : -1;
         const nextIndex =
           event.key === "ArrowDown"
-            ? currentIndex < filteredSessions.length - 1
+            ? currentIndex < navigableSessions.length - 1
               ? currentIndex + 1
               : 0
             : currentIndex > 0
               ? currentIndex - 1
-              : filteredSessions.length - 1;
-        setSelectedKey(getSessionKey(filteredSessions[nextIndex]));
+              : navigableSessions.length - 1;
+        const nextKey = getSessionKey(navigableSessions[nextIndex]);
+        keyboardNavigatedKeyRef.current = nextKey;
+        setSelectedKey(nextKey);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -897,7 +1037,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   }, [
     deletion.isDialogOpen,
     exitSelectionMode,
-    filteredSessions,
+    navigableSessions,
     selectedKey,
     selectionMode,
   ]);
@@ -966,6 +1106,9 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         <section className="asm-workspace" onWheel={(e) => e.stopPropagation()}>
           <AppTitleBar
             availableUpdate={availableUpdate}
+            theme={theme}
+            resolvedTheme={resolvedTheme}
+            onSetTheme={setTheme}
             onOpenUrl={handleOpenUrl}
           />
 
@@ -973,33 +1116,37 @@ export function SessionManagerPage({ appId }: { appId: string }) {
             {includesPiSessions &&
               piSessionDiscovery.data?.status ===
                 "requires_project_context" && (
-                <div
-                  role="status"
-                  className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200"
-                >
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    {t("sessionManager.piRelativeSessionDir")}{" "}
-                    <code>{piSessionDiscovery.data.configuredPath}</code>
-                  </span>
+                <div className="asm-banner-wrap">
+                  <div
+                    role="status"
+                    className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+                  >
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      {t("sessionManager.piRelativeSessionDir")}{" "}
+                      <code>{piSessionDiscovery.data.configuredPath}</code>
+                    </span>
+                  </div>
                 </div>
               )}
             {includesPiSessions &&
               (piSessionDiscovery.data?.status === "unavailable" ||
                 piSessionDiscovery.isError) && (
-                <div
-                  role="alert"
-                  className="flex shrink-0 items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-800 dark:text-red-200"
-                >
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    {t("sessionManager.piDiscoveryUnavailable", {
-                      error:
-                        piSessionDiscovery.data?.status === "unavailable"
-                          ? piSessionDiscovery.data.reason
-                          : extractErrorMessage(piSessionDiscovery.error),
-                    })}
-                  </span>
+                <div className="asm-banner-wrap">
+                  <div
+                    role="alert"
+                    className="flex shrink-0 items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-800 dark:text-red-200"
+                  >
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      {t("sessionManager.piDiscoveryUnavailable", {
+                        error:
+                          piSessionDiscovery.data?.status === "unavailable"
+                            ? piSessionDiscovery.data.reason
+                            : extractErrorMessage(piSessionDiscovery.error),
+                      })}
+                    </span>
+                  </div>
                 </div>
               )}
             <div
@@ -1058,16 +1205,18 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
               <div
                 role="separator"
+                tabIndex={0}
                 aria-orientation="vertical"
                 aria-label={t("sessionManager.resizeSidebar", {
                   defaultValue: "调整侧边栏宽度",
                 })}
                 aria-valuenow={sidebarWidth}
                 aria-valuemin={MIN_SIDEBAR_WIDTH}
-                aria-valuemax={MAX_SIDEBAR_WIDTH}
+                aria-valuemax={getEffectiveMaxSidebarWidth()}
                 className="asm-resizer"
                 onPointerDown={handleResizeStart}
                 onDoubleClick={handleResizeReset}
+                onKeyDown={handleResizeKeyDown}
               />
 
               <SessionDetailPane
@@ -1088,10 +1237,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 isDeleting={deletion.isDeleting}
                 onBatchDelete={openBatchDeleteDialog}
                 onSingleDelete={handleSingleDelete}
-                theme={theme}
-                resolvedTheme={resolvedTheme}
-                onSetTheme={setTheme}
-                onOpenUrl={handleOpenUrl}
                 onCopy={(text, message) => void handleCopy(text, message)}
                 onCopyMessage={handleCopyMessage}
                 onCopyCode={handleCopyCode}

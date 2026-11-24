@@ -6,9 +6,12 @@ import {
 } from "@/lib/githubRelease";
 
 describe("GitHub release update check", () => {
-  it("compares numeric release versions", () => {
+  it("compares numeric release versions and rejects hyphenated prereleases", () => {
     expect(isVersionNewer("1.3.9", "1.3.8")).toBe(true);
     expect(isVersionNewer("1.10.0", "1.9.9")).toBe(true);
+    expect(isVersionNewer("1.4.0+build.1", "1.3.9")).toBe(true);
+    expect(isVersionNewer("1.5.0-rc.1", "1.4.9")).toBe(false);
+    expect(isVersionNewer("v2.0.0-beta.1", "1.5.0")).toBe(false);
     expect(isVersionNewer("v1.3.8", "1.3.8")).toBe(false);
     expect(isVersionNewer("1.3.7", "1.3.8")).toBe(false);
     expect(isVersionNewer("not-a-version", "1.3.8")).toBe(false);

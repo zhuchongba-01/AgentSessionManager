@@ -66,13 +66,33 @@ impl MemberFingerprint {
 
     fn of_source(path: &Path, end_byte_offset: Option<u64>) -> io::Result<Self> {
         let metadata = fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Transcript source is not a regular file",
+            ));
+        }
         let mut fingerprint = Self::of_metadata(&metadata);
         let effective_len =
             end_byte_offset.map_or(metadata.len(), |limit| metadata.len().min(limit));
         if effective_len <= MAX_DIGESTED_SOURCE_BYTES && should_digest_member(path, &metadata) {
-            fingerprint.digest = Some(digest_file(path, end_byte_offset)?);
+            fingerprint.digest = Some(digest_file(
+                path,
+                Some(effective_len.min(MAX_DIGESTED_SOURCE_BYTES)),
+            )?);
         }
         Ok(fingerprint)
+    }
+
+    pub fn matches(&self, incoming: &Self) -> bool {
+        if self.modified != incoming.modified || self.len != incoming.len {
+            return false;
+        }
+        match (self.digest, incoming.digest) {
+            (Some(a), Some(b)) => a == b,
+            (Some(_), None) | (None, Some(_)) => self.modified.is_some(),
+            (None, None) => true,
+        }
     }
 }
 
@@ -112,6 +132,24 @@ fn digest_file(path: &Path, limit: Option<u64>) -> io::Result<u64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
     pub members: Vec<(PathBuf, Option<MemberFingerprint>)>,
+}
+
+impl Fingerprint {
+    pub fn matches(&self, incoming: &Self) -> bool {
+        self.members.len() == incoming.members.len()
+            && self
+                .members
+                .iter()
+                .zip(&incoming.members)
+                .all(|((path_a, fp_a), (path_b, fp_b))| {
+                    path_a == path_b
+                        && match (fp_a, fp_b) {
+                            (Some(a), Some(b)) => a.matches(b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
+    }
 }
 
 /// 正文源：有序的「文件 + 只读到该字节偏移」。`None` 表示读到文件末尾。
@@ -259,9 +297,15 @@ struct Entry {
     transcript: Arc<Transcript>,
 }
 
+#[derive(Default)]
+struct CacheState {
+    entries: VecDeque<Entry>,
+    generation: u64,
+}
+
 /// 按 LRU 控制容量：最多 [`MAX_ENTRIES`] 个会话、合计约 [`MAX_TOTAL_BYTES`]。
 pub struct TranscriptCache {
-    entries: Mutex<VecDeque<Entry>>,
+    state: Mutex<CacheState>,
     max_entries: usize,
     max_bytes: usize,
 }
@@ -269,15 +313,15 @@ pub struct TranscriptCache {
 impl TranscriptCache {
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
-            entries: Mutex::new(VecDeque::new()),
+            state: Mutex::new(CacheState::default()),
             max_entries,
             max_bytes,
         }
     }
 
     /// 锁中毒（上次解析 panic）时继续使用现有缓存，不影响本轮结果
-    fn lock(&self) -> MutexGuard<'_, VecDeque<Entry>> {
-        match self.entries.lock() {
+    fn lock(&self) -> MutexGuard<'_, CacheState> {
+        match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -295,45 +339,55 @@ impl TranscriptCache {
     where
         F: FnOnce() -> Result<Transcript, String>,
     {
-        {
-            let mut entries = self.lock();
-            if let Some(index) = entries.iter().position(|entry| entry.key == key) {
-                if entries[index].fingerprint == fingerprint {
-                    // 命中：移到队尾，保持 LRU 顺序
-                    if let Some(entry) = entries.remove(index) {
+        let gen_before = {
+            let mut state = self.lock();
+            if let Some(index) = state.entries.iter().position(|entry| entry.key == key) {
+                if state.entries[index].fingerprint.matches(&fingerprint) {
+                    // 命中：移到队尾，保持 LRU 顺序（保留已有摘要供同秒改写比对）
+                    if let Some(entry) = state.entries.remove(index) {
                         let transcript = Arc::clone(&entry.transcript);
-                        entries.push_back(entry);
+                        state.entries.push_back(entry);
                         return Ok((transcript, true));
                     }
                 } else {
                     // 指纹变了：旧结果作废，重新解析
-                    entries.remove(index);
+                    state.entries.remove(index);
                 }
             }
-        }
+            state.generation
+        };
 
         let mut transcript = load()?;
-        // 由实际容量决定是否保留正文，不能让调用方提前标记为已缓存。
-        // 零条目容量也表示不缓存；否则新条目会在插入后立即被淘汰。
-        transcript.cacheable = self.max_entries > 0 && transcript.approx_bytes <= self.max_bytes;
+        // 由实际容量与世代一致性决定是否保留正文，不能让调用方提前标记为已缓存。
+        let within_budget = self.max_entries > 0 && transcript.approx_bytes <= self.max_bytes;
+        if !within_budget {
+            transcript.cacheable = false;
+            return Ok((Arc::new(transcript), false));
+        }
+
+        let mut state = self.lock();
+        if state.generation != gen_before {
+            transcript.cacheable = false;
+            return Ok((Arc::new(transcript), false));
+        }
+
+        transcript.cacheable = true;
         let transcript = Arc::new(transcript);
-        // 超过总上限的单个会话不进缓存，否则会立刻把其他条目全部挤掉
-        if transcript.cacheable {
-            let mut entries = self.lock();
-            entries.push_back(Entry {
-                key,
-                fingerprint,
-                transcript: Arc::clone(&transcript),
-            });
-            while entries.len() > self.max_entries
-                || entries
-                    .iter()
-                    .map(|entry| entry.transcript.approx_bytes)
-                    .sum::<usize>()
-                    > self.max_bytes
-            {
-                entries.pop_front();
-            }
+        state.entries.retain(|entry| entry.key != key);
+        state.entries.push_back(Entry {
+            key,
+            fingerprint,
+            transcript: Arc::clone(&transcript),
+        });
+        while state.entries.len() > self.max_entries
+            || state
+                .entries
+                .iter()
+                .map(|entry| entry.transcript.approx_bytes)
+                .sum::<usize>()
+                > self.max_bytes
+        {
+            state.entries.pop_front();
         }
         Ok((transcript, false))
     }
@@ -341,12 +395,18 @@ impl TranscriptCache {
     /// 删除会话后整体作废。删除会级联清理同 ID 的历史副本与索引，逐个推导受影响
     /// 的缓存键容易漏；删除是低频操作，整体清空最安全。
     pub fn clear(&self) {
-        self.lock().clear();
+        let mut state = self.lock();
+        state.entries.clear();
+        state.generation = state.generation.wrapping_add(1);
     }
 
     #[cfg(test)]
     fn keys(&self) -> Vec<String> {
-        self.lock().iter().map(|entry| entry.key.clone()).collect()
+        self.lock()
+            .entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect()
     }
 }
 
@@ -812,5 +872,97 @@ mod tests {
         std::fs::write(&path, "world-2222").unwrap();
         let fp_prefix_c = MemberFingerprint::of_source(&path, Some(5)).unwrap();
         assert_ne!(fp_prefix_a.digest, fp_prefix_c.digest);
+    }
+
+    #[test]
+    fn non_regular_file_is_rejected_by_member_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = MemberFingerprint::of_source(temp.path(), None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn aging_past_two_seconds_keeps_cache_hit_while_same_second_rewrite_misses() {
+        let cache = TranscriptCache::new(MAX_ENTRIES, MAX_TOTAL_BYTES);
+        let key = test_key("claude", KEY_A);
+        let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+
+        let young = Fingerprint {
+            members: vec![(
+                PathBuf::from(KEY_A),
+                Some(MemberFingerprint {
+                    modified: mtime,
+                    len: 42,
+                    digest: Some(0x1111),
+                }),
+            )],
+        };
+        let aged = Fingerprint {
+            members: vec![(
+                PathBuf::from(KEY_A),
+                Some(MemberFingerprint {
+                    modified: mtime,
+                    len: 42,
+                    digest: None,
+                }),
+            )],
+        };
+        let rewritten_same_second = Fingerprint {
+            members: vec![(
+                PathBuf::from(KEY_A),
+                Some(MemberFingerprint {
+                    modified: mtime,
+                    len: 42,
+                    digest: Some(0x2222),
+                }),
+            )],
+        };
+
+        let (_, hit) = cache
+            .get_or_load(key.clone(), young, || Ok(transcript("v1")))
+            .unwrap();
+        assert!(!hit);
+
+        // File aged past 2s without mtime/len changing -> must still hit!
+        let (res, hit) = cache
+            .get_or_load(key.clone(), aged, || panic!("must hit aged entry"))
+            .unwrap();
+        assert!(hit);
+        assert_eq!(res.messages[0].content, "v1");
+
+        // Same-second rewrite with different digest -> must miss!
+        let (res2, hit) = cache
+            .get_or_load(key, rewritten_same_second, || Ok(transcript("v2")))
+            .unwrap();
+        assert!(!hit);
+        assert_eq!(res2.messages[0].content, "v2");
+    }
+
+    #[test]
+    fn clear_during_load_prevents_stale_insertion_and_deduplicates_concurrent_keys() {
+        let cache = TranscriptCache::new(MAX_ENTRIES, MAX_TOTAL_BYTES);
+        let key = test_key("claude", KEY_A);
+
+        let (stale, hit) = cache
+            .get_or_load(key.clone(), stamp(10), || {
+                cache.clear();
+                Ok(transcript("stale"))
+            })
+            .unwrap();
+        assert!(!hit);
+        assert!(!stale.cacheable);
+        assert!(cache.keys().is_empty());
+
+        // Concurrent duplicate load of the same key in the same generation deduplicates cleanly.
+        let (_, hit) = cache
+            .get_or_load(key.clone(), stamp(10), || {
+                let _ = cache
+                    .get_or_load(key.clone(), stamp(10), || Ok(transcript("inner")))
+                    .unwrap();
+                Ok(transcript("outer"))
+            })
+            .unwrap();
+        assert!(!hit);
+        assert_eq!(cache.keys().len(), 1);
     }
 }

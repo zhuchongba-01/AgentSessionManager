@@ -219,7 +219,10 @@ describe("SessionMessageItem", () => {
   });
 
   it("folds multi-line non-truncated tool output and toggles expansion", () => {
-    const lines = Array.from({ length: 12 }, (_, idx) => `tool line ${idx + 1}`);
+    const lines = Array.from(
+      { length: 12 },
+      (_, idx) => `tool line ${idx + 1}`,
+    );
     render(
       <SessionMessageItem
         message={{ role: "tool", content: lines.join("\n") }}
@@ -244,5 +247,128 @@ describe("SessionMessageItem", () => {
     expect(collapseButton).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(collapseButton);
     expect(screen.queryByText(/tool line 12/)).not.toBeInTheDocument();
+  });
+
+  it("renders thinking messages collapsed by default and expands or loads full content on demand", async () => {
+    const { container, rerender } = render(
+      <SessionMessageItem
+        message={{
+          role: "thinking",
+          content: "第一行思考\n第二行详细推理细节",
+        }}
+        isActive={false}
+        onCopy={vi.fn()}
+      />,
+    );
+
+    expect(container.firstElementChild).toHaveClass(
+      "asm-message",
+      "is-thinking",
+    );
+    expect(screen.getByText("思考过程")).toBeInTheDocument();
+    expect(
+      screen.getByText("第一行思考 第二行详细推理细节"),
+    ).toBeInTheDocument();
+
+    const expandBtn = screen.getByRole("button", { name: "展开思考过程" });
+    expect(expandBtn).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(expandBtn);
+
+    expect(
+      screen.getByRole("button", { name: "收起思考过程" }),
+    ).toHaveAttribute("aria-expanded", "true");
+
+    // Truncated thinking block fetches full content on expand
+    const onLoadFullContent = vi.fn(async () => "完整长思考内容：最终结论");
+    rerender(
+      <SessionMessageItem
+        message={{
+          role: "thinking",
+          content: "截断思考预览",
+          index: 2,
+          truncated: true,
+          contentChars: 6000,
+        }}
+        isActive={false}
+        onCopy={vi.fn()}
+        onLoadFullContent={onLoadFullContent}
+      />,
+    );
+
+    expect(onLoadFullContent).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "展开思考过程" }));
+    expect(
+      await screen.findByText("完整长思考内容：最终结论"),
+    ).toBeInTheDocument();
+    expect(onLoadFullContent).toHaveBeenCalledTimes(1);
+  });
+
+  it("copies full un-sliced code block when collapsed locally or truncated on backend", async () => {
+    const onCopyCode = vi.fn();
+    const fullCode = Array.from(
+      { length: 120 },
+      (_, idx) => `const line_${idx} = ${idx};`,
+    ).join("\n");
+    const longMarkdown = [
+      "完整实现如下：",
+      "```ts",
+      fullCode,
+      "```",
+      "收尾说明".repeat(300),
+    ].join("\n");
+    expect(longMarkdown.length).toBeGreaterThan(3000);
+
+    // 1. Locally collapsed (> 3000 chars, not server-truncated)
+    const { unmount } = render(
+      <SessionMessageItem
+        message={{ role: "assistant", content: longMarkdown }}
+        isActive={false}
+        onCopy={vi.fn()}
+        onCopyCode={onCopyCode}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: /展开完整内容/ }),
+    ).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(screen.getByRole("button", { name: "复制代码" }));
+    expect(onCopyCode).toHaveBeenCalledWith(fullCode);
+    unmount();
+
+    // 2. Server-truncated (> 4096 chars, preview sliced at 1500 chars)
+    onCopyCode.mockReset();
+    let resolveFull!: (val: string) => void;
+    const onLoadFullContent = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveFull = resolve;
+        }),
+    );
+
+    render(
+      <SessionMessageItem
+        message={{
+          role: "assistant",
+          content: longMarkdown.slice(0, 1500),
+          index: 1,
+          truncated: true,
+          contentChars: longMarkdown.length,
+        }}
+        isActive={false}
+        onCopy={vi.fn()}
+        onCopyCode={onCopyCode}
+        onLoadFullContent={onLoadFullContent}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "复制代码" }));
+    await waitFor(() => expect(onLoadFullContent).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: "已复制" })).toBeNull();
+
+    resolveFull(longMarkdown);
+    await waitFor(() => expect(onCopyCode).toHaveBeenCalledWith(fullCode));
+    expect(
+      await screen.findByRole("button", { name: "已复制" }),
+    ).toBeInTheDocument();
   });
 });

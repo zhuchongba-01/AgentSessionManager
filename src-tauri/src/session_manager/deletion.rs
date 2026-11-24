@@ -18,6 +18,17 @@ struct PendingDeletion {
     last_error: Option<String>,
 }
 
+const KNOWN_PROVIDERS: &[&str] = &[
+    "codex",
+    "claude",
+    "opencode",
+    "zcode",
+    "grokbuild",
+    "pi",
+    "deepseek",
+    "workbuddy",
+];
+
 fn directory() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|p| p.join("AgentSessionManager").join("pending-deletions"))
@@ -35,12 +46,75 @@ fn operation_path(target: &SessionMeta) -> Result<PathBuf, String> {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
     }
-    Ok(directory()?.join(format!("{hash:016x}.json")))
+    let dir = directory()?;
+    let legacy = dir.join(format!("{hash:016x}.json"));
+    if legacy.exists() || !KNOWN_PROVIDERS.contains(&target.provider_id.as_str()) {
+        return Ok(legacy);
+    }
+    Ok(dir.join(format!("{}-{hash:016x}.json", target.provider_id)))
+}
+
+#[derive(Debug, Clone)]
+struct JournalWarning {
+    provider_id: Option<String>,
+    message: String,
+}
+
+fn infer_journal_provider(path: &Path, raw_text: Option<&str>) -> Option<String> {
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if let Some((prefix, hash)) = stem.rsplit_once('-') {
+            if hash.len() == 16
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && KNOWN_PROVIDERS.contains(&prefix)
+            {
+                return Some(prefix.to_string());
+            }
+        }
+    }
+    raw_text
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|val| {
+            val.get("targets")?
+                .as_array()?
+                .first()?
+                .get("providerId")?
+                .as_str()
+                .filter(|p| KNOWN_PROVIDERS.contains(p))
+                .map(str::to_string)
+        })
 }
 
 /// 删除路径保持严格：任何一份清理记录读不出都拒绝继续操作，避免丢失重试依据。
+#[allow(dead_code)]
 pub fn pending_sessions() -> Result<Vec<SessionMeta>, String> {
     strict_pending_sessions(pending_sessions_report()?)
+}
+
+/// 按 provider 隔离损坏记录的阻断范围：可归属到其他 Agent 的损坏记录只阻断对应 Agent，
+/// 无法识别归属的损坏记录继续对所有 Agent 保守阻断。
+pub fn ensure_pending_journals_healthy(provider_id: Option<&str>) -> Result<(), String> {
+    let root = directory()?;
+    ensure_pending_journals_healthy_in(&root, provider_id)
+}
+
+fn ensure_pending_journals_healthy_in(
+    root: &Path,
+    provider_id: Option<&str>,
+) -> Result<(), String> {
+    let (_, issues) = pending_sessions_detailed_in(root)?;
+    let blocking: Vec<String> = issues
+        .into_iter()
+        .filter(|issue| match (&issue.provider_id, provider_id) {
+            (Some(corrupt_provider), Some(requested)) => corrupt_provider == requested,
+            _ => true,
+        })
+        .map(|issue| issue.message)
+        .collect();
+    if blocking.is_empty() {
+        Ok(())
+    } else {
+        Err(blocking.join("；"))
+    }
 }
 
 fn strict_pending_sessions(
@@ -61,6 +135,16 @@ pub fn pending_sessions_report() -> Result<(Vec<SessionMeta>, Vec<String>), Stri
 }
 
 fn pending_sessions_report_in(root: &Path) -> Result<(Vec<SessionMeta>, Vec<String>), String> {
+    let (sessions, issues) = pending_sessions_detailed_in(root)?;
+    Ok((
+        sessions,
+        issues.into_iter().map(|issue| issue.message).collect(),
+    ))
+}
+
+fn pending_sessions_detailed_in(
+    root: &Path,
+) -> Result<(Vec<SessionMeta>, Vec<JournalWarning>), String> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -74,28 +158,67 @@ fn pending_sessions_report_in(root: &Path) -> Result<(Vec<SessionMeta>, Vec<Stri
         let path = match entry {
             Ok(entry) => entry.path(),
             Err(error) => {
-                warnings.push(format!("无法枚举清理记录目录 {}：{error}", root.display()));
+                warnings.push(JournalWarning {
+                    provider_id: None,
+                    message: format!("无法枚举清理记录目录 {}：{error}", root.display()),
+                });
                 continue;
             }
         };
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let operation = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| {
-                serde_json::from_str::<PendingDeletion>(&text).map_err(|e| e.to_string())
-            });
-        let operation = match operation {
-            Ok(operation) => operation,
+        let raw_text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
             Err(error) => {
-                warnings.push(format!(
-                    "清理记录 {} 无法读取（{error}），已暂停相关删除；请先核对后再操作",
-                    path.display()
-                ));
+                warnings.push(JournalWarning {
+                    provider_id: infer_journal_provider(&path, None),
+                    message: format!(
+                        "清理记录 {} 无法读取（{error}），已暂停相关删除；请先核对后再操作",
+                        path.display()
+                    ),
+                });
                 continue;
             }
         };
+        let operation = match serde_json::from_str::<PendingDeletion>(&raw_text) {
+            Ok(operation) => operation,
+            Err(error) => {
+                warnings.push(JournalWarning {
+                    provider_id: infer_journal_provider(&path, Some(&raw_text)),
+                    message: format!(
+                        "清理记录 {} 无法读取（{error}），已暂停相关删除；请先核对后再操作",
+                        path.display()
+                    ),
+                });
+                continue;
+            }
+        };
+        let valid_primary = operation.targets.first().is_some_and(|first| {
+            !first.provider_id.trim().is_empty()
+                && !first.session_id.trim().is_empty()
+                && first
+                    .source_path
+                    .as_deref()
+                    .is_some_and(|source| !source.trim().is_empty())
+        });
+        if !valid_primary {
+            let inferred = operation
+                .targets
+                .first()
+                .map(|first| first.provider_id.as_str())
+                .filter(|p| KNOWN_PROVIDERS.contains(p))
+                .map(str::to_string)
+                .or_else(|| infer_journal_provider(&path, Some(&raw_text)));
+            warnings.push(JournalWarning {
+                provider_id: inferred,
+                message: format!(
+                    "清理记录 {} 无法读取（缺少有效目标或会话路径），已暂停相关删除；请先核对后再操作",
+                    path.display()
+                ),
+            });
+            continue;
+        }
         // One operation has one visible retry entry. Related historical copies
         // belong to its persisted plan, not to independently retryable tasks.
         for mut target in operation.targets.into_iter().take(1) {
@@ -258,9 +381,71 @@ pub fn run_codex(
     )
 }
 
+thread_local! {
+    static LAST_EXECUTED_CODEX_UNITS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn codex_batch_path_key(raw: &str) -> String {
+    let stripped_zst = raw
+        .strip_suffix(".zst")
+        .filter(|plain| plain.ends_with(".jsonl"))
+        .unwrap_or(raw);
+    let candidate = Path::new(stripped_zst);
+    let resolved = candidate
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .and_then(|parent| {
+            let name = candidate.file_name()?;
+            Some(parent.canonicalize().ok()?.join(name))
+        })
+        .unwrap_or_else(|| candidate.to_path_buf());
+    let text = resolved.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let normalized = text.replace('/', "\\");
+        let without_prefix = normalized
+            .strip_prefix("\\\\?\\UNC\\")
+            .map(|unc| format!("\\\\{unc}"))
+            .unwrap_or_else(|| {
+                normalized
+                    .strip_prefix("\\\\?\\")
+                    .unwrap_or(&normalized)
+                    .to_string()
+            });
+        without_prefix.trim_end_matches('\\').to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        text.trim_end_matches('/').to_string()
+    }
+}
+
+fn executed_plan_units(plan: &super::providers::codex::DeletionPlan) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::to_value(plan) else {
+        return Vec::new();
+    };
+    let next_unit = value
+        .get("next_unit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let Some(units) = value.get("units").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    units
+        .iter()
+        .take(next_unit)
+        .filter_map(|unit| {
+            let session_id = unit.get("session_id")?.as_str()?.to_string();
+            let path = unit.get("path")?.as_str()?.to_string();
+            Some((session_id, path))
+        })
+        .collect()
+}
+
 /// A batch keeps its discovery snapshot fixed, but records successful exact
 /// identities. Only this in-memory evidence permits skipping an already removed
-/// residual; arbitrary missing paths still fail the ordinary plan preflight.
+/// unit/residual; arbitrary missing paths still fail the ordinary plan preflight.
 #[derive(Default)]
 pub(crate) struct CodexBatchProgress {
     completed: std::collections::HashSet<(String, String)>,
@@ -279,7 +464,7 @@ impl CodexBatchProgress {
         let key = |item: &SessionMeta| {
             (
                 item.session_id.clone(),
-                item.source_path.clone().unwrap_or_default(),
+                codex_batch_path_key(item.source_path.as_deref().unwrap_or("")),
             )
         };
         let done =
@@ -304,7 +489,14 @@ impl CodexBatchProgress {
             .filter(|item| !done(item))
             .cloned()
             .collect::<Vec<_>>();
+        LAST_EXECUTED_CODEX_UNITS.with(|units| units.borrow_mut().clear());
         let reply = action(target, &remaining)?;
+        LAST_EXECUTED_CODEX_UNITS.with(|units| {
+            for (session_id, unit_path) in units.borrow_mut().drain(..) {
+                self.completed
+                    .insert((session_id, codex_batch_path_key(&unit_path)));
+            }
+        });
         if matches!(&reply, DeleteSessionReply::Deleted { warnings } if warnings.is_empty()) {
             self.completed.insert(key(target));
             if !target.residual {
@@ -413,6 +605,10 @@ where
         operation.codex_plan = Some(progress.clone());
         persist_operation(path, &operation)
     });
+    let executed = executed_plan_units(&plan);
+    if !executed.is_empty() {
+        LAST_EXECUTED_CODEX_UNITS.with(|units| units.borrow_mut().extend(executed));
+    }
     if let Err(error) = result {
         return mark_pending(path, vec![error]);
     }
@@ -477,70 +673,305 @@ enum ProcessMatch {
     Script { missing_cmdline: bool },
 }
 
-fn match_running_process(name: &str, args: Option<&str>, provider: &str) -> Option<ProcessMatch> {
-    if process_matches(name, provider) {
-        Some(ProcessMatch::Direct)
-    } else if script_process_matches(name, args, provider) {
-        let missing_cmdline = args.is_none_or(|value| value.trim().is_empty());
-        Some(ProcessMatch::Script { missing_cmdline })
-    } else {
-        None
+struct DiscoveredProcess {
+    pid: u32,
+    name: String,
+    exe_path: Option<String>,
+    command_line: Option<String>,
+    argv: Option<Vec<String>>,
+}
+
+fn match_discovered_process(proc: &DiscoveredProcess, provider: &str) -> Option<ProcessMatch> {
+    if proc
+        .exe_path
+        .as_deref()
+        .is_some_and(|exe| process_matches(exe, provider))
+        || process_matches(&proc.name, provider)
+    {
+        return Some(ProcessMatch::Direct);
     }
+
+    let runtime_candidate = proc
+        .exe_path
+        .as_deref()
+        .filter(|exe| is_script_runtime_name(exe))
+        .or_else(|| is_script_runtime_name(&proc.name).then_some(proc.name.as_str()));
+    let runtime = runtime_candidate?;
+
+    if let Some(argv) = proc.argv.as_deref() {
+        if script_process_matches_tokens(runtime, Some(argv), provider) {
+            return Some(ProcessMatch::Script {
+                missing_cmdline: argv.is_empty(),
+            });
+        }
+        return None;
+    }
+
+    if script_process_matches(runtime, proc.command_line.as_deref(), provider) {
+        let missing_cmdline = proc
+            .command_line
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty());
+        return Some(ProcessMatch::Script { missing_cmdline });
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_status_uids(status_text: &str) -> Option<(u32, u32)> {
+    for line in status_text.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut parts = rest.split_whitespace();
+            let ruid = parts.next()?.parse::<u32>().ok()?;
+            let euid = parts.next()?.parse::<u32>().ok()?;
+            return Some((ruid, euid));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn collect_current_user_processes() -> Result<Vec<DiscoveredProcess>, String> {
+    let self_status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| format!("无法读取当前进程状态，未开始清理：{e}"))?;
+    let (self_ruid, self_euid) = parse_status_uids(&self_status)
+        .ok_or_else(|| "无法识别当前进程 UID，未开始清理".to_string())?;
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|e| format!("无法检查 /proc 运行状态，未开始清理：{e}"))?;
+    let self_pid = std::process::id();
+    let mut processes = Vec::new();
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let Ok(status_text) = std::fs::read_to_string(proc_dir.join("status")) else {
+            continue;
+        };
+        let Some((p_ruid, p_euid)) = parse_status_uids(&status_text) else {
+            continue;
+        };
+        if p_ruid != self_ruid && p_ruid != self_euid && p_euid != self_ruid && p_euid != self_euid
+        {
+            continue;
+        }
+
+        let exe_path = std::fs::read_link(proc_dir.join("exe")).ok().map(|p| {
+            let s = p.to_string_lossy();
+            s.strip_suffix(" (deleted)").unwrap_or(&s).to_string()
+        });
+        let comm = std::fs::read_to_string(proc_dir.join("comm"))
+            .ok()
+            .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
+            .unwrap_or_default();
+        let argv = std::fs::read(proc_dir.join("cmdline"))
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| {
+                bytes
+                    .split(|&b| b == 0)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tokens| !tokens.is_empty());
+
+        let display_name = exe_path
+            .as_deref()
+            .and_then(|exe| exe.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!comm.is_empty()).then(|| comm.clone()))
+            .unwrap_or_else(|| pid.to_string());
+
+        // Check comm separately via command_line fallback if comm itself matches
+        let name = if process_matches(&comm, "deepseek")
+            || process_matches(&comm, "workbuddy")
+            || !process_matches(&display_name, "deepseek")
+                && !process_matches(&display_name, "workbuddy")
+                && !comm.is_empty()
+                && exe_path.is_none()
+        {
+            comm
+        } else {
+            display_name
+        };
+
+        processes.push(DiscoveredProcess {
+            pid,
+            name,
+            exe_path,
+            command_line: None,
+            argv,
+        });
+    }
+    Ok(processes)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parse_pid_line(line: &str) -> Option<(u32, &str)> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let split_idx = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let pid = trimmed[..split_idx].parse::<u32>().ok()?;
+    let rest = trimmed[split_idx..]
+        .trim_start()
+        .trim_end_matches(['\r', '\n']);
+    Some((pid, rest))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn collect_current_user_processes() -> Result<Vec<DiscoveredProcess>, String> {
+    let comm_output = std::process::Command::new("ps")
+        .args(["-x", "-o", "pid=", "-o", "comm="])
+        .output()
+        .map_err(|e| format!("无法检查 Agent 运行状态，未开始清理：{e}"))?;
+    if !comm_output.status.success() {
+        return Err("无法检查 Agent 运行状态，未开始清理".into());
+    }
+    let args_output = std::process::Command::new("ps")
+        .args(["-x", "-o", "pid=", "-o", "args="])
+        .output()
+        .map_err(|e| format!("无法检查 Agent 运行状态，未开始清理：{e}"))?;
+    if !args_output.status.success() {
+        return Err("无法检查 Agent 运行状态，未开始清理".into());
+    }
+
+    let args_text = String::from_utf8_lossy(&args_output.stdout);
+    let mut args_by_pid = std::collections::HashMap::new();
+    for line in args_text.lines() {
+        if let Some((pid, args)) = parse_pid_line(line) {
+            args_by_pid.insert(pid, args.to_string());
+        }
+    }
+
+    let self_pid = std::process::id();
+    let comm_text = String::from_utf8_lossy(&comm_output.stdout);
+    let mut processes = Vec::new();
+    for line in comm_text.lines() {
+        let Some((pid, comm)) = parse_pid_line(line) else {
+            continue;
+        };
+        if pid == self_pid || comm.is_empty() {
+            continue;
+        }
+        let command_line = args_by_pid.remove(&pid).filter(|s| !s.trim().is_empty());
+        processes.push(DiscoveredProcess {
+            pid,
+            name: comm.to_string(),
+            exe_path: Some(comm.to_string()),
+            command_line,
+            argv: None,
+        });
+    }
+    Ok(processes)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_current_user_processes() -> Result<Vec<DiscoveredProcess>, String> {
+    use std::os::windows::process::CommandExt;
+
+    #[derive(Deserialize)]
+    struct WinProcess {
+        #[serde(rename = "ProcessId")]
+        pid: u32,
+        #[serde(rename = "Name")]
+        name: String,
+        #[serde(rename = "ExecutablePath")]
+        executable_path: Option<String>,
+        #[serde(rename = "CommandLine")]
+        command_line: Option<String>,
+    }
+
+    let script = "$ErrorActionPreference='Stop'; \
+        try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}; \
+        $sid = (Get-Process -Id $PID).SessionId; \
+        ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -Filter ('SessionId = ' + $sid + ' AND ProcessId != ' + $PID) | Select-Object ProcessId,Name,ExecutablePath,CommandLine) -Compress";
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| format!("无法检查 Agent 运行状态，未开始清理：{e}"))?;
+    if !output.status.success() {
+        return Err("无法检查 Agent 运行状态，未开始清理".into());
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let trimmed = listing.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(Vec::new());
+    }
+    let parsed: Vec<WinProcess> =
+        serde_json::from_str(trimmed).map_err(|e| format!("无法解析 Agent 运行状态：{e}"))?;
+    let self_pid = std::process::id();
+    Ok(parsed
+        .into_iter()
+        .filter(|proc| proc.pid != self_pid)
+        .map(|proc| DiscoveredProcess {
+            pid: proc.pid,
+            name: proc.name,
+            exe_path: proc.executable_path,
+            command_line: proc.command_line,
+            argv: None,
+        })
+        .collect())
+}
+
+fn find_claude_lockfile_process<'a>(
+    sessions_dir: &Path,
+    processes: &'a [DiscoveredProcess],
+) -> Option<&'a DiscoveredProcess> {
+    let entries = std::fs::read_dir(sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let pid_from_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u32>().ok());
+        let pid_from_body = || {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|val| val.get("pid")?.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        let Some(lock_pid) = pid_from_name.or_else(pid_from_body) else {
+            continue;
+        };
+        if let Some(found) = processes.iter().find(|proc| proc.pid == lock_pid) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Fail closed if process inspection itself fails. No shell command contains
 /// session IDs, paths or other input from session history.
 pub fn ensure_agent_stopped(provider: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    let output = {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine) -Compress"])
-            .creation_flags(0x08000000).output()
-    };
-    #[cfg(not(target_os = "windows"))]
-    let output = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=", "-o", "comm=", "-o", "args="])
-        .output();
-    let output = output.map_err(|e| format!("无法检查 Agent 运行状态，未开始清理：{e}"))?;
-    if !output.status.success() {
-        return Err("无法检查 Agent 运行状态，未开始清理".into());
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
-    #[cfg(target_os = "windows")]
-    let blocked = {
-        #[derive(Deserialize)]
-        struct Process {
-            #[serde(rename = "ProcessId")]
-            pid: u32,
-            #[serde(rename = "Name")]
-            name: String,
-            #[serde(rename = "CommandLine")]
-            command_line: Option<String>,
-        }
-        let processes: Vec<Process> = serde_json::from_str(listing.trim_start_matches('\u{feff}'))
-            .map_err(|e| format!("无法解析 Agent 运行状态：{e}"))?;
-        processes.iter().find_map(|process| {
-            match_running_process(&process.name, process.command_line.as_deref(), provider)
-                .map(|kind| (process.pid.to_string(), process.name.clone(), kind))
-        })
-    };
-    #[cfg(not(target_os = "windows"))]
-    let blocked = listing.lines().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let (pid, rest) = trimmed
-            .split_once(char::is_whitespace)
-            .unwrap_or((trimmed, ""));
-        let rest = rest.trim_start();
-        let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        match_running_process(name, Some(args), provider)
-            .map(|kind| (pid.to_string(), name.to_string(), kind))
-    });
-    if let Some((pid, name, kind)) = blocked {
+    let processes = collect_current_user_processes()?;
+
+    if let Some((pid, name, kind)) = processes.iter().find_map(|proc| {
+        match_discovered_process(proc, provider)
+            .map(|kind| (proc.pid.to_string(), proc.name.clone(), kind))
+    }) {
         return match kind {
             ProcessMatch::Script {
                 missing_cmdline: true,
@@ -552,34 +983,91 @@ pub fn ensure_agent_stopped(provider: &str) -> Result<(), String> {
             )),
         };
     }
+
+    if provider == "claude" {
+        let sessions_dir = crate::session_paths::claude_config_dir().join("sessions");
+        if let Some(proc) = find_claude_lockfile_process(&sessions_dir, &processes) {
+            return Err(format!(
+                "请先完全退出 {provider}（检测到进程 {} [PID {}]，包括后台进程和终端任务），再清理会话",
+                proc.name, proc.pid
+            ));
+        }
+    }
+
+    if provider == "workbuddy" {
+        for home in crate::session_paths::workbuddy_homes() {
+            let sessions_dir = home.join("sessions");
+            if let Some(proc) = find_claude_lockfile_process(&sessions_dir, &processes) {
+                return Err(format!(
+                    "请先完全退出 {provider}（检测到进程 {} [PID {}]，包括后台进程和终端任务），再清理会话",
+                    proc.name, proc.pid
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn process_matches(executable: &str, provider: &str) -> bool {
-    let name = executable
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(executable)
-        .to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    // The packaged Windows app is not a node/bun runtime. Match its product
-    // name exactly rather than allowing similarly named helper applications.
-    if provider == "deepseek" && name == "deepseek harness" {
-        return true;
-    }
-    let aliases: &[&str] = match provider {
-        "codex" => &["codex"],
-        "claude" => &["claude", "claude-code"],
-        "opencode" => &["opencode"],
-        "zcode" => &["zcode"],
-        "grokbuild" => &["grok", "grokbuild"],
-        "pi" => &["pi"],
-        "deepseek" => &["dsh", "deepseek-harness"],
-        _ => &[],
-    };
+fn matches_alias(name: &str, aliases: &[&str]) -> bool {
     aliases
         .iter()
         .any(|alias| name == *alias || name.starts_with(&format!("{alias} ")))
+}
+
+fn process_matches(executable: &str, provider: &str) -> bool {
+    let lower_exec = executable.to_ascii_lowercase();
+    let raw_name = lower_exec.rsplit(['/', '\\']).next().unwrap_or(&lower_exec);
+    if raw_name.is_empty() {
+        return false;
+    }
+    if provider == "claude"
+        && (lower_exec.contains("/claude/versions/") || lower_exec.contains("\\claude\\versions\\"))
+    {
+        return true;
+    }
+    if provider == "workbuddy"
+        && (lower_exec.contains("/.workbuddy-ai/binaries/")
+            || lower_exec.contains("\\.workbuddy-ai\\binaries\\")
+            || lower_exec.contains("/.workbuddy/binaries/")
+            || lower_exec.contains("\\.workbuddy\\binaries\\"))
+    {
+        return true;
+    }
+    let name = raw_name.strip_suffix(".exe").unwrap_or(raw_name);
+    match provider {
+        "codex" => {
+            matches_alias(name, &["codex", "codex-app-server", "codex-cli"])
+                || name.starts_with("codex-")
+        }
+        "claude" => matches_alias(name, &["claude", "claude-code"]),
+        "opencode" => {
+            matches_alias(name, &["opencode", "opencode-cli", "opencode-desktop"])
+                || name.starts_with("opencode-")
+        }
+        "zcode" => matches_alias(name, &["zcode", "zcode-desktop"]) || name.starts_with("zcode-"),
+        "grokbuild" => matches_alias(name, &["grok", "grokbuild", "grok-build", "xai-grok-pager"]),
+        "pi" => matches_alias(name, &["pi", "pi-coding-agent"]),
+        // The packaged Windows app is not a node/bun runtime. Match its product
+        // name exactly rather than allowing similarly named helper applications.
+        "deepseek" => {
+            name == "deepseek harness" || matches_alias(name, &["dsh", "deepseek-harness"])
+        }
+        "workbuddy" => {
+            name == "workbuddy ai"
+                || matches_alias(
+                    name,
+                    &[
+                        "workbuddy",
+                        "workbuddyai",
+                        "workbuddy-ai",
+                        "workbuddysharetarget",
+                    ],
+                )
+                || name.starts_with("workbuddy-")
+        }
+        _ => false,
+    }
 }
 
 fn split_command_args(input: &str) -> Vec<String> {
@@ -631,6 +1119,89 @@ fn is_script_runtime_name(token: &str) -> bool {
     matches!(base, "node" | "nodejs" | "bun")
 }
 
+fn strip_script_extension(name: &str) -> &str {
+    for suffix in [".exe", ".cmd", ".bat", ".mjs", ".cjs", ".js", ".ts"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    name
+}
+
+fn strip_npm_version(segment: &str) -> &str {
+    if let Some(rest) = segment.strip_prefix('@') {
+        match rest.find('@') {
+            Some(idx) => &segment[..idx + 1],
+            None => segment,
+        }
+    } else {
+        segment.split('@').next().unwrap_or(segment)
+    }
+}
+
+fn scoped_package_matches(scope: &str, pkg: &str, provider: &str) -> bool {
+    let pkg = strip_npm_version(pkg);
+    match provider {
+        "deepseek" => scope == "@deepseek-ai" && matches!(pkg, "dsh" | "deepseek-harness"),
+        "grokbuild" => {
+            matches!(scope, "@xai-official" | "@xai")
+                && matches!(pkg, "grok" | "grokbuild" | "grok-build")
+        }
+        "claude" => scope == "@anthropic-ai" && matches!(pkg, "claude-code" | "claude"),
+        "codex" => scope == "@openai" && (pkg == "codex" || pkg.starts_with("codex-")),
+        "pi" => scope == "@mariozechner" && matches!(pkg, "pi-coding-agent" | "pi"),
+        "opencode" => {
+            matches!(scope, "@opencode-ai" | "@sst")
+                && (pkg == "opencode" || pkg.starts_with("opencode-"))
+        }
+        "zcode" => scope == "@zcode" && (pkg == "zcode" || pkg.starts_with("zcode-")),
+        "workbuddy" => {
+            matches!(scope, "@tencent" | "@codebuddy" | "@workbuddy")
+                && (pkg == "workbuddy" || pkg.starts_with("workbuddy-"))
+        }
+        _ => false,
+    }
+}
+
+fn package_or_bin_segment_matches(segment: &str, provider: &str) -> bool {
+    let pkg = strip_npm_version(segment);
+    match provider {
+        "codex" => matches!(pkg, "codex" | "codex-cli" | "codex-app-server"),
+        "claude" => matches!(pkg, "claude" | "claude-code"),
+        "opencode" => {
+            matches!(pkg, "opencode" | "opencode-ai" | "opencode-cli")
+                || pkg.starts_with("opencode-")
+        }
+        "zcode" => matches!(pkg, "zcode" | "zcode-cli") || pkg.starts_with("zcode-"),
+        "grokbuild" => matches!(pkg, "grok" | "grokbuild" | "grok-build" | "xai-grok-pager"),
+        "pi" => matches!(pkg, "pi" | "pi-coding-agent"),
+        "deepseek" => matches!(pkg, "dsh" | "deepseek-harness"),
+        "workbuddy" => {
+            matches!(pkg, "workbuddy" | "workbuddy-ai" | "workbuddy-cli")
+                || pkg.starts_with("workbuddy-")
+        }
+        _ => false,
+    }
+}
+
+fn unambiguous_package_dir_matches(segment: &str, provider: &str) -> bool {
+    let pkg = strip_npm_version(segment);
+    match provider {
+        "codex" => matches!(pkg, "codex-cli" | "codex-app-server"),
+        "claude" => pkg == "claude-code",
+        "opencode" => matches!(pkg, "opencode-ai" | "opencode-cli"),
+        "zcode" => matches!(pkg, "zcode-cli" | "zcode-desktop"),
+        "grokbuild" => matches!(pkg, "grokbuild" | "grok-build" | "xai-grok-pager"),
+        "pi" => pkg == "pi-coding-agent",
+        "deepseek" => pkg == "deepseek-harness",
+        "workbuddy" => matches!(
+            pkg,
+            "workbuddy-ai" | "workbuddy-cli" | ".workbuddy-ai" | ".workbuddy"
+        ),
+        _ => false,
+    }
+}
+
 fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) -> bool {
     if !is_script_runtime_name(executable) {
         return false;
@@ -639,24 +1210,42 @@ fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) 
         return true;
     };
     let parsed = split_command_args(args);
-    let inspected = match parsed.first() {
-        Some(argv0) if is_script_runtime_name(argv0) => &parsed[1..],
-        _ => parsed.as_slice(),
+    script_process_matches_tokens(executable, Some(&parsed), provider)
+}
+
+fn script_process_matches_tokens(
+    executable: &str,
+    tokens: Option<&[String]>,
+    provider: &str,
+) -> bool {
+    if !is_script_runtime_name(executable) {
+        return false;
+    }
+    let Some(tokens) = tokens.filter(|items| !items.is_empty()) else {
+        return true;
+    };
+    let inspected = match tokens.first() {
+        Some(argv0) if is_script_runtime_name(argv0) => &tokens[1..],
+        _ => tokens,
     };
     if inspected.is_empty() {
         return false;
     }
     let aliases: &[&str] = match provider {
-        "codex" => &["codex"],
+        "codex" => &["codex", "codex-cli", "codex-app-server"],
         "claude" => &["claude", "claude-code"],
-        "opencode" => &["opencode"],
+        "opencode" => &["opencode", "opencode-ai", "opencode-cli"],
         "zcode" => &["zcode"],
-        "grokbuild" => &["grok", "grokbuild"],
+        "grokbuild" => &["grok", "grokbuild", "grok-build", "xai-grok-pager"],
         "pi" => &["pi", "pi-coding-agent"],
         "deepseek" => &["dsh", "deepseek-harness"],
+        "workbuddy" => &["workbuddy", "workbuddy-ai", "workbuddy-cli"],
         _ => &[],
     };
     inspected.iter().any(|arg| {
+        if arg.starts_with('-') {
+            return false;
+        }
         let lower = arg.to_ascii_lowercase();
         let segments: Vec<&str> = lower
             .split(['/', '\\'])
@@ -665,19 +1254,30 @@ fn script_process_matches(executable: &str, args: Option<&str>, provider: &str) 
         let Some(&last) = segments.last() else {
             return false;
         };
-        let basename = last
-            .strip_suffix(".exe")
-            .or_else(|| last.strip_suffix(".cmd"))
-            .or_else(|| last.strip_suffix(".bat"))
-            .unwrap_or(last);
+        let basename = strip_npm_version(strip_script_extension(last));
         if aliases.contains(&basename) {
             return true;
         }
-        // Only match longer package/provider directory segments (>= 5 chars) so
-        // ordinary parent folders like `/projects/pi/` or `C:\Users\grok\` never trigger.
+        // Scoped npm packages (e.g. `@deepseek-ai/dsh/lib/bin.js`, `@xai-official/grok/bin/index.js`)
+        // or explicit package/bin directories (`node_modules/<alias>`, `bin/<alias>`, `.claude/versions`).
+        for pair in segments.windows(2) {
+            if scoped_package_matches(pair[0], pair[1], provider) {
+                return true;
+            }
+            if matches!(pair[0], "node_modules" | "bin" | ".bin")
+                && package_or_bin_segment_matches(pair[1], provider)
+            {
+                return true;
+            }
+            if provider == "claude" && pair == ["claude", "versions"] {
+                return true;
+            }
+        }
+        // Unambiguous hyphenated package directories (e.g. `/modules/pi-coding-agent/dist/cli.js`),
+        // without matching ordinary user folders like `/Users/claude/project/vite.js` or `/projects/pi/server.js`.
         segments[..segments.len() - 1]
             .iter()
-            .any(|segment| segment.len() >= 5 && aliases.contains(segment))
+            .any(|segment| unambiguous_package_dir_matches(segment, provider))
     })
 }
 
@@ -1409,5 +2009,170 @@ mod tests {
         ));
         assert!(script_process_matches("node", None, "pi"));
         assert!(!process_matches("AgentSessionManager.exe", "codex"));
+    }
+
+    #[test]
+    fn recognizes_upstream_binaries_scoped_packages_and_ignores_user_dirs() {
+        assert!(process_matches("zcode-windows-x64.exe", "zcode"));
+        assert!(process_matches("zcode-darwin-arm64", "zcode"));
+        assert!(process_matches(
+            "codex-app-server-x86_64-pc-windows-msvc.exe",
+            "codex"
+        ));
+        assert!(process_matches("xai-grok-pager", "grokbuild"));
+        assert!(process_matches(
+            "/home/alice/.local/share/claude/versions/2.1.144",
+            "claude"
+        ));
+        assert!(process_matches(
+            r"C:\Users\alice\.local\share\claude\versions\2.1.144.exe",
+            "claude"
+        ));
+        assert!(process_matches("opencode-cli", "opencode"));
+        assert!(process_matches("pi-coding-agent", "pi"));
+
+        assert!(script_process_matches(
+            "/usr/bin/node",
+            Some("node /usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"),
+            "deepseek"
+        ));
+        assert!(script_process_matches(
+            "node.exe",
+            Some(r"node C:\npm\node_modules\@xai-official\grok\bin\index.js"),
+            "grokbuild"
+        ));
+        assert!(script_process_matches(
+            "/usr/bin/node",
+            Some("node /usr/local/bin/claude.mjs"),
+            "claude"
+        ));
+        assert!(script_process_matches(
+            "node.exe",
+            Some(r"node C:\tools\codex.cjs --help"),
+            "codex"
+        ));
+
+        // Ordinary user home/project directory named `claude` must NOT block claude
+        assert!(!script_process_matches(
+            "/usr/bin/node",
+            Some("node /Users/claude/project/vite.js"),
+            "claude"
+        ));
+    }
+
+    #[test]
+    fn empty_or_sourceless_journal_warns_and_provider_scoped_corruption_isolates() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("claude-0123456789abcdef.json"),
+            r#"{"targets":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("opencode-fedcba9876543210.json"),
+            r#"{"targets":[{"providerId":"opencode","sessionId":"s1","residual":false}]}"#,
+        )
+        .unwrap();
+
+        let (sessions, warnings) = pending_sessions_report_in(temp.path()).unwrap();
+        assert!(sessions.is_empty());
+        assert_eq!(warnings.len(), 2);
+
+        // Provider-scoped corruption blocks claude & opencode, but allows codex!
+        assert!(ensure_pending_journals_healthy_in(temp.path(), Some("claude")).is_err());
+        assert!(ensure_pending_journals_healthy_in(temp.path(), Some("opencode")).is_err());
+        assert!(ensure_pending_journals_healthy_in(temp.path(), Some("codex")).is_ok());
+
+        // Unidentifiable corruption blocks all providers.
+        std::fs::write(temp.path().join("broken.json"), "not json").unwrap();
+        assert!(ensure_pending_journals_healthy_in(temp.path(), Some("codex")).is_err());
+    }
+
+    #[test]
+    fn codex_batch_progress_records_non_residual_paginated_plan_units() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let (leaf_meta, _leaf_path, base_path) = codex_fixture(&root);
+        let base_meta: SessionMeta = serde_json::from_value(serde_json::json!({
+            "providerId": "codex",
+            "sessionId": "thread",
+            "sourcePath": base_path.to_string_lossy(),
+            "residual": false,
+            "archived": true
+        }))
+        .unwrap();
+        let snapshot = vec![leaf_meta.clone(), base_meta.clone()];
+        let mut progress = CodexBatchProgress::default();
+
+        let first = progress
+            .run(&leaf_meta, &snapshot, |target, remaining| {
+                run_codex_at(
+                    &temp.path().join("op-leaf.json"),
+                    target,
+                    remaining,
+                    std::slice::from_ref(&root),
+                    |_| Ok(true),
+                    |_| Ok(()),
+                    |p| std::fs::remove_file(p).map_err(|e| e.to_string()),
+                )
+            })
+            .unwrap();
+        assert!(matches!(first, DeleteSessionReply::Deleted { .. }));
+
+        // Even though `base_meta.residual == false`, `CodexBatchProgress` recorded all executed
+        // `DeletionPlan` unit paths and recognizes `base_meta` as already removed!
+        let second = progress
+            .run(&base_meta, &snapshot, |_, _| {
+                panic!("base unit was already removed by leaf plan and must short-circuit")
+            })
+            .unwrap();
+        assert!(matches!(second, DeleteSessionReply::NotFound));
+    }
+
+    #[test]
+    fn recognizes_workbuddy_desktop_binaries_and_script_packages() {
+        for executable in [
+            "WorkBuddyAI.exe",
+            "WorkBuddyShareTarget.exe",
+            "WorkBuddy.exe",
+            "WorkBuddy AI",
+            r"D:\Program Files\WorkBuddyAI\WorkBuddyAI.exe",
+            r"C:\Users\alice\.workbuddy-ai\binaries\node\22.14.0\node.exe",
+            "/home/alice/.workbuddy/binaries/node/bin/node",
+            "workbuddy-cli",
+        ] {
+            assert!(process_matches(executable, "workbuddy"), "{executable}");
+        }
+
+        for unrelated in [
+            "AgentSessionManager.exe",
+            "Code.exe",
+            r"C:\Users\workbuddy\project\app.exe",
+        ] {
+            assert!(!process_matches(unrelated, "workbuddy"), "{unrelated}");
+        }
+
+        assert!(script_process_matches(
+            "node.exe",
+            Some(r"node C:\npm\node_modules\@tencent\workbuddy-cli\dist\index.js"),
+            "workbuddy"
+        ));
+        assert!(script_process_matches(
+            "/usr/bin/node",
+            Some("node /home/alice/.workbuddy-ai/agent/runner.js"),
+            "workbuddy"
+        ));
+        assert!(!script_process_matches(
+            "/usr/bin/node",
+            Some("node /Users/workbuddy/webapp/server.js"),
+            "workbuddy"
+        ));
+    }
+
+    #[test]
+    fn live_process_discovery_succeeds_and_excludes_self() {
+        let processes = collect_current_user_processes().expect("inspect current user processes");
+        assert!(processes.iter().all(|p| p.pid != std::process::id()));
     }
 }

@@ -5,6 +5,7 @@ import opencodeIcon from "@/icons/extracted/opencode-logo-light.svg?url";
 import zcodeIcon from "@/icons/extracted/zcode.png?url";
 import piIcon from "@/icons/extracted/pi.svg?url";
 import deepseekIcon from "@/icons/extracted/deepseek.svg?url";
+import workbuddyIcon from "@/icons/extracted/workbuddy.svg?url";
 import { cn } from "@/lib/utils";
 
 const icons: Record<string, string> = {
@@ -17,6 +18,7 @@ const icons: Record<string, string> = {
   zcode: zcodeIcon,
   pi: piIcon,
   deepseek: deepseekIcon,
+  workbuddy: workbuddyIcon,
 };
 
 // 纯黑的单色 logo：亮色主题直接用，暗色主题由 CSS 反色成白，
@@ -36,6 +38,7 @@ const opticalScale: Record<string, number> = {
   zcode: 1.1,
   pi: 1.55,
   deepseek: 1.08,
+  workbuddy: 1.0,
 };
 
 export function AgentIcon({

@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -10,20 +10,38 @@ use crate::session_manager::{SessionMessage, SessionMeta};
 use crate::session_paths::claude_config_dir;
 
 use super::utils::{
-    collect_files_where, ensure_readable_size, extract_text, is_safe_session_id,
-    parse_timestamp_to_ms, path_basename, read_head_tail_lines, remove_path_if_exists,
-    truncate_summary, FileParseCache, TITLE_MAX_CHARS,
+    atomic_write_json, checked_storage_child, ensure_readable_size, extract_text,
+    extract_thinking_text, is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms,
+    path_basename, read_head_tail_lines, remove_path_if_exists, scan_warning, truncate_summary,
+    FileParseCache, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "claude";
+const HEAD_SCAN_LINES: usize = 60;
+const TAIL_SCAN_LINES: usize = 30;
+const MAX_CLAUDE_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HEAD_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SESSIONS_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HISTORY_JSONL_BYTES: u64 = 64 * 1024 * 1024;
 
 static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let root = claude_config_dir().join("projects");
+    scan_sessions_in_root(&root, &PARSE_CACHE)
+}
+
+fn scan_sessions_in_root(root: &Path, cache: &FileParseCache) -> Vec<SessionMeta> {
+    let mut project_dirs = Vec::new();
     let mut files = Vec::new();
-    collect_jsonl_files(&root, &mut files);
-    PARSE_CACHE.scan(files, parse_session_result)
+    collect_project_dirs_and_jsonl_files(root, &mut project_dirs, &mut files);
+    let mut sessions = cache.scan(files, parse_session_result);
+    let mut ghosts = Vec::new();
+    for project_dir in &project_dirs {
+        scan_project_index_ghosts(project_dir, &sessions, &mut ghosts);
+    }
+    sessions.extend(ghosts);
+    sessions
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -56,25 +74,44 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
+
+        if role == "assistant" {
+            if let Some(content_val) = message.get("content") {
+                let thinking = extract_thinking_text(content_val);
+                if !thinking.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "thinking".to_string(),
+                        content: thinking,
+                        ts,
+                    });
+                }
+            }
+        }
 
         if role == "user" {
             if let Some(Value::Array(items)) = message.get("content") {
                 if !items.is_empty()
-                    && items
-                        .iter()
-                        .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    && items.iter().all(|item| {
+                        matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("tool_result" | "mcp_tool_result")
+                        )
+                    })
                 {
                     role = "tool".to_string();
                 }
             }
         }
-        let content = message.get("content").map(extract_text).unwrap_or_default();
+        let mut content = message.get("content").map(extract_text).unwrap_or_default();
         if !content.trim().is_empty() {
-            messages.push(SessionMessage {
-                role,
-                content,
-                ts: value.get("timestamp").and_then(parse_timestamp_to_ms),
-            });
+            if role == "user"
+                && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+                && !content.starts_with("[Compacted Summary]")
+            {
+                content = format!("[Compacted Summary]\n{content}");
+            }
+            messages.push(SessionMessage { role, content, ts });
         }
     }
     Ok(messages)
@@ -376,44 +413,696 @@ fn conversation_chain(entries: &[Value]) -> Vec<&Value> {
     output
 }
 
-pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
-    let meta = parse_session(path).ok_or_else(|| {
-        format!(
-            "Failed to parse Claude session metadata: {}",
-            path.display()
-        )
-    })?;
+fn is_valid_claude_session_id(id: &str) -> bool {
+    is_safe_session_id(id)
+        && !matches!(id, "memory" | "sessions-index")
+        && !id.starts_with("agent-")
+}
 
-    if meta.session_id != session_id {
+fn validate_claude_session_path(
+    root: &Path,
+    path: &Path,
+    session_id: &str,
+) -> Result<(PathBuf, PathBuf, bool), String> {
+    if !is_valid_claude_session_id(session_id) {
+        return Err(format!("Invalid Claude session ID: {session_id}"));
+    }
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!("Invalid Claude session path: {}", path.display()));
+    }
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
         return Err(format!(
-            "Claude session ID mismatch: expected {session_id}, found {}",
-            meta.session_id
+            "Invalid Claude session file extension: {}",
+            path.display()
+        ));
+    }
+    if is_agent_session(path) {
+        return Err(format!(
+            "Refusing to target Claude subagent file directly: {}",
+            path.display()
         ));
     }
 
-    if let Some(stem) = path.file_stem() {
-        let sibling = path.parent().unwrap_or_else(|| Path::new("")).join(stem);
-        let sibling = super::utils::checked_storage_child(root, &sibling)?;
-        remove_path_if_exists(&sibling).map_err(|e| {
-            format!(
-                "Failed to delete Claude session sidecar {}: {e}",
-                sibling.display()
-            )
-        })?;
+    let file_exists = match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) {
+                return Err(format!(
+                    "Claude session source must not be a symlink or reparse point: {}",
+                    path.display()
+                ));
+            }
+            if !meta.file_type().is_file() {
+                return Err(format!(
+                    "Claude session source is not a regular file: {}",
+                    path.display()
+                ));
+            }
+            true
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect Claude session {}: {err}",
+                path.display()
+            ))
+        }
+    };
+
+    let canonical_root = root.canonicalize().map_err(|err| {
+        format!(
+            "Failed to resolve Claude projects root {}: {err}",
+            root.display()
+        )
+    })?;
+    let root_meta = fs::metadata(&canonical_root).map_err(|err| {
+        format!(
+            "Failed to inspect Claude projects root {}: {err}",
+            canonical_root.display()
+        )
+    })?;
+    if !root_meta.is_dir() {
+        return Err(format!(
+            "Claude projects root is not a directory: {}",
+            canonical_root.display()
+        ));
     }
 
-    std::fs::remove_file(path).map_err(|e| {
+    let parent_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("Invalid Claude session parent: {}", path.display()))?;
+    match fs::symlink_metadata(parent_dir) {
+        Ok(parent_meta) => {
+            if is_reparse_or_symlink(&parent_meta) {
+                return Err(format!(
+                    "Claude project directory must not be a symlink or reparse point: {}",
+                    parent_dir.display()
+                ));
+            }
+            if !parent_meta.file_type().is_dir() {
+                return Err(format!(
+                    "Claude project path is not a directory: {}",
+                    parent_dir.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect Claude project directory {}: {err}",
+                parent_dir.display()
+            ))
+        }
+    }
+
+    let resolved_path = checked_storage_child(root, path)?;
+    let relative = resolved_path.strip_prefix(&canonical_root).map_err(|_| {
         format!(
-            "Failed to delete Claude session file {}: {e}",
+            "Claude session path is outside projects root: {}",
             path.display()
         )
     })?;
+    let components: Vec<_> = relative.components().collect();
+    if components.len() != 2
+        || !matches!(components[0], std::path::Component::Normal(_))
+        || !matches!(components[1], std::path::Component::Normal(_))
+    {
+        return Err(format!(
+            "Claude session path must be strictly <projects>/<project>/<session>.jsonl: {}",
+            path.display()
+        ));
+    }
 
+    let stem = resolved_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("Invalid Claude session filename: {}", path.display()))?;
+    if matches!(stem, "memory" | "sessions-index") {
+        return Err(format!(
+            "Refusing to delete reserved Claude file: {}",
+            path.display()
+        ));
+    }
+
+    if file_exists {
+        let meta = parse_session_result(&resolved_path)?.ok_or_else(|| {
+            format!(
+                "Failed to parse Claude session metadata: {}",
+                path.display()
+            )
+        })?;
+        if meta.session_id != session_id {
+            return Err(format!(
+                "Claude session ID mismatch: expected {session_id}, found {}",
+                meta.session_id
+            ));
+        }
+    } else if stem != session_id {
+        return Err(format!(
+            "Missing Claude session path does not match session ID {session_id}: {}",
+            path.display()
+        ));
+    }
+
+    Ok((canonical_root, resolved_path, file_exists))
+}
+
+pub fn preflight_delete(root: &Path, path: &Path, session_id: &str) -> Result<(), String> {
+    validate_claude_session_path(root, path, session_id).map(|_| ())
+}
+
+fn resolve_verified_claude_dir(root: &Path, configured_claude_dir: &Path) -> Option<PathBuf> {
+    let root_name = root.file_name()?.to_str()?;
+    #[cfg(windows)]
+    let is_projects = root_name.eq_ignore_ascii_case("projects");
+    #[cfg(not(windows))]
+    let is_projects = root_name == "projects";
+    if !is_projects {
+        return None;
+    }
+    let candidate = root.parent()?;
+    let meta = fs::symlink_metadata(candidate).ok()?;
+    if !meta.is_dir() && !is_reparse_or_symlink(&meta) {
+        return None;
+    }
+    let canonical_candidate = candidate.canonicalize().ok()?;
+    let canonical_configured = configured_claude_dir.canonicalize().ok()?;
+    (canonical_candidate == canonical_configured).then_some(canonical_candidate)
+}
+
+pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    let configured = claude_config_dir();
+    let verified_claude_dir = resolve_verified_claude_dir(root, &configured);
+    delete_session_with_claude_dir(root, path, session_id, verified_claude_dir.as_deref())
+}
+
+fn delete_session_with_claude_dir(
+    root: &Path,
+    path: &Path,
+    session_id: &str,
+    claude_dir: Option<&Path>,
+) -> Result<bool, String> {
+    let (canonical_root, resolved_path, file_exists) =
+        validate_claude_session_path(root, path, session_id)?;
+    let project_dir = resolved_path
+        .parent()
+        .ok_or_else(|| format!("Invalid Claude project directory: {}", path.display()))?;
+    let stem = resolved_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    let mut removed_anything = false;
+
+    if project_dir.exists() {
+        if cleanup_project_sessions_index(&canonical_root, project_dir, session_id)? {
+            removed_anything = true;
+        }
+
+        if stem == session_id && is_valid_claude_session_id(session_id) {
+            let sibling = project_dir.join(session_id);
+            let sibling = checked_storage_child(&canonical_root, &sibling)?;
+            if fs::symlink_metadata(&sibling).is_ok() {
+                remove_path_if_exists(&sibling).map_err(|e| {
+                    format!(
+                        "Failed to delete Claude session sidecar {}: {e}",
+                        sibling.display()
+                    )
+                })?;
+                removed_anything = true;
+            }
+        }
+
+        if cleanup_legacy_project_agents(&canonical_root, project_dir, session_id)? {
+            removed_anything = true;
+        }
+    }
+
+    if let Some(claude_dir) = claude_dir {
+        if cleanup_claude_dir_sidecars(claude_dir, session_id)? {
+            removed_anything = true;
+        }
+    }
+
+    if file_exists {
+        match fs::symlink_metadata(&resolved_path) {
+            Ok(meta) if is_reparse_or_symlink(&meta) => {
+                return Err(format!(
+                    "Claude session source turned into a symlink before deletion: {}",
+                    resolved_path.display()
+                ));
+            }
+            Ok(_) => {
+                fs::remove_file(&resolved_path).map_err(|e| {
+                    format!(
+                        "Failed to delete Claude session file {}: {e}",
+                        resolved_path.display()
+                    )
+                })?;
+                removed_anything = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "Failed to inspect Claude session file {}: {err}",
+                    resolved_path.display()
+                ))
+            }
+        }
+    }
+
+    Ok(removed_anything)
+}
+
+fn cleanup_project_sessions_index(
+    canonical_root: &Path,
+    project_dir: &Path,
+    session_id: &str,
+) -> Result<bool, String> {
+    let index_path = project_dir.join("sessions-index.json");
+    let index_path = checked_storage_child(canonical_root, &index_path)?;
+    let meta = match fs::symlink_metadata(&index_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect Claude sessions-index.json {}: {err}",
+                index_path.display()
+            ))
+        }
+    };
+    if is_reparse_or_symlink(&meta) {
+        return Err(format!(
+            "Refusing to modify symlinked Claude sessions-index.json: {}",
+            index_path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "Claude sessions-index.json is not a regular file: {}",
+            index_path.display()
+        ));
+    }
+    if meta.len() > MAX_SESSIONS_INDEX_BYTES {
+        return Err(format!(
+            "Claude sessions-index.json exceeds {} MiB limit: {}",
+            MAX_SESSIONS_INDEX_BYTES / 1024 / 1024,
+            index_path.display()
+        ));
+    }
+
+    let mut raw = String::new();
+    File::open(&index_path)
+        .map_err(|e| {
+            format!(
+                "Failed to open Claude sessions-index.json {}: {e}",
+                index_path.display()
+            )
+        })?
+        .take(MAX_SESSIONS_INDEX_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|e| {
+            format!(
+                "Failed to read Claude sessions-index.json {}: {e}",
+                index_path.display()
+            )
+        })?;
+    if raw.len() as u64 > MAX_SESSIONS_INDEX_BYTES {
+        return Err(format!(
+            "Claude sessions-index.json exceeds {} MiB limit: {}",
+            MAX_SESSIONS_INDEX_BYTES / 1024 / 1024,
+            index_path.display()
+        ));
+    }
+
+    let mut doc: Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "Failed to parse Claude sessions-index.json {}: {e}",
+            index_path.display()
+        )
+    })?;
+    let Some(entries) = doc.get_mut("entries").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let before_len = entries.len();
+    entries.retain(|entry| entry.get("sessionId").and_then(Value::as_str) != Some(session_id));
+    if entries.len() == before_len {
+        return Ok(false);
+    }
+    atomic_write_json(&index_path, &doc)?;
     Ok(true)
 }
 
+fn cleanup_legacy_project_agents(
+    canonical_root: &Path,
+    project_dir: &Path,
+    session_id: &str,
+) -> Result<bool, String> {
+    let entries = match fs::read_dir(project_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "Failed to scan Claude project directory {}: {err}",
+                project_dir.display()
+            ))
+        }
+    };
+    let mut removed_any = false;
+    let mut line_buf = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!(
+                "Failed to enumerate Claude project directory {}: {e}",
+                project_dir.display()
+            )
+        })?;
+        let candidate = entry.path();
+        if candidate.extension().and_then(|e| e.to_str()) != Some("jsonl")
+            || !is_agent_session(&candidate)
+        {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if is_reparse_or_symlink(&meta) || !meta.file_type().is_file() {
+            continue;
+        }
+        if agent_file_belongs_to_session(&candidate, session_id, &mut line_buf) {
+            let checked = checked_storage_child(canonical_root, &candidate)?;
+            remove_path_if_exists(&checked).map_err(|e| {
+                format!(
+                    "Failed to delete legacy Claude subagent transcript {}: {e}",
+                    checked.display()
+                )
+            })?;
+            removed_any = true;
+        }
+    }
+    Ok(removed_any)
+}
+
+fn agent_file_belongs_to_session(path: &Path, session_id: &str, buf: &mut Vec<u8>) -> bool {
+    const AGENT_HEADER_BUDGET: u64 = 4 * 1024 * 1024;
+    const AGENT_HEADER_LINES: usize = 25;
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file.take(AGENT_HEADER_BUDGET));
+    for _ in 0..AGENT_HEADER_LINES {
+        match read_bounded_line(&mut reader, buf, MAX_CLAUDE_LINE_BYTES) {
+            Ok(BoundedLine::Line(line)) => {
+                let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let Some(found) = val.get("sessionId").and_then(Value::as_str) {
+                    return found == session_id;
+                }
+            }
+            Ok(BoundedLine::OversizedSkipped) => continue,
+            Ok(BoundedLine::Eof) | Err(_) => break,
+        }
+    }
+    false
+}
+
+fn cleanup_claude_dir_sidecars(claude_dir: &Path, session_id: &str) -> Result<bool, String> {
+    if !claude_dir.exists() {
+        return Ok(false);
+    }
+    let mut removed_any = false;
+
+    let direct_targets = [
+        claude_dir.join("file-history").join(session_id),
+        claude_dir.join("tasks").join(session_id),
+        claude_dir.join("session-env").join(session_id),
+        claude_dir.join("debug").join(format!("{session_id}.txt")),
+    ];
+    for target in &direct_targets {
+        let resolved = checked_storage_child(claude_dir, target)?;
+        if fs::symlink_metadata(&resolved).is_ok() {
+            remove_path_if_exists(&resolved).map_err(|e| {
+                format!(
+                    "Failed to delete Claude sidecar {}: {e}",
+                    resolved.display()
+                )
+            })?;
+            removed_any = true;
+        }
+    }
+
+    let todos_dir = claude_dir.join("todos");
+    match fs::symlink_metadata(&todos_dir) {
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) {
+                return Err(format!(
+                    "Claude todos directory must not be a symlink or reparse point: {}",
+                    todos_dir.display()
+                ));
+            }
+            if meta.file_type().is_dir() {
+                let resolved_todos = checked_storage_child(claude_dir, &todos_dir)?;
+                let prefix = format!("{session_id}-");
+                let exact = format!("{session_id}.json");
+                let entries = fs::read_dir(&resolved_todos).map_err(|e| {
+                    format!(
+                        "Failed to read Claude todos directory {}: {e}",
+                        resolved_todos.display()
+                    )
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        format!(
+                            "Failed to enumerate Claude todos directory {}: {e}",
+                            resolved_todos.display()
+                        )
+                    })?;
+                    let file_name = entry.file_name();
+                    let Some(name) = file_name.to_str() else {
+                        continue;
+                    };
+                    if !name.starts_with(&prefix) && name != exact {
+                        continue;
+                    }
+                    let entry_path = entry.path();
+                    let Ok(entry_meta) = fs::symlink_metadata(&entry_path) else {
+                        continue;
+                    };
+                    // Only remove files (or non-directory links); never remove subdirectories in todos/
+                    if entry_meta.is_dir() && !is_reparse_or_symlink(&entry_meta) {
+                        continue;
+                    }
+                    let checked = checked_storage_child(claude_dir, &entry_path)?;
+                    remove_path_if_exists(&checked).map_err(|e| {
+                        format!(
+                            "Failed to delete Claude todo file {}: {e}",
+                            checked.display()
+                        )
+                    })?;
+                    removed_any = true;
+                }
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect Claude todos directory {}: {err}",
+                todos_dir.display()
+            ))
+        }
+    }
+
+    if cleanup_claude_history_jsonl(claude_dir, session_id)? {
+        removed_any = true;
+    }
+
+    Ok(removed_any)
+}
+
+fn cleanup_claude_history_jsonl(claude_dir: &Path, session_id: &str) -> Result<bool, String> {
+    let history_candidate = claude_dir.join("history.jsonl");
+    let history_path = checked_storage_child(claude_dir, &history_candidate)?;
+    let meta = match fs::symlink_metadata(&history_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect Claude history.jsonl {}: {err}",
+                history_path.display()
+            ))
+        }
+    };
+    if is_reparse_or_symlink(&meta) || !meta.file_type().is_file() {
+        return Ok(false);
+    }
+    if meta.len() > MAX_HISTORY_JSONL_BYTES {
+        return Ok(false);
+    }
+
+    let mut raw = Vec::new();
+    File::open(&history_path)
+        .map_err(|e| {
+            format!(
+                "Failed to open Claude history.jsonl {}: {e}",
+                history_path.display()
+            )
+        })?
+        .take(MAX_HISTORY_JSONL_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| {
+            format!(
+                "Failed to read Claude history.jsonl {}: {e}",
+                history_path.display()
+            )
+        })?;
+    if raw.len() as u64 > MAX_HISTORY_JSONL_BYTES {
+        return Ok(false);
+    }
+
+    let mut kept = Vec::with_capacity(raw.len());
+    let mut removed = false;
+    for chunk in raw.split_inclusive(|&b| b == b'\n') {
+        let trimmed_bytes = chunk
+            .strip_suffix(b"\r\n")
+            .or_else(|| chunk.strip_suffix(b"\n"))
+            .unwrap_or(chunk);
+        if let Ok(line_str) = std::str::from_utf8(trimmed_bytes) {
+            if line_str.contains(session_id) {
+                if let Ok(val) = serde_json::from_str::<Value>(line_str) {
+                    if val.get("sessionId").and_then(Value::as_str) == Some(session_id) {
+                        removed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        kept.extend_from_slice(chunk);
+    }
+
+    if !removed {
+        return Ok(false);
+    }
+
+    atomic_write_bytes(&history_path, &kept)?;
+    Ok(true)
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("Invalid target file path")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    temp.write_all(bytes).map_err(|e| e.to_string())?;
+    temp.flush().map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        let mut current_temp = temp;
+        let mut attempts = 0usize;
+        loop {
+            match current_temp.persist(path) {
+                Ok(_) => break,
+                Err(err) if err.error.kind() == io::ErrorKind::PermissionDenied && attempts < 3 => {
+                    attempts += 1;
+                    current_temp = err.file;
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(err) => return Err(err.error.to_string()),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        temp.persist(path).map_err(|e| e.error.to_string())?;
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_result(path).ok().flatten()
+}
+
+enum BoundedLine {
+    Eof,
+    Line(String),
+    OversizedSkipped,
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<BoundedLine> {
+    buf.clear();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if oversized {
+                return Ok(BoundedLine::OversizedSkipped);
+            }
+            if buf.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            break;
+        }
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            if !oversized {
+                if buf.len() + newline_pos <= max_bytes {
+                    buf.extend_from_slice(&available[..newline_pos]);
+                } else {
+                    buf.clear();
+                    oversized = true;
+                }
+            }
+            reader.consume(newline_pos + 1);
+            if oversized {
+                return Ok(BoundedLine::OversizedSkipped);
+            }
+            break;
+        } else {
+            let len = available.len();
+            if !oversized {
+                if buf.len() + len <= max_bytes {
+                    buf.extend_from_slice(available);
+                } else {
+                    buf.clear();
+                    oversized = true;
+                }
+            }
+            reader.consume(len);
+        }
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    match std::str::from_utf8(buf) {
+        Ok(s) => Ok(BoundedLine::Line(s.to_owned())),
+        Err(_) => Ok(BoundedLine::OversizedSkipped),
+    }
+}
+
+fn read_bounded_head_lines(path: &Path, head_n: usize) -> io::Result<Vec<String>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file.take(MAX_HEAD_SCAN_BYTES));
+    let mut buf = Vec::new();
+    let mut head = Vec::new();
+    while head.len() < head_n {
+        match read_bounded_line(&mut reader, &mut buf, MAX_CLAUDE_LINE_BYTES)? {
+            BoundedLine::Eof => break,
+            BoundedLine::OversizedSkipped => continue,
+            BoundedLine::Line(line) => head.push(line),
+        }
+    }
+    Ok(head)
 }
 
 /// 扫描缓存用：读失败（权限、被占用）返回 `Err`，本轮不缓存、下轮重试；`agent-*`
@@ -423,13 +1112,135 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         return Ok(None);
     }
 
-    let (head, tail) = read_head_tail_lines(path, 10, 30).map_err(|error| {
+    let file_len = fs::metadata(path)
+        .map_err(|error| {
+            let message = format!("无法读取 {}：{error}", path.display());
+            scan_warning(message.clone());
+            message
+        })?
+        .len();
+    let oversized = file_len > super::utils::MAX_MESSAGES_FILE_BYTES;
+
+    let head = read_bounded_head_lines(path, HEAD_SCAN_LINES).map_err(|error| {
         let message = format!("无法读取 {}：{error}", path.display());
-        super::utils::scan_warning(message.clone());
+        scan_warning(message.clone());
         message
     })?;
 
-    let mut session_id: Option<String> = None;
+    let (mut tail, need_stream_tail) = match read_head_tail_lines(path, 0, TAIL_SCAN_LINES) {
+        Ok((_, tail)) => (tail, false),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData && !oversized => {
+            (Vec::new(), true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidData && oversized => {
+            (Vec::new(), false)
+        }
+        Err(error) => {
+            let message = format!("无法读取 {}：{error}", path.display());
+            scan_warning(message.clone());
+            return Err(message);
+        }
+    };
+
+    let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
+    let mut summary_title: Option<String> = None;
+    let mut saw_json_object = false;
+
+    let mut apply_title_line = |line: &str, check_any_object: bool| {
+        let has_title_keyword = line.contains("customTitle")
+            || line.contains("aiTitle")
+            || line.contains("\"summary\"");
+        if !has_title_keyword {
+            if check_any_object
+                && !saw_json_object
+                && line.trim_start().starts_with('{')
+                && serde_json::from_str::<Value>(line).is_ok_and(|v| v.is_object())
+            {
+                saw_json_object = true;
+            }
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if value.is_object() {
+            saw_json_object = true;
+        }
+        if !is_main_entry(&value) {
+            return;
+        }
+        if let Some(raw) = value.get("customTitle").and_then(Value::as_str) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                custom_title = None;
+            } else {
+                custom_title = Some(trimmed.to_string());
+            }
+        }
+        if let Some(text) = value
+            .get("aiTitle")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            ai_title = Some(text.to_string());
+        }
+        if value.get("type").and_then(Value::as_str) == Some("summary") {
+            if let Some(text) = value
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                summary_title = Some(text.to_string());
+            }
+        }
+    };
+
+    if oversized {
+        scan_warning(format!(
+            "Claude 会话 {} 正文超限，标题仅依据头尾元信息",
+            path.display()
+        ));
+        for line in head.iter().chain(tail.iter()) {
+            apply_title_line(line, false);
+        }
+    } else {
+        let file = File::open(path).map_err(|error| {
+            let msg = format!("Failed to read Claude titles {}: {error}", path.display());
+            scan_warning(msg.clone());
+            msg
+        })?;
+        let mut reader = BufReader::new(file);
+        let mut line_buf = Vec::new();
+        let mut fallback_tail = need_stream_tail.then(|| VecDeque::with_capacity(TAIL_SCAN_LINES));
+        loop {
+            match read_bounded_line(&mut reader, &mut line_buf, MAX_CLAUDE_LINE_BYTES) {
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::OversizedSkipped) => continue,
+                Ok(BoundedLine::Line(line)) => {
+                    apply_title_line(&line, true);
+                    if let Some(ref mut ring) = fallback_tail {
+                        if ring.len() == TAIL_SCAN_LINES {
+                            ring.pop_front();
+                        }
+                        ring.push_back(line);
+                    }
+                }
+                Err(error) => {
+                    let msg = format!("Failed to read Claude titles {}: {error}", path.display());
+                    scan_warning(msg.clone());
+                    return Err(msg);
+                }
+            }
+        }
+        if let Some(ring) = fallback_tail {
+            tail = ring.into_iter().collect();
+        }
+    }
+
+    let mut json_session_id: Option<String> = None;
     let mut project_dir: Option<String> = None;
     let mut created_at: Option<i64> = None;
     let mut first_user_message: Option<String> = None;
@@ -440,8 +1251,12 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
             Ok(parsed) => parsed,
             Err(_) => continue,
         };
-        if session_id.is_none() {
-            session_id = value
+        if !value.is_object() {
+            continue;
+        }
+        saw_json_object = true;
+        if json_session_id.is_none() {
+            json_session_id = value
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
@@ -477,7 +1292,7 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
                 }
             }
         }
-        if session_id.is_some()
+        if json_session_id.is_some()
             && project_dir.is_some()
             && created_at.is_some()
             && first_user_message.is_some()
@@ -495,6 +1310,10 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
             Ok(parsed) => parsed,
             Err(_) => continue,
         };
+        if !value.is_object() {
+            continue;
+        }
+        saw_json_object = true;
         if last_active_at.is_none() {
             last_active_at = value.get("timestamp").and_then(parse_timestamp_to_ms);
         }
@@ -514,67 +1333,22 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         }
     }
 
-    let session_id = session_id.or_else(|| infer_session_id_from_filename(path));
+    if !saw_json_object {
+        return Ok(None);
+    }
+
+    let filename_stem = infer_session_id_from_filename(path);
+    let session_id = filename_stem
+        .filter(|stem| is_valid_claude_session_id(stem))
+        .or_else(|| json_session_id.filter(|id| is_valid_claude_session_id(id)));
     let Some(session_id) = session_id else {
         return Ok(None);
     };
 
-    // Explicit titles can be anywhere (including outside both sampling windows).
-    // Read the complete bounded stream without retaining transcript bodies.
-    // Fast pre-check avoids serde_json deserializing tens of thousands of transcript lines
-    // when neither `"customTitle"` nor `"aiTitle"` appears in the line.
-    let oversized = std::fs::metadata(path)
-        .map_err(|error| error.to_string())?
-        .len()
-        > super::utils::MAX_MESSAGES_FILE_BYTES;
-    let mut ai_title = None;
-    let title_lines: Box<dyn Iterator<Item = std::io::Result<String>>> = if oversized {
-        super::utils::scan_warning(format!(
-            "Claude 会话 {} 正文超限，标题仅依据头尾元信息",
-            path.display()
-        ));
-        Box::new(
-            head.iter()
-                .chain(tail.iter())
-                .cloned()
-                .map(Ok)
-                .collect::<Vec<_>>()
-                .into_iter(),
-        )
-    } else {
-        let file =
-            File::open(path).map_err(|error| format!("Failed to read Claude titles: {error}"))?;
-        Box::new(BufReader::new(file).lines())
-    };
-    let mut custom_title = None;
-    for line in title_lines {
-        let line = line.map_err(|error| format!("Failed to read Claude titles: {error}"))?;
-        if !line.contains("customTitle") && !line.contains("aiTitle") {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if !is_main_entry(&value) {
-            continue;
-        }
-        for (field, target) in [
-            ("customTitle", &mut custom_title),
-            ("aiTitle", &mut ai_title),
-        ] {
-            if let Some(text) = value
-                .get(field)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                *target = Some(text.to_string());
-            }
-        }
-    }
-    // SDK priority: customTitle > aiTitle > first user prompt > directory basename.
+    // Priority: customTitle > aiTitle > summary > first user prompt > directory basename.
     let title = custom_title
         .or(ai_title)
+        .or(summary_title)
         .map(|t| truncate_summary(&t, TITLE_MAX_CHARS))
         .or_else(|| first_user_message.map(|t| truncate_summary(&t, TITLE_MAX_CHARS)))
         .or_else(|| {
@@ -619,12 +1393,257 @@ fn infer_session_id_from_filename(path: &Path) -> Option<String> {
         .map(|stem| stem.to_string())
 }
 
-fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
-    collect_files_where(
-        root,
-        |path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
-        files,
-    );
+fn collect_project_dirs_and_jsonl_files(
+    root: &Path,
+    project_dirs: &mut Vec<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            scan_warning(format!("无法扫描 {}：{error}", root.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan_warning(format!("无法枚举 {}：{error}", root.display()));
+                continue;
+            }
+        };
+        let project_path = entry.path();
+        let meta = match fs::symlink_metadata(&project_path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                scan_warning(format!("无法读取 {}：{error}", project_path.display()));
+                continue;
+            }
+        };
+        if is_reparse_or_symlink(&meta) || !meta.file_type().is_dir() {
+            continue;
+        }
+        project_dirs.push(project_path.clone());
+
+        let project_entries = match fs::read_dir(&project_path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                scan_warning(format!("无法扫描 {}：{error}", project_path.display()));
+                continue;
+            }
+        };
+        for file_entry in project_entries {
+            let file_entry = match file_entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan_warning(format!("无法枚举 {}：{error}", project_path.display()));
+                    continue;
+                }
+            };
+            let file_path = file_entry.path();
+            if file_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let file_meta = match fs::symlink_metadata(&file_path) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    scan_warning(format!("无法读取 {}：{error}", file_path.display()));
+                    continue;
+                }
+            };
+            if is_reparse_or_symlink(&file_meta) || !file_meta.file_type().is_file() {
+                continue;
+            }
+            files.push(file_path);
+        }
+    }
+}
+
+fn scan_project_index_ghosts(
+    project_dir: &Path,
+    existing: &[SessionMeta],
+    out: &mut Vec<SessionMeta>,
+) {
+    let index_path = project_dir.join("sessions-index.json");
+    let meta = match fs::symlink_metadata(&index_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            scan_warning(format!(
+                "无法读取 Claude 索引 {}：{err}",
+                index_path.display()
+            ));
+            return;
+        }
+    };
+    if is_reparse_or_symlink(&meta) || !meta.file_type().is_file() {
+        scan_warning(format!(
+            "跳过非普通文件 Claude 索引：{}",
+            index_path.display()
+        ));
+        return;
+    }
+    if meta.len() > MAX_SESSIONS_INDEX_BYTES {
+        scan_warning(format!(
+            "Claude 索引 {} 超过 16 MB 上限，已跳过",
+            index_path.display()
+        ));
+        return;
+    }
+
+    let mut raw = String::new();
+    let read_res = File::open(&index_path).and_then(|file| {
+        file.take(MAX_SESSIONS_INDEX_BYTES + 1)
+            .read_to_string(&mut raw)
+    });
+    if let Err(err) = read_res {
+        scan_warning(format!(
+            "无法读取 Claude 索引 {}：{err}",
+            index_path.display()
+        ));
+        return;
+    }
+    if raw.len() as u64 > MAX_SESSIONS_INDEX_BYTES {
+        scan_warning(format!(
+            "Claude 索引 {} 超过 16 MB 上限，已跳过",
+            index_path.display()
+        ));
+        return;
+    }
+
+    let doc: Value = match serde_json::from_str(&raw) {
+        Ok(doc) => doc,
+        Err(err) => {
+            scan_warning(format!(
+                "无法解析 Claude 索引 {}：{err}",
+                index_path.display()
+            ));
+            return;
+        }
+    };
+
+    let default_project_path = doc
+        .get("originalPath")
+        .or_else(|| doc.get("projectPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let Some(entries) = doc.get("entries").and_then(Value::as_array) else {
+        return;
+    };
+
+    let mut seen_ids = HashSet::new();
+    for entry in entries {
+        let Some(session_id) = entry
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| is_valid_claude_session_id(id))
+        else {
+            continue;
+        };
+        if !seen_ids.insert(session_id.to_string()) {
+            continue;
+        }
+        let expected_jsonl = project_dir.join(format!("{session_id}.jsonl"));
+        match fs::symlink_metadata(&expected_jsonl) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            _ => continue,
+        }
+        let already_discovered = existing.iter().any(|s| {
+            s.session_id == session_id
+                && s.source_path
+                    .as_deref()
+                    .and_then(|p| Path::new(p).parent())
+                    .is_some_and(|p| p == project_dir)
+        });
+        if already_discovered {
+            continue;
+        }
+
+        let entry_project_dir = entry
+            .get("originalPath")
+            .or_else(|| entry.get("projectPath"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| default_project_path.clone());
+
+        let first_prompt = entry
+            .get("firstPrompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.contains("<local-command-caveat>")
+                    && !s.starts_with("<command-name>")
+            });
+        let entry_summary = entry
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let entry_custom = entry
+            .get("customTitle")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let entry_ai = entry
+            .get("aiTitle")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let title = entry_custom
+            .or(entry_ai)
+            .or(entry_summary)
+            .or(first_prompt)
+            .map(|t| truncate_summary(t, TITLE_MAX_CHARS))
+            .or_else(|| {
+                entry_project_dir
+                    .as_deref()
+                    .and_then(path_basename)
+                    .map(|v| v.to_string())
+            });
+        let summary = entry_summary
+            .or(first_prompt)
+            .map(|s| truncate_summary(s, 160));
+
+        let created_at = entry
+            .get("created")
+            .or_else(|| entry.get("createdAt"))
+            .and_then(parse_timestamp_to_ms);
+        let last_active_at = entry
+            .get("modified")
+            .or_else(|| entry.get("updatedAt"))
+            .or_else(|| entry.get("fileMtime"))
+            .and_then(parse_timestamp_to_ms)
+            .or(created_at);
+
+        out.push(SessionMeta {
+            provider_id: PROVIDER_ID.to_string(),
+            session_id: session_id.to_string(),
+            residual: true,
+            parent_session_id: None,
+            archived: false,
+            cleanup_pending: false,
+            sidebar_section: None,
+            title,
+            summary,
+            project_dir: entry_project_dir,
+            project_name: None,
+            created_at,
+            last_active_at,
+            source_path: Some(expected_jsonl.to_string_lossy().to_string()),
+            resume_command: None,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -728,7 +1747,7 @@ mod tests {
                 .iter()
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>(),
-            ["summary", "legacy mixed", "answer"]
+            ["[Compacted Summary]\nsummary", "legacy mixed", "answer"]
         );
         let legacy = compat_load(vec![
             serde_json::json!({"message":{"role":"user","content":"old schema"}}),
@@ -803,9 +1822,11 @@ mod tests {
     #[test]
     fn delete_session_removes_main_file_and_sidecar_directory() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("abc123-session.jsonl");
-        let sidecar = temp.path().join("abc123-session");
-        let independent_branch = temp.path().join("def456-branch.jsonl");
+        let root = temp.path().join("projects");
+        let project = root.join("my-project");
+        let path = project.join("session-123.jsonl");
+        let sidecar = project.join("session-123");
+        let independent_branch = project.join("branch-456.jsonl");
         let subagents = sidecar.join("subagents");
         let tool_results = sidecar.join("tool-results");
 
@@ -830,7 +1851,7 @@ mod tests {
         )
         .expect("write independent branch");
 
-        delete_session(temp.path(), &path, "session-123").expect("delete session");
+        delete_session(&root, &path, "session-123").expect("delete session");
 
         assert!(!path.exists());
         assert!(!sidecar.exists());
@@ -843,8 +1864,11 @@ mod tests {
     #[test]
     fn a_symlinked_sidecar_does_not_delete_its_target_contents() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("abc123-session.jsonl");
-        let sidecar = temp.path().join("abc123-session");
+        let root = temp.path().join("projects");
+        let project = root.join("my-project");
+        std::fs::create_dir_all(&project).expect("create project");
+        let path = project.join("session-123.jsonl");
+        let sidecar = project.join("session-123");
 
         // 链接目标放在另一个目录里，模拟"项目之外的真实数据"
         let victim = temp.path().join("outside").join("real-data");
@@ -867,7 +1891,7 @@ mod tests {
         )
         .expect("write session");
 
-        delete_session(temp.path(), &path, "session-123").expect("delete session");
+        delete_session(&root, &path, "session-123").expect("delete session");
 
         assert!(!path.exists());
         assert!(
@@ -959,7 +1983,7 @@ mod tests {
     #[test]
     fn parse_session_clears_resume_command_for_unsafe_filename_stem() {
         let temp = tempdir().expect("tempdir");
-        // 无 sessionId 时 ID 兜底来自文件名 stem，同样不允许带 shell 元字符
+        // 不安全的文件名 stem 在缺少合法 JSON sessionId 时直接拒绝入库，防止元字符进入恢复命令或无法删除
         let path = temp.path().join("weird; id-session.jsonl");
         std::fs::write(
             &path,
@@ -969,10 +1993,15 @@ mod tests {
             ),
         )
         .expect("write");
+        assert!(parse_session(&path).is_none());
 
-        let meta = parse_session(&path).unwrap();
-        assert_eq!(meta.session_id, "weird; id-session");
-        assert!(meta.resume_command.is_none());
+        // 若 JSON 内同样携带恶意 sessionId，也必须拒绝
+        std::fs::write(
+            &path,
+            "{\"sessionId\":\"$(evil)\",\"cwd\":\"/tmp/project\"}\n",
+        )
+        .expect("write unsafe json id");
+        assert!(parse_session(&path).is_none());
     }
 
     #[test]
@@ -1086,5 +2115,353 @@ mod tests {
 
         let meta = parse_session(&path).unwrap();
         assert_eq!(meta.title.as_deref(), Some("帮我看看工作区的改动"));
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_file_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+
+    #[test]
+    fn discovery_and_preflight_enforce_depth_two_and_protect_project_and_memory_dirs() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let project = root.join("proj-alpha");
+        let memory_dir = project.join("memory");
+        let subagents_dir = project
+            .join("550e8400-e29b-41d4-a716-446655440000")
+            .join("subagents");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::create_dir_all(&subagents_dir).unwrap();
+
+        fs::write(memory_dir.join("MEMORY.md"), "keep memory").unwrap();
+        // Depth-3 .jsonl files inside memory/ or subagents/ must NOT be scanned
+        fs::write(
+            memory_dir.join("nested.jsonl"),
+            "{\"sessionId\":\"nested-mem\",\"cwd\":\"/p\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            subagents_dir.join("sub.jsonl"),
+            "{\"sessionId\":\"sub-1\",\"cwd\":\"/p\"}\n",
+        )
+        .unwrap();
+
+        // Depth-1 <root>/proj-alpha.jsonl whose stem matches the project folder must NOT be scanned or deleted
+        let depth_one_hazard = root.join("proj-alpha.jsonl");
+        fs::write(
+            &depth_one_hazard,
+            "{\"sessionId\":\"proj-alpha\",\"cwd\":\"/p\"}\n",
+        )
+        .unwrap();
+
+        // Reserved memory.jsonl without valid sessionId must be ignored; empty/non-object .jsonl ignored
+        fs::write(project.join("memory.jsonl"), "{\"cwd\":\"/p\"}\n").unwrap();
+        fs::write(project.join("empty-uuid.jsonl"), "   \n[]\n123\n").unwrap();
+
+        // Real depth-2 session
+        let valid_id = "550e8400-e29b-41d4-a716-446655440000";
+        let valid_path = project.join(format!("{valid_id}.jsonl"));
+        fs::write(
+            &valid_path,
+            format!("{{\"sessionId\":\"{valid_id}\",\"cwd\":\"/p\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"),
+        )
+        .unwrap();
+
+        let scanned = scan_sessions_in_root(&root, &FileParseCache::new());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].session_id, valid_id);
+
+        // Preflight & delete_session must reject depth-1 hazard, depth-3 path, and "memory" session_id
+        assert!(preflight_delete(&root, &depth_one_hazard, "proj-alpha").is_err());
+        assert!(delete_session(&root, &depth_one_hazard, "proj-alpha").is_err());
+        assert!(project.exists(), "project directory must never be deleted");
+
+        assert!(preflight_delete(&root, &memory_dir.join("nested.jsonl"), "nested-mem").is_err());
+        assert!(preflight_delete(&root, &project.join("memory.jsonl"), "memory").is_err());
+
+        // Even if memory.jsonl contains a valid sessionId, preflight/delete must refuse reserved "memory.jsonl"
+        fs::write(
+            project.join("memory.jsonl"),
+            "{\"sessionId\":\"safe-id-999\",\"cwd\":\"/p\"}\n",
+        )
+        .unwrap();
+        assert!(preflight_delete(&root, &project.join("memory.jsonl"), "safe-id-999").is_err());
+        assert!(memory_dir.join("MEMORY.md").exists());
+
+        // Symlinked .jsonl source must be rejected before touching target
+        let link_jsonl = project.join("link-session.jsonl");
+        if create_file_symlink(&valid_path, &link_jsonl).is_ok() {
+            assert!(preflight_delete(&root, &link_jsonl, valid_id).is_err());
+            assert!(delete_session(&root, &link_jsonl, valid_id).is_err());
+            assert!(valid_path.exists());
+        }
+    }
+
+    #[test]
+    fn forked_session_prefers_filename_stem_and_reads_deep_head_and_bounded_titles() {
+        let temp = tempdir().expect("tempdir");
+        let fork_id = "11111111-2222-3333-4444-555555555555";
+        let path = temp.path().join(format!("{fork_id}.jsonl"));
+
+        let mut lines = Vec::new();
+        // 45 leading snapshot/queue lines before cwd and first user message (> old 10-line window!)
+        lines.push(json!({"type":"file-history-snapshot","sessionId":"parent-0000"}).to_string());
+        for i in 0..44 {
+            lines.push(json!({"type":"queue-operation","index":i}).to_string());
+        }
+        lines.push(
+            json!({
+                "type":"user",
+                "sessionId":"parent-0000",
+                "cwd":"/workspace/deep-app",
+                "timestamp":"2026-03-06T10:00:00Z",
+                "message":{"role":"user","content":"Prompt at line 46"}
+            })
+            .to_string(),
+        );
+        // Oversized >4 MiB single line must be drained and skipped without failing the session
+        let huge_blob = "x".repeat(MAX_CLAUDE_LINE_BYTES + 64 * 1024);
+        lines.push(format!(
+            "{{\"type\":\"progress\",\"blob\":\"{huge_blob}\"}}"
+        ));
+        lines.push(json!({"type":"summary","summary":"Summary fallback title"}).to_string());
+        lines.push(json!({"type":"custom-title","customTitle":"Temporary custom"}).to_string());
+        // Later empty customTitle clears custom_title so summary/aiTitle can take effect
+        lines.push(json!({"type":"custom-title","customTitle":""}).to_string());
+        lines.push(
+            json!({
+                "type":"assistant",
+                "timestamp":"2026-03-06T10:05:00Z",
+                "message":{"role":"assistant","content":"Final tail answer"}
+            })
+            .to_string(),
+        );
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let meta = parse_session(&path).expect("parse session with >4MiB line");
+        assert_eq!(meta.session_id, fork_id);
+        assert_eq!(
+            meta.resume_command.as_deref(),
+            Some("claude --resume 11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(meta.project_dir.as_deref(), Some("/workspace/deep-app"));
+        assert_eq!(meta.title.as_deref(), Some("Summary fallback title"));
+        assert_eq!(meta.summary.as_deref(), Some("Final tail answer"));
+    }
+
+    #[test]
+    fn sessions_index_ghosts_and_claude_sidecars_are_discovered_and_cleaned() {
+        let temp = tempdir().expect("tempdir");
+        let claude_dir = temp.path().join(".claude");
+        let root = claude_dir.join("projects");
+        let project = root.join("-work-demo");
+        fs::create_dir_all(&project).unwrap();
+
+        let live_id = "live-1111";
+        let ghost_id = "ghost-2222";
+        let keep_id = "keep-3333";
+
+        let live_jsonl = project.join(format!("{live_id}.jsonl"));
+        fs::write(
+            &live_jsonl,
+            format!("{{\"sessionId\":\"{live_id}\",\"cwd\":\"/work/demo\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"live prompt\"}}}}\n"),
+        )
+        .unwrap();
+
+        let index_path = project.join("sessions-index.json");
+        fs::write(
+            &index_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "originalPath": "/work/demo",
+                "entries": [
+                    {
+                        "sessionId": live_id,
+                        "firstPrompt": "live prompt",
+                        "created": "2026-03-06T10:00:00Z",
+                        "modified": "2026-03-06T10:01:00Z"
+                    },
+                    {
+                        "sessionId": ghost_id,
+                        "customTitle": "Orphaned Resume Entry",
+                        "summary": "Ghost summary",
+                        "projectPath": "/work/demo",
+                        "created": "2026-03-06T09:00:00Z",
+                        "modified": "2026-03-06T09:30:00Z"
+                    },
+                    {
+                        "sessionId": keep_id,
+                        "firstPrompt": "Keep me",
+                        "created": "2026-03-06T08:00:00Z"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Populate ~/.claude/ per-session sidecars and legacy flat agent-*.jsonl for live_id + keep_id
+        for sid in [live_id, keep_id] {
+            fs::create_dir_all(claude_dir.join("file-history").join(sid)).unwrap();
+            fs::write(claude_dir.join("file-history").join(sid).join("v1"), "snap").unwrap();
+            fs::create_dir_all(claude_dir.join("tasks").join(sid)).unwrap();
+            fs::create_dir_all(claude_dir.join("session-env").join(sid)).unwrap();
+            fs::create_dir_all(claude_dir.join("debug")).unwrap();
+            fs::write(claude_dir.join("debug").join(format!("{sid}.txt")), "dbg").unwrap();
+            fs::create_dir_all(claude_dir.join("todos")).unwrap();
+            fs::write(
+                claude_dir.join("todos").join(format!("{sid}-agent-a.json")),
+                "[]",
+            )
+            .unwrap();
+            fs::write(claude_dir.join("todos").join(format!("{sid}.json")), "[]").unwrap();
+        }
+        fs::write(
+            project.join("agent-sub1.jsonl"),
+            format!("{{\"sessionId\":\"{live_id}\",\"isSidechain\":true}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            project.join("agent-sub2.jsonl"),
+            format!("{{\"sessionId\":\"{keep_id}\",\"isSidechain\":true}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            claude_dir.join("history.jsonl"),
+            format!(
+                "{{\"sessionId\":\"{live_id}\",\"display\":\"ask live\"}}\n\
+                 {{\"sessionId\":\"{keep_id}\",\"display\":\"ask keep\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_verified_claude_dir(&root, &claude_dir),
+            Some(claude_dir.canonicalize().unwrap())
+        );
+        assert_eq!(resolve_verified_claude_dir(temp.path(), &claude_dir), None);
+
+        let sessions = scan_sessions_in_root(&root, &FileParseCache::new());
+        // live_id (from .jsonl, NOT duplicated from index) + ghost_id + keep_id (both ghosts)
+        assert_eq!(sessions.len(), 3);
+        let ghost = sessions
+            .iter()
+            .find(|s| s.session_id == ghost_id)
+            .expect("ghost surfaced");
+        assert!(ghost.residual);
+        assert!(ghost.resume_command.is_none());
+        assert_eq!(ghost.title.as_deref(), Some("Orphaned Resume Entry"));
+        assert_eq!(ghost.project_dir.as_deref(), Some("/work/demo"));
+
+        // Delete live_id: removes .jsonl, index entry, flat agent-sub1.jsonl, and all ~/.claude sidecars
+        assert!(
+            delete_session_with_claude_dir(&root, &live_jsonl, live_id, Some(&claude_dir)).unwrap()
+        );
+        assert!(!live_jsonl.exists());
+        assert!(!project.join("agent-sub1.jsonl").exists());
+        assert!(project.join("agent-sub2.jsonl").exists());
+        assert!(!claude_dir.join("file-history").join(live_id).exists());
+        assert!(!claude_dir.join("tasks").join(live_id).exists());
+        assert!(!claude_dir.join("session-env").join(live_id).exists());
+        assert!(!claude_dir
+            .join("debug")
+            .join(format!("{live_id}.txt"))
+            .exists());
+        assert!(!claude_dir
+            .join("todos")
+            .join(format!("{live_id}-agent-a.json"))
+            .exists());
+        assert!(!claude_dir
+            .join("todos")
+            .join(format!("{live_id}.json"))
+            .exists());
+        assert!(claude_dir.join("file-history").join(keep_id).exists());
+        assert!(claude_dir
+            .join("todos")
+            .join(format!("{keep_id}.json"))
+            .exists());
+
+        let history_after = fs::read_to_string(claude_dir.join("history.jsonl")).unwrap();
+        assert!(!history_after.contains(live_id));
+        assert!(history_after.contains(keep_id));
+
+        // Delete ghost_id (whose .jsonl never existed on disk!)
+        let ghost_path = PathBuf::from(ghost.source_path.as_ref().unwrap());
+        preflight_delete(&root, &ghost_path, ghost_id).expect("ghost preflight");
+        assert!(
+            delete_session_with_claude_dir(&root, &ghost_path, ghost_id, Some(&claude_dir))
+                .unwrap()
+        );
+
+        let index_after: Value =
+            serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
+        let remaining_ids: Vec<&str> = index_after["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("sessionId").and_then(Value::as_str))
+            .collect();
+        assert_eq!(remaining_ids, vec![keep_id]);
+    }
+
+    #[test]
+    fn load_messages_emits_thinking_before_assistant_and_handles_rich_blocks() {
+        let messages = compat_load(vec![
+            json!({
+                "type": "user",
+                "uuid": "u1",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "document"},
+                        {"type": "text", "text": "Inspect these"}
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "message": {
+                    "id": "resp-1",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Analyzing attachments"},
+                        {"type": "server_tool_use", "id": "srv_1", "name": "web_search"},
+                        {
+                            "type": "web_search_tool_result",
+                            "content": [{"title": "Docs", "url": "https://docs.example.com"}]
+                        },
+                        {"type": "mcp_tool_use", "id": "mcp_1", "name": "linear_get_issue"},
+                        {"type": "text", "text": "All set."}
+                    ]
+                }
+            }),
+        ]);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "[Image]\n[Document]\nInspect these");
+        assert_eq!(messages[1].role, "thinking");
+        assert_eq!(messages[1].content, "Analyzing attachments");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(
+            messages[2].content,
+            "[Tool: web_search]\n- Docs (https://docs.example.com)\n[Tool: linear_get_issue]\nAll set."
+        );
     }
 }

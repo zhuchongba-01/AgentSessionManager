@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use providers::{claude, codex, deepseek, grokbuild, opencode, pi, zcode};
+use providers::{claude, codex, deepseek, grokbuild, opencode, pi, workbuddy, zcode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,7 +112,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 }
 
 fn scan_report() -> SessionScanReport {
-    let (r1, r2, r3, r4, r5, r6, r7) = std::thread::scope(|s| {
+    let (r1, r2, r3, r4, r5, r6, r7, r8) = std::thread::scope(|s| {
         let h1 = s.spawn(|| providers::utils::scan_with_diagnostics("codex", codex::scan_sessions));
         let h2 =
             s.spawn(|| providers::utils::scan_with_diagnostics("claude", claude::scan_sessions));
@@ -125,6 +125,9 @@ fn scan_report() -> SessionScanReport {
         let h6 = s.spawn(|| providers::utils::scan_with_diagnostics("zcode", zcode::scan_sessions));
         let h7 = s
             .spawn(|| providers::utils::scan_with_diagnostics("deepseek", deepseek::scan_sessions));
+        let h8 = s.spawn(|| {
+            providers::utils::scan_with_diagnostics("workbuddy", workbuddy::scan_sessions)
+        });
         (
             join_scan_results(h1),
             join_scan_results(h2),
@@ -133,12 +136,13 @@ fn scan_report() -> SessionScanReport {
             join_scan_results(h5),
             join_scan_results(h6),
             join_scan_results(h7),
+            join_scan_results(h8),
         )
     });
 
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    for (items, issues) in [r1, r2, r3, r4, r5, r6, r7] {
+    for (items, issues) in [r1, r2, r3, r4, r5, r6, r7, r8] {
         sessions.extend(items);
         warnings.extend(issues);
     }
@@ -194,14 +198,90 @@ fn join_scan_results(
     }
 }
 
+#[cfg(windows)]
+fn special_windows_prefix_key(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(prefix_comp)) = path.components().next() else {
+        return None;
+    };
+    match prefix_comp.kind() {
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) => None,
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some(format!(
+            "unc:{}\\{}",
+            server.to_string_lossy().to_ascii_lowercase(),
+            share.to_string_lossy().to_ascii_lowercase()
+        )),
+        Prefix::DeviceNS(dev) => Some(format!(
+            "dev:{}",
+            dev.to_string_lossy().to_ascii_lowercase()
+        )),
+        Prefix::Verbatim(v) => Some(format!(
+            "verbatim:{}",
+            v.to_string_lossy().to_ascii_lowercase()
+        )),
+    }
+}
+
+fn validate_lexical_source_path(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "Session source path must be absolute: {}",
+            path.display()
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "Session source path contains parent traversal: {}",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    if let Some(prefix_key) = special_windows_prefix_key(path) {
+        let allowed = roots
+            .iter()
+            .any(|root| special_windows_prefix_key(root).as_deref() == Some(prefix_key.as_str()));
+        if !allowed {
+            return Err(format!(
+                "Session source path uses an unconfigured UNC or device prefix: {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = roots;
+    Ok(())
+}
+
 /// 校验 `source_path` 归属并返回规范化路径；SQLite 源没有文件路径，由调用方先行分发。
 fn validated_file_source(provider_id: &str, source_path: &str) -> Result<PathBuf, String> {
     let roots = provider_roots(provider_id)?;
+    let raw_path = Path::new(source_path);
+    validate_lexical_source_path(raw_path, &roots)?;
     let physical = if provider_id == "codex" {
-        codex::physical_rollout_path(Path::new(source_path))?
+        codex::physical_rollout_path(raw_path)?
     } else {
-        PathBuf::from(source_path)
+        raw_path.to_path_buf()
     };
+    if matches!(provider_id, "pi" | "claude" | "workbuddy") {
+        let raw_meta = std::fs::symlink_metadata(&physical)
+            .map_err(|_| format!("session source not found: {}", physical.display()))?;
+        if providers::utils::is_reparse_or_symlink(&raw_meta) {
+            return Err(format!(
+                "Session source path must not be a symlink or reparse point: {}",
+                physical.display()
+            ));
+        }
+        if !roots
+            .iter()
+            .filter(|root| root.exists())
+            .any(|root| providers::utils::checked_storage_child(root, &physical).is_ok())
+        {
+            return Err("Session source is outside configured storage".into());
+        }
+    }
     let canonical = canonicalize_existing_path(&physical, "session source")?;
     if !roots.iter().any(|root| {
         root.canonicalize()
@@ -212,6 +292,27 @@ fn validated_file_source(provider_id: &str, source_path: &str) -> Result<PathBuf
     Ok(canonical)
 }
 
+pub fn search_messages(messages: &[SessionMessage], query: &str) -> Vec<usize> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let haystack = message.content.to_lowercase();
+            terms
+                .iter()
+                .all(|term| haystack.contains(term.as_str()))
+                .then_some(index)
+        })
+        .collect()
+}
+
 fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessage>, String> {
     match provider_id {
         "codex" => codex::load_messages(path),
@@ -220,6 +321,7 @@ fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessag
         "grokbuild" => grokbuild::load_messages(path),
         "pi" => pi::load_messages(path),
         "deepseek" => deepseek::load_messages(path),
+        "workbuddy" => workbuddy::load_messages(path),
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
 }
@@ -228,18 +330,18 @@ fn dispatch_messages(provider_id: &str, path: &Path) -> Result<Vec<SessionMessag
 ///
 /// 少列一个文件、或漏掉链的顺序/截断偏移，都会命中过期正文，因此只接受已经逐行核对
 /// 过读取范围的 provider：
-/// - `claude` / `deepseek` / `pi`：正文就是源文件本身
+/// - `claude` / `deepseek` / `pi` / `workbuddy`：正文就是源文件本身
 /// - `grokbuild`：正文在同目录 `chat_history.jsonl`，而 `summary.json` 只在一轮
 ///   结束时改写，只盯后者会让一轮进行中的会话命中旧正文
 /// - `codex`：正文是「当前文件 + 基座文件的前 N 字节」拼起来的分页历史链
 ///
-/// SQLite 源（`opencode` / `zcode`）在这里拿不到路径，由 `load_transcript` 的 SQLite
+/// SQLite 源（`opencode` / `zcode` / `workbuddy`）在这里拿不到路径，由 `load_transcript` 的 SQLite
 /// 分支处理。`opencode` 的旧版消息目录不接入：列出兄弟 `part/` 目录需要先读
 /// 消息文件取 id，等于把读取本身做一遍。`pi` 扫描期的 `residual` 标志依赖父会话文件是否
 /// 存在，那是元数据的顾虑，与正文无关。
 fn transcript_cache_sources(provider_id: &str, path: &Path) -> Option<cache::TranscriptSources> {
     match provider_id {
-        "claude" | "deepseek" | "pi" => Some(vec![(path.to_path_buf(), None)]),
+        "claude" | "deepseek" | "pi" | "workbuddy" => Some(vec![(path.to_path_buf(), None)]),
         "grokbuild" => grokbuild::transcript_sources(path).ok(),
         // 链解析失败时不缓存，交给正文读取去报真正的错误
         "codex" => codex::transcript_sources(path).ok(),
@@ -256,11 +358,14 @@ fn transcript_cache_sources(provider_id: &str, path: &Path) -> Option<cache::Tra
 enum SqliteSourceKind {
     OpenCode,
     ZCode,
+    WorkBuddy,
 }
 
 fn sqlite_source_kind(source_path: &str) -> Option<SqliteSourceKind> {
     if source_path.starts_with("sqlite-zcode:") {
         Some(SqliteSourceKind::ZCode)
+    } else if source_path.starts_with("sqlite-workbuddy:") {
+        Some(SqliteSourceKind::WorkBuddy)
     } else if source_path.starts_with("sqlite:") {
         Some(SqliteSourceKind::OpenCode)
     } else {
@@ -273,6 +378,7 @@ fn sqlite_source_owner(provider_id: &str) -> Option<SqliteSourceKind> {
     match provider_id {
         "opencode" => Some(SqliteSourceKind::OpenCode),
         "zcode" => Some(SqliteSourceKind::ZCode),
+        "workbuddy" => Some(SqliteSourceKind::WorkBuddy),
         _ => None,
     }
 }
@@ -323,6 +429,16 @@ pub fn load_transcript(
                     source_path,
                 )?))),
             },
+            SqliteSourceKind::WorkBuddy => {
+                match workbuddy::sqlite_transcript_sources(source_path) {
+                    Some(sources) => cached_transcript(provider_id, source_path, sources, || {
+                        workbuddy::load_messages_sqlite(source_path)
+                    }),
+                    None => Ok(Arc::new(cache::Transcript::new(
+                        workbuddy::load_messages_sqlite(source_path)?,
+                    ))),
+                }
+            }
         };
     }
 
@@ -367,6 +483,13 @@ pub fn checked_list_sessions() -> Result<SessionScanReport, String> {
     Ok(scan_report())
 }
 
+fn validate_codex_sqlite_home_preflight() -> Result<(), String> {
+    let config_dir = crate::session_paths::codex_config_dir();
+    let config_text = crate::session_paths::read_codex_config_text()?;
+    crate::session_paths::validate_codex_sqlite_home_for_delete(&config_dir, &config_text)
+        .map(|_| ())
+}
+
 pub fn delete_session_checked(
     provider_id: &str,
     session_id: &str,
@@ -380,7 +503,7 @@ pub fn delete_session_checked(
         .lock()
         .map_err(|_| "清理锁不可用，请重启管理器")?;
     deletion::ensure_agent_stopped(provider_id)?;
-    deletion::pending_sessions()?;
+    deletion::ensure_pending_journals_healthy(Some(provider_id))?;
     let sessions = scan_sessions();
     let target = sessions
         .iter()
@@ -391,7 +514,9 @@ pub fn delete_session_checked(
         })
         .ok_or("会话已变化或不存在，请重新扫描")?;
     let reply = if provider_id == "codex" {
-        deletion::run_codex(target, &sessions, &provider_roots("codex")?)
+        let roots = provider_roots("codex")?;
+        validate_codex_sqlite_home_preflight()?;
+        deletion::run_codex(target, &sessions, &roots)
     } else {
         deletion::run(target, &sessions, preflight_deletion, |plan| {
             delete_session_in_snapshot(provider_id, session_id, source_path, include_project, plan)
@@ -419,10 +544,13 @@ fn plan_entry_skips_preflight(item: &SessionMeta) -> Result<bool, String> {
         return Ok(false);
     }
     let path = item.source_path.as_deref().ok_or("缺少会话路径")?;
-    Ok(!Path::new(path).exists())
+    Ok(std::fs::symlink_metadata(path).is_err())
 }
 
 fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
+    if plan.iter().any(|item| item.provider_id == "codex") {
+        validate_codex_sqlite_home_preflight()?;
+    }
     // Validate every Codex transcript in the persisted plan using the exact
     // canonical paths later used by deletion, before any index or journal write.
     for item in plan.iter().filter(|item| item.provider_id == "codex") {
@@ -439,6 +567,14 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
         codex::validate_delete_under_root(&root, &canonical, &item.session_id)?;
         codex::should_cleanup_index_after_delete(&item.session_id, &canonical.to_string_lossy())?;
     }
+    for item in plan.iter().filter(|item| item.provider_id == "claude") {
+        let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
+        let root = provider_roots("claude")?
+            .into_iter()
+            .find(|root| root.exists())
+            .ok_or("Claude 会话根目录不存在")?;
+        claude::preflight_delete(&root, path, &item.session_id)?;
+    }
     for item in plan.iter().filter(|item| item.provider_id == "deepseek") {
         let path = Path::new(item.source_path.as_deref().ok_or("缺少会话路径")?);
         let root = provider_roots("deepseek")?
@@ -448,6 +584,7 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
         deepseek::preflight_delete(&root, path, &item.session_id)?;
     }
     for item in plan.iter().filter(|item| item.provider_id == "zcode") {
+        provider_roots("zcode")?;
         zcode::preflight_delete(
             item.source_path.as_deref().ok_or("缺少会话路径")?,
             &item.session_id,
@@ -465,6 +602,7 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
         pi::preflight_delete(&root, path, &item.session_id)?;
     }
     for item in plan.iter().filter(|item| item.provider_id == "opencode") {
+        provider_roots("opencode")?;
         opencode::preflight_delete(
             item.source_path.as_deref().ok_or("缺少会话路径")?,
             &item.session_id,
@@ -472,6 +610,15 @@ fn preflight_deletion(plan: &[SessionMeta]) -> Result<(), String> {
     }
     if plan.iter().any(|item| item.provider_id == "grokbuild") {
         preflight_grok_deletion(plan, &provider_roots("grokbuild")?)?;
+    }
+    for item in plan.iter().filter(|item| item.provider_id == "workbuddy") {
+        let roots = provider_roots("workbuddy")?;
+        let source = item.source_path.as_deref().ok_or("缺少会话路径")?;
+        if source.starts_with("sqlite-workbuddy:") {
+            workbuddy::preflight_delete_sqlite(source, &item.session_id)?;
+        } else {
+            workbuddy::preflight_delete_in_roots(&roots, Path::new(source), &item.session_id)?;
+        }
     }
     Ok(())
 }
@@ -526,7 +673,7 @@ where
         return Err("会话清理不再删除项目目录；请使用文件管理器单独处理项目文件".into());
     }
     if selected.is_some_and(|item| item.residual && !item.cleanup_pending)
-        && matches!(provider_id, "codex" | "claude" | "pi" | "deepseek")
+        && matches!(provider_id, "codex" | "pi" | "deepseek")
         && !Path::new(source_path).exists()
     {
         return Ok(DeleteSessionReply::NotFound);
@@ -553,13 +700,17 @@ where
     {
         codex::cleanup_after_delete(session_id)?;
     }
-    // DeepSeek and Grok are deliberately excluded: their providers finish
-    // directory/cache cleanup even after the primary source has disappeared
-    // (see `delete_session_with_roots`), so each must reach
-    // `delete_session_record` even when `source_path` no longer exists.
-    let missing_file =
-        matches!(provider_id, "codex" | "claude" | "pi") && !Path::new(source_path).exists();
-    let deleted = if missing_file {
+    // DeepSeek, Grok, and Claude (for sessions-index.json ghosts and sidecar
+    // retries) finish index/sidecar cleanup even after the primary `.jsonl`
+    // source is gone, so they must reach `delete_session_record`.
+    let missing_file = matches!(provider_id, "codex" | "pi") && !Path::new(source_path).exists();
+    let unexpectedly_missing = (provider_id == "claude"
+        || (provider_id == "workbuddy" && !source_path.starts_with("sqlite-workbuddy:")))
+        && !Path::new(source_path).exists()
+        && !selected.is_some_and(|item| item.cleanup_pending || item.residual);
+    let deleted = if unexpectedly_missing {
+        return Err("会话文件已消失，请重新扫描".into());
+    } else if missing_file {
         if selected.is_some_and(|item| item.cleanup_pending || item.residual) {
             true
         } else {
@@ -576,9 +727,7 @@ where
     // entry itself remains deliberately scoped to that one entry.
     if deleted || selected.is_some_and(|item| item.cleanup_pending) {
         for residual_source in related_residual_sources {
-            if matches!(provider_id, "codex" | "claude" | "pi")
-                && !Path::new(&residual_source).exists()
-            {
+            if matches!(provider_id, "codex" | "pi") && !Path::new(&residual_source).exists() {
                 continue;
             }
             if let Err(error) = delete_record(provider_id, session_id, &residual_source, false) {
@@ -629,11 +778,16 @@ fn delete_session_record(
     source_path: &str,
     include_project: bool,
 ) -> Result<bool, String> {
-    // SQLite sessions bypass the file-based deletion path.
+    // SQLite sessions bypass the file-based deletion path, but still enforce absolute provider_roots.
     let deleted = if provider_id == "opencode" && source_path.starts_with("sqlite:") {
+        provider_roots("opencode")?;
         opencode::delete_session_sqlite(session_id, source_path)?
     } else if provider_id == "zcode" && source_path.starts_with("sqlite-zcode:") {
+        provider_roots("zcode")?;
         zcode::delete_session(session_id, source_path, include_project)?
+    } else if provider_id == "workbuddy" && source_path.starts_with("sqlite-workbuddy:") {
+        provider_roots("workbuddy")?;
+        workbuddy::delete_session_sqlite(session_id, source_path)?
     } else {
         let roots = provider_roots(provider_id)?;
         delete_session_with_roots(provider_id, session_id, Path::new(source_path), &roots)?
@@ -653,8 +807,31 @@ fn delete_sessions_with_check<F>(
 where
     F: FnMut(&str) -> Result<(), String>,
 {
+    if requests.is_empty() {
+        return Vec::new();
+    }
     let guard = deletion::DELETE_LOCK.lock();
-    let pending_check = deletion::pending_sessions().map(|_| ());
+    if guard.is_err() {
+        return collect_delete_session_outcomes(requests, |_| {
+            Err("清理锁不可用，请重启管理器".into())
+        });
+    }
+    let all_journals_healthy = deletion::ensure_pending_journals_healthy(None).is_ok();
+    if !all_journals_healthy
+        && requests
+            .iter()
+            .all(|req| deletion::ensure_pending_journals_healthy(Some(&req.provider_id)).is_err())
+    {
+        return collect_delete_session_outcomes(requests, |request| {
+            if request.include_project {
+                return Err("批量清理不删除项目目录".into());
+            }
+            ensure_stopped(&request.provider_id)?;
+            deletion::ensure_pending_journals_healthy(Some(&request.provider_id))?;
+            Ok(DeleteSessionReply::NotFound)
+        });
+    }
+
     let sessions = scan_sessions();
     let codex_order = codex::deletion_order(requests);
     let order = deepseek::deletion_order(requests, &codex_order);
@@ -668,15 +845,12 @@ where
         .collect::<Vec<_>>();
     let mut codex_progress = deletion::CodexBatchProgress::default();
     let outcomes = collect_delete_session_outcomes(&ordered, |request| {
-        if guard.is_err() {
-            return Err("清理锁不可用，请重启管理器".into());
-        }
         if request.include_project {
             return Err("批量清理不删除项目目录".into());
         }
         ensure_stopped(&request.provider_id)?;
-        if let Err(error) = &pending_check {
-            return Err(error.clone());
+        if !all_journals_healthy {
+            deletion::ensure_pending_journals_healthy(Some(&request.provider_id))?;
         }
         let Some(target) = sessions.iter().find(|item| {
             item.provider_id == request.provider_id
@@ -686,8 +860,10 @@ where
             return Err("会话已变化或不存在，请重新扫描".into());
         };
         if request.provider_id == "codex" {
+            let roots = provider_roots("codex")?;
+            validate_codex_sqlite_home_preflight()?;
             return codex_progress.run(target, &sessions, |target, remaining| {
-                deletion::run_codex(target, remaining, &provider_roots("codex")?)
+                deletion::run_codex(target, remaining, &roots)
             });
         }
         deletion::run(target, &sessions, preflight_deletion, |plan| {
@@ -715,6 +891,8 @@ fn delete_session_with_roots(
     source_path: &Path,
     roots: &[PathBuf],
 ) -> Result<bool, String> {
+    validate_lexical_source_path(source_path, roots)?;
+
     // Grok owns a directory, not just summary.json. Preserve the original path
     // so its validator can reject links and finish partially removed directories.
     if provider_id == "grokbuild" {
@@ -732,6 +910,63 @@ fn delete_session_with_roots(
             .find(|root| root.exists())
             .ok_or("DeepSeek Harness 会话根目录不存在")?;
         return deepseek::delete_session(root, source_path, session_id);
+    }
+
+    // Claude validates depth-2 layout, rejects symlinked transcripts/ancestors,
+    // and supports `sessions-index.json` ghost and sidecar cleanup retries even
+    // when the `.jsonl` file has already been removed.
+    if provider_id == "claude" {
+        let root = roots.iter().find(|root| root.exists()).ok_or_else(|| {
+            format!(
+                "Session root not found for provider claude: {}",
+                roots
+                    .first()
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            )
+        })?;
+        return claude::delete_session(root, source_path, session_id);
+    }
+
+    if provider_id == "workbuddy" {
+        return workbuddy::delete_session_in_roots(roots, source_path, session_id);
+    }
+
+    // Reject symlinked Pi session paths before `canonicalize_existing_path`
+    // could resolve a link onto another session target.
+    if provider_id == "pi" {
+        let raw_meta = std::fs::symlink_metadata(source_path)
+            .map_err(|_| format!("session source not found: {}", source_path.display()))?;
+        if providers::utils::is_reparse_or_symlink(&raw_meta) {
+            return Err(format!(
+                "Session source path must not be a symlink or reparse point: {}",
+                source_path.display()
+            ));
+        }
+        let mut saw_existing_root = false;
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            saw_existing_root = true;
+            if providers::utils::checked_storage_child(root, source_path).is_ok() {
+                let validated_root = canonicalize_existing_path(root, "session root")?;
+                return pi::delete_session(&validated_root, source_path, session_id);
+            }
+        }
+        if !saw_existing_root {
+            return Err(format!(
+                "Session root not found for provider pi: {}",
+                roots
+                    .first()
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            ));
+        }
+        return Err(format!(
+            "Session source path is outside provider roots: {}",
+            source_path.display()
+        ));
     }
 
     // A legacy OpenCode session can retain its metadata after its message
@@ -802,6 +1037,7 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
             .parent()
             .ok_or("Invalid ZCode database path")?
             .to_path_buf()],
+        "workbuddy" => workbuddy::session_roots(),
         _ => return Err(format!("Unsupported provider: {provider_id}")),
     };
 
@@ -1536,5 +1772,199 @@ mod tests {
             .expect("stale residual short-circuits to NotFound");
 
         assert!(matches!(reply, DeleteSessionReply::NotFound));
+    }
+
+    #[test]
+    fn lexical_source_validation_rejects_relative_parent_and_unconfigured_unc_paths() {
+        let temp = tempdir().expect("tempdir");
+        let roots = vec![temp.path().to_path_buf()];
+
+        assert!(validate_lexical_source_path(Path::new("relative/session.jsonl"), &roots).is_err());
+        assert!(
+            validate_lexical_source_path(&temp.path().join("..").join("escape.jsonl"), &roots)
+                .is_err()
+        );
+        assert!(validate_lexical_source_path(&temp.path().join("session.jsonl"), &roots).is_ok());
+
+        #[cfg(windows)]
+        {
+            assert!(validate_lexical_source_path(
+                Path::new(r"\\198.51.100.1\share\session.jsonl"),
+                &roots
+            )
+            .is_err());
+            assert!(validate_lexical_source_path(Path::new(r"\\.\PIPE\evil"), &roots).is_err());
+            let unc_roots = vec![PathBuf::from(r"\\nas.local\homes\alice\.codex\sessions")];
+            assert!(validate_lexical_source_path(
+                Path::new(r"\\NAS.LOCAL\HOMES\alice\.codex\sessions\rollout.jsonl"),
+                &unc_roots
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn empty_batch_delete_returns_immediately_and_search_messages_matches_all_terms() {
+        assert!(
+            delete_sessions_with_check(&[], |_| panic!("must not check empty batch")).is_empty()
+        );
+
+        let messages = vec![
+            SessionMessage {
+                role: "user".into(),
+                content: "Fix Rust TranscriptCache race".into(),
+                ts: None,
+            },
+            SessionMessage {
+                role: "assistant".into(),
+                content: "Updated transcriptcache generation counter".into(),
+                ts: None,
+            },
+            SessionMessage {
+                role: "tool".into(),
+                content: "Cargo check passed".into(),
+                ts: None,
+            },
+        ];
+        assert_eq!(
+            search_messages(&messages, "  transcriptcache   rust "),
+            vec![0]
+        );
+        assert_eq!(search_messages(&messages, "TRANSCRIPTCACHE"), vec![0, 1]);
+        assert!(search_messages(&messages, "   ").is_empty());
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink_mod(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink_mod(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_file_symlink_mod(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+
+    #[test]
+    fn claude_and_pi_reject_symlink_sources_and_claude_ghost_deletion_reaches_provider() {
+        let temp = tempdir().expect("tempdir");
+        let claude_root = temp.path().join("projects");
+        let project = claude_root.join("demo-proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let real_claude = project.join("real-session.jsonl");
+        std::fs::write(
+            &real_claude,
+            "{\"sessionId\":\"real-session\",\"cwd\":\"/demo\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        let link_claude = project.join("link-session.jsonl");
+        if create_file_symlink_mod(&real_claude, &link_claude).is_ok() {
+            assert!(delete_session_with_roots(
+                "claude",
+                "real-session",
+                &link_claude,
+                std::slice::from_ref(&claude_root),
+            )
+            .is_err());
+            assert!(
+                real_claude.exists(),
+                "real Claude session must survive symlink delete attempt"
+            );
+        }
+
+        let pi_root = temp.path().join("pi-sessions");
+        std::fs::create_dir_all(&pi_root).unwrap();
+        let real_pi = pi_root.join("pi-real.jsonl");
+        std::fs::write(
+            &real_pi,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"pi-real\",\"cwd\":\"/demo\"}\n",
+        )
+        .unwrap();
+        let link_pi = pi_root.join("pi-link.jsonl");
+        if create_file_symlink_mod(&real_pi, &link_pi).is_ok() {
+            assert!(delete_session_with_roots(
+                "pi",
+                "pi-real",
+                &link_pi,
+                std::slice::from_ref(&pi_root),
+            )
+            .is_err());
+            assert!(
+                real_pi.exists(),
+                "real Pi session must survive symlink delete attempt"
+            );
+        }
+
+        // Claude sessions-index.json ghost (residual: true, .jsonl missing on disk) reaches provider cleanup
+        let ghost_id = "ghost-session-1";
+        let ghost_source = project.join(format!("{ghost_id}.jsonl"));
+        let index_path = project.join("sessions-index.json");
+        std::fs::write(
+            &index_path,
+            serde_json::json!({
+                "version": 1,
+                "entries": [{ "sessionId": ghost_id, "firstPrompt": "orphaned" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ghost_meta = session_meta("claude", ghost_id, &ghost_source.to_string_lossy(), true);
+        let reply = delete_session_in_snapshot_with(
+            "claude",
+            ghost_id,
+            &ghost_source.to_string_lossy(),
+            false,
+            std::slice::from_ref(&ghost_meta),
+            |provider, id, source, _| {
+                delete_session_with_roots(
+                    provider,
+                    id,
+                    Path::new(source),
+                    std::slice::from_ref(&claude_root),
+                )
+            },
+        )
+        .expect("ghost cleanup should succeed");
+        assert!(matches!(reply, DeleteSessionReply::Deleted { warnings } if warnings.is_empty()));
+        let updated_index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        assert!(updated_index["entries"].as_array().unwrap().is_empty());
+
+        // WorkBuddy sqlite-workbuddy: source ownership & symlink source rejection
+        assert_eq!(
+            checked_sqlite_source("workbuddy", "sqlite-workbuddy:C:/wb/workbuddy.db:s1").unwrap(),
+            Some(SqliteSourceKind::WorkBuddy)
+        );
+        assert!(
+            checked_sqlite_source("opencode", "sqlite-workbuddy:C:/wb/workbuddy.db:s1").is_err()
+        );
+        assert!(checked_sqlite_source("workbuddy", "sqlite-zcode:C:/z/db.sqlite:s1").is_err());
+
+        let wb_home = temp.path().join(".workbuddy-ai");
+        let wb_proj = wb_home.join("projects").join("demo");
+        std::fs::create_dir_all(&wb_proj).unwrap();
+        let real_wb = wb_proj.join("11111111-1111-4111-8111-111111111111.jsonl");
+        std::fs::write(&real_wb, "{}\n").unwrap();
+        let link_wb = wb_proj.join("22222222-2222-4222-8222-222222222222.jsonl");
+        if create_file_symlink_mod(&real_wb, &link_wb).is_ok() {
+            assert!(delete_session_with_roots(
+                "workbuddy",
+                "22222222-2222-4222-8222-222222222222",
+                &link_wb,
+                std::slice::from_ref(&wb_home),
+            )
+            .is_err());
+            assert!(real_wb.exists());
+        }
     }
 }

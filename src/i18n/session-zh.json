@@ -13,7 +13,8 @@
     "opencode": "OpenCode",
     "zcode": "ZCode",
     "pi": "Pi",
-    "deepseek": "DeepSeek Harness"
+    "deepseek": "DeepSeek Harness",
+    "workbuddy": "WorkBuddy"
   },
   "sessionManager": {
     "providerFilterAll": "全部 Agent",
@@ -92,7 +93,11 @@
     "roleUser": "用户",
     "roleSystem": "系统",
     "roleTool": "工具",
+    "roleThinking": "思考过程",
+    "expandThinking": "展开思考过程",
+    "collapseThinking": "收起思考过程",
     "copyMessage": "复制消息",
+    "copyFailed": "复制失败",
     "messageCopied": "已复制消息内容",
     "conversationHistory": "对话记录",
     "expandContent": "展开完整内容",
@@ -171,6 +176,9 @@
     "statusFilterCleanupPending": "待清理 {{count}}",
     "statusFilterChild": "子会话 {{count}}",
     "statusFilterArchived": "已归档 {{count}}",
-    "resizeSidebar": "调整侧边栏宽度"
+    "resizeSidebar": "调整侧边栏宽度",
+    "unsupportedUrlProtocol": "仅允许打开 HTTPS 链接",
+    "errorBoundaryTitle": "页面渲染出现异常",
+    "errorBoundaryReload": "重新加载"
   }
 }

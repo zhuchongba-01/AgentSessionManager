@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -10,10 +10,12 @@ use serde_json::Value;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    checked_storage_child, collect_files_where, collect_files_where_checked, ensure_readable_size,
-    extract_text, is_safe_session_id, order_selected_children, parse_timestamp_to_ms,
-    truncate_summary, validate_parent_graph, FileParseCache, TITLE_MAX_CHARS,
+    checked_storage_child, collect_files_where_checked, ensure_readable_size, extract_text,
+    is_reparse_or_symlink, is_safe_session_id, order_selected_children, parse_timestamp_to_ms,
+    scan_warning, truncate_summary, validate_parent_graph, FileParseCache, TITLE_MAX_CHARS,
 };
+
+const MAX_CWD_FILE_BYTES: u64 = 4096;
 
 #[derive(Debug, Deserialize)]
 struct GrokSessionInfo {
@@ -64,6 +66,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 fn parse_discovered_summary(path: &Path) -> Result<Option<SessionMeta>, String> {
     Ok(parse_summary_result(path)?.map(|mut session| {
         if is_archived_summary(path) {
+            session.archived = true;
             session.residual = true;
             session.resume_command = None;
         }
@@ -94,12 +97,17 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             ))
         }
     };
-    if needs_rebuild && read_summary(path)?.chat_format_version == Some(1) {
+    if needs_rebuild {
         let updates_path = session_dir.join("updates.jsonl");
-        ensure_readable_size(&updates_path)?;
-        let file = File::open(&updates_path)
-            .map_err(|error| format!("Failed to open Grok Build updates: {error}"))?;
-        return read_update_messages(BufReader::new(file));
+        let chat_format_version = read_summary(path)?.chat_format_version;
+        if chat_format_version == Some(1)
+            || (chat_format_version.is_none() && updates_path.is_file())
+        {
+            ensure_readable_size(&updates_path)?;
+            let file = File::open(&updates_path)
+                .map_err(|error| format!("Failed to open Grok Build updates: {error}"))?;
+            return read_update_messages(BufReader::new(file));
+        }
     }
     ensure_readable_size(&chat_path)?;
     let file = File::open(&chat_path)
@@ -155,12 +163,28 @@ fn conversation_message(value: &Value) -> Option<SessionMessage> {
     if kind == "assistant" {
         if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
-                let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
-                let args = call.get("arguments").and_then(Value::as_str).unwrap_or("");
+                let name = call
+                    .get("name")
+                    .or_else(|| call.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("tool");
+                let args = match call
+                    .get("arguments")
+                    .or_else(|| call.pointer("/function/arguments"))
+                {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) if !other.is_null() => other.to_string(),
+                    _ => String::new(),
+                };
                 if !content.is_empty() {
                     content.push('\n');
                 }
-                content.push_str(&format!("[Tool: {name}] {args}"));
+                if args.is_empty() {
+                    content.push_str(&format!("[Tool: {name}]"));
+                } else {
+                    content.push_str(&format!("[Tool: {name}] {args}"));
+                }
             }
         }
     } else if kind == "backend_tool_call" {
@@ -361,6 +385,74 @@ fn read_update_messages(reader: impl BufRead) -> Result<Vec<SessionMessage>, Str
     Ok(state.output)
 }
 
+fn has_three_level_summary_layout(root: &Path, summary_path: &Path) -> bool {
+    let Ok(relative) = summary_path.strip_prefix(root) else {
+        return false;
+    };
+    let parts = relative.components().collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        && parts[1]
+            .as_os_str()
+            .to_str()
+            .is_some_and(is_safe_session_id)
+        && parts[2].as_os_str() == "summary.json"
+}
+
+fn active_copy_exists_in_roots(roots: &[PathBuf], session_id: &str) -> Result<bool, String> {
+    if !is_safe_session_id(session_id) {
+        return Ok(false);
+    }
+    for root in roots {
+        if is_archived_summary(root) {
+            continue;
+        }
+        let root_meta = match std::fs::symlink_metadata(root) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect Grok Build session root {}: {error}",
+                    root.display()
+                ))
+            }
+        };
+        if is_reparse_or_symlink(&root_meta) || !root_meta.is_dir() {
+            continue;
+        }
+        let projects = std::fs::read_dir(root).map_err(|error| {
+            format!(
+                "Failed to scan Grok Build session root {}: {error}",
+                root.display()
+            )
+        })?;
+        for entry in projects {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Failed to enumerate Grok Build session root {}: {error}",
+                    root.display()
+                )
+            })?;
+            let candidate = entry.path().join(session_id).join("summary.json");
+            let Ok(target) = checked_delete_target(root, &candidate, session_id) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::symlink_metadata(&target) else {
+                continue;
+            };
+            if is_reparse_or_symlink(&meta) || !meta.is_file() {
+                continue;
+            }
+            if read_summary(&target).is_ok_and(|summary| summary.info.id == session_id) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn parent_relations_in_roots(roots: &[PathBuf]) -> Result<HashMap<String, String>, String> {
     let mut relations = HashMap::new();
     let mut seen_paths = HashSet::new();
@@ -384,10 +476,15 @@ fn parent_relations_in_roots(roots: &[PathBuf]) -> Result<HashMap<String, String
             if !seen_paths.insert(summary_path.clone()) {
                 continue;
             }
+            // Only admit `<root>/<project>/<session_id>/summary.json` layouts so
+            // misplaced files at arbitrary depths cannot deadlock parent deletion.
+            if !has_three_level_summary_layout(&root, &summary_path) {
+                continue;
+            }
             let summary = read_summary(&summary_path)?;
             let child = summary.info.id;
-            if !is_safe_session_id(&child) {
-                return Err("Grok Build summary contains an invalid session ID".into());
+            if checked_delete_target(&root, &summary_path, &child).is_err() {
+                continue;
             }
             let Some(parent) = summary
                 .parent_session_id
@@ -456,13 +553,7 @@ fn checked_delete_target(root: &Path, path: &Path, session_id: &str) -> Result<P
         target.push(part.as_os_str());
         match std::fs::symlink_metadata(&target) {
             Ok(meta) => {
-                #[cfg(windows)]
-                let is_link = {
-                    use std::os::windows::fs::MetadataExt;
-                    meta.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
-                };
-                #[cfg(not(windows))]
-                let is_link = meta.file_type().is_symlink();
+                let is_link = is_reparse_or_symlink(&meta);
                 if is_link || (index < 2 && !meta.is_dir()) || (index == 2 && !meta.is_file()) {
                     return Err(format!(
                         "Invalid Grok Build session path component: {}",
@@ -504,13 +595,17 @@ pub(in crate::session_manager) fn preflight_delete_in_roots(
         Err(error) => return Err(format!("Failed to inspect Grok Build summary: {error}")),
     }
     let relations = parent_relations_in_roots(roots)?;
-    if let Some(child) = relations
-        .iter()
-        .find_map(|(child, parent)| (parent == session_id).then_some(child))
-    {
-        return Err(format!(
-            "该 Grok Build 会话仍被子会话 {child} 依赖，请先删除子会话"
-        ));
+    let archived_backed_by_active =
+        is_archived_summary(path) && active_copy_exists_in_roots(roots, session_id)?;
+    if !archived_backed_by_active {
+        if let Some(child) = relations
+            .iter()
+            .find_map(|(child, parent)| (parent == session_id).then_some(child))
+        {
+            return Err(format!(
+                "该 Grok Build 会话仍被子会话 {child} 依赖，请先删除子会话"
+            ));
+        }
     }
     Ok(())
 }
@@ -562,7 +657,7 @@ pub fn delete_session_in_roots(
     let session_dir = target
         .parent()
         .ok_or("Invalid Grok Build session directory")?;
-    match std::fs::remove_dir_all(session_dir) {
+    let outcome = match std::fs::remove_dir_all(session_dir) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // NotFound can originate from a child during recursive removal; only
@@ -579,7 +674,13 @@ pub fn delete_session_in_roots(
             "Failed to delete Grok Build session directory {}: {error}",
             session_dir.display()
         )),
+    };
+    if outcome.is_ok() {
+        if let Some(project_dir) = session_dir.parent() {
+            let _ = std::fs::remove_dir(project_dir);
+        }
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -588,11 +689,77 @@ fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, St
 }
 
 fn collect_summary_files(root: &Path, files: &mut Vec<PathBuf>) {
-    collect_files_where(
-        root,
-        |path| path.file_name().and_then(|name| name.to_str()) == Some("summary.json"),
-        files,
-    );
+    let root_meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            scan_warning(format!("无法扫描 {}：{error}", root.display()));
+            return;
+        }
+    };
+    if is_reparse_or_symlink(&root_meta) || !root_meta.is_dir() {
+        return;
+    }
+    let projects = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            scan_warning(format!("无法扫描 {}：{error}", root.display()));
+            return;
+        }
+    };
+    for project_entry in projects {
+        let project_entry = match project_entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan_warning(format!("无法枚举 {}：{error}", root.display()));
+                continue;
+            }
+        };
+        let project_path = project_entry.path();
+        let Ok(project_meta) = std::fs::symlink_metadata(&project_path) else {
+            continue;
+        };
+        if is_reparse_or_symlink(&project_meta) || !project_meta.is_dir() {
+            continue;
+        }
+        let sessions = match std::fs::read_dir(&project_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                scan_warning(format!("无法扫描 {}：{error}", project_path.display()));
+                continue;
+            }
+        };
+        for session_entry in sessions {
+            let session_entry = match session_entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan_warning(format!("无法枚举 {}：{error}", project_path.display()));
+                    continue;
+                }
+            };
+            let Some(dir_id) = session_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !is_safe_session_id(&dir_id) {
+                continue;
+            }
+            let session_path = session_entry.path();
+            let Ok(session_meta) = std::fs::symlink_metadata(&session_path) else {
+                continue;
+            };
+            if is_reparse_or_symlink(&session_meta) || !session_meta.is_dir() {
+                continue;
+            }
+            let summary_path = session_path.join("summary.json");
+            let Ok(summary_meta) = std::fs::symlink_metadata(&summary_path) else {
+                continue;
+            };
+            if !is_reparse_or_symlink(&summary_meta) && summary_meta.is_file() {
+                files.push(summary_path);
+            }
+        }
+    }
 }
 
 fn read_summary(path: &Path) -> Result<GrokSessionSummary, String> {
@@ -603,13 +770,43 @@ fn read_summary(path: &Path) -> Result<GrokSessionSummary, String> {
         .map_err(|e| format!("Failed to parse Grok Build session summary: {e}"))
 }
 
+fn read_project_cwd_fallback(summary_path: &Path) -> Option<String> {
+    let project_dir = summary_path.parent()?.parent()?;
+    let cwd_file = project_dir.join(".cwd");
+    let meta = std::fs::symlink_metadata(&cwd_file).ok()?;
+    if is_reparse_or_symlink(&meta) || !meta.is_file() || meta.len() > MAX_CWD_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    File::open(&cwd_file)
+        .ok()?
+        .take(MAX_CWD_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CWD_FILE_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// 扫描缓存用：读失败（权限、被占用、JSON 损坏）返回 `Err`，本轮不缓存、下轮重试，
 /// 与接入缓存前「每轮重扫都重新解析并重复警告」的行为一致。
 fn parse_summary_result(path: &Path) -> Result<Option<SessionMeta>, String> {
     let summary = read_summary(path).inspect_err(|error| {
-        super::utils::scan_warning(error.clone());
+        scan_warning(error.clone());
     })?;
     let session_id = summary.info.id;
+    if !is_safe_session_id(&session_id)
+        || path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some(session_id.as_str())
+    {
+        return Ok(None);
+    }
     let is_subagent = summary
         .session_kind
         .as_deref()
@@ -636,6 +833,14 @@ fn parse_summary_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         .as_ref()
         .or(summary.updated_at.as_ref())
         .and_then(parse_timestamp_to_ms);
+    let project_dir = summary
+        .info
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
+        .or_else(|| read_project_cwd_fallback(path));
 
     Ok(Some(SessionMeta {
         provider_id: "grokbuild".to_string(),
@@ -650,7 +855,7 @@ fn parse_summary_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         sidebar_section: None,
         title,
         summary: session_summary,
-        project_dir: summary.info.cwd,
+        project_dir,
         project_name: None,
         created_at,
         last_active_at,
@@ -905,6 +1110,7 @@ mod tests {
             .expect("parse summary")
             .expect("session meta");
 
+        assert!(session.archived);
         assert!(session.residual);
         assert!(session.resume_command.is_none());
     }
@@ -1180,5 +1386,151 @@ mod tests {
 
         assert!(error.contains("outside the session root"));
         assert!(outside_dir.exists());
+    }
+
+    #[test]
+    fn misplaced_summaries_do_not_deadlock_parent_deletion_or_scan() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let parent = write_summary(&root, "project", "session-parent", None, None);
+
+        // Misplaced depth-1, depth-2, depth-4, and mismatched-directory summaries
+        let depth1 = root.join("summary.json");
+        let depth2 = root.join("project/summary.json");
+        let depth4 = root.join("project/nested/extra/summary.json");
+        let mismatched = root.join("project/wrong-folder/summary.json");
+        std::fs::create_dir_all(depth4.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mismatched.parent().unwrap()).unwrap();
+
+        let child_payload = r#"{"info":{"id":"ghost-child"},"parent_session_id":"session-parent"}"#;
+        std::fs::write(&depth1, child_payload).unwrap();
+        std::fs::write(&depth2, child_payload).unwrap();
+        std::fs::write(&depth4, child_payload).unwrap();
+        std::fs::write(&mismatched, child_payload).unwrap();
+
+        let mut scanned = Vec::new();
+        collect_summary_files(&root, &mut scanned);
+        let parsed: Vec<SessionMeta> = scanned
+            .iter()
+            .filter_map(|p| parse_discovered_summary(p).unwrap())
+            .collect();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].session_id, "session-parent");
+
+        // Misplaced summaries must not block deleting the valid parent session!
+        assert!(delete_session(&root, &parent, "session-parent").unwrap());
+        assert!(!parent.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn archived_residual_copy_allows_standalone_deletion_when_active_parent_exists() {
+        let temp = tempdir().unwrap();
+        let active_root = temp.path().join("sessions");
+        let archived_root = temp.path().join("archived_sessions");
+        let roots = vec![active_root.clone(), archived_root.clone()];
+
+        let active_parent = write_summary(&active_root, "project", "parent-1", None, None);
+        let archived_parent = write_summary(&archived_root, "project", "parent-1", None, None);
+        let active_child = write_summary(
+            &active_root,
+            "project",
+            "child-1",
+            Some("parent-1"),
+            Some("subagent"),
+        );
+
+        // Deleting active parent directly is still blocked while child-1 exists
+        assert!(
+            preflight_delete_in_roots(&roots, &active_parent, "parent-1")
+                .unwrap_err()
+                .contains("child-1")
+        );
+
+        // Standalone deletion of the archived residual copy is allowed because active_parent exists!
+        assert!(delete_session_in_roots(&roots, &archived_parent, "parent-1").unwrap());
+        assert!(!archived_parent.parent().unwrap().exists());
+        assert!(active_parent.exists());
+        assert!(active_child.exists());
+
+        // If ONLY an archived parent exists (no active copy), child-1 still protects it
+        let orphan_archived =
+            write_summary(&archived_root, "project", "parent-only-arch", None, None);
+        let child_of_arch = write_summary(
+            &active_root,
+            "project",
+            "child-2",
+            Some("parent-only-arch"),
+            Some("subagent"),
+        );
+        assert!(
+            delete_session_in_roots(&roots, &orphan_archived, "parent-only-arch")
+                .unwrap_err()
+                .contains("child-2")
+        );
+        assert!(delete_session_in_roots(&roots, &child_of_arch, "child-2").unwrap());
+        assert!(delete_session_in_roots(&roots, &orphan_archived, "parent-only-arch").unwrap());
+    }
+
+    #[test]
+    fn openai_tool_calls_object_args_and_missing_version_updates_fallback_work() {
+        let input = concat!(
+            "{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[",
+            "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"exec_cmd\",\"arguments\":\"{\\\"cmd\\\":\\\"cargo check\\\"}\"}},",
+            "{\"id\":\"c2\",\"name\":\"write_json\",\"arguments\":{\"ok\":true,\"items\":[1,2]}}",
+            "]}\n",
+            "{\"type\":\"reasoning\",\"text\":\"encrypted reasoning\",\"encrypted_content\":\"SECRET\"}\n"
+        );
+        let messages = super::read_chat_messages(std::io::Cursor::new(input)).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert!(messages[0]
+            .content
+            .contains("[Tool: exec_cmd] {\"cmd\":\"cargo check\"}"));
+        assert!(messages[0]
+            .content
+            .contains("[Tool: write_json] {\"ok\":true,\"items\":[1,2]}"));
+
+        // Fallback to updates.jsonl when chat_format_version is None and updates.jsonl exists
+        let temp = tempdir().unwrap();
+        let summary = temp.path().join("summary.json");
+        std::fs::write(&summary, r#"{"info":{"id":"fixture"}}"#).unwrap();
+        std::fs::write(temp.path().join("updates.jsonl"), compat_updates()).unwrap();
+        let rebuilt = load_messages(&summary).unwrap();
+        assert_eq!(rebuilt.len(), 4);
+        assert_eq!(rebuilt[0].content, "hello");
+        assert_eq!(rebuilt[3].content, "done");
+    }
+
+    #[test]
+    fn cwd_file_fallback_and_empty_project_directory_cleanup() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let project_dir = root.join("encoded-cwd-dir");
+        let s1_dir = project_dir.join("session-1");
+        std::fs::create_dir_all(&s1_dir).unwrap();
+        std::fs::write(project_dir.join(".cwd"), "  D:/workspace/grok-app \n").unwrap();
+        let s1_summary = s1_dir.join("summary.json");
+        std::fs::write(&s1_summary, r#"{"info":{"id":"session-1","cwd":"   "}}"#).unwrap();
+
+        let meta = parse_discovered_summary(&s1_summary).unwrap().unwrap();
+        assert_eq!(meta.project_dir.as_deref(), Some("D:/workspace/grok-app"));
+
+        // Oversized .cwd (> 4096 bytes) is ignored safely
+        std::fs::write(project_dir.join(".cwd"), "x".repeat(5000)).unwrap();
+        let meta_oversized = parse_discovered_summary(&s1_summary).unwrap().unwrap();
+        assert_eq!(meta_oversized.project_dir, None);
+
+        // While `.cwd` is still in `project_dir`, non-recursive remove_dir leaves `project_dir` intact
+        assert!(delete_session(&root, &s1_summary, "session-1").unwrap());
+        assert!(!s1_dir.exists());
+        assert!(project_dir.exists());
+
+        // When deleting the last session in an empty `<encoded-cwd>` folder, the empty shell is removed
+        let empty_proj = root.join("encoded-empty-proj");
+        let s2_summary = write_summary(&root, "encoded-empty-proj", "session-2", None, None);
+        assert!(empty_proj.exists());
+        assert!(delete_session(&root, &s2_summary, "session-2").unwrap());
+        assert!(!empty_proj.exists());
+        assert!(root.exists());
     }
 }

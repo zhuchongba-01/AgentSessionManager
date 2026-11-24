@@ -139,6 +139,23 @@ async fn stream_session_messages(
 }
 
 #[tauri::command]
+async fn search_session_messages(
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] sourcePath: String,
+    query: String,
+) -> Result<Vec<usize>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let transcript = session_manager::load_transcript(&providerId, &sourcePath)?;
+        Ok(session_manager::search_messages(
+            &transcript.messages,
+            &query,
+        ))
+    })
+    .await
+    .map_err(|error| format!("搜索会话失败：{error}"))?
+}
+
+#[tauri::command]
 async fn delete_session(
     #[allow(non_snake_case)] providerId: String,
     #[allow(non_snake_case)] sessionId: String,
@@ -167,8 +184,11 @@ async fn delete_sessions(
 }
 
 #[tauri::command]
-fn get_pi_session_discovery() -> session_manager::providers::pi::PiSessionDiscovery {
-    session_manager::providers::pi::session_discovery()
+async fn get_pi_session_discovery(
+) -> Result<session_manager::providers::pi::PiSessionDiscovery, String> {
+    tauri::async_runtime::spawn_blocking(session_manager::providers::pi::session_discovery)
+        .await
+        .map_err(|error| format!("读取 Pi 会话配置失败：{error}"))
 }
 
 #[tauri::command]
@@ -190,8 +210,12 @@ pub fn run() {
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            tray::show_main_window(app);
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if args.iter().any(|arg| arg == "--quit") {
+                app.exit(0);
+            } else {
+                tray::show_main_window(app);
+            }
         }));
     }
 
@@ -216,6 +240,10 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            if std::env::args().any(|arg| arg == "--quit") {
+                app.handle().exit(0);
+                return Ok(());
+            }
             let menu = tray::create_tray_menu(app.handle())?;
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
                 .tooltip("Agent会话管理")
@@ -236,6 +264,7 @@ pub fn run() {
             get_session_messages,
             get_message_content,
             stream_session_messages,
+            search_session_messages,
             delete_session,
             delete_sessions,
             get_pi_session_discovery,

@@ -292,7 +292,6 @@ export function useSessionDeletion({
       return;
     }
 
-    setDeleteTargets(null);
     setIsBatchDeleting(true);
     try {
       const results = await sessionsApi.deleteMany(
@@ -309,23 +308,22 @@ export function useSessionDeletion({
           (result) =>
             `${result.providerId}:${result.sessionId}:${result.sourcePath ?? ""}`,
         );
+      const deletedKeySet = new Set(deletedKeys);
 
-      const failedErrors = results
-        .filter((result) => !result.success)
-        .map((result) =>
-          [
-            `${formatSessionTitle(result)}（${getProviderLabel(result.providerId, t)}）`,
-            result.error || t("common.unknown"),
-            ...(result.warnings ?? []),
-          ].join("："),
-        );
+      const failedResults = results.filter((result) => !result.success);
+      const failedErrors = failedResults.map((result) =>
+        [
+          `${formatSessionTitle(result)}（${getProviderLabel(result.providerId, t)}）`,
+          result.error || t("common.unknown"),
+          ...(result.warnings ?? []),
+        ].join("："),
+      );
 
       const deleteWarnings = results
         .filter((result) => result.success)
         .flatMap((result) => result.warnings ?? []);
 
       if (deletedKeys.length > 0) {
-        const deletedKeySet = new Set(deletedKeys);
         queryClient.setQueryData<SessionMeta[]>(["sessions"], (current) =>
           (current ?? []).filter(
             (session) => !deletedKeySet.has(getSessionKey(session)),
@@ -356,11 +354,48 @@ export function useSessionDeletion({
         );
       }
 
-      if (deleteWarnings.length > 0) {
-        toast.warning(deleteWarnings[0]);
+      const uniqueWarnings = Array.from(new Set(deleteWarnings));
+      if (uniqueWarnings.length > 0) {
+        toast.warning(uniqueWarnings.join("；"));
       }
 
-      if (failedErrors.length > 0) {
+      if (failedResults.length === 0) {
+        setDeleteTargets(null);
+      } else {
+        const failedKeySet = new Set(
+          failedResults.map(
+            (result) =>
+              `${result.providerId}:${result.sessionId}:${result.sourcePath ?? ""}`,
+          ),
+        );
+        const remainingSessions = sessions.filter(
+          (session) => !deletedKeySet.has(getSessionKey(session)),
+        );
+        const remainingRoots = deleteTargets.filter(
+          (session) => !deletedKeySet.has(getSessionKey(session)),
+        );
+        const coveredByRemainingRoots = new Set(
+          [
+            ...remainingRoots,
+            ...(deleteWithChildren
+              ? collectSessionDescendants(remainingSessions, remainingRoots)
+              : []),
+          ].map(getSessionKey),
+        );
+        const extraFailedTargets = targets.filter(
+          (session) =>
+            failedKeySet.has(getSessionKey(session)) &&
+            !coveredByRemainingRoots.has(getSessionKey(session)),
+        );
+        const nextTargets = [...remainingRoots, ...extraFailedTargets];
+        setDeleteTargets(
+          nextTargets.length > 0
+            ? nextTargets
+            : targets.filter((session) =>
+                failedKeySet.has(getSessionKey(session)),
+              ),
+        );
+
         // 逐条列出失败对象，而不是只报数量 + 第一条：混合结果下用户必须能
         // 看出哪几条没删掉、为什么。
         toast.error(
@@ -390,9 +425,11 @@ export function useSessionDeletion({
     deleteAcknowledged,
     deleteSessionMutation,
     deleteTargets,
+    deleteWithChildren,
     isDeleting,
     plannedDeleteTargets,
     queryClient,
+    sessions,
     setSelectedSessionKeys,
     t,
   ]);
@@ -411,26 +448,26 @@ export function useSessionDeletion({
       ? deleteWithChildren && deleteDescendants.length > 0
         ? t("sessionManager.batchDeleteWithChildrenMessage", {
             defaultValue:
-              "将永久删除 {{count}} 个本地会话记录，其中 {{children}} 条是随父会话一并删除的子会话。\n\n此操作不可恢复。",
+              "将永久删除 {{count}} 个本地会话记录，其中 {{children}} 条是随父会话一并删除的子会话。\n\n不会删除项目目录。\n\n请先退出对应 Agent 并备份重要会话。此操作不可恢复。",
             count: plannedDeleteTargets.length,
             children: deleteDescendants.length,
           })
         : t("sessionManager.batchDeleteConfirmMessage", {
             defaultValue:
-              "将永久删除已选中的 {{count}} 个本地会话记录。\n\n此操作不可恢复。",
+              "将永久删除已选中的 {{count}} 个本地会话记录。\n\n当前会话包含同 ID 历史副本与关联索引；单独选择历史副本仅删除该副本。不会删除项目目录。\n\n请先退出对应 Agent 并备份重要会话。此操作不可恢复。",
             count: plannedDeleteTargets.length,
           })
       : deleteTargets?.[0]
         ? plannedDeleteTargets.length > 1
           ? t("sessionManager.deleteConfirmWithChildrenMessage", {
               defaultValue:
-                "将永久删除本地会话“{{title}}”及其 {{count}} 个子会话。\n\n此操作不可恢复。",
+                "将永久删除本地会话“{{title}}”及其 {{count}} 个子会话（子会话先于父会话删除）。\n\n不会删除项目目录。\n\n请先退出对应 Agent 并备份重要会话。此操作不可恢复。",
               title: formatSessionTitle(deleteTargets[0]),
               count: plannedDeleteTargets.length - 1,
             })
           : t("sessionManager.deleteConfirmMessage", {
               defaultValue:
-                "将永久删除本地会话“{{title}}”\nSession ID: {{sessionId}}\n\n此操作不可恢复。",
+                "将永久删除本地会话“{{title}}”\nSession ID: {{sessionId}}\n\n当前会话包含同 ID 历史副本与关联索引；单独选择历史副本仅删除该副本。不会删除项目目录。\n\n请先退出对应 Agent 并备份重要会话。此操作不可恢复。",
               title: formatSessionTitle(deleteTargets[0]),
               sessionId: deleteTargets[0].sessionId,
             })

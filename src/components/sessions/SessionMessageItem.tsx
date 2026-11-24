@@ -1,6 +1,7 @@
 import {
   memo,
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -18,7 +19,11 @@ import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import type { SessionMessage } from "@/types";
 import { EMPTY_HIGHLIGHT_TERMS, highlightText } from "./highlightText";
-import { hasRichMarkdown, MessageMarkdown } from "./MessageMarkdown";
+import {
+  extractFullCodeBlock,
+  hasRichMarkdown,
+  MessageMarkdown,
+} from "./MessageMarkdown";
 import {
   formatMessageTimestamp,
   getRoleLabel,
@@ -27,6 +32,7 @@ import {
 
 const COLLAPSE_THRESHOLD = 3000;
 const COLLAPSED_LENGTH = 1500;
+const THINKING_PREVIEW_LENGTH = 100;
 const TOOL_FOLD_LINE_LIMIT = 8;
 const TOOL_PREVIEW_LINES = 4;
 
@@ -36,8 +42,10 @@ interface SessionMessageItemProps {
   isActive: boolean;
   isCodexSession?: boolean;
   highlightTerms?: string[];
+  isSearchMatch?: boolean;
+  isActiveSearchMatch?: boolean;
   onCopy: (content: string) => void;
-  onCopyCode?: (code: string) => void;
+  onCopyCode?: (code: string) => Promise<void> | void;
   /**
    * 取回被截断消息的全文。后端只下发预览的消息必须靠它才能展开/复制完整内容；
    * 未提供时退化为只显示预览。
@@ -69,12 +77,15 @@ function SessionMessageContent({
   isActive,
   isCodexSession = false,
   highlightTerms = EMPTY_HIGHLIGHT_TERMS,
+  isSearchMatch = false,
+  isActiveSearchMatch = false,
   onCopy,
   onCopyCode,
   onLoadFullContent,
 }: SessionMessageItemProps) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const [showIdeContext, setShowIdeContext] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   const [toolExpanded, setToolExpanded] = useState(false);
@@ -93,16 +104,23 @@ function SessionMessageContent({
     };
   }, []);
 
+  const roleLower = message.role.toLowerCase();
+  const isThinking = roleLower === "thinking";
+  const isTool =
+    roleLower !== "user" && roleLower !== "assistant" && !isThinking;
+
   const loaded = fullContent ?? message.content;
   const codexSplit =
-    isCodexSession && message.role.toLowerCase() === "user"
+    isCodexSession && roleLower === "user"
       ? splitCodexIdeContext(loaded)
       : null;
   const primaryText = codexSplit ? codexSplit.prompt : loaded;
 
   const isTruncated = message.truncated === true && message.index !== undefined;
+  const isUnloadedTruncated = isTruncated && fullContent === null;
   // 未截断的长正文仍就地折叠；被截断的正文里只有预览，展开要向后端取
-  const isLong = isTruncated || primaryText.length > COLLAPSE_THRESHOLD;
+  const isLong =
+    !isThinking && (isTruncated || primaryText.length > COLLAPSE_THRESHOLD);
   const collapsed = isLong && !expanded;
   const totalChars =
     isTruncated || !codexSplit
@@ -137,12 +155,104 @@ function SessionMessageContent({
     return request;
   }, [isTruncated, message, onLoadFullContent]);
 
+  const normalizedTerms = useMemo(
+    () =>
+      highlightTerms
+        .map((term) => term.trim().toLocaleLowerCase())
+        .filter(Boolean),
+    [highlightTerms],
+  );
+
+  const previewHasAllTerms = useMemo(() => {
+    if (normalizedTerms.length === 0) return false;
+    const lowerLoaded = loaded.toLocaleLowerCase();
+    return normalizedTerms.every((term) => lowerLoaded.includes(term));
+  }, [loaded, normalizedTerms]);
+
+  const hasHiddenLongHit = useMemo(() => {
+    if (
+      isThinking ||
+      normalizedTerms.length === 0 ||
+      primaryText.length <= COLLAPSE_THRESHOLD
+    ) {
+      return false;
+    }
+    const hiddenTail = primaryText.slice(COLLAPSED_LENGTH).toLocaleLowerCase();
+    return normalizedTerms.some((term) => hiddenTail.includes(term));
+  }, [isThinking, normalizedTerms, primaryText]);
+
+  const hasIdeContextSearchHit = useMemo(() => {
+    if (!codexSplit || normalizedTerms.length === 0) return false;
+    const lowerContext = codexSplit.context.toLocaleLowerCase();
+    return normalizedTerms.some((term) => lowerContext.includes(term));
+  }, [codexSplit, normalizedTerms]);
+
+  const hasLocalThinkingHit = useMemo(() => {
+    if (!isThinking || normalizedTerms.length === 0) return false;
+    const lowerText = primaryText.toLocaleLowerCase();
+    return normalizedTerms.every((term) => lowerText.includes(term));
+  }, [isThinking, normalizedTerms, primaryText]);
+
+  useEffect(() => {
+    if (hasHiddenLongHit) {
+      setExpanded(true);
+    }
+  }, [hasHiddenLongHit]);
+
+  useEffect(() => {
+    if (hasIdeContextSearchHit) {
+      setShowIdeContext(true);
+    }
+  }, [hasIdeContextSearchHit]);
+
+  useEffect(() => {
+    if (isThinking && (isSearchMatch || hasLocalThinkingHit)) {
+      if (!isUnloadedTruncated || previewHasAllTerms) {
+        setThinkingExpanded(true);
+      }
+    }
+  }, [
+    hasLocalThinkingHit,
+    isSearchMatch,
+    isThinking,
+    isUnloadedTruncated,
+    previewHasAllTerms,
+  ]);
+
+  useEffect(() => {
+    if (
+      !isActiveSearchMatch ||
+      !isUnloadedTruncated ||
+      normalizedTerms.length === 0 ||
+      previewHasAllTerms
+    ) {
+      return;
+    }
+    void loadFullContent()
+      .then(() => {
+        if (!mounted.current) return;
+        if (isThinking) {
+          setThinkingExpanded(true);
+        } else {
+          setExpanded(true);
+        }
+      })
+      .catch(() => undefined);
+  }, [
+    isActiveSearchMatch,
+    isThinking,
+    isUnloadedTruncated,
+    loadFullContent,
+    normalizedTerms.length,
+    previewHasAllTerms,
+  ]);
+
   const handleToggle = useCallback(() => {
     if (expanded) {
       setExpanded(false);
       return;
     }
-    if (!isTruncated) {
+    if (!isUnloadedTruncated) {
       setExpanded(true);
       return;
     }
@@ -152,11 +262,27 @@ function SessionMessageContent({
         if (mounted.current) setExpanded(true);
       })
       .catch(() => undefined);
-  }, [expanded, isTruncated, loadFullContent]);
+  }, [expanded, isUnloadedTruncated, loadFullContent]);
+
+  const handleThinkingToggle = useCallback(() => {
+    if (thinkingExpanded) {
+      setThinkingExpanded(false);
+      return;
+    }
+    if (!isUnloadedTruncated) {
+      setThinkingExpanded(true);
+      return;
+    }
+    void loadFullContent()
+      .then(() => {
+        if (mounted.current) setThinkingExpanded(true);
+      })
+      .catch(() => undefined);
+  }, [isUnloadedTruncated, loadFullContent, thinkingExpanded]);
 
   const handleCopy = useCallback(() => {
     if (copying.current) return;
-    if (!isTruncated) {
+    if (!isUnloadedTruncated) {
       onCopy(loaded);
       return;
     }
@@ -171,14 +297,21 @@ function SessionMessageContent({
         copying.current = false;
         if (mounted.current) setIsCopying(false);
       });
-  }, [isTruncated, loadFullContent, loaded, onCopy]);
+  }, [isUnloadedTruncated, loadFullContent, loaded, onCopy]);
 
-  const displayContent = collapsed
-    ? primaryText.slice(0, COLLAPSED_LENGTH) + "…"
-    : primaryText;
+  const collapsedSlice = useMemo(
+    () => (collapsed ? primaryText.slice(0, COLLAPSED_LENGTH) : primaryText),
+    [collapsed, primaryText],
+  );
 
-  const roleLower = message.role.toLowerCase();
-  const isTool = roleLower !== "user" && roleLower !== "assistant";
+  const thinkingPreview = useMemo(() => {
+    if (!isThinking) return "";
+    const singleLine = primaryText.replace(/\s+/g, " ").trim();
+    return singleLine.length > THINKING_PREVIEW_LENGTH
+      ? `${singleLine.slice(0, THINKING_PREVIEW_LENGTH)}…`
+      : singleLine;
+  }, [isThinking, primaryText]);
+
   const toolLines = useMemo(
     () => (isTool && !isTruncated ? primaryText.split(/\r?\n/) : []),
     [isTool, isTruncated, primaryText],
@@ -195,18 +328,53 @@ function SessionMessageContent({
   );
   const hasHiddenSearchHit =
     isToolLineFoldable &&
-    highlightTerms.some(
-      (term) =>
-        term.trim() !== "" &&
-        hiddenToolText.includes(term.trim().toLocaleLowerCase()),
-    );
+    normalizedTerms.some((term) => hiddenToolText.includes(term));
   const isToolPreviewFolded =
     isToolLineFoldable && !toolExpanded && !hasHiddenSearchHit;
-  const renderedContent = isToolPreviewFolded
+
+  const markdownSource = isThinking ? primaryText : collapsedSlice;
+  const plainDisplayContent = isToolPreviewFolded
     ? toolLines.slice(0, TOOL_PREVIEW_LINES).join("\n")
-    : displayContent;
-  const canRenderMarkdown = !isTool && hasRichMarkdown(renderedContent);
-  const handleCodeCopy = onCopyCode ?? onCopy;
+    : collapsed
+      ? `${collapsedSlice}…`
+      : primaryText;
+
+  const canRenderMarkdown =
+    !isTool &&
+    (!isThinking || thinkingExpanded) &&
+    hasRichMarkdown(markdownSource);
+
+  const handleCodeCopy = useCallback(
+    (code: string, blockIndex: number): Promise<void> | void => {
+      const copyTarget = onCopyCode ?? onCopy;
+      if (!collapsed) {
+        return copyTarget(code);
+      }
+      if (!isUnloadedTruncated) {
+        const fullCode = extractFullCodeBlock(primaryText, blockIndex, code);
+        return copyTarget(fullCode);
+      }
+      return loadFullContent().then((full) => {
+        if (!mounted.current) return;
+        const fullPrimary =
+          isCodexSession && roleLower === "user"
+            ? (splitCodexIdeContext(full)?.prompt ?? full)
+            : full;
+        const fullCode = extractFullCodeBlock(fullPrimary, blockIndex, code);
+        return copyTarget(fullCode);
+      });
+    },
+    [
+      collapsed,
+      isCodexSession,
+      isUnloadedTruncated,
+      loadFullContent,
+      onCopy,
+      onCopyCode,
+      primaryText,
+      roleLower,
+    ],
+  );
 
   return (
     <div
@@ -216,12 +384,17 @@ function SessionMessageContent({
           ? "is-user"
           : roleLower === "assistant"
             ? "is-assistant"
-            : "is-tool",
+            : isThinking
+              ? "is-thinking"
+              : "is-tool",
         isActive && "is-active",
       )}
     >
       <div className="asm-message-role">
-        <span>{getRoleLabel(message.role, t)}</span>
+        <span className="asm-role-badge">
+          <span className="asm-role-dot" aria-hidden="true" />
+          <span>{getRoleLabel(message.role, t)}</span>
+        </span>
         {message.ts && (
           <span className="asm-message-ts">
             {formatMessageTimestamp(message.ts)}
@@ -291,22 +464,58 @@ function SessionMessageContent({
           </button>
         </span>
       </div>
-      <div
-        className={cn(
-          "asm-message-body",
-          isToolPreviewFolded && "is-tool-preview",
-        )}
-      >
-        {!isTool && !showRaw ? (
-          <MessageMarkdown
-            content={renderedContent}
-            highlightTerms={highlightTerms}
-            onCopyCode={handleCodeCopy}
-          />
-        ) : (
-          highlightText(renderedContent, highlightTerms)
-        )}
-      </div>
+      {isThinking && !thinkingExpanded ? (
+        <div className="asm-thinking-preview">
+          {highlightText(thinkingPreview, highlightTerms)}
+        </div>
+      ) : (
+        <div
+          className={cn(
+            "asm-message-body",
+            isToolPreviewFolded && "is-tool-preview",
+          )}
+        >
+          {!isTool && !showRaw ? (
+            <MessageMarkdown
+              content={markdownSource}
+              collapsed={collapsed}
+              highlightTerms={highlightTerms}
+              onCopyCode={handleCodeCopy}
+            />
+          ) : (
+            highlightText(plainDisplayContent, highlightTerms)
+          )}
+        </div>
+      )}
+      {isThinking && (
+        <button
+          type="button"
+          aria-expanded={thinkingExpanded}
+          aria-busy={isLoadingFull || undefined}
+          onClick={handleThinkingToggle}
+          className="asm-thinking-toggle"
+        >
+          {thinkingExpanded ? (
+            <>
+              <ChevronUp className="size-3" aria-hidden="true" />
+              {t("sessionManager.collapseThinking", {
+                defaultValue: "收起思考过程",
+              })}
+            </>
+          ) : (
+            <>
+              <ChevronDown className="size-3" aria-hidden="true" />
+              {isLoadingFull
+                ? t("sessionManager.loadingFullContent", {
+                    defaultValue: "正在读取完整内容…",
+                  })
+                : t("sessionManager.expandThinking", {
+                    defaultValue: "展开思考过程",
+                  })}
+            </>
+          )}
+        </button>
+      )}
       {isToolLineFoldable && !hasHiddenSearchHit && (
         <button
           type="button"
@@ -368,7 +577,7 @@ function SessionMessageContent({
           aria-expanded={expanded}
           aria-busy={isLoadingFull || undefined}
           onClick={handleToggle}
-          className="mt-1 flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          className="asm-tool-fold-toggle"
         >
           {expanded ? (
             <>

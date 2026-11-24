@@ -18,9 +18,9 @@ describe("ConfirmDialog", () => {
       />,
     );
 
-    const cancelButton = screen.getByRole("button", { name: "common.cancel" });
+    const cancelButton = screen.getByRole("button", { name: "取消" });
     const confirmButton = screen.getByRole("button", {
-      name: "common.confirm",
+      name: "确定",
     });
     expect(cancelButton).toBeDisabled();
     expect(confirmButton).toBeDisabled();

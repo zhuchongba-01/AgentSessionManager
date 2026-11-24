@@ -25,12 +25,12 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; script-src 'self' 'sha256-0cGbEpHvM25eAjkFPQpKFOPlBw2ox7tx4gKTSgsMqY0='; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost https://api.github.com"
+      "csp": "default-src 'self'; img-src 'self' data:; script-src 'self' 'sha256-0cGbEpHvM25eAjkFPQpKFOPlBw2ox7tx4gKTSgsMqY0='; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost https://api.github.com; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [],
     "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",

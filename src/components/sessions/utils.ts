@@ -171,7 +171,7 @@ export const formatRelativeTime = (
 
 export const getProviderLabel = (
   providerId: string,
-  t: (key: string) => string,
+  t: (key: string, options?: Record<string, unknown>) => string,
 ) => {
   const normalized = providerId.toLocaleLowerCase();
   const labels: Record<string, string> = {
@@ -182,6 +182,7 @@ export const getProviderLabel = (
     grokbuild: "Grok Build",
     pi: "Pi",
     deepseek: "DeepSeek Harness",
+    workbuddy: "WorkBuddy",
   };
   const key = `apps.${normalized}`;
   const translated = t(key);
@@ -203,12 +204,20 @@ export const getRoleTone = (role: string) => {
   return "text-muted-foreground";
 };
 
-export const getRoleLabel = (role: string, t: (key: string) => string) => {
+export const getRoleLabel = (
+  role: string,
+  t: (key: string, options?: Record<string, unknown>) => string,
+) => {
   const normalized = role.toLowerCase();
   if (normalized === "assistant") return "AI";
-  if (normalized === "user") return t("sessionManager.roleUser");
-  if (normalized === "system") return t("sessionManager.roleSystem");
-  if (normalized === "tool") return t("sessionManager.roleTool");
+  if (normalized === "user")
+    return t("sessionManager.roleUser", { defaultValue: "用户" });
+  if (normalized === "system")
+    return t("sessionManager.roleSystem", { defaultValue: "系统" });
+  if (normalized === "tool")
+    return t("sessionManager.roleTool", { defaultValue: "工具" });
+  if (normalized === "thinking")
+    return t("sessionManager.roleThinking", { defaultValue: "思考过程" });
   return role;
 };
 
@@ -247,8 +256,8 @@ const getSessionLineageKey = (session: SessionMeta, id = session.sessionId) => {
   const source = session.sourcePath ?? "";
   let scope: string | undefined;
   if (source.startsWith("sqlite:")) {
-    const separator = source.lastIndexOf(":ses_");
-    if (separator > 7) {
+    const separator = source.lastIndexOf(":");
+    if (separator > 7 && !(separator === 8 && /^[a-z]$/i.test(source[7]))) {
       scope = `db:${normalizeDirectoryIdentity(source.slice(7, separator))}`;
     }
   } else if (source) {
@@ -426,6 +435,7 @@ export const getVisibleSessionMessages = (
 
   return messages.filter((message) => {
     const role = message.role.toLowerCase();
+    if (role === "thinking") return true;
     if (role === "developer" || role === "system") return false;
     return !(role === "user" && shouldHideCodexMessageFromToc(message.content));
   });

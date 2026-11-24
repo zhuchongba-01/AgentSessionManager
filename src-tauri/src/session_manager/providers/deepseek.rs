@@ -9,9 +9,10 @@ use serde_json::Value;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    atomic_write_json, checked_storage_child, is_safe_session_id, order_selected_children,
-    path_basename, scan_warning, truncate_summary, FileParseCache, MAX_MESSAGES_FILE_BYTES,
-    TITLE_MAX_CHARS,
+    atomic_write_json, checked_storage_child, is_reparse_or_symlink, is_safe_session_id,
+    order_selected_children, path_basename, quote_sqlite_identifier, remove_path_if_exists,
+    scan_warning, sqlite_table_has_column, truncate_summary, FileParseCache,
+    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "deepseek";
@@ -46,9 +47,7 @@ struct WorkspaceAssignment {
 }
 
 pub fn dsh_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".dsh")
+    crate::session_paths::dsh_home()
 }
 
 pub fn session_roots() -> Vec<PathBuf> {
@@ -63,6 +62,10 @@ fn projection_cache_root(home: &Path) -> PathBuf {
     home.join("storages")
         .join("session_projcache")
         .join("sessions")
+}
+
+fn session_search_db_path(home: &Path) -> PathBuf {
+    home.join("storages").join("session-search.db")
 }
 
 static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
@@ -153,16 +156,17 @@ fn child_directories(root: &Path, discovery: &mut SessionDiscovery) -> Vec<PathB
                 continue;
             }
         };
-        match entry.file_type() {
-            Ok(kind) if kind.is_symlink() => discovery.warn(format!(
+        let path = entry.path();
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if is_reparse_or_symlink(&meta) => discovery.warn(format!(
                 "DeepSeek Harness 目录包含未跟随的链接：{}",
-                entry.path().display()
+                path.display()
             )),
-            Ok(kind) if kind.is_dir() => directories.push(entry.path()),
+            Ok(meta) if meta.is_dir() => directories.push(path),
             Ok(_) => {}
             Err(error) => discovery.warn(format!(
                 "无法检查 DeepSeek Harness 目录项 {}：{error}",
-                entry.path().display()
+                path.display()
             )),
         }
     }
@@ -172,6 +176,15 @@ fn child_directories(root: &Path, discovery: &mut SessionDiscovery) -> Vec<PathB
 
 fn discover_session_logs(root: &Path) -> SessionDiscovery {
     let mut discovery = SessionDiscovery::default();
+    if let Ok(meta) = fs::symlink_metadata(root) {
+        if is_reparse_or_symlink(&meta) {
+            discovery.warn(format!(
+                "DeepSeek Harness 目录包含未跟随的链接：{}",
+                root.display()
+            ));
+            return discovery;
+        }
+    }
     for project in child_directories(root, &mut discovery) {
         for session in child_directories(&project, &mut discovery) {
             match select_generation(&session) {
@@ -218,22 +231,20 @@ fn select_generation(session_dir: &Path) -> Result<Option<PathBuf>, String> {
             continue;
         };
         if let Some((generation, compressed)) = generation_of_filename(&name) {
-            if !entry
-                .file_type()
-                .map_err(|error| {
-                    format!(
-                        "无法检查 DeepSeek Harness 会话文件 {}：{error}",
-                        entry.path().display()
-                    )
-                })?
-                .is_file()
-            {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "无法检查 DeepSeek Harness 会话文件 {}：{error}",
+                    path.display()
+                )
+            })?;
+            if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
                 return Err(format!(
                     "DeepSeek Harness 会话文件不是普通文件或是链接：{}",
-                    entry.path().display()
+                    path.display()
                 ));
             }
-            candidates.push((generation, compressed, entry.path()));
+            candidates.push((generation, compressed, path));
         }
     }
     let Some(highest) = candidates.iter().map(|item| item.0).max() else {
@@ -425,8 +436,55 @@ fn validate_header(header: &Value, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn append_surface_event(event: &Value) -> bool {
-    event.get("surfaceOp").and_then(Value::as_str) == Some("append")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceOp {
+    Append,
+    Replace { range: Option<(u64, u64)> },
+}
+
+fn parse_surface_op(event: &Value) -> Option<SurfaceOp> {
+    match event.get("surfaceOp")? {
+        Value::String(op) if op == "append" => Some(SurfaceOp::Append),
+        Value::Object(map) => match map.get("op").and_then(Value::as_str) {
+            Some("append") => Some(SurfaceOp::Append),
+            Some("replace") => {
+                let start = map
+                    .get("startSeq")
+                    .or_else(|| map.get("fromSeq"))
+                    .and_then(Value::as_u64);
+                let end = map
+                    .get("endSeq")
+                    .or_else(|| map.get("toSeq"))
+                    .and_then(Value::as_u64);
+                let range = match (start, end) {
+                    (Some(s), Some(e)) if s <= e => Some((s, e)),
+                    (None, Some(e)) => Some((0, e)),
+                    _ => None,
+                };
+                Some(SurfaceOp::Replace { range })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn append_or_replace_surface_event(event: &Value) -> bool {
+    parse_surface_op(event).is_some()
+}
+
+fn is_visible_user_source(event: &Value) -> bool {
+    if event.pointer("/data/hidden").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    match event.pointer("/data/source/kind").and_then(Value::as_str) {
+        Some(
+            "plugin" | "agent-instructions" | "tool-skill" | "system" | "hook" | "internal"
+            | "developer",
+        ) => false,
+        Some(_) => true,
+        None => event.pointer("/data/source").is_none_or(Value::is_null),
+    }
 }
 
 fn visible_message_text(content: &Value) -> String {
@@ -450,8 +508,8 @@ fn visible_message_text(content: &Value) -> String {
 
 fn user_text(event: &Value) -> Option<String> {
     if event.get("type").and_then(Value::as_str) != Some("user/message")
-        || !append_surface_event(event)
-        || event.pointer("/data/source/kind").and_then(Value::as_str) != Some("user")
+        || !append_or_replace_surface_event(event)
+        || !is_visible_user_source(event)
     {
         return None;
     }
@@ -461,7 +519,7 @@ fn user_text(event: &Value) -> Option<String> {
 
 fn assistant_text(event: &Value) -> Option<String> {
     if event.get("type").and_then(Value::as_str) != Some("assistant/message")
-        || !append_surface_event(event)
+        || !append_or_replace_surface_event(event)
     {
         return None;
     }
@@ -469,6 +527,178 @@ fn assistant_text(event: &Value) -> Option<String> {
         .pointer("/data/message/content")
         .map(visible_message_text)?;
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn format_tool_call_block(block: &Value) -> Option<String> {
+    let name = block
+        .get("name")
+        .or_else(|| block.get("toolName"))
+        .or_else(|| block.pointer("/function/name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tool");
+    let args = match block
+        .get("arguments")
+        .or_else(|| block.get("args"))
+        .or_else(|| block.get("input"))
+        .or_else(|| block.pointer("/function/arguments"))
+    {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => String::new(),
+    };
+    if args.is_empty() {
+        Some(format!("[Tool: {name}]"))
+    } else {
+        Some(format!("[Tool: {name}] {args}"))
+    }
+}
+
+fn assistant_transcript_text(event: &Value) -> Option<String> {
+    if let Some(text) = assistant_text(event) {
+        return Some(text);
+    }
+    if event.get("type").and_then(Value::as_str) != Some("assistant/message")
+        || !append_or_replace_surface_event(event)
+    {
+        return None;
+    }
+    let mut lines = Vec::new();
+    if let Some(content) = event.pointer("/data/message/content") {
+        match content {
+            Value::Array(blocks) => {
+                for block in blocks {
+                    if matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("tool-call" | "tool_call" | "toolCall" | "tool_use")
+                    ) {
+                        if let Some(formatted) = format_tool_call_block(block) {
+                            lines.push(formatted);
+                        }
+                    }
+                }
+            }
+            Value::Object(_) => {
+                if matches!(
+                    content.get("type").and_then(Value::as_str),
+                    Some("tool-call" | "tool_call" | "toolCall" | "tool_use")
+                ) {
+                    if let Some(formatted) = format_tool_call_block(content) {
+                        lines.push(formatted);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        if let Some(calls) = event
+            .pointer("/data/message/toolCalls")
+            .or_else(|| event.pointer("/data/message/tool_calls"))
+            .and_then(Value::as_array)
+        {
+            for call in calls {
+                if let Some(formatted) = format_tool_call_block(call) {
+                    lines.push(formatted);
+                }
+            }
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn extract_tool_result_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(extract_tool_result_value)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("reasoning" | "thinking" | "redacted_thinking")
+            ) {
+                return String::new();
+            }
+            if let Some(text) = map
+                .get("text")
+                .or_else(|| map.get("value"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                return text.to_string();
+            }
+            for key in ["content", "output", "result", "error"] {
+                if let Some(nested) = map.get(key) {
+                    let extracted = extract_tool_result_value(nested);
+                    if !extracted.trim().is_empty() {
+                        return extracted;
+                    }
+                }
+            }
+            value.to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn tool_result_text(event: &Value) -> Option<String> {
+    if event.get("type").and_then(Value::as_str) != Some("tool/result") {
+        return None;
+    }
+    if event.get("surfaceOp").is_some() && !append_or_replace_surface_event(event) {
+        return None;
+    }
+    if event.pointer("/data/hidden").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let data = event.get("data")?;
+    for candidate in [
+        data.get("content"),
+        data.get("output"),
+        data.get("result"),
+        data.pointer("/message/content"),
+        data.get("error"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let text = extract_tool_result_value(candidate);
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn replacement_compaction_message(event: &Value) -> Option<(&'static str, String)> {
+    if event.get("type").and_then(Value::as_str) == Some("user/message") {
+        if let Some(text) = event.pointer("/data/content").map(visible_message_text) {
+            if !text.trim().is_empty() {
+                return Some(("user", text));
+            }
+        }
+    }
+    let data = event.get("data")?;
+    for candidate in [
+        data.get("summary"),
+        data.get("content"),
+        data.get("text"),
+        data.pointer("/message/content"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let text = visible_message_text(candidate);
+        if !text.trim().is_empty() {
+            return Some(("system", text));
+        }
+    }
+    None
 }
 
 fn event_time(event: &Value) -> Option<i64> {
@@ -543,14 +773,14 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
         });
     let created_at = decoded.header.get("createdAt").and_then(Value::as_i64);
     // Match Harness's session-list projection: recency is the latest real
-    // user prompt, not an internal title/tool event.
+    // user-visible prompt, not an internal title/tool event.
     let last_prompt_at = decoded
         .events
         .iter()
         .rev()
         .filter(|event| {
             event.get("type").and_then(Value::as_str) == Some("user/message")
-                && event.pointer("/data/source/kind").and_then(Value::as_str) == Some("user")
+                && is_visible_user_source(event)
         })
         .find_map(event_time);
     let last_active_at = match (created_at, last_prompt_at) {
@@ -585,22 +815,62 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     let decoded = read_session(path)?;
-    let mut messages = Vec::new();
+    let mut surface: Vec<(u64, SessionMessage)> = Vec::new();
     for event in decoded.events {
-        let (role, content) = if let Some(content) = user_text(&event) {
-            ("user", content)
-        } else if let Some(content) = assistant_text(&event) {
-            ("assistant", content)
+        let seq = event.get("seq").and_then(Value::as_u64).unwrap_or(0);
+        let surface_op = parse_surface_op(&event);
+        let message = if let Some(content) = user_text(&event) {
+            Some(("user", content))
+        } else if let Some(content) = assistant_transcript_text(&event) {
+            Some(("assistant", content))
+        } else if let Some(content) = tool_result_text(&event) {
+            Some(("tool", content))
+        } else if matches!(surface_op, Some(SurfaceOp::Replace { .. })) {
+            replacement_compaction_message(&event)
         } else {
-            continue;
+            None
         };
-        messages.push(SessionMessage {
-            role: role.to_string(),
-            content,
-            ts: event_time(&event),
-        });
+
+        match surface_op {
+            Some(SurfaceOp::Replace { range }) => {
+                let insert_at = if let Some((start, end)) = range {
+                    let first = surface
+                        .iter()
+                        .position(|(item_seq, _)| (start..=end).contains(item_seq));
+                    surface.retain(|(item_seq, _)| !(start..=end).contains(item_seq));
+                    first.unwrap_or(surface.len())
+                } else {
+                    surface.len()
+                };
+                if let Some((role, content)) = message {
+                    surface.insert(
+                        insert_at,
+                        (
+                            seq,
+                            SessionMessage {
+                                role: role.to_string(),
+                                content,
+                                ts: event_time(&event),
+                            },
+                        ),
+                    );
+                }
+            }
+            _ => {
+                if let Some((role, content)) = message {
+                    surface.push((
+                        seq,
+                        SessionMessage {
+                            role: role.to_string(),
+                            content,
+                            ts: event_time(&event),
+                        },
+                    ));
+                }
+            }
+        }
     }
-    Ok(messages)
+    Ok(surface.into_iter().map(|(_, msg)| msg).collect())
 }
 
 fn read_index(home: &Path) -> Result<Option<Value>, String> {
@@ -971,16 +1241,83 @@ fn active_schedules(events: &[Value]) -> Result<usize, String> {
     Ok(active.len())
 }
 
+fn v2_scope_references_session(
+    scope: &serde_json::Map<String, Value>,
+    session_id: &str,
+) -> Result<bool, String> {
+    let mut referenced = false;
+
+    match scope.get("sessionId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if !s.is_empty() => {
+            if s == session_id {
+                referenced = true;
+            }
+        }
+        _ => return Err("DeepSeek Harness 主机定时任务 sessionId 无效".into()),
+    }
+
+    match scope.get("target") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if !s.is_empty() => {
+            if s == session_id {
+                referenced = true;
+            }
+        }
+        Some(Value::Object(target_obj)) => {
+            let kind = target_obj.get("kind").and_then(Value::as_str);
+            match target_obj.get("sessionId") {
+                Some(Value::String(s)) if !s.is_empty() => {
+                    if s == session_id {
+                        referenced = true;
+                    }
+                }
+                None | Some(Value::Null) => {
+                    if matches!(kind, Some("session" | "existing")) {
+                        return Err("DeepSeek Harness 主机定时任务目标缺少 sessionId".into());
+                    }
+                }
+                _ => return Err("DeepSeek Harness 主机定时任务目标 sessionId 无效".into()),
+            }
+        }
+        _ => return Err("DeepSeek Harness 主机定时任务 target 结构异常".into()),
+    }
+
+    match scope.get("involvedSessionIds") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for item in items {
+                let Some(s) = item.as_str().filter(|s| !s.is_empty()) else {
+                    return Err("DeepSeek Harness 主机定时任务 involvedSessionIds 含无效项".into());
+                };
+                if s == session_id {
+                    referenced = true;
+                }
+            }
+        }
+        _ => return Err("DeepSeek Harness 主机定时任务 involvedSessionIds 结构异常".into()),
+    }
+
+    Ok(referenced)
+}
+
 /// Current Harness reminders belong to a host-wide storage domain, not only
 /// historical session events. Inspect it read-only; the user cancels active
 /// tasks in Harness so delivery state is never rewritten by this manager.
 fn active_host_schedules(home: &Path, session_id: &str) -> Result<usize, String> {
     let path = home.join("storages").join("schedule.json");
-    let file = match File::open(&path) {
-        Ok(file) => file,
+    match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(format!("读取 DeepSeek Harness 主机定时任务失败：{error}")),
-    };
+        Ok(meta)
+            if is_reparse_or_symlink(&meta) || !meta.is_file() || meta.len() > MAX_INDEX_BYTES =>
+        {
+            return Err("DeepSeek Harness 主机定时任务存储类型或大小异常".into());
+        }
+        Ok(_) => {}
+    }
+    let file = File::open(&path)
+        .map_err(|error| format!("读取 DeepSeek Harness 主机定时任务失败：{error}"))?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() > MAX_INDEX_BYTES {
         return Err("DeepSeek Harness 主机定时任务存储类型或大小异常".into());
@@ -994,11 +1331,12 @@ fn active_host_schedules(home: &Path, session_id: &str) -> Result<usize, String>
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("DeepSeek Harness 主机定时任务存储损坏：{error}"))?;
-    if value.pointer("/unit/name").and_then(Value::as_str) != Some("schedule")
-        || value.pointer("/unit/version").and_then(Value::as_u64) != Some(1)
-    {
+    let unit_name = value.pointer("/unit/name").and_then(Value::as_str);
+    let version = value.pointer("/unit/version").and_then(Value::as_u64);
+    if unit_name != Some("schedule") || !matches!(version, Some(1 | 2)) {
         return Err("DeepSeek Harness 主机定时任务存储版本未知".into());
     }
+    let version = version.unwrap_or(0);
     let tables = value
         .get("tables")
         .and_then(Value::as_object)
@@ -1011,26 +1349,222 @@ fn active_host_schedules(home: &Path, session_id: &str) -> Result<usize, String>
         .ok_or("DeepSeek Harness 主机定时任务 tasks 结构异常")?;
     let mut active = 0;
     for (id, task) in tasks {
-        let owner = task
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or("DeepSeek Harness 主机定时任务缺少归属")?;
-        if id.is_empty() || task.pointer("/record/id").and_then(Value::as_str) != Some(id.as_str())
-        {
-            return Err("DeepSeek Harness 主机定时任务 ID 不匹配".into());
-        }
-        let is_active = match task.get("status") {
-            None => true,
-            Some(Value::String(status)) if status == "active" => true,
-            Some(Value::String(status)) if status == "inactive" => false,
-            _ => return Err("DeepSeek Harness 主机定时任务状态未知".into()),
-        };
-        if owner == session_id && is_active {
-            active += 1;
+        let task_obj = task
+            .as_object()
+            .ok_or("DeepSeek Harness 主机定时任务条目结构异常")?;
+        if version == 1 {
+            let owner = task_obj
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("DeepSeek Harness 主机定时任务缺少归属")?;
+            if id.is_empty()
+                || task.pointer("/record/id").and_then(Value::as_str) != Some(id.as_str())
+            {
+                return Err("DeepSeek Harness 主机定时任务 ID 不匹配".into());
+            }
+            let is_active = match task_obj.get("status") {
+                None => true,
+                Some(Value::String(status)) if status == "active" => true,
+                Some(Value::String(status)) if status == "inactive" => false,
+                _ => return Err("DeepSeek Harness 主机定时任务状态未知".into()),
+            };
+            if owner == session_id && is_active {
+                active += 1;
+            }
+        } else {
+            if id.is_empty() {
+                return Err("DeepSeek Harness 主机定时任务 ID 不匹配".into());
+            }
+            if let Some(top_id) = task_obj.get("id").filter(|v| !v.is_null()) {
+                if top_id.as_str() != Some(id.as_str()) {
+                    return Err("DeepSeek Harness 主机定时任务 ID 不匹配".into());
+                }
+            }
+            let record_obj = match task_obj.get("record") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(record)) => {
+                    if let Some(rec_id) = record.get("id").filter(|v| !v.is_null()) {
+                        if rec_id.as_str() != Some(id.as_str()) {
+                            return Err("DeepSeek Harness 主机定时任务 ID 不匹配".into());
+                        }
+                    }
+                    Some(record)
+                }
+                _ => return Err("DeepSeek Harness 主机定时任务 record 结构异常".into()),
+            };
+            let status_value = task_obj
+                .get("status")
+                .or_else(|| record_obj.and_then(|record| record.get("status")));
+            let is_active = match status_value {
+                None => true,
+                Some(Value::String(status)) if status == "active" => true,
+                Some(Value::String(status))
+                    if matches!(status.as_str(), "inactive" | "paused" | "ended") =>
+                {
+                    false
+                }
+                _ => return Err("DeepSeek Harness 主机定时任务状态未知".into()),
+            };
+            let mut referenced = v2_scope_references_session(task_obj, session_id)?;
+            if let Some(record) = record_obj {
+                referenced |= v2_scope_references_session(record, session_id)?;
+            }
+            if is_active && referenced {
+                active += 1;
+            }
         }
     }
     Ok(active)
+}
+
+fn validated_session_search_db(home: &Path) -> Result<Option<PathBuf>, String> {
+    let candidate = session_search_db_path(home);
+    let resolved = checked_storage_child(home, &candidate)?;
+    match fs::symlink_metadata(&resolved) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "无法检查 DeepSeek Harness 搜索索引数据库 {}：{error}",
+            resolved.display()
+        )),
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) || !meta.is_file() {
+                return Err(format!(
+                    "DeepSeek Harness 搜索索引数据库不是普通文件或是链接：{}",
+                    resolved.display()
+                ));
+            }
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = resolved.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                let sidecar_path = PathBuf::from(sidecar);
+                if let Ok(side_meta) = fs::symlink_metadata(&sidecar_path) {
+                    if is_reparse_or_symlink(&side_meta) || !side_meta.is_file() {
+                        return Err(format!(
+                            "DeepSeek Harness 搜索索引附属文件异常：{}",
+                            sidecar_path.display()
+                        ));
+                    }
+                }
+            }
+            Ok(Some(resolved))
+        }
+    }
+}
+
+fn cleanup_session_search_db(home: &Path, session_id: &str) -> Result<(), String> {
+    let Some(db_path) = validated_session_search_db(home)? else {
+        return Ok(());
+    };
+    let mut connection = rusqlite::Connection::open(&db_path).map_err(|error| {
+        format!(
+            "会话已删除，但无法打开 DeepSeek Harness 搜索索引 {}：{error}",
+            db_path.display()
+        )
+    })?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| {
+            format!(
+                "会话已删除，但无法配置 DeepSeek Harness 搜索索引超时 {}：{error}",
+                db_path.display()
+            )
+        })?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| {
+            format!(
+                "会话已删除，但无法开启 DeepSeek Harness 搜索索引事务 {}：{error}",
+                db_path.display()
+            )
+        })?;
+
+    let mut regular_tables = Vec::new();
+    let mut virtual_tables = Vec::new();
+    {
+        let mut stmt = transaction
+            .prepare(
+                "SELECT name, COALESCE(sql, '') FROM sqlite_master \
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .map_err(|error| {
+                format!(
+                    "无法枚举 DeepSeek Harness 搜索索引数据表 {}：{error}",
+                    db_path.display()
+                )
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                format!(
+                    "无法读取 DeepSeek Harness 搜索索引结构 {}：{error}",
+                    db_path.display()
+                )
+            })?;
+        for row in rows {
+            let (name, sql) = row.map_err(|error| error.to_string())?;
+            let is_virtual = sql
+                .trim_start()
+                .get(..20)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE VIRTUAL TABLE"));
+            if is_virtual {
+                virtual_tables.push(name);
+            } else {
+                regular_tables.push(name);
+            }
+        }
+    }
+
+    let shadow_suffixes = [
+        "_data",
+        "_idx",
+        "_content",
+        "_docsize",
+        "_config",
+        "_segdir",
+        "_segments",
+        "_stat",
+    ];
+    let is_shadow = |name: &str| {
+        virtual_tables.iter().any(|vt| {
+            shadow_suffixes
+                .iter()
+                .any(|suffix| name == format!("{vt}{suffix}"))
+        })
+    };
+
+    for table in regular_tables
+        .iter()
+        .filter(|name| !is_shadow(name))
+        .chain(virtual_tables.iter())
+    {
+        let quoted = quote_sqlite_identifier(table);
+        for column in ["session_id", "sessionId"] {
+            if sqlite_table_has_column(&transaction, table, column)? {
+                let quoted_col = quote_sqlite_identifier(column);
+                transaction
+                    .execute(
+                        &format!("DELETE FROM {quoted} WHERE {quoted_col} = ?1"),
+                        [session_id],
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "会话已删除，但清理 DeepSeek Harness 搜索索引表 {table} 失败：{error}"
+                        )
+                    })?;
+            }
+        }
+    }
+
+    transaction.commit().map_err(|error| {
+        format!(
+            "会话已删除，但提交 DeepSeek Harness 搜索索引清理失败 {}：{error}",
+            db_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn preflight_delete(root: &Path, source: &Path, session_id: &str) -> Result<(), String> {
@@ -1038,6 +1572,9 @@ pub fn preflight_delete(root: &Path, source: &Path, session_id: &str) -> Result<
     let (source, _) = source_layout(root, source, session_id)?;
     let home = root.parent().ok_or("DeepSeek Harness 根目录无效")?;
     read_index(home)?;
+    let cache_root = projection_cache_root(home);
+    checked_storage_child(home, &cache_root.join(format!("{session_id}.json")))?;
+    validated_session_search_db(home)?;
     let active_host = active_host_schedules(home, session_id)?;
     if active_host > 0 {
         return Err(format!(
@@ -1082,7 +1619,7 @@ pub fn preflight_delete(root: &Path, source: &Path, session_id: &str) -> Result<
 }
 
 pub fn delete_session(root: &Path, source: &Path, session_id: &str) -> Result<bool, String> {
-    validate_delete_under_root(root, source, session_id)?;
+    preflight_delete(root, source, session_id)?;
     let (_, session_dir) = source_layout(root, source, session_id)?;
     let home = root.parent().ok_or("DeepSeek Harness 根目录无效")?;
 
@@ -1109,18 +1646,15 @@ pub fn delete_session(root: &Path, source: &Path, session_id: &str) -> Result<bo
     }
 
     let cache_root = projection_cache_root(home);
-    if cache_root.exists() {
-        let cache =
-            checked_storage_child(&cache_root, &cache_root.join(format!("{session_id}.json")))?;
-        if cache.exists() {
-            fs::remove_file(&cache).map_err(|error| {
-                format!(
-                    "会话已删除，但 DeepSeek Harness 投影缓存 {} 清理失败：{error}",
-                    cache.display()
-                )
-            })?;
-        }
-    }
+    let cache = checked_storage_child(home, &cache_root.join(format!("{session_id}.json")))?;
+    remove_path_if_exists(&cache).map_err(|error| {
+        format!(
+            "会话已删除，但 DeepSeek Harness 投影缓存 {} 清理失败：{error}",
+            cache.display()
+        )
+    })?;
+
+    cleanup_session_search_db(home, session_id)?;
     Ok(true)
 }
 
@@ -1252,7 +1786,9 @@ mod tests {
         let path = temp.path().join("storages/schedule.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         for invalid in [
-            json!({"unit":{"name":"schedule","version":2},"tables":{}}),
+            json!({"unit":{"name":"schedule","version":0},"tables":{}}),
+            json!({"unit":{"name":"schedule","version":3},"tables":{}}),
+            json!({"unit":{"name":"other","version":2},"tables":{}}),
             json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":[]}}),
             json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":{"s":{"sessionId":"target","record":{"id":"other"}}}}}),
             json!({"unit":{"name":"schedule","version":1},"tables":{"tasks":{"s":{"record":{"id":"s"}}}}}),
@@ -1266,6 +1802,12 @@ mod tests {
         fs::write(
             &path,
             b"{\"unit\":{\"name\":\"schedule\",\"version\":1},\"tables\":{}}",
+        )
+        .unwrap();
+        assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 0);
+        fs::write(
+            &path,
+            b"{\"unit\":{\"name\":\"schedule\",\"version\":2},\"tables\":{}}",
         )
         .unwrap();
         assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 0);
@@ -2140,6 +2682,335 @@ mod tests {
         assert!(
             home.join("sessions").exists(),
             "DeepSeek Harness is not installed"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn dsh_home_delegates_to_dsh_home_environment_variable() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let custom = temp.path().join("custom-dsh-home");
+        fs::create_dir_all(custom.join("sessions")).unwrap();
+        let prev = std::env::var_os("DSH_HOME");
+        std::env::set_var("DSH_HOME", &custom);
+        let resolved_home = dsh_home();
+        let resolved_roots = session_roots();
+        match prev {
+            Some(v) => std::env::set_var("DSH_HOME", v),
+            None => std::env::remove_var("DSH_HOME"),
+        }
+        assert_eq!(resolved_home, custom);
+        assert_eq!(resolved_roots, vec![custom.join("sessions")]);
+    }
+
+    #[test]
+    fn compat_schedule_v2_protects_active_targets_and_involved_sessions_and_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let target_src = root.join("project/target/session.v4.jsonl");
+        let involved_src = root.join("project/involved-sess/session.v4.jsonl");
+        let paused_src = root.join("project/paused-sess/session.v4.jsonl");
+        let ended_src = root.join("project/ended-sess/session.v4.jsonl");
+        let unrelated_src = root.join("project/unrelated/session.v4.jsonl");
+        for (src, id) in [
+            (&target_src, "target"),
+            (&involved_src, "involved-sess"),
+            (&paused_src, "paused-sess"),
+            (&ended_src, "ended-sess"),
+            (&unrelated_src, "unrelated"),
+        ] {
+            write_plain_session(src, id, None, None);
+        }
+        write_index(
+            temp.path(),
+            &[
+                "target",
+                "involved-sess",
+                "paused-sess",
+                "ended-sess",
+                "unrelated",
+            ],
+            &[],
+        );
+
+        let sched_path = temp.path().join("storages/schedule.json");
+        let store = json!({
+            "unit": {"name": "schedule", "version": 2},
+            "tables": {
+                "tasks": {
+                    "t-existing": {
+                        "status": "active",
+                        "target": {"kind": "existing", "sessionId": "target"},
+                        "record": {"id": "t-existing", "kind": "every"}
+                    },
+                    "t-paused": {
+                        "status": "paused",
+                        "target": {"kind": "session", "sessionId": "paused-sess"},
+                        "record": {"id": "t-paused", "kind": "every"}
+                    },
+                    "t-ended": {
+                        "status": "ended",
+                        "sessionId": "ended-sess"
+                    },
+                    "t-new": {
+                        "status": "active",
+                        "target": {"kind": "new", "cwd": "C:/work/demo"}
+                    },
+                    "t-new-once": {
+                        "target": {"kind": "new_once", "prompt": "ping"},
+                        "involvedSessionIds": ["involved-sess"]
+                    }
+                }
+            }
+        });
+        fs::write(&sched_path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        assert_eq!(active_host_schedules(temp.path(), "target").unwrap(), 1);
+        assert_eq!(
+            active_host_schedules(temp.path(), "involved-sess").unwrap(),
+            1
+        );
+        assert_eq!(
+            active_host_schedules(temp.path(), "paused-sess").unwrap(),
+            0
+        );
+        assert_eq!(active_host_schedules(temp.path(), "ended-sess").unwrap(), 0);
+        assert_eq!(active_host_schedules(temp.path(), "unrelated").unwrap(), 0);
+
+        assert!(delete_session(&root, &target_src, "target")
+            .unwrap_err()
+            .contains("主机定时任务"));
+        assert!(delete_session(&root, &involved_src, "involved-sess")
+            .unwrap_err()
+            .contains("主机定时任务"));
+        assert!(target_src.exists());
+        assert!(involved_src.exists());
+
+        assert!(delete_session(&root, &paused_src, "paused-sess").unwrap());
+        assert!(delete_session(&root, &ended_src, "ended-sess").unwrap());
+        assert!(delete_session(&root, &unrelated_src, "unrelated").unwrap());
+
+        for malformed in [
+            json!({"unit":{"name":"schedule","version":3},"tables":{"tasks":{}}}),
+            json!({"unit":{"name":"schedule","version":2},"tables":{"tasks":{"bad":{"status":"unknown","target":{"kind":"new"}}}}}),
+            json!({"unit":{"name":"schedule","version":2},"tables":{"tasks":{"bad":{"status":123,"target":{"kind":"new"}}}}}),
+            json!({"unit":{"name":"schedule","version":2},"tables":{"tasks":{"bad":{"status":"active","target":{"kind":"existing"}}}}}),
+            json!({"unit":{"name":"schedule","version":2},"tables":{"tasks":{"bad":{"status":"active","involvedSessionIds":[42]}}}}),
+            json!({"unit":{"name":"schedule","version":2},"tables":{"tasks":{"bad":{"status":"active","record":{"id":"mismatch"}}}}}),
+        ] {
+            fs::write(&sched_path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+            assert!(active_host_schedules(temp.path(), "target").is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discover_session_logs_rejects_ntfs_junctions_like_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let good = root.join("project/session-good/session.v4.jsonl");
+        write_plain_session(&good, "session-good", None, None);
+        write_index(temp.path(), &["session-good"], &[]);
+
+        let hidden_outside = temp.path().join("outside-target");
+        write_plain_session(
+            &hidden_outside.join("session-child/session.v4.jsonl"),
+            "session-child",
+            Some("session-good"),
+            Some("subagent"),
+        );
+
+        let junction = root.join("junction-project");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&hidden_outside)
+            .output()
+            .expect("invoke mklink /J");
+        assert!(
+            status.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        let discovery = discover_session_logs(&root);
+        assert_eq!(discovery.logs, vec![good.clone()]);
+        assert!(discovery
+            .warnings
+            .iter()
+            .any(|w| w.contains("未跟随的链接")));
+        assert!(discovery.complete().is_err());
+        assert!(delete_session(&root, &good, "session-good").is_err());
+        assert!(good.exists());
+    }
+
+    #[test]
+    fn delete_session_is_self_contained_unlinks_dangling_cache_and_cleans_search_db() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let parent_src = root.join("project/parent-1/session.v4.jsonl");
+        let child_src = root.join("project/child-1/session.v4.jsonl");
+        let keep_src = root.join("project/keep-1/session.v4.jsonl");
+        write_plain_session(&parent_src, "parent-1", None, None);
+        write_plain_session(&child_src, "child-1", Some("parent-1"), Some("subagent"));
+        write_plain_session(&keep_src, "keep-1", None, None);
+        write_index(temp.path(), &["parent-1", "child-1", "keep-1"], &[]);
+
+        // Direct delete_session must run preflight and block deleting parent while child exists!
+        assert!(delete_session(&root, &parent_src, "parent-1")
+            .unwrap_err()
+            .contains("子 Agent"));
+        assert!(parent_src.exists());
+
+        // Set up FTS5 + regular tables in storages/session-search.db
+        let search_db = session_search_db_path(temp.path());
+        {
+            let conn = rusqlite::Connection::open(&search_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE indexed_sessions (session_id TEXT PRIMARY KEY, updated_at INTEGER);
+                 CREATE TABLE camel_hits (sessionId TEXT, snippet TEXT);
+                 CREATE VIRTUAL TABLE messages_fts USING fts5(session_id UNINDEXED, title, body);
+                 INSERT INTO indexed_sessions VALUES ('child-1', 1), ('parent-1', 2), ('keep-1', 3);
+                 INSERT INTO camel_hits VALUES ('child-1', 'c'), ('parent-1', 'p'), ('keep-1', 'k');
+                 INSERT INTO messages_fts(session_id, title, body) VALUES
+                     ('child-1', 'Child', 'alpha unique_child_token'),
+                     ('parent-1', 'Parent', 'beta unique_parent_token'),
+                     ('keep-1', 'Keep', 'gamma unique_keep_token');",
+            )
+            .unwrap();
+        }
+
+        // Set up projection cache including a dangling symlink (if symlink creation allowed)
+        let cache_root = projection_cache_root(temp.path());
+        fs::create_dir_all(&cache_root).unwrap();
+        let child_cache = cache_root.join("child-1.json");
+        let missing_target = temp.path().join("nonexistent-cache-target.json");
+        let symlink_created = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&missing_target, &child_cache).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&missing_target, &child_cache).is_ok()
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                false
+            }
+        };
+        if !symlink_created {
+            fs::write(&child_cache, "{}").unwrap();
+        }
+        fs::write(cache_root.join("parent-1.json"), "{}").unwrap();
+
+        assert!(delete_session(&root, &child_src, "child-1").unwrap());
+        assert!(fs::symlink_metadata(&child_cache).is_err());
+        assert!(delete_session(&root, &parent_src, "parent-1").unwrap());
+        assert!(fs::symlink_metadata(cache_root.join("parent-1.json")).is_err());
+        assert!(keep_src.exists());
+
+        let conn = rusqlite::Connection::open(&search_db).unwrap();
+        let remaining_indexed: Vec<String> = conn
+            .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(remaining_indexed, vec!["keep-1".to_string()]);
+
+        let remaining_camel: Vec<String> = conn
+            .prepare("SELECT sessionId FROM camel_hits ORDER BY sessionId")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(remaining_camel, vec!["keep-1".to_string()]);
+
+        let child_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'unique_child_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parent_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'unique_parent_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let keep_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'unique_keep_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_hits, 0);
+        assert_eq!(parent_hits, 0);
+        assert_eq!(keep_hits, 1);
+    }
+
+    #[test]
+    fn transcript_supports_compaction_replace_tool_turns_and_delivery_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions/project/s-rich/session.v4.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let rows = [
+            json!({
+                "type": "session", "version": 4, "id": "s-rich",
+                "createdAt": 1_700_000_000_000_i64, "cwd": "C:/work/demo"
+            }),
+            json!({"type":"turn/start","seq":0,"time":1700000000010_i64,"data":{}}),
+            // Excluded system/skill/instruction injections
+            json!({"type":"user/message","seq":1,"time":1700000000020_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"agent-instructions"},"content":[{"type":"text","text":"AGENTS.md"}]}}),
+            json!({"type":"user/message","seq":2,"time":1700000000030_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"tool-skill"},"content":[{"type":"text","text":"skill body"}]}}),
+            json!({"type":"user/message","seq":3,"time":1700000000040_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"system"},"content":[{"type":"text","text":"system prompt"}]}}),
+            // Early conversation that will be replaced by compaction (seq 4..=5)
+            json!({"type":"user/message","seq":4,"time":1700000000100_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"old turn 1"}]}}),
+            json!({"type":"assistant/message","seq":5,"time":1700000000200_i64,"surfaceOp":"append","data":{"message":{"role":"assistant","content":[{"type":"text","text":"old reply 1"}]}}}),
+            // Visible channel message (seq 6) kept outside compacted range
+            json!({"type":"user/message","seq":6,"time":1700000000300_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"channel","channel":"feishu"},"content":[{"type":"text","text":"channel prompt"}]}}),
+            // Compaction replacing 4..=5 in-place
+            json!({"type":"session/compact","seq":7,"time":1700000000350_i64,"surfaceOp":{"op":"replace","startSeq":4,"endSeq":5},"data":{"summary":"[Compacted turns 1]"}}),
+            // Tool-only assistant turn + tool/result
+            json!({"type":"assistant/message","seq":8,"time":1700000000400_i64,"surfaceOp":"append","data":{"message":{"role":"assistant","content":[{"type":"reasoning","text":"secret"},{"type":"tool-call","name":"bash","arguments":{"cmd":"cargo test"}}]}}}),
+            json!({"type":"tool/result","seq":9,"time":1700000000450_i64,"surfaceOp":"append","data":{"toolCallId":"c1","content":[{"type":"text","text":"test result: ok"}]}}),
+            // Schedule & import user messages
+            json!({"type":"user/message","seq":10,"time":1700000000500_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"schedule"},"content":[{"type":"text","text":"scheduled check"}]}}),
+            json!({"type":"user/message","seq":11,"time":1700000000600_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"import"},"content":"imported question"}}),
+        ];
+        fs::write(
+            &path,
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let messages = load_messages(&path).unwrap();
+        let pairs: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("system", "[Compacted turns 1]"),
+                ("user", "channel prompt"),
+                ("assistant", "[Tool: bash] {\"cmd\":\"cargo test\"}"),
+                ("tool", "test result: ok"),
+                ("user", "scheduled check"),
+                ("user", "imported question"),
+            ]
         );
     }
 }

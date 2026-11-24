@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -80,9 +80,11 @@ export const useSessionMessagesQuery = (
     },
     enabled: Boolean(providerId && sourcePath),
     staleTime: 30_000,
+    refetchOnWindowFocus: false,
   });
 
   const snapshot =
+    !query.data &&
     query.isFetching &&
     streamed &&
     streamed.providerId === providerId &&
@@ -90,9 +92,19 @@ export const useSessionMessagesQuery = (
       ? streamed
       : query.data;
 
+  const stampedMessages = useMemo(
+    () =>
+      snapshot?.messages.map((msg, idx) =>
+        msg.transcriptIndex !== undefined
+          ? msg
+          : { ...msg, transcriptIndex: msg.index ?? idx },
+      ),
+    [snapshot?.messages],
+  );
+
   return {
     ...query,
-    data: snapshot?.messages,
+    data: stampedMessages,
     messageRevision: snapshot?.revision ?? 0,
   };
 };

@@ -299,7 +299,7 @@ export function SessionListSidebar({
       statusCounts.archived +
       statusCounts.child >
       0 || statusFilter !== "all";
-  const isFiltering = isSearching || statusFilter !== "all";
+  const paginationResetKey = `${providerFilter}\u0000${statusFilter}\u0000${searchTerms.join(" ")}\u0000${listViewMode}`;
 
   return (
     <div className="asm-list" onContextMenu={(event) => event.preventDefault()}>
@@ -386,7 +386,7 @@ export function SessionListSidebar({
                         defaultValue: "退出批量管理",
                       })
                     : t("sessionManager.manageBatchTooltip", {
-                        defaultValue: "批量管理",
+                        defaultValue: "进入批量管理",
                       })
                 }
                 onClick={() => {
@@ -406,7 +406,7 @@ export function SessionListSidebar({
                     defaultValue: "退出批量管理",
                   })
                 : t("sessionManager.manageBatchTooltip", {
-                    defaultValue: "批量管理",
+                    defaultValue: "进入批量管理",
                   })}
             </TooltipContent>
           </Tooltip>
@@ -519,17 +519,19 @@ export function SessionListSidebar({
       </div>
       {selectionMode && (
         <div className="asm-batch-bar">
+          <span className="asm-batch-dot" aria-hidden="true" />
           <span>
             {t("sessionManager.selectedCount", {
               defaultValue: "已选 {{count}} 项",
               count: selectedDeletableSessions.length,
             })}
           </span>
+          <span className="asm-toolbar-spacer" />
           {deletableFilteredSessions.length > 0 && (
             <Button
               variant="ghost"
               size="sm"
-              className="h-6 px-2 text-xs whitespace-nowrap"
+              className="h-6 rounded-md px-2 text-xs whitespace-nowrap"
               onClick={onToggleSelectAll}
             >
               {allFilteredSelected
@@ -545,11 +547,11 @@ export function SessionListSidebar({
             <Button
               variant="ghost"
               size="sm"
-              className="h-6 px-2 text-xs whitespace-nowrap"
+              className="h-6 rounded-md px-2 text-xs whitespace-nowrap"
               onClick={onClearSelection}
             >
               {t("sessionManager.clearSelection", {
-                defaultValue: "清空",
+                defaultValue: "清空已选",
               })}
             </Button>
           )}
@@ -754,9 +756,9 @@ export function SessionListSidebar({
               </div>
             )}
             {groupedSessions.map((providerGroup) => {
-              const providerOpen =
-                isFiltering ||
-                expandedProviderGroups.has(providerGroup.providerId);
+              const providerOpen = expandedProviderGroups.has(
+                providerGroup.providerId,
+              );
               const providerLabel = getProviderLabel(
                 providerGroup.providerId,
                 t,
@@ -809,9 +811,9 @@ export function SessionListSidebar({
                   </div>
                   <CollapsibleContent className="asm-group-items">
                     {providerGroup.directories.map((directoryGroup) => {
-                      const directoryOpen =
-                        isFiltering ||
-                        expandedDirectoryGroups.has(directoryGroup.key);
+                      const directoryOpen = expandedDirectoryGroups.has(
+                        directoryGroup.key,
+                      );
                       const directorySelectionState = getGroupSelectionState(
                         directoryGroup.sessions,
                       );
@@ -877,6 +879,8 @@ export function SessionListSidebar({
                           <CollapsibleContent className="asm-dir-items">
                             <SessionRows
                               sessions={directoryGroup.sessions}
+                              selectedKey={selectedKey}
+                              resetKey={paginationResetKey}
                               renderItem={renderSessionItem}
                             />
                           </CollapsibleContent>
@@ -897,6 +901,8 @@ export function SessionListSidebar({
             )}
             <SessionRows
               sessions={filteredSessions}
+              selectedKey={selectedKey}
+              resetKey={paginationResetKey}
               renderItem={renderSessionItem}
             />
           </div>
@@ -913,6 +919,7 @@ export function SessionListSidebar({
             : undefined
         }
       >
+        <span className="asm-status-live-dot" aria-hidden="true" />
         <span>
           {t("sessionManager.statusbarSessions", {
             defaultValue: "{{count}} 个会话",

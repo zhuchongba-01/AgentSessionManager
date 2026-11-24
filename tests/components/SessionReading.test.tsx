@@ -17,11 +17,17 @@ import { setSessionFixtures } from "../msw/state";
 
 // jsdom has no layout: expose rows deterministically to test page wiring.
 vi.mock("@tanstack/react-virtual", () => ({
-  useVirtualizer: ({ count }: { count: number }) => ({
+  useVirtualizer: ({
+    count,
+    getItemKey,
+  }: {
+    count: number;
+    getItemKey?: (index: number) => string | number;
+  }) => ({
     getVirtualItems: () =>
       Array.from({ length: count }, (_, index) => ({
         index,
-        key: index,
+        key: getItemKey ? getItemKey(index) : index,
         start: index * 120,
         end: (index + 1) * 120,
       })),
@@ -258,5 +264,42 @@ describe("session reading integration", () => {
         "/mock/reading.jsonl",
       ]),
     ).toBeUndefined();
+  });
+
+  it("does not refetch on window focus and preserves existing transcript during background refetch", async () => {
+    let resolveRefetch!: (messages: SessionMessage[]) => void;
+    const streamSpy = vi
+      .spyOn(sessionsApi, "streamMessages")
+      .mockResolvedValueOnce([{ role: "assistant", content: "cached reply" }])
+      .mockImplementationOnce(
+        (_p, _s, onProgress) =>
+          new Promise((resolve) => {
+            onProgress?.([]);
+            resolveRefetch = resolve;
+          }),
+      );
+
+    renderReader();
+    expect(await screen.findByText("cached reply")).toBeInTheDocument();
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+
+    // Window focus should NOT trigger a refetch (refetchOnWindowFocus: false)
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+
+    // Manual background invalidation keeps existing transcript visible without skeleton flash
+    act(() => {
+      void clients[0].invalidateQueries({ queryKey: ["sessionMessages"] });
+    });
+    await waitFor(() => expect(streamSpy).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("cached reply")).toBeInTheDocument();
+    expect(screen.queryByText("正在读取会话…")).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveRefetch([{ role: "assistant", content: "refreshed reply" }]);
+    });
+    expect(await screen.findByText("refreshed reply")).toBeInTheDocument();
   });
 });

@@ -49,6 +49,93 @@ pub const MAX_QUERY_BYTES: i64 = 32 * 1024 * 1024;
 pub const MAX_QUERY_ROWS: i64 = 20_000;
 const MAX_SCAN_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Check whether metadata describes a symlink or (on Windows) any reparse point
+/// such as an NTFS directory junction (`FILE_ATTRIBUTE_REPARSE_POINT = 0x400`).
+pub fn is_reparse_or_symlink(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_type().is_symlink() || (meta.file_attributes() & 0x400 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn same_directory_entry(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(a_name), Some(b_name), Some(a_parent), Some(b_parent)) =
+        (a.file_name(), b.file_name(), a.parent(), b.parent())
+    else {
+        return false;
+    };
+    let names_match = {
+        #[cfg(windows)]
+        {
+            a_name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&b_name.to_string_lossy())
+        }
+        #[cfg(not(windows))]
+        {
+            a_name == b_name
+        }
+    };
+    names_match
+        && a_parent
+            .canonicalize()
+            .ok()
+            .zip(b_parent.canonicalize().ok())
+            .is_some_and(|(pa, pb)| pa == pb)
+}
+
+/// Verify that `child` descends from `root` and that no existing intermediate
+/// directory strictly between `root` and `child` is a symlink or reparse point.
+fn verify_no_intermediate_links(
+    raw_root: &Path,
+    canonical_root: &Path,
+    child: &Path,
+) -> Result<(), String> {
+    let mut current = child
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or("Invalid storage path")?;
+
+    loop {
+        if current == raw_root || current == canonical_root {
+            return Ok(());
+        }
+        match std::fs::symlink_metadata(current) {
+            Ok(meta) => {
+                if is_reparse_or_symlink(&meta) {
+                    if same_directory_entry(current, raw_root) {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "Storage path traverses a symlink or reparse point: {}",
+                        current.display()
+                    ));
+                }
+                if current
+                    .canonicalize()
+                    .is_ok_and(|resolved| resolved == canonical_root)
+                {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        current = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or("Derived storage path escapes its root")?;
+    }
+}
+
 /// Validate every derived path, including symlinked ancestors of missing targets.
 ///
 /// 目标本身是一个符号链接时**不解析它**：`canonicalize` 会把链接换成它的目标，
@@ -56,16 +143,21 @@ const MAX_SCAN_LINE_BYTES: u64 = 4 * 1024 * 1024;
 /// 备份/同步副本很容易形成这种链接）。这里改为只解析链接的父目录并保留链接文件名，
 /// 让删除落在链接本身上—— [`remove_path_if_exists`] 会摘掉链接而不跟随。
 pub fn checked_storage_child(root: &Path, child: &Path) -> Result<PathBuf, String> {
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
     if child
         .components()
         .any(|part| matches!(part, std::path::Component::ParentDir))
     {
         return Err("Storage path contains a parent-directory component".into());
     }
+    if child == root || child == canonical_root {
+        return Err("Derived storage path escapes its root".into());
+    }
 
-    // 目标本身是链接：解析它的父目录，但保留链接自身的文件名
-    if std::fs::symlink_metadata(child).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    verify_no_intermediate_links(root, &canonical_root, child)?;
+
+    // 目标本身是链接/重解析点：解析它的父目录，但保留链接自身的文件名
+    if std::fs::symlink_metadata(child).is_ok_and(|meta| is_reparse_or_symlink(&meta)) {
         let parent = child
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -73,14 +165,14 @@ pub fn checked_storage_child(root: &Path, child: &Path) -> Result<PathBuf, Strin
         let name = child.file_name().ok_or("Invalid storage path")?;
         let resolved = resolve_existing_ancestors(parent)?;
         let resolved = resolved.join(name);
-        if resolved == root || !resolved.starts_with(&root) {
+        if resolved == canonical_root || !resolved.starts_with(&canonical_root) {
             return Err("Derived storage path escapes its root".into());
         }
         return Ok(resolved);
     }
 
     let resolved = resolve_existing_ancestors(child)?;
-    if resolved == root || !resolved.starts_with(&root) {
+    if resolved == canonical_root || !resolved.starts_with(&canonical_root) {
         return Err("Derived storage path escapes its root".into());
     }
     Ok(resolved)
@@ -115,17 +207,25 @@ fn resolve_existing_ancestors(path: &Path) -> Result<PathBuf, String> {
 
 /// 删除一个可能存在也可能不存在的路径。
 ///
-/// 对符号链接只摘掉链接本身，绝不跟随：跟随会把「删除一个链接」变成「删除链接指向
-/// 的真实数据」。`symlink_metadata` 不跟随链接，所以链接的 `is_dir()` 为假；Windows
-/// 上目录链接是 reparse point，要用 `remove_dir`（不是 `remove_dir_all`，不递归）。
+/// 对符号链接/重解析点只摘掉链接本身，绝不跟随：跟随会把「删除一个链接」变成
+/// 「删除链接指向的真实数据」。绝不调用 `path.is_dir()`（它会跟随链接）；Windows
+/// 上目录链接与目录 junction 均根据自身的元数据属性用 `remove_dir` 摘除。
 pub fn remove_path_if_exists(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
+        Ok(meta) if is_reparse_or_symlink(&meta) => {
             #[cfg(windows)]
-            if path.is_dir() {
-                return std::fs::remove_dir(path);
+            {
+                use std::os::windows::fs::{FileTypeExt, MetadataExt};
+                if meta.file_type().is_symlink_dir() || (meta.file_attributes() & 0x10 != 0) {
+                    std::fs::remove_dir(path)
+                } else {
+                    std::fs::remove_file(path)
+                }
             }
-            std::fs::remove_file(path)
+            #[cfg(not(windows))]
+            {
+                std::fs::remove_file(path)
+            }
         }
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
         Ok(_) => std::fs::remove_file(path),
@@ -277,14 +377,7 @@ where
 }
 
 fn reject_scan_link(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
-    #[cfg(windows)]
-    let is_link = {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    };
-    #[cfg(not(windows))]
-    let is_link = metadata.file_type().is_symlink();
-    if is_link {
+    if is_reparse_or_symlink(metadata) {
         return Err(format!(
             "Dependency scan encountered a link: {}",
             path.display()
@@ -397,13 +490,24 @@ pub fn read_head_tail_lines(
 }
 
 pub fn parse_timestamp_to_ms(value: &Value) -> Option<i64> {
-    // Integer: milliseconds (>1e12) or seconds
+    // Integer: milliseconds (|n| > 1e12) or seconds
     if let Some(n) = value.as_i64() {
-        return Some(if n > 1_000_000_000_000 { n } else { n * 1000 });
+        return if n.unsigned_abs() > 1_000_000_000_000 {
+            Some(n)
+        } else {
+            n.checked_mul(1000)
+        };
     }
     if let Some(n) = value.as_f64() {
+        if !n.is_finite() || !(-9e15..=9e15).contains(&n) {
+            return None;
+        }
         let n = n as i64;
-        return Some(if n > 1_000_000_000_000 { n } else { n * 1000 });
+        return if n.unsigned_abs() > 1_000_000_000_000 {
+            Some(n)
+        } else {
+            n.checked_mul(1000)
+        };
     }
     // RFC3339 string
     let raw = value.as_str()?;
@@ -421,20 +525,134 @@ pub fn extract_text(content: &Value) -> String {
             .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
-        Value::Object(map) => map
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        Value::Object(_) => extract_text_from_item(content).unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+#[allow(dead_code)]
+pub fn extract_thinking_text(content: &Value) -> String {
+    match content {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(extract_thinking_from_item)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(_) => extract_thinking_from_item(content)
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn extract_thinking_from_item(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    match item_type {
+        "thinking" => item
+            .get("thinking")
+            .or_else(|| item.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "summary_text" | "reasoning_text" => {
+            item.get("text").and_then(Value::as_str).map(str::to_string)
+        }
+        "reasoning" => {
+            if let Some(text) = item
+                .get("text")
+                .or_else(|| item.get("thinking"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                return Some(text.to_string());
+            }
+            let mut parts = Vec::new();
+            if let Some(summary) = item.get("summary") {
+                let s = extract_thinking_text(summary);
+                if !s.trim().is_empty() {
+                    parts.push(s);
+                }
+            }
+            if let Some(nested) = item.get("content") {
+                let c = extract_thinking_text(nested);
+                if !c.trim().is_empty() {
+                    parts.push(c);
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn format_web_search_tool_result(item: &Value) -> String {
+    if let Some(err) = item
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return format!("[Web search error: {err}]");
+    }
+    match item.get("content") {
+        Some(Value::Array(results)) => {
+            let mut lines = Vec::new();
+            for entry in results {
+                let title = entry
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let url = entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                match (!title.is_empty(), !url.is_empty()) {
+                    (true, true) => lines.push(format!("- {title} ({url})")),
+                    (true, false) => lines.push(format!("- {title}")),
+                    (false, true) => lines.push(format!("- {url}")),
+                    (false, false) => {}
+                }
+            }
+            if lines.is_empty() {
+                "[Web search result]".to_string()
+            } else {
+                lines.join("\n")
+            }
+        }
+        Some(Value::Object(map)) => {
+            if let Some(err) = map
+                .get("error_code")
+                .or_else(|| map.get("error"))
+                .or_else(|| map.get("message"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                format!("[Web search error: {err}]")
+            } else {
+                "[Web search result]".to_string()
+            }
+        }
+        _ => "[Web search result]".to_string(),
     }
 }
 
 fn extract_text_from_item(item: &Value) -> Option<String> {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
 
-    // Anthropic uses tool_use; Pi's assistant messages use toolCall.
-    if matches!(item_type, "tool_use" | "toolCall") {
+    // Keep thinking/reasoning blocks strictly out of visible text / SessionMeta summaries.
+    if matches!(
+        item_type,
+        "thinking" | "reasoning" | "redacted_thinking" | "summary_text" | "reasoning_text"
+    ) {
+        return None;
+    }
+
+    // Anthropic uses tool_use / server_tool_use / mcp_tool_use; Pi's assistant messages use toolCall.
+    if matches!(
+        item_type,
+        "tool_use" | "toolCall" | "server_tool_use" | "mcp_tool_use"
+    ) {
         let name = item
             .get("name")
             .and_then(Value::as_str)
@@ -442,8 +660,20 @@ fn extract_text_from_item(item: &Value) -> Option<String> {
         return Some(format!("[Tool: {name}]"));
     }
 
-    // tool_result: extract nested content
-    if item_type == "tool_result" {
+    if item_type == "web_search_tool_result" {
+        return Some(format_web_search_tool_result(item));
+    }
+
+    if matches!(item_type, "image" | "input_image") {
+        return Some("[Image]".to_string());
+    }
+
+    if matches!(item_type, "document" | "input_file") {
+        return Some("[Document]".to_string());
+    }
+
+    // tool_result / mcp_tool_result: extract nested content
+    if matches!(item_type, "tool_result" | "mcp_tool_result") {
         if let Some(content) = item.get("content") {
             let text = extract_text(content);
             if !text.is_empty() {
@@ -517,6 +747,7 @@ pub fn file_stamp(path: &Path) -> io::Result<FileStamp> {
     })
 }
 
+#[derive(Clone)]
 struct CachedParse<T> {
     stamp: FileStamp,
     meta: Option<T>,
@@ -526,11 +757,10 @@ struct CachedParse<T> {
 /// 解析出的 [`SessionMeta`](crate::session_manager::SessionMeta) 或原始结构体，只重新解析新增或
 /// 改过的文件。
 ///
-/// 只存摘要（标题、路径、时间等），不存会话正文；每次扫描都用本轮看到的文件重建
-/// 整张表，已删除文件的条目随之丢弃，内存占用与会话数量成正比。解析结果必须只
-/// 取决于文件本身——依赖外部数据的部分（DeepSeek Harness 的 `workspace.json` 项目
-/// 归属、Codex 的 `config.toml` 分区、Pi 的父会话文件存在性）在缓存之外叠加，
-/// 否则会出现「文件没变但结论已过期」的陈旧行。
+/// 只存摘要（标题、路径、时间等），不存会话正文；已删除文件的条目自动淘汰，内存占用
+/// 与会话数量成正比。解析结果必须只取决于文件本身——依赖外部数据的部分（DeepSeek
+/// Harness 的 `workspace.json` 项目归属、Codex 的 `config.toml` 分区、Pi 的父会话文件
+/// 存在性）在缓存之外叠加，否则会出现「文件没变但结论已过期」的陈旧行。
 pub struct FileParseCache<T = crate::session_manager::SessionMeta> {
     entries: Mutex<HashMap<PathBuf, CachedParse<T>>>,
 }
@@ -551,29 +781,29 @@ impl<T: Clone> FileParseCache<T> {
     where
         F: Fn(&Path) -> Result<Option<T>, String>,
     {
-        // 锁中毒（上次扫描 panic）时丢掉旧缓存重来，不影响本次结果
-        let mut previous = match self.entries.lock() {
-            Ok(mut guard) => std::mem::take(&mut *guard),
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.clear();
-                HashMap::new()
-            }
-        };
+        // 短暂加锁复制当前快照：并发扫描都能命中已有缓存，锁中毒时继续恢复内部表
+        let previous = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
-        let mut next = HashMap::with_capacity(files.len());
+        let mut scanned = HashMap::with_capacity(files.len());
+        let mut evict = Vec::new();
         let mut sessions = Vec::new();
         for path in files {
-            // 元数据都读不到（权限、被占用、刚被删除）：本轮跳过，下轮重试
+            // 元数据都读不到（权限、被占用、刚被删除）：本轮跳过并移出缓存，下轮重试
             let Ok(stamp) = file_stamp(&path) else {
+                evict.push(path);
                 continue;
             };
-            let meta = match previous.remove(&path) {
-                Some(entry) if entry.stamp == stamp => entry.meta,
+            let meta = match previous.get(&path) {
+                Some(entry) if entry.stamp == stamp => entry.meta.clone(),
                 _ => match parse(&path) {
                     Ok(meta) => meta,
                     Err(error) => {
                         log::debug!("会话文件暂时读取失败，下轮重试 {}: {error}", path.display());
+                        evict.push(path);
                         continue;
                     }
                 },
@@ -581,12 +811,18 @@ impl<T: Clone> FileParseCache<T> {
             if let Some(meta) = &meta {
                 sessions.push(meta.clone());
             }
-            next.insert(path, CachedParse { stamp, meta });
+            scanned.insert(path, CachedParse { stamp, meta });
         }
 
-        if let Ok(mut guard) = self.entries.lock() {
-            *guard = next;
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in evict {
+            guard.remove(&path);
         }
+        guard.retain(|path, _| scanned.contains_key(path) || path.exists());
+        guard.extend(scanned);
         sessions
     }
 }
@@ -721,7 +957,29 @@ pub fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Resul
     temp.write_all(b"\n").map_err(|e| e.to_string())?;
     temp.flush().map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
-    temp.persist(path).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        let mut current_temp = temp;
+        let mut attempts = 0usize;
+        loop {
+            match current_temp.persist(path) {
+                Ok(_) => break,
+                Err(err) if err.error.kind() == io::ErrorKind::PermissionDenied && attempts < 3 => {
+                    attempts += 1;
+                    current_temp = err.file;
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(err) => return Err(err.error.to_string()),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        temp.persist(path).map_err(|e| e.error.to_string())?;
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -1140,5 +1398,107 @@ mod tests {
             order_selected_children(&selected, &[0, 1, 2, 3]),
             vec![1, 3, 2, 0]
         );
+    }
+
+    #[test]
+    fn intermediate_symlink_inside_root_is_rejected_by_checked_storage_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let real_dir = root.join("real");
+        let linked_dir = root.join("linked");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("victim.txt"), "keep").unwrap();
+
+        if create_dir_symlink(&real_dir, &linked_dir).is_err() {
+            eprintln!("skipped: directory symlink creation unavailable");
+            return;
+        }
+
+        assert!(checked_storage_child(&root, &linked_dir.join("victim.txt")).is_err());
+        assert!(checked_storage_child(&root, &linked_dir.join("missing.txt")).is_err());
+        // Direct link child itself is still accepted as the link (not its target)
+        assert!(checked_storage_child(&root, &linked_dir).is_ok());
+    }
+
+    #[test]
+    fn parse_timestamp_to_ms_never_overflows_on_extreme_numbers() {
+        assert_eq!(parse_timestamp_to_ms(&json!(i64::MIN)), Some(i64::MIN));
+        assert_eq!(parse_timestamp_to_ms(&json!(i64::MAX)), Some(i64::MAX));
+        assert_eq!(parse_timestamp_to_ms(&json!(u64::MAX)), None);
+        assert_eq!(parse_timestamp_to_ms(&json!(1e100)), None);
+        assert_eq!(parse_timestamp_to_ms(&json!(-1e100)), None);
+        assert_eq!(parse_timestamp_to_ms(&json!(-5_i64)), Some(-5_000));
+    }
+
+    #[test]
+    fn extract_text_and_thinking_handle_rich_blocks_cleanly() {
+        let content = json!([
+            { "type": "thinking", "thinking": "step 1" },
+            { "type": "reasoning", "text": "step 2" },
+            { "type": "server_tool_use", "name": "web_search" },
+            { "type": "mcp_tool_use", "name": "github_pr" },
+            {
+                "type": "web_search_tool_result",
+                "content": [
+                    { "type": "web_search_result", "title": "Rust", "url": "https://rust-lang.org" }
+                ]
+            },
+            { "type": "image" },
+            { "type": "input_image" },
+            { "type": "document" },
+            { "type": "input_file" },
+            { "type": "text", "text": "Final answer" }
+        ]);
+        assert_eq!(
+            extract_text(&content),
+            "[Tool: web_search]\n[Tool: github_pr]\n- Rust (https://rust-lang.org)\n[Image]\n[Image]\n[Document]\n[Document]\nFinal answer"
+        );
+        assert_eq!(extract_thinking_text(&content), "step 1\nstep 2");
+        assert_eq!(
+            extract_thinking_text(&json!({
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "summary line" }]
+            })),
+            "summary line"
+        );
+    }
+
+    #[test]
+    fn file_parse_cache_retains_entries_during_concurrent_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a.jsonl");
+        let b = temp.path().join("b.jsonl");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "beta").unwrap();
+
+        let cache = FileParseCache::new();
+        // Seed `a` into cache
+        assert_eq!(
+            cache
+                .scan(vec![a.clone()], |p| Ok(cache_test_meta(p, "a")))
+                .len(),
+            1
+        );
+
+        let a_parses = AtomicUsize::new(0);
+        // While scanning `[a, b]`, trigger a nested concurrent scan of `[a]` inside `parse(b)`.
+        // Because `scan` clones under a brief lock instead of `mem::take`, the inner scan hits `a`!
+        let outer = cache.scan(vec![a.clone(), b.clone()], |p| {
+            if p == a {
+                a_parses.fetch_add(1, Ordering::SeqCst);
+                Ok(cache_test_meta(p, "a"))
+            } else {
+                let inner = cache.scan(vec![a.clone()], |inner_p| {
+                    a_parses.fetch_add(1, Ordering::SeqCst);
+                    Ok(cache_test_meta(inner_p, "a"))
+                });
+                assert_eq!(inner.len(), 1);
+                Ok(cache_test_meta(p, "b"))
+            }
+        });
+        assert_eq!(outer.len(), 2);
+        assert_eq!(a_parses.load(Ordering::SeqCst), 0);
     }
 }

@@ -1,13 +1,24 @@
 import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Square, X } from "lucide-react";
+import {
+  Github,
+  Minus,
+  Monitor,
+  Moon,
+  Sparkles,
+  Square,
+  Sun,
+  X,
+} from "lucide-react";
 import appIcon from "@/icons/app-icon.png";
 import {
   APP_VERSION,
   GITHUB_LATEST_RELEASE_URL,
+  GITHUB_REPOSITORY_URL,
   type AvailableUpdate,
 } from "@/lib/githubRelease";
-import { isMac } from "@/lib/platform";
+import { isMac, isWindows } from "@/lib/platform";
+import { cn } from "@/lib/utils";
 import {
   Tooltip,
   TooltipContent,
@@ -29,11 +40,21 @@ const windowAction = (action: "minimize" | "toggleMaximize" | "close") => {
 
 interface AppTitleBarProps {
   availableUpdate: AvailableUpdate | null;
+  theme: "light" | "dark" | "system";
+  resolvedTheme: "light" | "dark";
+  onSetTheme: (theme: "light" | "dark" | "system") => void;
   onOpenUrl: (url: string) => void;
 }
 
-export function AppTitleBar({ availableUpdate, onOpenUrl }: AppTitleBarProps) {
+export function AppTitleBar({
+  availableUpdate,
+  theme,
+  resolvedTheme,
+  onSetTheme,
+  onOpenUrl,
+}: AppTitleBarProps) {
   const { t } = useTranslation();
+  const showWinControls = isWindows();
 
   return (
     <header
@@ -41,7 +62,7 @@ export function AppTitleBar({ availableUpdate, onOpenUrl }: AppTitleBarProps) {
       data-tauri-drag-region
       style={isMac() ? { paddingLeft: 80 } : undefined}
     >
-      {/* 品牌区：即标题栏（自绘），空余区域可拖拽窗口 */}
+      {/* 品牌区：自绘标题栏，空余区域可拖拽窗口 */}
       <div className="asm-topbar-brand" data-tauri-drag-region>
         <img src={appIcon} alt="" className="asm-app-icon" />
         <span className="asm-app-name" data-tauri-drag-region>
@@ -62,9 +83,12 @@ export function AppTitleBar({ availableUpdate, onOpenUrl }: AppTitleBarProps) {
                 })}
                 onClick={() => void onOpenUrl(GITHUB_LATEST_RELEASE_URL)}
               >
-                {t("sessionManager.updateButton", {
-                  defaultValue: "更新",
-                })}
+                <Sparkles className="size-3" aria-hidden="true" />
+                <span>
+                  {t("sessionManager.updateButton", {
+                    defaultValue: "更新",
+                  })}
+                </span>
               </button>
             </TooltipTrigger>
             <TooltipContent
@@ -88,8 +112,101 @@ export function AppTitleBar({ availableUpdate, onOpenUrl }: AppTitleBarProps) {
           </Tooltip>
         )}
       </div>
-      <div className="asm-topbar-actions">
-        {!isMac() && (
+
+      <div
+        className={cn(
+          "asm-topbar-actions",
+          showWinControls && "has-win-controls",
+        )}
+      >
+        <div className="asm-topbar-capsule">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="asm-topbar-btn"
+                aria-label={t("sessionManager.openProjectGitHub", {
+                  defaultValue: "在 GitHub 查看项目",
+                })}
+                onClick={() => onOpenUrl(GITHUB_REPOSITORY_URL)}
+              >
+                <Github className="size-3.5" aria-hidden="true" />
+                <span>GitHub</span>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {t("sessionManager.openProjectGitHub", {
+                defaultValue: "在 GitHub 查看项目",
+              })}
+            </TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  "asm-topbar-btn is-icon",
+                  theme === "system" && "is-active",
+                )}
+                aria-label={t("sessionManager.followSystemTheme", {
+                  defaultValue: "跟随系统外观",
+                })}
+                aria-pressed={theme === "system"}
+                onClick={() => onSetTheme("system")}
+              >
+                <Monitor className="size-3.5" aria-hidden="true" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {theme === "system"
+                ? t("sessionManager.followingSystemTheme", {
+                    defaultValue: "当前已跟随系统外观",
+                  })
+                : t("sessionManager.followSystemTheme", {
+                    defaultValue: "跟随系统外观",
+                  })}
+            </TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="asm-topbar-btn is-icon"
+                aria-label={
+                  resolvedTheme === "dark"
+                    ? t("sessionManager.switchToLightTheme", {
+                        defaultValue: "切换到明亮主题",
+                      })
+                    : t("sessionManager.switchToDarkTheme", {
+                        defaultValue: "切换到暗色主题",
+                      })
+                }
+                onClick={() =>
+                  onSetTheme(resolvedTheme === "dark" ? "light" : "dark")
+                }
+              >
+                {resolvedTheme === "dark" ? (
+                  <Sun className="size-3.5" aria-hidden="true" />
+                ) : (
+                  <Moon className="size-3.5" aria-hidden="true" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {resolvedTheme === "dark"
+                ? t("sessionManager.switchToLightTheme", {
+                    defaultValue: "切换到明亮主题",
+                  })
+                : t("sessionManager.switchToDarkTheme", {
+                    defaultValue: "切换到暗色主题",
+                  })}
+            </TooltipContent>
+          </Tooltip>
+        </div>
+
+        {showWinControls && (
           <div className="asm-window-controls">
             <button
               type="button"

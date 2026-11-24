@@ -4,9 +4,9 @@
 
 # Agent会话管理
 
-**Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi 与 Grok Build 七种本地编码 Agent 的会话管理工具**
+**Codex、Claude Code、DeepSeek Harness、WorkBuddy、OpenCode、ZCode、Pi 与 Grok Build 八种本地编码 Agent 的会话管理工具**
 
-<sub>Desktop session manager for local coding agents — browse, group and safely clean up Codex, Claude Code, DeepSeek Harness, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
+<sub>Desktop session manager for local coding agents — browse, group and safely clean up Codex, Claude Code, DeepSeek Harness, WorkBuddy, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
 [![Release](https://img.shields.io/github/v/release/zhuchongba-01/AgentSessionManager?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
@@ -22,27 +22,29 @@
 
 面向本地编码 Agent 的独立会话管理工具：浏览、搜索、分类与安全清理历史会话。当前版本不负责启动 Agent 或恢复会话，需要恢复会话请在原 Agent 中操作。
 
-当前支持扫描 **Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi 与 Grok Build** 七种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
+当前支持扫描 **Codex、DeepSeek Harness、Claude Code、WorkBuddy、OpenCode、ZCode、Pi 与 Grok Build** 八种 Agent 的本地会话。项目归类优先遵循各 Agent 自身保存的项目绑定。
 
 ## 支持的 Agent 与会话位置
 
 | Agent | 会话数据位置 |
 | --- | --- |
-| Codex | `~/.codex`（`config.toml`、`state_5.sqlite`、`thread_history_1.sqlite`），可用 `CODEX_HOME` 覆盖 |
-| Claude Code | `~/.claude/projects`，可用 `CLAUDE_CONFIG_DIR` 覆盖 |
-| DeepSeek Harness | `~/.dsh/sessions` |
-| OpenCode | `~/.local/share/opencode`（遵循 `XDG_DATA_HOME`） |
-| ZCode | `~/.zcode/cli/db/db.sqlite`、`~/.zcode/v2/tasks-index.sqlite` |
-| Pi | `~/.pi/agent`，可用 `PI_CODING_AGENT_DIR` 覆盖 |
-| Grok Build | `~/.grok/sessions`、`~/.grok/archived_sessions`，可用 `GROK_CONFIG_DIR` 覆盖 |
+| Codex | `~/.codex`（`config.toml`、`state_*.sqlite`、`thread_history_*.sqlite`），可用 `CODEX_HOME`、`CODEX_SQLITE_HOME` 覆盖 |
+| Claude Code | `~/.claude/projects`（及 `sessions-index.json`、`file-history`、`todos` 等会话边车），可用 `CLAUDE_CONFIG_DIR` 覆盖 |
+| DeepSeek Harness | `~/.dsh/sessions`，可用 `DSH_HOME` 覆盖 |
+| WorkBuddy | `~/.workbuddy-ai`、`~/.workbuddy`（`workbuddy.db`、`projects/`、`workspace/sessions/` 等），可用 `WORKBUDDY_HOME` 覆盖 |
+| OpenCode | `~/.local/share/opencode`（兼容 2.0+ `session_v2`、v1 SQLite 与旧版 JSON；遵循 `XDG_DATA_HOME`、`OPENCODE_DB`） |
+| ZCode | `~/.zcode/cli/db/db.sqlite`、`~/.zcode/v2/tasks-index.sqlite`，可用 `ZCODE_DATA_BASE_DIR`、`ZCODE_STORAGE_DIR` 覆盖 |
+| Pi | `~/.pi/agent`，可用 `PI_CODING_AGENT_DIR`、`PI_CODING_AGENT_SESSION_DIR` 覆盖 |
+| Grok Build | `~/.grok/sessions`、`~/.grok/archived_sessions`，可用 `GROK_HOME`（兼容 `GROK_CONFIG_DIR`）覆盖 |
 
 Windows 下 `~` 即 `%USERPROFILE%`。扫描与阅读仅访问本地会话数据，不迁移各 Agent 的存储格式；用户确认清理后，会删除选定会话及相应索引、关联记录和缓存，不删除项目工作目录。
 
 ## 主要特性
 
-- 🔍 **七种 Agent，一个界面**：Codex、DeepSeek Harness、Claude Code、OpenCode、ZCode、Pi、Grok Build 的本地会话一站式浏览。
+- 🔍 **八种 Agent，一个界面**：Codex、DeepSeek Harness、Claude Code、WorkBuddy、OpenCode、ZCode、Pi、Grok Build 的本地会话一站式浏览。
 - 🗂️ **项目分组 + 缩略导航**：遵循 Agent 的项目绑定与 Codex 自定义侧边栏分区，紧凑型列表配合缩略导航快速定位；只要有用户提问就一定会出现导航条，不会因为窗口大小或正文长短忽隐忽现。
-- 📖 **完整会话详情**：按时间线阅读本地 Agent 的对话内容，快速定位历史消息。
+- 📖 **结构化会话阅读与搜索**：零依赖安全渲染 Markdown、代码块（支持一键复制完整代码）与 Diff 高亮；模型思考过程（`thinking`）默认折叠展示，工具调用支持折叠与一键隐藏；支持 `Ctrl+F` 全文定位搜索（含超长截断消息全文检索）。
+- 🎛️ **高效筛选与顺手布局**：支持状态快捷筛选（残留、待清理、子会话、已归档）、分组一键展开/折叠、方向键与 `Esc` 键盘导航、侧边栏可拖拽分栏，以及浅色/深色/跟随系统三态主题。
 - 🧹 **安全清理**：识别残留、归档和仅剩索引的任务，支持批量删除与失败后继续清理；子会话可随父会话一键清理。会话清理绝不删除项目工作目录。
 - 🛡️ **明确失败而非假装为空**：扫描不完整或消息读取失败时显示原因，并限制超大会话的单次读取量。
 - 📚 **长历史可控**：会话列表每页最多显示 100 条，消息按可视区域渲染。
@@ -59,10 +61,10 @@ Windows 下 `~` 即 `%USERPROFILE%`。扫描与阅读仅访问本地会话数据
 
 **Windows x64**：下载 `AgentSessionManager-Setup-vX.Y.Z.exe`，关闭旧版管理器后运行安装包。
 
-**Linux amd64**（Ubuntu 24.04 已测试）：下载 `AgentSessionManager-X.Y.Z-amd64.deb` 后安装。
+**Linux amd64**（Ubuntu 24.04 已测试）：下载 `Agent会话管理_X.Y.Z_amd64.deb`（或 `.AppImage`）后安装。
 
 ```bash
-sudo apt install ./AgentSessionManager-X.Y.Z-amd64.deb
+sudo apt install ./Agent会话管理_X.Y.Z_amd64.deb
 ```
 
 > [!IMPORTANT]
@@ -101,11 +103,11 @@ Codex 把会话数据放在 `~/.codex`，包含 `config.toml`、`state_5.sqlite`
 两者都提供安装包（Windows exe / Linux deb），macOS 暂未发布。
 
 **支持哪些 AI 编程助手？和同类会话管理工具相比有什么不同？**
-Codex、Claude Code、DeepSeek Harness、OpenCode、ZCode、Pi、Grok Build 共七种，一个界面全部覆盖，同时提供 Windows 与 Linux 安装包，而不是只支持单一 Agent 或只支持 macOS。
+Codex、Claude Code、DeepSeek Harness、WorkBuddy、OpenCode、ZCode、Pi、Grok Build 共八种，一个界面全部覆盖，同时提供 Windows 与 Linux 安装包，而不是只支持单一 Agent 或只支持 macOS。
 
-<sub>Keywords: codex session manager · codex history viewer · claude code session viewer · coding agent session manager · agent session browser · session transcript viewer · local-first · AI coding agent session cleaner · Windows · Linux.</sub>
+<sub>Keywords: codex session manager · codex history viewer · claude code session viewer · workbuddy session cleaner · coding agent session manager · agent session browser · session transcript viewer · local-first · AI coding agent session cleaner · Windows · Linux.</sub>
 
-<sub>关键词：Codex 会话管理 · Codex 对话记录查看 · Claude Code 历史会话查看 · Claude Code 会话浏览 · DeepSeek Harness 会话日志 · AI 编程助手会话管理 · 清理会话记录 · 删除会话 · 批量删除会话 · 历史会话查看 · 本地会话查看器 · 会话按项目分组 · 会话浏览与搜索 · 会话数据留在本机 · Windows 与 Linux 桌面应用。</sub>
+<sub>关键词：Codex 会话管理 · Codex 对话记录查看 · Claude Code 历史会话查看 · Claude Code 会话浏览 · DeepSeek Harness 会话日志 · WorkBuddy 会话清理 · AI 编程助手会话管理 · 清理会话记录 · 删除会话 · 批量删除会话 · 历史会话查看 · 本地会话查看器 · 会话按项目分组 · 会话浏览与搜索 · 会话数据留在本机 · Windows 与 Linux 桌面应用。</sub>
 
 ## 开发
 
@@ -117,7 +119,7 @@ pnpm tauri dev
 Ubuntu 24.04 下开发与打包需先安装系统依赖：
 
 ```bash
-sudo apt install -y build-essential curl file wget \
+sudo apt install -y build-essential curl file libssl-dev wget \
   libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
   librsvg2-dev libxdo-dev
 pnpm install --frozen-lockfile

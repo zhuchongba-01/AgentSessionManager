@@ -10,6 +10,9 @@ import {
 const TAURI_ENDPOINT = "http://tauri.local";
 const GITHUB_RELEASE_ENDPOINT =
   "https://api.github.com/repos/zhuchongba-01/AgentSessionManager/releases/latest";
+const WIRE_TRUNCATE_THRESHOLD = 4096;
+const WIRE_PREVIEW_CHARS = 1500;
+
 const success = <T>(payload: T) => HttpResponse.json(payload as never);
 
 const readJson = async <T>(request: Request): Promise<T> => {
@@ -29,8 +32,52 @@ export const handlers = [
       providerId: string;
       sourcePath: string;
     }>(request);
-    return success(getSessionMessages(providerId, sourcePath));
+    const wireMessages = getSessionMessages(providerId, sourcePath).map(
+      (message, index) => {
+        if (
+          !message.truncated &&
+          message.content.length > WIRE_TRUNCATE_THRESHOLD
+        ) {
+          return {
+            ...message,
+            content: message.content.slice(0, WIRE_PREVIEW_CHARS),
+            index,
+            truncated: true,
+            contentChars: message.content.length,
+            contentIdentity: contentIdentityHex(message),
+          };
+        }
+        return message;
+      },
+    );
+    return success(wireMessages);
   }),
+  http.post(
+    `${TAURI_ENDPOINT}/search_session_messages`,
+    async ({ request }) => {
+      const { providerId, sourcePath, query } = await readJson<{
+        providerId: string;
+        sourcePath: string;
+        query: string;
+      }>(request);
+      const terms = query
+        .trim()
+        .toLocaleLowerCase()
+        .split(/\s+/)
+        .filter(Boolean);
+      if (terms.length === 0) {
+        return success<number[]>([]);
+      }
+      const matches: number[] = [];
+      getSessionMessages(providerId, sourcePath).forEach((message, index) => {
+        const lower = message.content.toLocaleLowerCase();
+        if (terms.every((term) => lower.includes(term))) {
+          matches.push(index);
+        }
+      });
+      return success(matches);
+    },
+  ),
   // 与后端一致：长度或身份摘要对不上就拒绝返回，避免把另一条消息的正文当成这一条
   http.post(`${TAURI_ENDPOINT}/get_message_content`, async ({ request }) => {
     const { providerId, sourcePath, index, expectedChars, expectedIdentity } =

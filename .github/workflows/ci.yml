@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -42,6 +45,8 @@ jobs:
         run: pnpm test:unit
       - name: Build frontend
         run: pnpm build:renderer
+      - name: Use upstream crates.io on GitHub-hosted runners
+        run: Remove-Item -Force .cargo/config.toml -ErrorAction SilentlyContinue
       # rustup reads the pinned toolchain and components from rust-toolchain.toml.
       - name: Prepare Rust toolchain
         run: rustup show
@@ -54,6 +59,14 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Build Windows installer
+        run: pnpm build:installer
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-session-manager-windows-${{ github.sha }}
+          path: installer/Output/*.exe
+          if-no-files-found: error
 
   build-linux:
     runs-on: ubuntu-24.04
@@ -81,6 +94,8 @@ jobs:
             wget
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Use upstream crates.io on GitHub-hosted runners
+        run: rm -f .cargo/config.toml
       - name: Prepare Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2

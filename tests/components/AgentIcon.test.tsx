@@ -8,12 +8,14 @@ describe("AgentIcon", () => {
       <>
         <AgentIcon icon="openai" name="Codex" size={16} />
         <AgentIcon icon="deepseek" name="DeepSeek Harness" size={16} />
+        <AgentIcon icon="workbuddy" name="WorkBuddy" size={16} />
         <AgentIcon icon="pi" name="Pi" size={16} />
       </>,
     );
     for (const icon of [
       screen.getByTitle("Codex"),
       screen.getByTitle("DeepSeek Harness"),
+      screen.getByTitle("WorkBuddy"),
       screen.getByTitle("Pi"),
     ]) {
       expect(icon).toHaveStyle({ width: "16px", height: "16px" });

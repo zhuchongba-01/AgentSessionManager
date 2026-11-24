@@ -9,26 +9,20 @@ use crate::session_manager::cache;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
 use super::utils::{
-    check_sqlite_message_budget, checked_storage_child, collect_files_where, is_safe_session_id,
-    order_selected_children, parse_timestamp_to_ms, path_basename, quote_sqlite_identifier,
-    sqlite_table_has_column, sqlite_table_names, truncate_summary, validate_parent_graph,
+    check_sqlite_message_budget, checked_storage_child, collect_files_where, extract_thinking_text,
+    is_safe_session_id, order_selected_children, parse_timestamp_to_ms, path_basename,
+    quote_sqlite_identifier, remove_path_if_exists, sqlite_table_has_column, sqlite_table_names,
+    truncate_summary, validate_parent_graph, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "opencode";
 
 /// Return the OpenCode base directory (`$XDG_DATA_HOME/opencode`).
 ///
-/// Respects `XDG_DATA_HOME` on all platforms; falls back to
+/// Respects `XDG_DATA_HOME` (including `~` expansion) on all platforms; falls back to
 /// `~/.local/share/opencode/`.
 pub(crate) fn get_opencode_base_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("opencode");
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".local/share/opencode"))
-        .unwrap_or_else(|| PathBuf::from(".local/share/opencode"))
+    crate::session_paths::opencode_base_dir()
 }
 
 /// Return the OpenCode JSON storage directory (legacy flat-file layout).
@@ -41,18 +35,22 @@ fn get_opencode_db_path() -> PathBuf {
     get_opencode_base_dir().join("opencode.db")
 }
 
-/// OpenCode 1.19.5: relative OPENCODE_DB is relative to Global.Path.data,
-/// not the process cwd. In-memory databases cannot be discovered as files.
+/// OpenCode 1.19.5+: relative OPENCODE_DB is relative to Global.Path.data,
+/// not the process cwd, and `~` prefixes expand to the user's home directory.
+/// In-memory databases cannot be discovered as files.
 fn database_paths(
     base: &Path,
     override_path: Option<&str>,
     disable_channels: bool,
 ) -> Vec<PathBuf> {
-    if let Some(value) = override_path.filter(|value| !value.is_empty()) {
+    if let Some(value) = override_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         if value == ":memory:" {
             return Vec::new();
         }
-        let path = PathBuf::from(value);
+        let path = crate::session_paths::resolve_user_path(value);
         return vec![if path.is_absolute() {
             path
         } else {
@@ -167,15 +165,15 @@ fn scan_sessions_json() -> Vec<SessionMeta> {
 
 /// Parse a SQLite source reference in the format `sqlite:<db_path>:<session_id>`.
 ///
-/// Uses `rfind(":ses_")` to split the path from the session ID because the
-/// db path itself may contain colons (e.g. `C:\Users\...` on Windows).
-/// This relies on the OpenCode convention that session IDs start with `ses_`.
+/// Splits from the rightmost `:` so Windows drive letters in `<db_path>` are
+/// preserved while non-`ses_` safe session IDs (UUIDs, OpenCode 2.0 IDs) are supported.
 fn parse_sqlite_source(source: &str) -> Option<(PathBuf, String)> {
     let rest = source.strip_prefix("sqlite:")?;
-    let sep = rest.rfind(":ses_")?;
-    let db_path = PathBuf::from(&rest[..sep]);
-    let session_id = rest[sep + 1..].to_string();
-    Some((db_path, session_id))
+    let (db_part, session_id) = rest.rsplit_once(':')?;
+    if db_part.is_empty() || !is_safe_session_id(session_id) {
+        return None;
+    }
+    Some((PathBuf::from(db_part), session_id.to_string()))
 }
 
 #[cfg(test)]
@@ -184,7 +182,7 @@ fn scan_sessions_sqlite() -> Vec<SessionMeta> {
 }
 
 fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
-    if std::env::var("OPENCODE_DB").as_deref() == Ok(":memory:") {
+    if std::env::var("OPENCODE_DB").ok().as_deref().map(str::trim) == Some(":memory:") {
         super::utils::scan_warning("OPENCODE_DB=:memory: 是进程内数据库，未进行文件发现");
         return None;
     }
@@ -222,32 +220,57 @@ fn enable_resume_for_database(rows: &mut [SessionMeta], db_path: &Path, primary:
     }
 }
 
-fn scan_database(db_path: &Path) -> Option<Vec<SessionMeta>> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-
-    conn.busy_timeout(Duration::from_secs(2)).ok()?;
-    let has_parent_id = sqlite_table_has_column(&conn, "session", "parent_id").ok()?;
-    let has_archived = sqlite_table_has_column(&conn, "session", "time_archived").ok()?;
+fn scan_session_table(
+    conn: &Connection,
+    table: &str,
+    db_display: &str,
+    seen_ids: &mut HashSet<String>,
+    sessions: &mut Vec<SessionMeta>,
+) -> Option<()> {
+    let has_title = sqlite_table_has_column(conn, table, "title").ok()?;
+    let has_directory = sqlite_table_has_column(conn, table, "directory").ok()?;
+    let has_created = sqlite_table_has_column(conn, table, "time_created").ok()?;
+    let has_updated = sqlite_table_has_column(conn, table, "time_updated").ok()?;
+    let has_parent_id = sqlite_table_has_column(conn, table, "parent_id").ok()?;
+    let has_archived = sqlite_table_has_column(conn, table, "time_archived").ok()?;
+    let quoted = quote_sqlite_identifier(table);
+    let order_by = if has_updated {
+        "time_updated DESC"
+    } else if has_created {
+        "time_created DESC"
+    } else {
+        "rowid DESC"
+    };
     let sql = format!(
-        "SELECT id, title, directory, time_created, time_updated, {}, {} FROM session ORDER BY time_updated DESC",
+        "SELECT id, {}, {}, {}, {}, {}, {} FROM {quoted} ORDER BY {order_by}",
+        if has_title {
+            "COALESCE(title, '')"
+        } else {
+            "''"
+        },
+        if has_directory {
+            "COALESCE(directory, '')"
+        } else {
+            "''"
+        },
+        if has_created { "time_created" } else { "NULL" },
+        if has_updated { "time_updated" } else { "NULL" },
         if has_parent_id { "parent_id" } else { "NULL" },
-        if has_archived { "time_archived IS NOT NULL" } else { "0" },
+        if has_archived {
+            "time_archived IS NOT NULL"
+        } else {
+            "0"
+        },
     );
     let mut stmt = conn.prepare(&sql).ok()?;
-
-    let db_display = db_path.display().to_string();
 
     let iter = stmt
         .query_map([], |row| {
             let session_id: String = row.get(0)?;
             let title: String = row.get(1)?;
             let directory: String = row.get(2)?;
-            let created: i64 = row.get(3)?;
-            let updated: i64 = row.get(4)?;
+            let created: Option<i64> = row.get(3)?;
+            let updated: Option<i64> = row.get(4)?;
             let parent_id: Option<String> = row.get(5)?;
             let archived: bool = row.get(6)?;
             Ok((
@@ -256,7 +279,6 @@ fn scan_database(db_path: &Path) -> Option<Vec<SessionMeta>> {
         })
         .ok()?;
 
-    let mut sessions = Vec::new();
     for row in iter {
         let row = match row {
             Ok(row) => row,
@@ -266,33 +288,81 @@ fn scan_database(db_path: &Path) -> Option<Vec<SessionMeta>> {
             }
         };
         let (session_id, title, directory, created, updated, parent_id, archived) = row;
-        let display_title = if title.is_empty() {
+        if !seen_ids.insert(session_id.clone()) {
+            continue;
+        }
+        let parent_session_id = parent_id.filter(|value| !value.trim().is_empty());
+        let residual = parent_session_id.is_some();
+        let raw_label = if title.is_empty() {
             path_basename(&directory)
         } else {
             Some(title)
         };
+        let display_title = raw_label
+            .as_deref()
+            .map(|t| truncate_summary(t, TITLE_MAX_CHARS))
+            .filter(|t| !t.is_empty());
+        let summary = raw_label
+            .as_deref()
+            .map(|t| truncate_summary(t, 160))
+            .filter(|t| !t.is_empty());
         sessions.push(SessionMeta {
             provider_id: PROVIDER_ID.to_string(),
             session_id: session_id.clone(),
-            residual: parent_id.is_some(),
-            parent_session_id: parent_id.clone().filter(|value| !value.trim().is_empty()),
+            residual,
+            parent_session_id,
             archived,
             cleanup_pending: false,
             sidebar_section: None,
-            title: display_title.clone(),
-            summary: display_title,
+            title: display_title,
+            summary,
             project_dir: if directory.is_empty() {
                 None
             } else {
                 Some(directory)
             },
             project_name: None,
-            created_at: Some(created),
-            last_active_at: Some(updated),
+            created_at: created,
+            last_active_at: updated.or(created),
             source_path: Some(format!("sqlite:{db_display}:{session_id}")),
-            resume_command: (parent_id.is_none() && is_safe_session_id(&session_id))
+            resume_command: (!residual && is_safe_session_id(&session_id))
                 .then(|| format!("opencode -s {session_id}")),
         });
+    }
+    Some(())
+}
+
+fn scan_database(db_path: &Path) -> Option<Vec<SessionMeta>> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+
+    conn.busy_timeout(Duration::from_secs(2)).ok()?;
+    let has_v2 = sqlite_table_has_column(&conn, "session_v2", "id").ok()?;
+    let has_v1 = sqlite_table_has_column(&conn, "session", "id").ok()?;
+    if !has_v2 && !has_v1 {
+        return None;
+    }
+
+    let db_display = db_path.display().to_string();
+    let mut seen_ids = HashSet::new();
+    let mut sessions = Vec::new();
+    if has_v2 {
+        scan_session_table(
+            &conn,
+            "session_v2",
+            &db_display,
+            &mut seen_ids,
+            &mut sessions,
+        )?;
+    }
+    if has_v1 {
+        scan_session_table(&conn, "session", &db_display, &mut seen_ids, &mut sessions)?;
+    }
+    if has_v2 && has_v1 {
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_active_at));
     }
     Some(sessions)
 }
@@ -312,9 +382,10 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
 
     let mut msg_files = Vec::new();
     collect_json_files(path, &mut msg_files);
+    msg_files.sort();
 
-    // Parse all messages and collect (created_ts, message_id, role, parts_text)
-    let mut entries: Vec<(i64, String, String, String)> = Vec::new();
+    // Parse all messages and collect (created_ts, message_id, role, thinking_text, visible_text)
+    let mut entries: Vec<(i64, String, String, String, String)> = Vec::new();
 
     for msg_path in &msg_files {
         let value = read_json_bounded(msg_path, &mut remaining_bytes)?;
@@ -336,27 +407,44 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             .and_then(parse_timestamp_to_ms)
             .unwrap_or(0);
 
-        // Collect text parts from storage/part/{messageID}/
+        // Collect parts from storage/part/{messageID}/
         let part_dir = checked_storage_child(storage, &storage.join("part").join(&msg_id))?;
-        let text = collect_parts_text(&part_dir, &mut remaining_bytes)?;
-        if text.trim().is_empty() {
+        let mut parsed = collect_parts(&part_dir, &mut remaining_bytes)?;
+        if role == "assistant" {
+            if let Some(err) = value.get("error").and_then(format_error_value) {
+                parsed.visible.push(format!("[Error: {err}]"));
+            }
+        }
+        let thinking = parsed.thinking.join("\n");
+        let text = parsed.visible.join("\n");
+        if thinking.trim().is_empty() && text.trim().is_empty() {
             continue;
         }
 
-        entries.push((created_ts, msg_id, role, text));
+        entries.push((created_ts, msg_id, role, thinking, text));
     }
 
-    // Sort by created timestamp
-    entries.sort_by_key(|(ts, _, _, _)| *ts);
+    // Sort deterministically by (created timestamp, message_id)
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    let messages = entries
-        .into_iter()
-        .map(|(ts, _, role, content)| SessionMessage {
-            role,
-            content,
-            ts: if ts > 0 { Some(ts) } else { None },
-        })
-        .collect();
+    let mut messages = Vec::new();
+    for (ts, _, role, thinking, content) in entries {
+        let msg_ts = (ts > 0).then_some(ts);
+        if !thinking.trim().is_empty() {
+            messages.push(SessionMessage {
+                role: "thinking".to_string(),
+                content: thinking,
+                ts: msg_ts,
+            });
+        }
+        if !content.trim().is_empty() {
+            messages.push(SessionMessage {
+                role,
+                content,
+                ts: msg_ts,
+            });
+        }
+    }
 
     Ok(messages)
 }
@@ -425,7 +513,7 @@ fn load_messages_connection(
 
     let mut msg_stmt = conn
         .prepare(
-            "SELECT id, time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
+            "SELECT id, time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
         )
         .map_err(|e| format!("Failed to prepare message query: {e}"))?;
 
@@ -438,10 +526,15 @@ fn load_messages_connection(
         })
         .map_err(|e| format!("Failed to query messages: {e}"))?;
 
+    let part_order = if sqlite_table_has_column(conn, "part", "id")? {
+        "time_created ASC, id ASC"
+    } else {
+        "time_created ASC, rowid ASC"
+    };
     let mut part_stmt = conn
-        .prepare(
-            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created ASC",
-        )
+        .prepare(&format!(
+            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY {part_order}"
+        ))
         .map_err(|e| format!("Failed to prepare part query: {e}"))?;
 
     let part_rows = part_stmt
@@ -452,8 +545,7 @@ fn load_messages_connection(
         })
         .map_err(|e| format!("Failed to query parts: {e}"))?;
 
-    let mut parts_map: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut parts_map: HashMap<String, Vec<String>> = HashMap::new();
     for part in part_rows {
         let (message_id, data) = part.map_err(|e| e.to_string())?;
         parts_map.entry(message_id).or_default().push(data);
@@ -472,45 +564,60 @@ fn load_messages_connection(
             .unwrap_or("unknown")
             .to_string();
 
-        let mut texts = Vec::new();
+        let mut parsed = ParsedParts::default();
         if let Some(parts) = parts_map.get(&msg_id) {
             for part_data in parts {
                 let part_value: Value = match serde_json::from_str(part_data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(text) = extract_part_text(&part_value) {
-                    texts.push(text);
-                }
+                append_part_value(&part_value, &mut parsed);
+            }
+        }
+        if role == "assistant" {
+            if let Some(err) = msg_value.get("error").and_then(format_error_value) {
+                parsed.visible.push(format!("[Error: {err}]"));
             }
         }
 
-        let content = texts.join("\n");
-        if content.trim().is_empty() {
-            continue;
+        let thinking = parsed.thinking.join("\n");
+        if !thinking.trim().is_empty() {
+            messages.push(SessionMessage {
+                role: "thinking".to_string(),
+                content: thinking,
+                ts: Some(ts),
+            });
         }
 
-        messages.push(SessionMessage {
-            role,
-            content,
-            ts: Some(ts),
-        });
+        let content = parsed.visible.join("\n");
+        if !content.trim().is_empty() {
+            messages.push(SessionMessage {
+                role,
+                content,
+                ts: Some(ts),
+            });
+        }
     }
 
     Ok(messages)
 }
 
 fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMessage>, String> {
-    let (rows, bytes): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0) FROM session_message WHERE session_id=?1",
-        [session_id], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|error| error.to_string())?;
+    let (rows, bytes): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0) FROM session_message WHERE session_id=?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
     if rows > super::utils::MAX_QUERY_ROWS || bytes > super::utils::MAX_QUERY_BYTES {
         return Err("OpenCode V2 transcript exceeds the 20000-row / 32 MiB read limit".into());
     }
-    let mut statement = conn.prepare(
-        "SELECT type, time_created, data FROM session_message WHERE session_id=?1 ORDER BY seq ASC",
-    ).map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT type, time_created, data FROM session_message WHERE session_id=?1 ORDER BY seq ASC, id ASC",
+        )
+        .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([session_id], |row| {
             Ok((
@@ -525,76 +632,96 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
         let (kind, ts, data) = row.map_err(|error| error.to_string())?;
         let value: Value = serde_json::from_str(&data)
             .map_err(|error| format!("Invalid OpenCode V2 message: {error}"))?;
-        let (role, content) = match kind.as_str() {
-            "user" | "system" | "synthetic" => (
-                if kind == "user" { "user" } else { "system" },
-                value
+        match kind.as_str() {
+            "user" | "system" | "synthetic" => {
+                let role = if kind == "user" { "user" } else { "system" };
+                let mut segments = Vec::new();
+                if let Some(text) = value
                     .get("text")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            "assistant" => (
-                "assistant",
-                value
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                                Some("text" | "reasoning") => {
-                                    part.get("text").and_then(Value::as_str).map(str::to_owned)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    segments.push(text.to_string());
+                }
+                if let Some(files) = value.get("files").and_then(Value::as_array) {
+                    for file in files {
+                        segments.push(format_file_label(file));
+                    }
+                }
+                let content = segments.join("\n");
+                if !content.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: role.into(),
+                        content,
+                        ts: Some(ts),
+                    });
+                }
+            }
+            "assistant" => {
+                let mut thinking_parts = Vec::new();
+                let mut visible_parts = Vec::new();
+                if let Some(parts) = value.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("reasoning" | "thinking") => {
+                                if let Some(reasoning) = extract_reasoning_part(part) {
+                                    thinking_parts.push(reasoning);
                                 }
-                                Some("tool") => {
-                                    let mut text = format!(
-                                        "[Tool: {}]",
-                                        part.get("name")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("unknown")
-                                    );
-                                    if let Some(content) = part
-                                        .get("state")
-                                        .and_then(|state| state.get("content"))
-                                        .and_then(Value::as_array)
-                                    {
-                                        for item in content {
-                                            let output = match item
-                                                .get("type")
-                                                .and_then(Value::as_str)
-                                            {
-                                                Some("text") => item
-                                                    .get("text")
-                                                    .and_then(Value::as_str)
-                                                    .unwrap_or_default()
-                                                    .to_string(),
-                                                Some("file") => format!(
-                                                    "[File: {}]",
-                                                    item.get("name")
-                                                        .or_else(|| item.get("uri"))
-                                                        .and_then(Value::as_str)
-                                                        .unwrap_or("attachment")
-                                                ),
-                                                _ => format!("[Unsupported tool content] {item}"),
-                                            };
-                                            if !output.trim().is_empty() {
-                                                text.push('\n');
-                                                text.push_str(&output);
-                                            }
-                                        }
-                                    }
-                                    Some(text)
+                            }
+                            Some("text") => {
+                                if let Some(text) = part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.trim().is_empty())
+                                {
+                                    visible_parts.push(text.to_owned());
                                 }
-                                _ => Some(format!("[Unsupported assistant content] {part}")),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default(),
-            ),
-            "shell" => (
-                "tool",
-                format!(
+                            }
+                            Some("tool") => {
+                                visible_parts.push(format_tool_part(part, "unknown"));
+                            }
+                            Some("file") => {
+                                visible_parts.push(format_file_label(part));
+                            }
+                            Some("subtask") => {
+                                visible_parts.push(format_subtask_part(part));
+                            }
+                            Some("patch") => {
+                                visible_parts.push(format_patch_part(part));
+                            }
+                            Some("compaction") => {
+                                visible_parts.push(format_compaction_part(part));
+                            }
+                            Some("step-start" | "step-finish" | "snapshot") => {}
+                            _ => {
+                                visible_parts
+                                    .push(format!("[Unsupported assistant content] {part}"));
+                            }
+                        }
+                    }
+                }
+                if let Some(err) = value.get("error").and_then(format_error_value) {
+                    visible_parts.push(format!("[Error: {err}]"));
+                }
+                let thinking = thinking_parts.join("\n");
+                if !thinking.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "thinking".into(),
+                        content: thinking,
+                        ts: Some(ts),
+                    });
+                }
+                let content = visible_parts.join("\n");
+                if !content.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "assistant".into(),
+                        content,
+                        ts: Some(ts),
+                    });
+                }
+            }
+            "shell" => {
+                let content = format!(
                     "$ {}\n{}",
                     value
                         .get("command")
@@ -604,38 +731,64 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
                         .get("output")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
-                ),
-            ),
-            "compaction" => (
-                "system",
-                value
+                );
+                if !content.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "tool".into(),
+                        content,
+                        ts: Some(ts),
+                    });
+                }
+            }
+            "compaction" => {
+                let content = if let Some(summary) = value
                     .get("summary")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            "agent-switched" => (
-                "system",
-                format!(
-                    "[Agent: {}]",
-                    value
-                        .get("agent")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                ),
-            ),
-            "model-switched" => (
-                "system",
-                format!("[Model: {}]", value.get("model").unwrap_or(&Value::Null)),
-            ),
-            _ => return Err(format!("Unsupported OpenCode V2 message type: {kind}")),
-        };
-        if !content.trim().is_empty() {
-            messages.push(SessionMessage {
-                role: role.into(),
-                content,
-                ts: Some(ts),
-            });
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    summary.to_string()
+                } else if let Some(err) = value.get("error").and_then(format_error_value) {
+                    format!("[Compaction failed: {err}]")
+                } else if matches!(
+                    value.get("status").and_then(Value::as_str),
+                    Some("failed" | "error" | "aborted")
+                ) || value.get("failed").and_then(Value::as_bool) == Some(true)
+                {
+                    "[Compaction failed]".to_string()
+                } else {
+                    String::new()
+                };
+                if !content.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "system".into(),
+                        content,
+                        ts: Some(ts),
+                    });
+                }
+            }
+            "agent-switched" => {
+                messages.push(SessionMessage {
+                    role: "system".into(),
+                    content: format!(
+                        "[Agent: {}]",
+                        value
+                            .get("agent")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    ),
+                    ts: Some(ts),
+                });
+            }
+            "model-switched" => {
+                messages.push(SessionMessage {
+                    role: "system".into(),
+                    content: format_model_switched(&value),
+                    ts: Some(ts),
+                });
+            }
+            _ => {
+                log::debug!("Skipping unknown OpenCode V2 message type: {kind}");
+            }
         }
     }
     Ok(messages)
@@ -673,29 +826,72 @@ fn sqlite_parent_relations(db_path: &Path) -> Result<HashMap<String, String>, St
     connection
         .busy_timeout(Duration::from_secs(2))
         .map_err(|error| format!("Failed to configure OpenCode dependency check: {error}"))?;
-    if !sqlite_table_has_column(&connection, "session", "id")? {
-        return Err("OpenCode database is missing session.id".into());
+
+    let has_v2 = sqlite_table_has_column(&connection, "session_v2", "id")?;
+    let has_v1 = sqlite_table_has_column(&connection, "session", "id")?;
+    if !has_v2 && !has_v1 {
+        return Err("OpenCode database is missing session.id and session_v2.id".into());
     }
-    if !sqlite_table_has_column(&connection, "session", "parent_id")? {
-        return Ok(HashMap::new());
-    }
-    let mut statement = connection
-        .prepare(
-            "SELECT id, parent_id FROM session \
-             WHERE parent_id IS NOT NULL AND parent_id<>''",
-        )
-        .map_err(|error| format!("Failed to inspect OpenCode parent sessions: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| format!("Failed to read OpenCode parent sessions: {error}"))?;
+
     let mut parents = HashMap::new();
-    for row in rows {
-        let (child, parent) =
-            row.map_err(|error| format!("Invalid OpenCode parent relation: {error}"))?;
-        insert_parent_relation(&mut parents, child, parent)?;
+    let mut v2_ids = HashSet::new();
+    if has_v2 {
+        let mut id_stmt = connection
+            .prepare("SELECT id FROM session_v2 WHERE id IS NOT NULL AND id<>''")
+            .map_err(|error| format!("Failed to inspect OpenCode session_v2 IDs: {error}"))?;
+        let ids = id_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Failed to read OpenCode session_v2 IDs: {error}"))?;
+        for id in ids {
+            v2_ids.insert(id.map_err(|error| format!("Invalid OpenCode session_v2 ID: {error}"))?);
+        }
+
+        if sqlite_table_has_column(&connection, "session_v2", "parent_id")? {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, parent_id FROM session_v2 \
+                     WHERE parent_id IS NOT NULL AND parent_id<>''",
+                )
+                .map_err(|error| {
+                    format!("Failed to inspect OpenCode session_v2 parent sessions: {error}")
+                })?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| {
+                    format!("Failed to read OpenCode session_v2 parent sessions: {error}")
+                })?;
+            for row in rows {
+                let (child, parent) = row.map_err(|error| {
+                    format!("Invalid OpenCode session_v2 parent relation: {error}")
+                })?;
+                insert_parent_relation(&mut parents, child, parent)?;
+            }
+        }
     }
+
+    if has_v1 && sqlite_table_has_column(&connection, "session", "parent_id")? {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, parent_id FROM session \
+                 WHERE parent_id IS NOT NULL AND parent_id<>''",
+            )
+            .map_err(|error| format!("Failed to inspect OpenCode parent sessions: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("Failed to read OpenCode parent sessions: {error}"))?;
+        for row in rows {
+            let (child, parent) =
+                row.map_err(|error| format!("Invalid OpenCode parent relation: {error}"))?;
+            if !v2_ids.contains(&child) {
+                insert_parent_relation(&mut parents, child, parent)?;
+            }
+        }
+    }
+
     validate_parent_graph(&parents, "OpenCode")?;
     Ok(parents)
 }
@@ -913,53 +1109,53 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
     let mut budget = super::utils::MAX_QUERY_BYTES as u64;
     for message_path in &message_files {
         let value = read_json_bounded(message_path, &mut budget)?;
-        {
-            let message_id = value
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| is_safe_session_id(id))
-                .ok_or("Invalid or missing OpenCode message ID; no files deleted")?;
-            if message_path.file_stem().and_then(|name| name.to_str()) != Some(message_id) {
-                return Err("OpenCode message ID does not match filename; no files deleted".into());
-            }
-            // 消息里的 sessionID 必须证明这条消息属于所选会话，才能据此删除
-            // part/<消息ID>。只看 ID 是否合法不够：损坏或混入其他会话的消息
-            // 会把别的会话附件目录带进删除范围。
-            let owner = value
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!(
-                        "OpenCode message {} 缺少会话归属，已停止删除",
-                        message_path.display()
-                    )
-                })?;
-            if owner != session_id {
-                return Err(format!(
-                    "OpenCode message {} 属于会话 {owner}，不是所选会话 {session_id}，已停止删除",
-                    message_path.display()
-                ));
-            }
-            message_ids.push(message_id.to_string());
+        let message_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_safe_session_id(id))
+            .ok_or("Invalid or missing OpenCode message ID; no files deleted")?;
+        if message_path.file_stem().and_then(|name| name.to_str()) != Some(message_id) {
+            return Err("OpenCode message ID does not match filename; no files deleted".into());
         }
+        // 消息里的 sessionID 必须证明这条消息属于所选会话，才能据此删除
+        // part/<消息ID>。只看 ID 是否合法不够：损坏或混入其他会话的消息
+        // 会把别的会话附件目录带进删除范围。
+        let owner = value
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "OpenCode message {} 缺少会话归属，已停止删除",
+                    message_path.display()
+                )
+            })?;
+        if owner != session_id {
+            return Err(format!(
+                "OpenCode message {} 属于会话 {owner}，不是所选会话 {session_id}，已停止删除",
+                message_path.display()
+            ));
+        }
+        message_ids.push(message_id.to_string());
     }
 
     let part_dirs = message_ids
         .iter()
         .map(|id| checked_storage_child(storage, &storage.join("part").join(id)))
         .collect::<Result<Vec<_>, _>>()?;
-    let session_diff_path = checked_storage_child(
-        storage,
-        &storage
-            .join("session_diff")
-            .join(format!("{session_id}.json")),
-    )?;
+    let json_sidecar_name = format!("{session_id}.json");
+    let sidecar_paths = ["session_diff", "todo", "share", "session_share"]
+        .into_iter()
+        .map(|subdir| {
+            checked_storage_child(storage, &storage.join(subdir).join(&json_sidecar_name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let session_file = find_session_file(storage, session_id)
         .map(|path| checked_storage_child(storage, &path))
         .transpose()?;
+
     // Complete validation before the first destructive operation.
     for part_dir in &part_dirs {
-        remove_dir_all_if_exists(part_dir).map_err(|e| {
+        remove_path_if_exists(part_dir).map_err(|e| {
             format!(
                 "Failed to delete OpenCode part directory {}: {e}",
                 part_dir.display()
@@ -967,22 +1163,24 @@ pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<b
         })?;
     }
 
-    remove_file_if_exists(&session_diff_path).map_err(|e| {
-        format!(
-            "Failed to delete OpenCode session diff {}: {e}",
-            session_diff_path.display()
-        )
-    })?;
+    for sidecar_path in &sidecar_paths {
+        remove_path_if_exists(sidecar_path).map_err(|e| {
+            format!(
+                "Failed to delete OpenCode session sidecar {}: {e}",
+                sidecar_path.display()
+            )
+        })?;
+    }
 
-    remove_dir_all_if_exists(path).map_err(|e| {
+    remove_path_if_exists(&actual).map_err(|e| {
         format!(
             "Failed to delete OpenCode message directory {}: {e}",
-            path.display()
+            actual.display()
         )
     })?;
 
     if let Some(session_file) = session_file {
-        remove_file_if_exists(&session_file).map_err(|e| {
+        remove_path_if_exists(&session_file).map_err(|e| {
             format!(
                 "Failed to delete OpenCode session file {}: {e}",
                 session_file.display()
@@ -1014,7 +1212,7 @@ pub fn delete_session_sqlite(session_id: &str, source: &str) -> Result<bool, Str
         .map_err(|e| format!("Failed to enable OpenCode foreign keys: {e}"))?;
 
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("Failed to begin transaction: {e}"))?;
 
     let deleted = delete_session_rows(&tx, session_id)?;
@@ -1040,13 +1238,15 @@ fn delete_session_rows(tx: &Transaction<'_>, session_id: &str) -> Result<bool, S
     }
     let mut child_tables = Vec::new();
     for table in sqlite_table_names(tx)? {
-        if table != "session" && sqlite_table_has_column(tx, &table, "session_id")? {
+        if !matches!(table.as_str(), "session" | "session_v2")
+            && sqlite_table_has_column(tx, &table, "session_id")?
+        {
             child_tables.push(table);
         }
     }
-    // message can be referenced by part-like tables, so delete it after all
-    // other session-scoped tables. The final session delete remains last.
-    child_tables.sort_by_key(|table| (table == "message") as u8);
+    // message / session_message can be referenced by part-like tables, so delete
+    // them after all other session-scoped tables. The final session delete remains last.
+    child_tables.sort_by_key(|table| matches!(table.as_str(), "message" | "session_message") as u8);
     for table in child_tables {
         let quoted = quote_sqlite_identifier(&table);
         tx.execute(
@@ -1056,11 +1256,25 @@ fn delete_session_rows(tx: &Transaction<'_>, session_id: &str) -> Result<bool, S
         .map_err(|e| format!("Failed to delete OpenCode {table} rows: {e}"))?;
     }
 
-    let deleted = tx
-        .execute("DELETE FROM session WHERE id = ?1", [session_id])
-        .map_err(|e| format!("Failed to delete OpenCode session: {e}"))?;
+    let has_v2 = sqlite_table_has_column(tx, "session_v2", "id")?;
+    let has_v1 = sqlite_table_has_column(tx, "session", "id")?;
+    if !has_v2 && !has_v1 {
+        return Err("OpenCode database is missing session table".into());
+    }
+    let deleted_v2 = if has_v2 {
+        tx.execute("DELETE FROM session_v2 WHERE id = ?1", [session_id])
+            .map_err(|e| format!("Failed to delete OpenCode session_v2: {e}"))?
+    } else {
+        0
+    };
+    let deleted_v1 = if has_v1 {
+        tx.execute("DELETE FROM session WHERE id = ?1", [session_id])
+            .map_err(|e| format!("Failed to delete OpenCode session: {e}"))?
+    } else {
+        0
+    };
 
-    Ok(deleted > 0)
+    Ok(deleted_v2 + deleted_v1 > 0)
 }
 
 fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
@@ -1094,15 +1308,28 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         .get("time")
         .and_then(|t| t.get("updated"))
         .and_then(parse_timestamp_to_ms);
+    let archived = value
+        .get("time")
+        .and_then(|t| t.get("archived"))
+        .is_some_and(|v| {
+            !v.is_null()
+                && v.as_bool() != Some(false)
+                && v.as_i64() != Some(0)
+                && v.as_str() != Some("")
+        });
 
     // Derive title from directory basename if no explicit title
     let has_title = title.is_some();
-    let display_title = title.or_else(|| {
+    let raw_title = title.or_else(|| {
         directory
             .as_deref()
             .and_then(path_basename)
             .map(|s| s.to_string())
     });
+    let display_title = raw_title
+        .as_deref()
+        .map(|t| truncate_summary(t, TITLE_MAX_CHARS))
+        .filter(|t| !t.is_empty());
 
     // Build source_path = message directory for this session
     let msg_dir = storage.join("message").join(&session_id);
@@ -1111,7 +1338,10 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
 
     // Skip expensive I/O if title already available from session JSON
     let summary = if has_title {
-        display_title.clone()
+        raw_title
+            .as_deref()
+            .map(|t| truncate_summary(t, 160))
+            .filter(|t| !t.is_empty())
     } else {
         get_first_user_summary(storage, &session_id)
     };
@@ -1125,7 +1355,7 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         parent_session_id: parent_id
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned),
-        archived: false,
+        archived,
         cleanup_pending: false,
         sidebar_section: None,
         title: display_title,
@@ -1177,7 +1407,7 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
         user_msgs.push((ts, msg_id));
     }
 
-    user_msgs.sort_by_key(|(ts, _)| *ts);
+    user_msgs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     // Take first user message and get its parts
     let (_, first_id) = user_msgs.first()?;
@@ -1189,43 +1419,281 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
     Some(truncate_summary(&text, 160))
 }
 
-/// Collect text content from all parts in a part directory.
-fn extract_part_text(part_value: &Value) -> Option<String> {
-    match part_value.get("type").and_then(Value::as_str) {
-        Some("text") => part_value
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| t.to_string()),
-        Some("tool") => {
-            let tool = part_value
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            Some(format!("[Tool: {tool}]"))
+#[derive(Default)]
+struct ParsedParts {
+    thinking: Vec<String>,
+    visible: Vec<String>,
+}
+
+fn format_error_value(err: &Value) -> Option<String> {
+    match err {
+        Value::Null => None,
+        Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
         }
-        _ => None,
+        Value::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let message = map
+                .get("data")
+                .and_then(|d| d.get("message"))
+                .or_else(|| map.get("message"))
+                .or_else(|| map.get("error"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (name, message) {
+                (Some(n), Some(m)) => Some(format!("{n}: {m}")),
+                (None, Some(m)) => Some(m.to_string()),
+                (Some(n), None) => Some(n.to_string()),
+                (None, None) => (!map.is_empty()).then(|| Value::Object(map.clone()).to_string()),
+            }
+        }
+        other => {
+            let rendered = other.to_string();
+            (!rendered.trim().is_empty()).then_some(rendered)
+        }
     }
 }
 
-fn collect_parts_text(part_dir: &Path, remaining_bytes: &mut u64) -> Result<String, String> {
+fn format_file_label(item: &Value) -> String {
+    let candidate = item
+        .get("filename")
+        .or_else(|| item.get("name"))
+        .or_else(|| item.get("source").and_then(|s| s.get("path")))
+        .or_else(|| item.get("path"))
+        .or_else(|| item.get("uri"))
+        .or_else(|| item.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with("data:"));
+    format!("[File: {}]", candidate.unwrap_or("attachment"))
+}
+
+fn format_tool_part(part: &Value, name_fallback: &str) -> String {
+    let name = part
+        .get("name")
+        .or_else(|| part.get("tool"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(name_fallback);
+    let mut text = format!("[Tool: {name}]");
+    if let Some(state) = part.get("state") {
+        let mut has_structured_content = false;
+        if let Some(content) = state.get("content").and_then(Value::as_array) {
+            for item in content {
+                let output = match item.get("type").and_then(Value::as_str) {
+                    Some("text") => item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    Some("file") => format_file_label(item),
+                    _ => format!("[Unsupported tool content] {item}"),
+                };
+                if !output.trim().is_empty() {
+                    has_structured_content = true;
+                    text.push('\n');
+                    text.push_str(&output);
+                }
+            }
+        }
+        if !has_structured_content {
+            if let Some(output) = state
+                .get("output")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                text.push('\n');
+                text.push_str(output);
+            }
+        }
+        if let Some(err) = state.get("error").and_then(format_error_value) {
+            text.push_str(&format!("\n[Error: {err}]"));
+        }
+    }
+    text
+}
+
+fn format_subtask_part(part: &Value) -> String {
+    let agent = part
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let desc = part
+        .get("description")
+        .or_else(|| part.get("prompt"))
+        .or_else(|| part.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (agent, desc) {
+        (Some(a), Some(d)) => format!("[Subtask ({a}): {d}]"),
+        (None, Some(d)) => format!("[Subtask: {d}]"),
+        (Some(a), None) => format!("[Subtask: {a}]"),
+        (None, None) => "[Subtask]".to_string(),
+    }
+}
+
+fn format_compaction_part(part: &Value) -> String {
+    if let Some(summary) = part
+        .get("summary")
+        .or_else(|| part.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return summary.to_string();
+    }
+    if let Some(err) = part.get("error").and_then(format_error_value) {
+        return format!("[Compaction failed: {err}]");
+    }
+    "[Compaction]".to_string()
+}
+
+fn format_patch_part(part: &Value) -> String {
+    if let Some(files) = part.get("files").and_then(Value::as_array) {
+        let names = files
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            return format!("[Patch: {}]", names.join(", "));
+        }
+    }
+    "[Patch]".to_string()
+}
+
+fn format_model_switched(value: &Value) -> String {
+    if let Some(model) = value.get("model") {
+        match model {
+            Value::String(s) if !s.trim().is_empty() => {
+                return format!("[Model: {}]", s.trim());
+            }
+            Value::Object(map) => {
+                let provider = map
+                    .get("providerID")
+                    .or_else(|| map.get("providerId"))
+                    .or_else(|| map.get("provider_id"))
+                    .or_else(|| map.get("provider"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let model_id = map
+                    .get("modelID")
+                    .or_else(|| map.get("modelId"))
+                    .or_else(|| map.get("model_id"))
+                    .or_else(|| map.get("id"))
+                    .or_else(|| map.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                return match (provider, model_id) {
+                    (Some(p), Some(m)) => format!("[Model: {p}/{m}]"),
+                    (None, Some(m)) => format!("[Model: {m}]"),
+                    (Some(p), None) => format!("[Model: {p}]"),
+                    (None, None) => format!("[Model: {model}]"),
+                };
+            }
+            _ => {}
+        }
+    }
+    let provider = value
+        .get("providerID")
+        .or_else(|| value.get("providerId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let model_id = value
+        .get("modelID")
+        .or_else(|| value.get("modelId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (provider, model_id) {
+        (Some(p), Some(m)) => format!("[Model: {p}/{m}]"),
+        (None, Some(m)) => format!("[Model: {m}]"),
+        (Some(p), None) => format!("[Model: {p}]"),
+        (None, None) => "[Model: unknown]".to_string(),
+    }
+}
+
+fn extract_reasoning_part(part_value: &Value) -> Option<String> {
+    let extracted = extract_thinking_text(part_value);
+    if !extracted.trim().is_empty() {
+        return Some(extracted);
+    }
+    part_value
+        .get("text")
+        .or_else(|| part_value.get("thinking"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn append_part_value(part_value: &Value, parsed: &mut ParsedParts) {
+    match part_value.get("type").and_then(Value::as_str) {
+        Some("reasoning" | "thinking") => {
+            if let Some(thinking) = extract_reasoning_part(part_value) {
+                parsed.thinking.push(thinking);
+            }
+        }
+        Some("text") => {
+            if let Some(text) = part_value
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+            {
+                parsed.visible.push(text.to_string());
+            }
+        }
+        Some("tool") => {
+            parsed.visible.push(format_tool_part(part_value, "unknown"));
+        }
+        Some("file") => {
+            parsed.visible.push(format_file_label(part_value));
+        }
+        Some("subtask") => {
+            parsed.visible.push(format_subtask_part(part_value));
+        }
+        Some("compaction") => {
+            parsed.visible.push(format_compaction_part(part_value));
+        }
+        Some("patch") => {
+            parsed.visible.push(format_patch_part(part_value));
+        }
+        _ => {}
+    }
+}
+
+fn collect_parts(part_dir: &Path, remaining_bytes: &mut u64) -> Result<ParsedParts, String> {
     if !part_dir.is_dir() {
-        return Ok(String::new());
+        return Ok(ParsedParts::default());
     }
 
     let mut parts = Vec::new();
     collect_json_files(part_dir, &mut parts);
+    parts.sort();
 
-    let mut texts = Vec::new();
+    let mut parsed = ParsedParts::default();
     for part_path in &parts {
         let value = read_json_bounded(part_path, remaining_bytes)?;
-
-        if let Some(text) = extract_part_text(&value) {
-            texts.push(text);
-        }
+        append_part_value(&value, &mut parsed);
     }
 
-    Ok(texts.join("\n"))
+    Ok(parsed)
+}
+
+fn collect_parts_text(part_dir: &Path, remaining_bytes: &mut u64) -> Result<String, String> {
+    let parsed = collect_parts(part_dir, remaining_bytes)?;
+    Ok(parsed.visible.join("\n"))
 }
 
 fn read_json_bounded(path: &Path, remaining_bytes: &mut u64) -> Result<Value, String> {
@@ -1250,31 +1718,49 @@ fn collect_json_files(root: &Path, files: &mut Vec<PathBuf>) {
     );
 }
 
+fn session_file_matches_id(path: &Path, session_id: &str) -> bool {
+    let mut budget = super::utils::MAX_QUERY_BYTES as u64;
+    read_json_bounded(path, &mut budget)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| id == session_id)
+        })
+        .unwrap_or(false)
+}
+
 fn find_session_file(storage: &Path, session_id: &str) -> Option<PathBuf> {
     let session_root = storage.join("session");
+    if !session_root.is_dir() {
+        return None;
+    }
+
+    let expected = format!("{session_id}.json");
+    let direct_candidate = session_root.join(&expected);
+    if direct_candidate.is_file() && session_file_matches_id(&direct_candidate, session_id) {
+        return Some(direct_candidate);
+    }
+
     let mut files = Vec::new();
     collect_json_files(&session_root, &mut files);
-    let expected = format!("{session_id}.json");
+    files.sort();
 
-    files
-        .into_iter()
-        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(expected.as_str()))
-}
-
-fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+    // Fast path: check files named `{session_id}.json` first, verifying JSON `"id" == session_id`.
+    for path in &files {
+        if path.file_name().and_then(|name| name.to_str()) == Some(expected.as_str())
+            && session_file_matches_id(path, session_id)
+        {
+            return Some(path.clone());
+        }
     }
-}
 
-fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
+    // Fallback: scan remaining `.json` files under `session/` for `value["id"] == session_id`.
+    files.into_iter().find(|path| {
+        path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str())
+            && session_file_matches_id(path, session_id)
+    })
 }
 
 #[cfg(test)]
@@ -1371,9 +1857,12 @@ mod compat_tests {
             "[Tool: read]\nfile result\n[File: image.png]"
         );
         conn.execute("INSERT INTO session_message VALUES ('4','ses_new','future',4,0,'{\"text\":\"visible?\"}')",[]).unwrap();
-        assert!(load_messages_connection(&conn, "ses_new")
-            .unwrap_err()
-            .contains("Unsupported"));
+        let after_future = load_messages_connection(&conn, "ses_new").unwrap();
+        assert_eq!(
+            after_future.len(),
+            3,
+            "unknown V2 message types should be skipped gracefully without failing the transcript"
+        );
     }
 
     #[test]
@@ -1976,16 +2465,25 @@ mod tests {
     #[test]
     fn parse_sqlite_source_accepts_valid_references() {
         let parsed = parse_sqlite_source("sqlite:/tmp/opencode.db:ses_123").expect("valid source");
-
         assert_eq!(parsed.0, PathBuf::from("/tmp/opencode.db"));
         assert_eq!(parsed.1, "ses_123");
+
+        let uuid_parsed = parse_sqlite_source(
+            r"sqlite:C:\Users\me\opencode.db:019cc369-bd7c-7891-b371-7b20b4fe0b18",
+        )
+        .expect("Windows path with non-ses_ ID");
+        assert_eq!(uuid_parsed.0, PathBuf::from(r"C:\Users\me\opencode.db"));
+        assert_eq!(uuid_parsed.1, "019cc369-bd7c-7891-b371-7b20b4fe0b18");
     }
 
     #[test]
     fn parse_sqlite_source_rejects_invalid_references() {
         assert!(parse_sqlite_source("/tmp/opencode.db:ses_123").is_none());
-        assert!(parse_sqlite_source("sqlite:/tmp/opencode.db:msg_123").is_none());
+        assert!(parse_sqlite_source("sqlite::ses_123").is_none());
         assert!(parse_sqlite_source("sqlite:/tmp/opencode.db").is_none());
+        assert!(parse_sqlite_source(r"sqlite:C:\Users\me\opencode.db").is_none());
+        assert!(parse_sqlite_source("sqlite:/tmp/opencode.db:../escape").is_none());
+        assert!(parse_sqlite_source("sqlite:/tmp/opencode.db:bad;id").is_none());
     }
 
     #[test]
@@ -2268,5 +2766,379 @@ mod tests {
         } else {
             std::env::remove_var("XDG_DATA_HOME");
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn session_v2_only_and_upgraded_dual_table_scan_parent_relations_and_delete() {
+        let _guard = opencode_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+
+        let base_dir = temp.path().join("opencode");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        // 1. Fresh OpenCode 2.0 DB with ONLY session_v2 + session_message + session_part (no `session` table)
+        // and non-`ses_` UUID session IDs + strict FK from session_part -> session_message without CASCADE!
+        let v2_only_db = base_dir.join("opencode.db");
+        let conn = Connection::open(&v2_only_db).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                directory TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                parent_id TEXT,
+                time_archived INTEGER
+             );
+             CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES session_v2(id),
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+             );
+             CREATE TABLE session_part (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL REFERENCES session_message(id)
+             );",
+        )
+        .unwrap();
+
+        let uuid_parent = "019cc369-bd7c-7891-b371-7b20b4fe0b18";
+        let uuid_child = "019cc369-bd7c-7891-b371-7b20b4fe0b99";
+        let long_title = "V".repeat(200);
+        conn.execute(
+            "INSERT INTO session_v2 VALUES (?1, ?2, '/proj', 100, 300, NULL, NULL)",
+            rusqlite::params![uuid_parent, long_title],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES (?1, 'Subtask', '/proj', 150, 250, ?2, 1700)",
+            rusqlite::params![uuid_child, uuid_parent],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('m1', ?1, 'user', 1, 100, '{\"text\":\"hello v2\"}')",
+            [uuid_parent],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_part VALUES ('p1', ?1, 'm1')",
+            [uuid_parent],
+        )
+        .unwrap();
+        drop(conn);
+
+        let scanned = scan_sessions_sqlite();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].session_id, uuid_parent);
+        assert_eq!(
+            scanned[0].title.as_ref().unwrap().chars().count(),
+            TITLE_MAX_CHARS + 3
+        );
+        assert_eq!(
+            scanned[0].summary.as_ref().unwrap().chars().count(),
+            160 + 3
+        );
+        assert_eq!(
+            scanned[0].resume_command.as_deref(),
+            Some("opencode -s 019cc369-bd7c-7891-b371-7b20b4fe0b18")
+        );
+        assert_eq!(scanned[1].session_id, uuid_child);
+        assert!(scanned[1].archived);
+        assert!(scanned[1].residual);
+        assert_eq!(scanned[1].parent_session_id.as_deref(), Some(uuid_parent));
+
+        let parent_src = format!("sqlite:{}:{uuid_parent}", v2_only_db.display());
+        let child_src = format!("sqlite:{}:{uuid_child}", v2_only_db.display());
+        assert_eq!(
+            load_messages_sqlite(&parent_src).unwrap()[0].content,
+            "hello v2"
+        );
+
+        // Parent protected while V2 child exists
+        assert!(delete_session_sqlite(uuid_parent, &parent_src).is_err());
+        assert!(delete_session_sqlite(uuid_child, &child_src).unwrap());
+        assert!(delete_session_sqlite(uuid_parent, &parent_src).unwrap());
+        assert!(scan_sessions_sqlite().is_empty());
+
+        // 2. Upgraded 1.x -> 2.x DB having BOTH `session` and `session_v2`
+        let dual_db = base_dir.join("opencode-dual.db");
+        let conn = Connection::open(&dual_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                parent_id TEXT
+             );
+             CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                parent_id TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_upgraded', 'Old V1 Title', '/p', 1, 10, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('ses_upgraded', 'New V2 Title', '/p', 1, 50, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_v1_only', 'Legacy V1 Only', '/p', 1, 20, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let dual_rows = scan_database(&dual_db).unwrap();
+        assert_eq!(dual_rows.len(), 2);
+        assert_eq!(dual_rows[0].session_id, "ses_upgraded");
+        assert_eq!(dual_rows[0].title.as_deref(), Some("New V2 Title"));
+        assert_eq!(dual_rows[1].session_id, "ses_v1_only");
+
+        let dual_src = format!("sqlite:{}:ses_upgraded", dual_db.display());
+        assert!(delete_session_sqlite("ses_upgraded", &dual_src).unwrap());
+        let after_dual_delete = scan_database(&dual_db).unwrap();
+        assert_eq!(after_dual_delete.len(), 1);
+        assert_eq!(after_dual_delete[0].session_id, "ses_v1_only");
+
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn v2_and_v1_transcripts_emit_thinking_role_rich_tools_attachments_errors_and_models() {
+        // V2 transcript
+        let v2_conn = Connection::open_in_memory().unwrap();
+        v2_conn
+            .execute_batch(
+                "CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    type TEXT,
+                    seq INTEGER,
+                    time_created INTEGER,
+                    data TEXT
+                 );",
+            )
+            .unwrap();
+        for (seq, kind, ts, data) in [
+            (
+                1,
+                "user",
+                100,
+                r#"{"text":"","files":[{"filename":"design.png"}]}"#,
+            ),
+            (
+                2,
+                "assistant",
+                200,
+                r#"{"content":[{"type":"reasoning","text":"Analyzing image"},{"type":"tool","name":"bash","state":{"status":"error","output":"partial log","error":{"name":"ExecError","message":"exit 2"}}},{"type":"text","text":"Fixed command"}]}"#,
+            ),
+            (
+                3,
+                "assistant",
+                300,
+                r#"{"error":{"name":"APIError","data":{"message":"Rate limit exceeded"}}}"#,
+            ),
+            (
+                4,
+                "compaction",
+                400,
+                r#"{"status":"failed","error":"Context window exceeded"}"#,
+            ),
+            (
+                5,
+                "model-switched",
+                500,
+                r#"{"model":{"providerID":"anthropic","modelID":"claude-sonnet-4"}}"#,
+            ),
+        ] {
+            v2_conn
+                .execute(
+                    "INSERT INTO session_message VALUES (?1, 's_v2', ?2, ?3, ?4, ?5)",
+                    rusqlite::params![format!("m{seq}"), kind, seq, ts, data],
+                )
+                .unwrap();
+        }
+
+        let v2_msgs = load_messages_connection(&v2_conn, "s_v2").unwrap();
+        assert_eq!(v2_msgs.len(), 6);
+        assert_eq!(
+            (&*v2_msgs[0].role, &*v2_msgs[0].content),
+            ("user", "[File: design.png]")
+        );
+        assert_eq!(
+            (&*v2_msgs[1].role, &*v2_msgs[1].content, v2_msgs[1].ts),
+            ("thinking", "Analyzing image", Some(200))
+        );
+        assert_eq!(
+            (&*v2_msgs[2].role, &*v2_msgs[2].content),
+            (
+                "assistant",
+                "[Tool: bash]\npartial log\n[Error: ExecError: exit 2]\nFixed command"
+            )
+        );
+        assert_eq!(
+            (&*v2_msgs[3].role, &*v2_msgs[3].content),
+            ("assistant", "[Error: APIError: Rate limit exceeded]")
+        );
+        assert_eq!(
+            (&*v2_msgs[4].role, &*v2_msgs[4].content),
+            ("system", "[Compaction failed: Context window exceeded]")
+        );
+        assert_eq!(
+            (&*v2_msgs[5].role, &*v2_msgs[5].content),
+            ("system", "[Model: anthropic/claude-sonnet-4]")
+        );
+
+        // Legacy JSON deterministic ordering + V1 rich part types + thinking role
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+        let msg_dir = storage.join("message").join("ses_rich");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        // Same timestamp -> deterministic tie-breaker on msg_id (`msg_a` before `msg_b`)
+        std::fs::write(
+            msg_dir.join("msg_b.json"),
+            r#"{"id":"msg_b","role":"assistant","time":{"created":1000}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("msg_a.json"),
+            r#"{"id":"msg_a","role":"user","time":{"created":1000}}"#,
+        )
+        .unwrap();
+
+        let part_a = storage.join("part").join("msg_a");
+        std::fs::create_dir_all(&part_a).unwrap();
+        std::fs::write(
+            part_a.join("prt_1.json"),
+            r#"{"type":"file","filename":"notes.md"}"#,
+        )
+        .unwrap();
+
+        let part_b = storage.join("part").join("msg_b");
+        std::fs::create_dir_all(&part_b).unwrap();
+        std::fs::write(
+            part_b.join("prt_3.json"),
+            r#"{"type":"patch","files":["src/lib.rs","src/main.rs"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            part_b.join("prt_1.json"),
+            r#"{"type":"reasoning","text":"Planning patch"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            part_b.join("prt_2.json"),
+            r#"{"type":"subtask","agent":"explore","description":"Inspect workspace"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            part_b.join("prt_4.json"),
+            r#"{"type":"compaction","auto":true}"#,
+        )
+        .unwrap();
+
+        let json_msgs = load_messages(&msg_dir).unwrap();
+        assert_eq!(json_msgs.len(), 3);
+        assert_eq!(
+            (&*json_msgs[0].role, &*json_msgs[0].content),
+            ("user", "[File: notes.md]")
+        );
+        assert_eq!(
+            (&*json_msgs[1].role, &*json_msgs[1].content),
+            ("thinking", "Planning patch")
+        );
+        assert_eq!(
+            (&*json_msgs[2].role, &*json_msgs[2].content),
+            (
+                "assistant",
+                "[Subtask (explore): Inspect workspace]\n[Patch: src/lib.rs, src/main.rs]\n[Compaction]"
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_json_archived_truncation_nonstandard_session_filename_and_sidecar_cleanup() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+        let session_dir = storage.join("session").join("proj");
+        let msg_dir = storage.join("message").join("ses_target");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+
+        // Decoy file named `ses_target.json` whose JSON `id` actually belongs to `ses_other`!
+        let decoy_file = session_dir.join("ses_target.json");
+        std::fs::write(
+            &decoy_file,
+            r#"{"id":"ses_other","title":"Keep me","time":{"archived":0}}"#,
+        )
+        .unwrap();
+
+        // Real session file has non-`{id}.json` filename and `time.archived` set + long title
+        let real_file = session_dir.join("custom_slug.json");
+        let long_title = "A".repeat(200);
+        std::fs::write(
+            &real_file,
+            format!(
+                r#"{{"id":"ses_target","title":"{long_title}","time":{{"created":10,"archived":1770000000}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_session(storage, &real_file).unwrap();
+        assert!(parsed.archived);
+        assert_eq!(
+            parsed.title.as_ref().unwrap().chars().count(),
+            TITLE_MAX_CHARS + 3
+        );
+        assert_eq!(parsed.summary.as_ref().unwrap().chars().count(), 160 + 3);
+        assert!(!parse_session(storage, &decoy_file).unwrap().archived);
+
+        for subdir in ["session_diff", "todo", "share", "session_share"] {
+            let dir = storage.join(subdir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("ses_target.json"), "{}").unwrap();
+        }
+
+        delete_session(storage, &msg_dir, "ses_target").unwrap();
+        assert!(
+            decoy_file.exists(),
+            "must never mis-delete decoy file owned by ses_other"
+        );
+        assert!(
+            !real_file.exists(),
+            "must find and delete custom-named session file by JSON id"
+        );
+        for subdir in ["session_diff", "todo", "share", "session_share"] {
+            assert!(!storage.join(subdir).join("ses_target.json").exists());
+        }
+
+        let tilde_db = database_paths(storage, Some("~/custom-opencode.db"), false);
+        assert_eq!(
+            tilde_db,
+            vec![crate::session_paths::home_dir().join("custom-opencode.db")]
+        );
     }
 }

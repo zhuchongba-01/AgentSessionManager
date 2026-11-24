@@ -16,9 +16,8 @@ export function highlightText(text: string, terms: string[]): ReactNode {
   const parts = text.split(pattern);
   if (parts.length <= 1) return text;
 
-  const normalized = new Set(cleaned.map((term) => term.toLocaleLowerCase()));
   return parts.map((part, index) =>
-    part && normalized.has(part.toLocaleLowerCase()) ? (
+    index % 2 === 1 ? (
       <mark key={index} className="asm-search-mark">
         {part}
       </mark>

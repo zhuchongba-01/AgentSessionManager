@@ -44,6 +44,29 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: openUrlMock,
 }));
 
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({
+    count,
+    getItemKey,
+  }: {
+    count: number;
+    getItemKey?: (index: number) => string | number;
+  }) => ({
+    getVirtualItems: () =>
+      Array.from({ length: count }, (_, index) => ({
+        index,
+        key: getItemKey ? getItemKey(index) : index,
+        start: index * 120,
+        end: (index + 1) * 120,
+      })),
+    getTotalSize: () => count * 120,
+    measureElement: () => undefined,
+    scrollToIndex: () => undefined,
+    scrollOffset: 0,
+    scrollRect: { height: 600 },
+  }),
+}));
+
 const renderPage = (appId = "codex") => {
   const client = new QueryClient({
     defaultOptions: {
@@ -322,6 +345,12 @@ describe("SessionManagerPage", () => {
       within(deepseekOption).getByTitle("DeepSeek Harness"),
     ).toBeInTheDocument();
     expect(deepseekOption).toHaveTextContent("0");
+
+    const workbuddyOption = screen.getByRole("option", {
+      name: /WorkBuddy/,
+    });
+    expect(within(workbuddyOption).getByTitle("WorkBuddy")).toBeInTheDocument();
+    expect(workbuddyOption).toHaveTextContent("0");
   });
 
   it("coalesces rapid rescan clicks into one disk scan and one notification", async () => {
@@ -527,7 +556,7 @@ describe("SessionManagerPage", () => {
     deleteSpy.mockRestore();
   });
 
-  it("restores batch delete controls when deleteMany rejects", async () => {
+  it("restores batch delete controls and keeps confirm dialog open for retry when deleteMany rejects", async () => {
     const deleteManySpy = vi
       .spyOn(sessionsApi, "deleteMany")
       .mockRejectedValueOnce(new Error("network error"));
@@ -553,6 +582,14 @@ describe("SessionManagerPage", () => {
       expect(toastErrorMock).toHaveBeenCalledWith("network error"),
     );
 
+    // 失败后确认框保持打开并恢复可点击，便于退出 Agent 后直接重试
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      ).not.toBeDisabled(),
+    );
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
     await waitFor(() => expect(batchDeleteButton()).not.toBeDisabled());
 
     deleteManySpy.mockRestore();
@@ -1614,5 +1651,241 @@ describe("SessionManagerPage", () => {
 
     expect(systemThemeButton).toHaveAttribute("aria-pressed", "true");
     expect(window.localStorage.getItem("test-session-theme")).toBe("system");
+  });
+
+  it("keeps thinking messages visible when hiding tools and excludes them from tool count", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "claude",
+          sessionId: "claude-thinking-1",
+          title: "Thinking Session",
+          sourcePath: "/mock/claude/thinking-1.jsonl",
+          lastActiveAt: 100,
+        },
+      ],
+      {
+        "claude:/mock/claude/thinking-1.jsonl": [
+          { role: "user", content: "求解问题", ts: 10 },
+          { role: "thinking", content: "先分析边界条件\n再验证结论", ts: 15 },
+          { role: "tool", content: "bash output", ts: 20 },
+          { role: "assistant", content: "最终答案", ts: 30 },
+        ],
+      },
+    );
+
+    renderPage("claude");
+    await screen.findByRole("heading", { name: "Thinking Session" });
+
+    // 工具计数只算真正的 tool 消息，不含 thinking
+    const hideToolsButton = await screen.findByRole("button", {
+      name: "隐藏工具 (1)",
+    });
+    expect(
+      screen.getByRole("button", { name: "展开思考过程" }),
+    ).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(hideToolsButton);
+    expect(
+      screen.getByRole("button", { name: "显示工具 (1)" }),
+    ).toBeInTheDocument();
+    // 隐藏工具后思考过程仍然保留显示
+    expect(
+      screen.getByRole("button", { name: "展开思考过程" }),
+    ).toBeInTheDocument();
+  });
+
+  it("searches >4096-char server-truncated messages via IPC and advances Enter navigation after >2s pause", async () => {
+    const tailNeedle = "server_hidden_needle_xyz";
+    const truncatedBody = `${"普通前缀内容 ".repeat(700)}${tailNeedle}`;
+    expect(truncatedBody.length).toBeGreaterThan(4096);
+
+    setSessionFixtures(
+      [
+        {
+          providerId: "claude",
+          sessionId: "claude-trunc-search",
+          title: "Truncated Search Session",
+          sourcePath: "/mock/claude/trunc-search.jsonl",
+          lastActiveAt: 100,
+        },
+      ],
+      {
+        "claude:/mock/claude/trunc-search.jsonl": [
+          { role: "user", content: `first ${tailNeedle}`, ts: 10 },
+          { role: "assistant", content: truncatedBody, ts: 20 },
+        ],
+      },
+    );
+
+    const searchSpy = vi.spyOn(sessionsApi, "searchMessages");
+    renderPage("claude");
+    await screen.findByRole("heading", { name: "Truncated Search Session" });
+
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    const searchInput = await screen.findByRole("searchbox", {
+      name: "在当前会话中搜索",
+    });
+    fireEvent.change(searchInput, { target: { value: tailNeedle } });
+
+    // 后端全文搜索命中第 2 条 >4096 字符的被截断消息，总匹配数为 2
+    expect(await screen.findByText("1 / 2")).toBeInTheDocument();
+    expect(searchSpy).toHaveBeenCalledWith(
+      "claude",
+      "/mock/claude/trunc-search.jsonl",
+      tailNeedle,
+    );
+
+    vi.useFakeTimers();
+    try {
+      // 第 1 次 Enter 定位到第 1 处匹配（1 / 2）
+      fireEvent.keyDown(searchInput, { key: "Enter" });
+      expect(screen.getByText("1 / 2")).toBeInTheDocument();
+
+      // 停顿超过 2 秒（高亮闪烁定时器已清零 activeMessageIndex）
+      act(() => {
+        vi.advanceTimersByTime(2500);
+      });
+
+      // 第 2 次 Enter 仍必须推进到第 2 处匹配（2 / 2），不能卡在 1 / 2
+      fireEvent.keyDown(searchInput, { key: "Enter" });
+      expect(screen.getByText("2 / 2")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // 切到第 2 处匹配后，被截断消息自动取回全文并展开高亮
+    await waitFor(() =>
+      expect(
+        document.querySelectorAll("mark.asm-search-mark").length,
+      ).toBeGreaterThanOrEqual(2),
+    );
+    searchSpy.mockRestore();
+  });
+
+  it("ignores ArrowDown inside .asm-detail and closes detail search on Escape before batch selectionMode", async () => {
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+
+    // 在详情区内按 ArrowDown 不劫持左侧会话选中项
+    const detailPane = document.querySelector(".asm-detail")!;
+    fireEvent.keyDown(detailPane, { key: "ArrowDown" });
+    expect(
+      screen.getByRole("heading", { name: "Alpha Session" }),
+    ).toBeInTheDocument();
+
+    // 在列表侧按 ArrowDown 正常切换到下一条可见会话
+    const listPane = document.querySelector(".asm-list")!;
+    fireEvent.keyDown(listPane, { key: "ArrowDown" });
+    expect(
+      await screen.findByRole("heading", { name: "Beta Session" }),
+    ).toBeInTheDocument();
+
+    // 同时开启批量管理与会话内搜索：第一次按 Escape 只关搜索，不清空批量模式
+    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    expect(
+      screen.getByRole("button", { name: /退出批量管理/i }),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    expect(
+      await screen.findByRole("searchbox", { name: "在当前会话中搜索" }),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(listPane, { key: "Escape" });
+    expect(
+      screen.queryByRole("searchbox", { name: "在当前会话中搜索" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /退出批量管理/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("allows collapsing groups under status filter pills and narrows ConfirmDialog to failed items on partial delete failure", async () => {
+    const deleteManySpy = vi
+      .spyOn(sessionsApi, "deleteMany")
+      .mockResolvedValueOnce([
+        {
+          providerId: "codex",
+          sessionId: "codex-session-1",
+          sourcePath: "/mock/codex/session-1.jsonl",
+          success: true,
+          warnings: ["dup warning", "dup warning"],
+        },
+        {
+          providerId: "codex",
+          sessionId: "codex-session-2",
+          sourcePath: "/mock/codex/session-2.jsonl",
+          success: false,
+          error: "file locked by agent",
+        },
+      ]);
+
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+
+    // 状态胶囊激活时仍可手动折叠分组
+    fireEvent.click(screen.getByRole("button", { name: "残留 1" }));
+    const dirToggle = screen.getByRole("button", {
+      name: /展开或折叠 codex 目录分组/,
+    });
+    expect(dirToggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(dirToggle);
+    expect(dirToggle).toHaveAttribute("aria-expanded", "false");
+
+    // 切回全部并测试批量删除部分失败后保留失败项供直接重试
+    fireEvent.click(screen.getByRole("button", { name: "全部 3" }));
+    fireEvent.click(dirToggle);
+    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    const checkboxes = screen.getAllByRole("checkbox", { name: "选择会话" });
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+
+    openBatchDeleteDialog(2);
+    const dialog = screen.getByTestId("confirm-dialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+    );
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalled());
+    // 去重合并后的警告只弹一次
+    expect(toastWarningMock).toHaveBeenCalledWith("dup warning");
+    // 对话框保持打开，且收敛为剩余失败的那 1 条（Beta Session）
+    expect(screen.getByTestId("confirm-dialog")).toBeInTheDocument();
+    expect(within(dialog).getByText(/Beta Session/)).toBeInTheDocument();
+
+    deleteManySpy.mockRestore();
+  });
+
+  it("selects adjacent neighbor when deleting the last session and renders window controls only on Windows", async () => {
+    const uaSpy = vi
+      .spyOn(window.navigator, "userAgent", "get")
+      .mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
+
+    const { unmount } = renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+    expect(document.querySelector(".asm-window-controls")).toBeNull();
+
+    // 选中最后一条 Gamma Session 并删除，应就近选中相邻的 Beta Session，而非跳回第 1 条 Alpha Session
+    fireEvent.click(screen.getByRole("button", { name: /Gamma Session/ }));
+    await screen.findByRole("heading", { name: "Gamma Session" });
+    fireEvent.click(screen.getByRole("button", { name: /仅删除此会话/ }));
+    fireEvent.click(
+      within(screen.getByTestId("confirm-dialog")).getByRole("button", {
+        name: /删除会话/,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Beta Session" }),
+      ).toBeInTheDocument(),
+    );
+
+    unmount();
+    uaSpy.mockReturnValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    renderPage();
+    await screen.findByRole("heading", { name: "Alpha Session" });
+    expect(document.querySelector(".asm-window-controls")).not.toBeNull();
+    uaSpy.mockRestore();
   });
 });

@@ -6,6 +6,7 @@
 AppId={{7C1E5A93-9D4E-4F5C-B8A2-1E6D0C4B9F31}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppMutex=com.agent-session-manager.desktop-sim
 DefaultDirName={autopf}\Agent会话管理
 DefaultGroupName={#MyAppName}
 UninstallDisplayName={#MyAppName}
@@ -16,8 +17,10 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-PrivilegesRequired=admin
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
 DisableProgramGroupPage=yes
 CloseApplications=yes
 RestartApplications=no
@@ -38,3 +41,44 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{localappdata}\com.agent-session-manager.desktop\EBWebView"
+
+[Code]
+procedure StopRunningInstance();
+var
+  AppExe: String;
+  ResultCode: Integer;
+  ElapsedMs: Integer;
+begin
+  if not CheckForMutexes('com.agent-session-manager.desktop-sim') then
+    Exit;
+
+  AppExe := ExpandConstant('{app}\{#MyAppExeName}');
+  if FileExists(AppExe) then
+  begin
+    if Exec(AppExe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      ElapsedMs := 0;
+      while CheckForMutexes('com.agent-session-manager.desktop-sim') and (ElapsedMs < 3000) do
+      begin
+        Sleep(100);
+        ElapsedMs := ElapsedMs + 100;
+      end;
+      Sleep(400);
+    end;
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  StopRunningInstance();
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  StopRunningInstance();
+  Result := True;
+end;

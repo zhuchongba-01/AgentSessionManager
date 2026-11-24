@@ -24,6 +24,8 @@ const files = {
     '{"version":"1.3.16","app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]}}\n',
   "src-tauri/tauri.windows.conf.json":
     '{"app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]}}\n',
+  "src-tauri/tauri.macos.conf.json":
+    '{"app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]}}\n',
   "installer/AgentSessionManager.iss":
     '#define MyAppVersion "1.3.16"\r\n[Setup]\r\nAppVersion={#MyAppVersion}\r\n',
 };
@@ -60,7 +62,7 @@ test("check is read-only and accepts aligned metadata", (t) => {
 test("updates all release metadata without touching dependencies or line endings", (t) => {
   const root = fixture(t);
   const result = synchronizeVersion(root, { version: "1.3.17" });
-  assert.equal(result.changed.length, 6);
+  assert.equal(result.changed.length, 7);
   const after = snapshot(root);
   for (const [name, text] of Object.entries(files)) {
     const expected =
@@ -136,6 +138,57 @@ test("rejects ambiguous metadata rather than updating unintended fields", (t) =>
   assert.deepEqual(snapshot(root), before);
 });
 
+test("ignores nested version keys in package.json and tauri.conf.json", (t) => {
+  const root = fixture(t);
+  writeFileSync(
+    join(root, "package.json"),
+    '{"name":"agent-session-manager","version":"1.3.16","dependencies":{"version":"1.3.16"},"nested":{"version":"9.9.9"}}\n',
+  );
+  writeFileSync(
+    join(root, "src-tauri/tauri.conf.json"),
+    '{"version":"1.3.16","app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]},"plugins":{"updater":{"version":"9.9.9"}}}\n',
+  );
+
+  const result = synchronizeVersion(root, { version: "1.3.17" });
+  assert.equal(result.changed.length, 7);
+  assert.equal(
+    readFileSync(join(root, "package.json"), "utf8"),
+    '{"name":"agent-session-manager","version":"1.3.17","dependencies":{"version":"1.3.16"},"nested":{"version":"9.9.9"}}\n',
+  );
+  assert.equal(
+    readFileSync(join(root, "src-tauri/tauri.conf.json"), "utf8"),
+    '{"version":"1.3.17","app":{"windows":[{"title":"Agent会话管理  v1.3.17"}]},"plugins":{"updater":{"version":"9.9.9"}}}\n',
+  );
+});
+
+test("rejects missing top-level version even when nested version exists", (t) => {
+  const root = fixture(t);
+  writeFileSync(
+    join(root, "src-tauri/tauri.conf.json"),
+    '{"app":{"windows":[{"title":"Agent会话管理  v1.3.16"}]},"plugins":{"updater":{"version":"1.3.16"}}}\n',
+  );
+  const before = snapshot(root);
+  assert.throws(
+    () => synchronizeVersion(root, { version: "1.3.17" }),
+    /tauri\.conf\.json: expected exactly one release metadata field, found 0/,
+  );
+  assert.deepEqual(snapshot(root), before);
+});
+
+test("check detects drift in tauri.macos.conf.json window title", (t) => {
+  const root = fixture(t);
+  writeFileSync(
+    join(root, "src-tauri/tauri.macos.conf.json"),
+    files["src-tauri/tauri.macos.conf.json"].replace("1.3.16", "1.0.0"),
+  );
+  const before = snapshot(root);
+  assert.throws(
+    () => synchronizeVersion(root, { check: true }),
+    /Version mismatch.*tauri\.macos\.conf\.json/,
+  );
+  assert.deepEqual(snapshot(root), before);
+});
+
 function runCli(root, args) {
   const script = join(root, "scripts", "version.mjs");
   mkdirSync(dirname(script), { recursive: true });
@@ -157,7 +210,7 @@ test("CLI works outside the repository cwd and synchronizes the fixture only", (
   assert.match(check.stdout, /Versions aligned: 1\.3\.16/);
   const update = runCli(root, ["1.3.17"]);
   assert.equal(update.status, 0, update.stderr);
-  assert.match(update.stdout, /updated 6 files/);
+  assert.match(update.stdout, /updated 7 files/);
   assert.equal(synchronizeVersion(root, { check: true }).version, "1.3.17");
 });
 
