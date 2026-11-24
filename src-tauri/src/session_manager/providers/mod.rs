@@ -1,6 +1,8 @@
+pub mod blocks;
 pub mod claude;
 pub mod codebuddy;
 pub mod codex;
+pub(crate) mod codex_items;
 pub mod copilot;
 pub mod deepseek;
 pub mod gemini;
@@ -8,7 +10,9 @@ pub mod grokbuild;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub(crate) mod opencode_blocks;
 pub mod pi;
+pub(crate) mod pi_blocks;
 pub(crate) mod utils;
 pub mod workbuddy;
 pub mod zcode;

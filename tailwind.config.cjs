@@ -36,8 +36,36 @@ module.exports = {
           foreground: "hsl(var(--destructive-foreground))",
         },
         border: "hsl(var(--border))",
+        "border-strong": "hsl(var(--border-strong))",
+        strong: "hsl(var(--border-strong))",
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
+        app: "hsl(var(--bg-app))",
+        surface: "hsl(var(--bg-surface))",
+        subtle: "var(--bg-subtle)",
+        selected: "var(--bg-selected)",
+        "fg-1": "hsl(var(--fg-1))",
+        "fg-2": "hsl(var(--fg-2))",
+        "fg-3": "hsl(var(--fg-3))",
+        action: {
+          DEFAULT: "hsl(var(--action-bg))",
+          text: "hsl(var(--action-text))",
+        },
+        success: {
+          DEFAULT: "hsl(var(--success-border))",
+          text: "hsl(var(--success-text))",
+        },
+        danger: {
+          DEFAULT: "hsl(var(--destructive))",
+          text: "hsl(var(--danger-text))",
+        },
+        warning: {
+          DEFAULT: "hsl(var(--warning-border))",
+          soft: "var(--warning-soft)",
+          text: "hsl(var(--warning-text))",
+        },
+        "diff-add": "var(--diff-add-bg)",
+        "diff-del": "var(--diff-del-bg)",
         blue: {
           400: "#409CFF",
           500: "#0A84FF",
@@ -73,12 +101,26 @@ module.exports = {
         sm: "0 1px 2px 0 rgb(0 0 0 / 0.05)",
         md: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)",
         lg: "0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)",
+        "v7-md":
+          "0 8px 24px -4px rgb(15 23 42 / 0.12), 0 2px 6px -2px rgb(15 23 42 / 0.08)",
+        "v7-lg":
+          "0 18px 42px -8px rgb(15 23 42 / 0.2), 0 4px 12px -4px rgb(15 23 42 / 0.1)",
       },
       borderRadius: {
         sm: "0.375rem",
         md: "0.5rem",
         lg: "0.75rem",
         xl: "0.875rem",
+        control: "0.375rem",
+        panel: "0.625rem",
+        dialog: "0.75rem",
+      },
+      fontSize: {
+        title: ["1rem", { lineHeight: "1.5rem", fontWeight: "600" }],
+        section: ["0.875rem", { lineHeight: "1.25rem", fontWeight: "600" }],
+        body: ["0.875rem", { lineHeight: "1.4rem" }],
+        caption: ["0.75rem", { lineHeight: "1.125rem" }],
+        badge: ["0.6875rem", { lineHeight: "1rem", fontWeight: "500" }],
       },
       fontFamily: {
         // 使用与之前版本保持一致的系统字体栈

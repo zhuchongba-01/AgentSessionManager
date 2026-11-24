@@ -1,4 +1,6 @@
-import type { SessionMessage, SessionMeta } from "@/types";
+import { createElement, type ReactNode } from "react";
+import { isWindows } from "@/lib/platform";
+import type { SessionMessage, SessionMeta, SessionTextRange } from "@/types";
 
 const CODEX_IDE_CONTEXT_PREFIX = "# Context from my IDE setup:";
 const CODEX_REQUEST_MARKER = "my request for codex";
@@ -441,6 +443,7 @@ export const getVisibleSessionMessages = (
   return messages.filter((message) => {
     const role = message.role.toLowerCase();
     if (role === "thinking") return true;
+    if (message.blocks?.some((block) => block.type === "event")) return true;
     if (role === "developer" || role === "system") return false;
     return !(role === "user" && shouldHideCodexMessageFromToc(message.content));
   });
@@ -624,4 +627,260 @@ export const buildResumeShellCommand = (
     return `Set-Location -LiteralPath '${dir.replace(/'/g, "''")}'; ${cmd}`;
   }
   return `cd '${dir.replace(/'/g, "'\\''")}' && ${cmd}`;
+};
+
+// ── cc-switch 会话列表与阅读器共用辅助函数 ───────────────────────────────
+
+export const SESSION_APP_IDS = [
+  "claude",
+  "codex",
+  "gemini",
+  "copilot",
+  "opencode",
+  "zcode",
+  "pi",
+  "openclaw",
+  "deepseek",
+  "workbuddy",
+  "codebuddy",
+  "kimi",
+  "grokbuild",
+] as const;
+
+export type SessionAppId = (typeof SESSION_APP_IDS)[number];
+
+export const isSessionAppId = (value: string): value is SessionAppId =>
+  (SESSION_APP_IDS as readonly string[]).includes(value);
+
+export const SESSION_SOURCE_PATHS: Record<SessionAppId, string[]> = {
+  claude: ["~/.claude/projects"],
+  codex: ["~/.codex/sessions", "~/.codex/archived_sessions"],
+  gemini: ["~/.gemini/tmp/<project>/chats"],
+  copilot: ["~/.copilot/session-state"],
+  opencode: ["~/.local/share/opencode"],
+  zcode: ["~/.zcode"],
+  pi: ["~/.pi/agent/sessions"],
+  openclaw: ["~/.openclaw/agents/<agent>/sessions"],
+  deepseek: ["~/.deepseek/sessions", "~/.dsh/sessions"],
+  workbuddy: ["~/.workbuddy/projects"],
+  codebuddy: ["~/.codebuddy/projects"],
+  kimi: ["~/.kimi/sessions", "~/.kimi-code/sessions"],
+  grokbuild: ["~/.grok/sessions", "~/.grok/archived_sessions"],
+};
+
+export interface SessionProjectGroup {
+  key: string;
+  projectDir: string | null;
+  label: string;
+  sessions: SessionMeta[];
+  latest: number;
+}
+
+export const getSessionTime = (session: SessionMeta) =>
+  session.lastActiveAt ?? session.createdAt ?? 0;
+
+export const sortSessionsByTime = (sessions: SessionMeta[]) =>
+  [...sessions].sort((a, b) => getSessionTime(b) - getSessionTime(a));
+
+export const shortenHomePath = (value: string) =>
+  value
+    .replace(/^\/Users\/[^/]+(?=\/|$)/, "~")
+    .replace(/^\/home\/[^/]+(?=\/|$)/, "~")
+    .replace(/^[A-Za-z]:\\Users\\[^\\]+(?=\\|$)/, "~");
+
+export const formatShortDateTime = (value?: number) => {
+  if (!value) return "";
+  return new Date(value).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+
+export const formatMessageTime = (value?: number) => {
+  if (!value) return "";
+  const date = new Date(value);
+  return date.toLocaleString(undefined, {
+    ...(date.getFullYear() !== new Date().getFullYear()
+      ? { year: "numeric" as const }
+      : {}),
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+
+export const formatClock = (value?: number) => {
+  if (!value) return "";
+  return new Date(value).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+
+export const getSessionLastText = (session: SessionMeta) => {
+  const summary = session.summary?.trim();
+  if (!summary) return "";
+  if (summary === formatSessionTitle(session).trim()) return "";
+  return summary;
+};
+
+const CODEX_CHAT_DIR_RE =
+  /^(.*[\\/]Documents[\\/]Codex)[\\/]\d{4}-\d{2}-\d{2}[\\/][^\\/]+[\\/]*$/i;
+const CODEX_CHATS_KEY_PREFIX = "__codex_chats__:";
+
+export const groupSessionsByProject = (
+  sessions: SessionMeta[],
+  unknownDirectoryLabel: string,
+  codexChatsLabel: string,
+): SessionProjectGroup[] => {
+  const groups = new Map<string, SessionProjectGroup>();
+
+  sessions.forEach((session) => {
+    const rawDir = session.projectDir?.trim() || null;
+    const codexChatsRoot = rawDir?.match(CODEX_CHAT_DIR_RE)?.[1] ?? null;
+    const projectDir = codexChatsRoot ?? rawDir;
+    const key = session.sidebarSection
+      ? `${session.providerId}:section:${session.sidebarSection.id}`
+      : codexChatsRoot
+        ? CODEX_CHATS_KEY_PREFIX + normalizeDirectoryIdentity(codexChatsRoot)
+        : projectDir
+          ? normalizeDirectoryIdentity(projectDir)
+          : UNKNOWN_PROJECT_DIR_KEY;
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        projectDir,
+        label: session.sidebarSection?.name
+          ? session.sidebarSection.name
+          : codexChatsRoot
+            ? codexChatsLabel
+            : session.projectName?.trim() ||
+              (projectDir
+                ? getBaseName(projectDir) || projectDir
+                : unknownDirectoryLabel),
+        sessions: [],
+        latest: 0,
+      };
+      groups.set(key, group);
+    }
+    group.sessions.push(session);
+    group.latest = Math.max(group.latest, getSessionTime(session));
+  });
+
+  return Array.from(groups.values()).sort((a, b) => {
+    if (a.projectDir === null && b.projectDir !== null) return 1;
+    if (a.projectDir !== null && b.projectDir === null) return -1;
+    return b.latest - a.latest;
+  });
+};
+
+export const buildCdResumeCommand = (projectDir: string, command: string) =>
+  isWindows()
+    ? `Set-Location -LiteralPath '${projectDir.replace(/'/g, "''")}'; ${command}`
+    : `cd '${projectDir.replace(/'/g, `'\\''`)}' && ${command}`;
+
+export function* findTextMatches(text: string, query: string) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return;
+  const haystack = text.toLowerCase();
+  let at = haystack.indexOf(needle);
+  if (at < 0) return;
+
+  if (!/[^\x00-\x7f]/.test(text)) {
+    while (at >= 0) {
+      yield { start: at, end: at + needle.length };
+      at = haystack.indexOf(needle, at + needle.length);
+    }
+    return;
+  }
+
+  const offsets: number[] = [];
+  let originalAt = 0;
+  for (const point of text) {
+    const length = point.toLowerCase().length;
+    for (let i = 0; i < length; i += 1) {
+      offsets.push(originalAt);
+    }
+    originalAt += point.length;
+  }
+
+  while (at >= 0) {
+    const last = offsets[at + needle.length - 1];
+    yield {
+      start: offsets[at],
+      end: last + (text.codePointAt(last)! > 0xffff ? 2 : 1),
+    };
+    at = haystack.indexOf(needle, at + needle.length);
+  }
+}
+
+export const highlightTextRanges = (
+  text: string,
+  ranges: readonly SessionTextRange[],
+): ReactNode => {
+  if (!Array.isArray(ranges)) return text;
+  const valid = ranges
+    .filter(
+      (range) =>
+        range &&
+        Number.isInteger(range.start) &&
+        Number.isInteger(range.end) &&
+        range.start >= 0 &&
+        range.start < range.end &&
+        range.end <= text.length &&
+        !(range.start > 0 && text.codePointAt(range.start - 1)! > 0xffff) &&
+        !(text.codePointAt(range.end - 1)! > 0xffff),
+    )
+    .map(({ start, end }) => ({ start, end }))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const matches: SessionTextRange[] = [];
+  for (const match of valid) {
+    const previous = matches[matches.length - 1];
+    if (previous && match.start < previous.end) {
+      previous.end = Math.max(previous.end, match.end);
+    } else {
+      matches.push(match);
+    }
+  }
+  if (!matches.length) return text;
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const { start, end } of matches) {
+    parts.push(
+      text.slice(cursor, start),
+      createElement(
+        "mark",
+        {
+          key: start,
+          className:
+            "asm-search-mark rounded-sm bg-warning-soft px-0.5 text-inherit",
+        },
+        text.slice(start, end),
+      ),
+    );
+    cursor = end;
+  }
+  parts.push(text.slice(cursor));
+  return parts;
+};
+
+export const highlightQueryText = (text: string, query: string): ReactNode =>
+  highlightTextRanges(text, [...findTextMatches(text, query)]);
+
+export const countMatches = (text: string, query: string) => {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return 0;
+  const haystack = text.toLowerCase();
+  let count = 0;
+  let at = haystack.indexOf(needle);
+  while (at >= 0) {
+    count += 1;
+    at = haystack.indexOf(needle, at + needle.length);
+  }
+  return count;
 };

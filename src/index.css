@@ -22,10 +22,36 @@
     --destructive: 358 75% 52%;
     --destructive-foreground: 0 0% 100%;
     --border: 220 13% 87.2%;
+    --border-strong: 220 13% 77%;
     --input: 220 13% 86.5%;
     --ring: 228 74% 54%;
     --thinking-accent: 258 62% 56%;
     --radius: 0.625rem;
+    --bg-app: 220 16% 95.8%;
+    --bg-surface: 0 0% 100%;
+    --bg-subtle: rgba(15, 23, 42, 0.045);
+    --bg-selected: rgba(37, 99, 235, 0.09);
+    --fg-1: 224 26% 12%;
+    --fg-2: 220 12% 34%;
+    --fg-3: 220 10% 50%;
+    --action-bg: 221 83% 53%;
+    --action-fg: #ffffff;
+    --action-text: 221 83% 48%;
+    --success-border: 152 60% 38%;
+    --success-text: 152 68% 30%;
+    --danger-text: 358 74% 46%;
+    --warning-border: 38 92% 45%;
+    --warning-soft: rgba(245, 158, 11, 0.12);
+    --warning-text: 32 88% 34%;
+    --diff-add-bg: rgba(16, 185, 129, 0.12);
+    --diff-del-bg: rgba(239, 68, 68, 0.12);
+    --agent-claude: #d97757;
+    --agent-codex: #10a37f;
+    --agent-gemini: #3b82f6;
+    --agent-opencode: #6366f1;
+    --agent-pi: #0ea5e9;
+    --agent-generic: #64748b;
+    --reader-accent: var(--agent-generic);
   }
 
   .dark {
@@ -47,9 +73,35 @@
     --destructive: 358 72% 58%;
     --destructive-foreground: 0 0% 100%;
     --border: 224 13% 17.8%;
+    --border-strong: 224 13% 27%;
     --input: 224 13% 18.2%;
     --ring: 226 86% 67%;
     --thinking-accent: 258 78% 72%;
+    --bg-app: 225 21% 7.6%;
+    --bg-surface: 224 18% 10.8%;
+    --bg-subtle: rgba(255, 255, 255, 0.055);
+    --bg-selected: rgba(96, 165, 250, 0.14);
+    --fg-1: 220 18% 93%;
+    --fg-2: 220 12% 72%;
+    --fg-3: 220 10% 54%;
+    --action-bg: 221 83% 60%;
+    --action-fg: #ffffff;
+    --action-text: 217 91% 68%;
+    --success-border: 152 58% 46%;
+    --success-text: 152 68% 62%;
+    --danger-text: 358 82% 68%;
+    --warning-border: 38 92% 55%;
+    --warning-soft: rgba(245, 158, 11, 0.15);
+    --warning-text: 42 92% 68%;
+    --diff-add-bg: rgba(16, 185, 129, 0.16);
+    --diff-del-bg: rgba(239, 68, 68, 0.16);
+    --agent-claude: #e88c6f;
+    --agent-codex: #34d399;
+    --agent-gemini: #60a5fa;
+    --agent-opencode: #818cf8;
+    --agent-pi: #38bdf8;
+    --agent-generic: #94a3b8;
+    --reader-accent: var(--agent-generic);
   }
 }
 

@@ -30,7 +30,7 @@ use super::{SessionMessage, SessionMeta};
 const INDEX_DIR_NAME: &str = "AgentSessionManager";
 const INDEX_FILE_NAME: &str = "session-index.db";
 /// 索引 schema 与收录规则版本号；升级后自动丢弃旧表重建并清理边车文件。
-const INDEX_VERSION: i64 = 1;
+const INDEX_VERSION: i64 = 2;
 /// `rowid = (source_id << 24) | message_index`，单会话最多收录 16,777,216 条消息。
 const ROW_SHIFT: u32 = 24;
 const MAX_MESSAGES_PER_SOURCE: usize = 1 << ROW_SHIFT;
@@ -176,9 +176,12 @@ pub fn message_rows(messages: &[SessionMessage]) -> Vec<(usize, String)> {
         .iter()
         .enumerate()
         .take(MAX_MESSAGES_PER_SOURCE)
-        .filter(|(_, message)| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter(|(_, message)| {
+            !message.injected && matches!(message.role.as_str(), "user" | "assistant")
+        })
         .filter_map(|(index, message)| {
-            let text = message.content.trim();
+            let raw = super::model::searchable_text(message);
+            let text = raw.trim();
             if text.is_empty() {
                 return None;
             }
@@ -1591,8 +1594,7 @@ mod tests {
         SessionMessage {
             role: role.to_string(),
             content: content.to_string(),
-            ts: None,
-            meta: None,
+            ..SessionMessage::default()
         }
     }
 

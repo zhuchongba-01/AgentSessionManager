@@ -117,6 +117,7 @@ async fn stream_session_messages(
         send(TranscriptChunk::Header {
             total: transcript.messages.len(),
             approx_bytes: transcript.approx_bytes as u64,
+            turns: transcript.turns.clone(),
         })?;
         for (start, end) in chunk_ranges(&transcript.message_bytes) {
             send(TranscriptChunk::Messages {
@@ -136,6 +137,37 @@ async fn stream_session_messages(
     })
     .await
     .map_err(|error| format!("读取会话失败：{error}"))?
+}
+
+#[tauri::command]
+async fn get_session_block_content(
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] sourcePath: String,
+    #[allow(non_snake_case)] contentRef: session_manager::model::ContentRef,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<session_manager::content::BlockContent, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = session_manager::content::validate_source(&providerId, &sourcePath)?;
+        let full = session_manager::content::resolve_content_ref(&source, &contentRef)?;
+        Ok(session_manager::content::paginate(&full, offset, limit))
+    })
+    .await
+    .map_err(|error| format!("读取内容块失败：{error}"))?
+}
+
+#[tauri::command]
+async fn get_session_image(
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] sourcePath: String,
+    image: session_manager::model::ImageRef,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = session_manager::content::validate_source(&providerId, &sourcePath)?;
+        session_manager::content::load_image_data_url(&source, &image)
+    })
+    .await
+    .map_err(|error| format!("读取会话图片失败：{error}"))?
 }
 
 #[tauri::command]
@@ -243,7 +275,13 @@ fn resolve_reveal_target(raw: &str) -> Result<std::path::PathBuf, String> {
     if trimmed.is_empty() {
         return Err("路径不能为空".into());
     }
-    let candidate = Path::new(trimmed);
+    let decoded_storage: PathBuf;
+    let candidate = if trimmed.starts_with("file://") {
+        decoded_storage = session_manager::content::parse_file_url(trimmed)?;
+        decoded_storage.as_path()
+    } else {
+        Path::new(trimmed)
+    };
     if !candidate.is_absolute() {
         return Err(format!("仅支持打开本地绝对路径：{trimmed}"));
     }
@@ -370,6 +408,8 @@ pub fn run() {
             get_session_messages,
             get_message_content,
             stream_session_messages,
+            get_session_block_content,
+            get_session_image,
             search_session_messages,
             delete_session,
             delete_sessions,

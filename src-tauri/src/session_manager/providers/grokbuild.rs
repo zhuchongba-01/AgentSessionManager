@@ -7,12 +7,15 @@ use std::sync::LazyLock;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::session_manager::model::{MessageMeta, SessionBlock, ToolStatus};
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
+use super::blocks::{assign_turn_ids, openai_tool_calls, thinking_block, tool_result_block};
 use super::utils::{
     checked_storage_child, collect_files_where_checked, ensure_readable_size, extract_text,
     is_reparse_or_symlink, is_safe_session_id, order_selected_children, parse_timestamp_to_ms,
-    scan_warning, truncate_summary, validate_parent_graph, FileParseCache, TITLE_MAX_CHARS,
+    scan_warning, truncate_summary, validate_parent_graph, FileParseCache, JsonlSpan, LineSpans,
+    TITLE_MAX_CHARS,
 };
 
 const MAX_CWD_FILE_BYTES: u64 = 4096;
@@ -133,78 +136,198 @@ pub fn transcript_sources(path: &Path) -> Result<Vec<(PathBuf, Option<u64>)>, St
 
 fn read_chat_messages(reader: impl BufRead) -> Result<Vec<SessionMessage>, String> {
     let mut messages = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|error| {
-            format!(
-                "Failed to read Grok Build chat history at line {}: {error}",
-                index + 1
-            )
+    let mut lines = LineSpans::new(reader);
+    let mut line_num = 0usize;
+    loop {
+        line_num += 1;
+        let Some(line) = lines.next_line().map_err(|error| {
+            format!("Failed to read Grok Build chat history at line {line_num}: {error}")
+        })?
+        else {
+            break;
+        };
+        let raw_line = std::str::from_utf8(line.bytes).map_err(|error| {
+            format!("Failed to read Grok Build chat history at line {line_num}: {error}")
         })?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(raw_line) else {
             continue;
         };
-        if let Some(message) = conversation_message(&value) {
+        if let Some(message) = conversation_message(&value, Some(line.span)) {
             messages.push(message);
         }
     }
 
+    assign_turn_ids(&mut messages);
     Ok(messages)
 }
 
-fn conversation_message(value: &Value) -> Option<SessionMessage> {
-    let kind = value.get("type").and_then(Value::as_str)?;
-    let role = match kind {
-        "system" | "user" | "assistant" | "tool" => kind,
-        "tool_result" => "tool",
-        "backend_tool_call" => "assistant",
-        _ => return None, // Never expose encrypted/internal reasoning records.
-    };
-    let mut content = value.get("content").map(extract_text).unwrap_or_default();
-    if kind == "assistant" {
-        if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                let name = call
-                    .get("name")
-                    .or_else(|| call.pointer("/function/name"))
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("tool");
-                let args = match call
-                    .get("arguments")
-                    .or_else(|| call.pointer("/function/arguments"))
-                {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(other) if !other.is_null() => other.to_string(),
-                    _ => String::new(),
-                };
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                if args.is_empty() {
-                    content.push_str(&format!("[Tool: {name}]"));
-                } else {
-                    content.push_str(&format!("[Tool: {name}] {args}"));
-                }
+fn conversation_message(value: &Value, span: Option<JsonlSpan>) -> Option<SessionMessage> {
+    let (kind, role) = match value.get("type").and_then(Value::as_str) {
+        Some(kind @ ("system" | "user" | "assistant" | "tool")) => (kind, kind),
+        Some("tool_result") => ("tool_result", "tool"),
+        Some("backend_tool_call") => ("backend_tool_call", "assistant"),
+        Some("message") | None => {
+            let role = value.get("role").and_then(Value::as_str)?;
+            match role {
+                "system" | "user" | "assistant" | "tool" => (role, role),
+                _ => return None,
             }
         }
-    } else if kind == "backend_tool_call" {
-        // `kind` is a public, structured backend tool descriptor, not reasoning.
-        if let Some(tool) = value.get("kind") {
-            content = format!("[Backend tool] {tool}");
+        // Never expose encrypted/internal reasoning records.
+        Some(_) => return None,
+    };
+
+    let text = value.get("content").map(extract_text).unwrap_or_default();
+    let mut meta = None;
+    let blocks = match role {
+        "tool" => {
+            let call_id = value
+                .get("tool_call_id")
+                .or_else(|| value.get("call_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let status = tool_result_status(value);
+            vec![tool_result_block(call_id, status, &text, || {
+                span.map(|s| s.content_ref("/content"))
+            })]
         }
-    }
-    if content.trim().is_empty() {
+        "assistant" if kind == "backend_tool_call" => {
+            // `kind` is a public, structured backend tool descriptor, not reasoning.
+            let descriptor = match value.get("kind") {
+                Some(tool) => format!("[Backend tool] {tool}"),
+                None => text,
+            };
+            if descriptor.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![SessionBlock::text(descriptor)]
+            }
+        }
+        "assistant" => {
+            let mut blocks = Vec::new();
+            if let Some(reasoning_val) = value.get("reasoning_content") {
+                let reasoning = extract_text(reasoning_val);
+                if !reasoning.trim().is_empty() {
+                    blocks.push(thinking_block(&reasoning, None, None, || {
+                        span.map(|s| s.content_ref("/reasoning_content"))
+                    }));
+                }
+            }
+            if !text.trim().is_empty() {
+                blocks.push(SessionBlock::text(text));
+            }
+            blocks.extend(openai_tool_calls(value.get("tool_calls"), |pointer| {
+                span.map(|s| s.content_ref(format!("/tool_calls{pointer}")))
+            }));
+            meta = assistant_meta(value);
+            blocks
+        }
+        _ if text.trim().is_empty() => Vec::new(),
+        _ => vec![SessionBlock::text(text)],
+    };
+
+    let ts = value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(parse_timestamp_to_ms);
+    let mut message = SessionMessage::from_blocks(role, ts, blocks);
+    message.meta = meta;
+    if message.is_empty() && message.meta.is_none() {
         return None;
     }
-    Some(SessionMessage {
-        role: role.to_string(),
-        content,
-        ts: value
-            .get("timestamp")
-            .or_else(|| value.get("ts"))
-            .and_then(parse_timestamp_to_ms),
-        meta: None,
-    })
+    message.id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    message.injected = role == "system";
+    Some(message)
+}
+
+fn tool_result_status(value: &Value) -> ToolStatus {
+    if value.get("is_error").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("error" | "failed")
+        )
+    {
+        ToolStatus::Error
+    } else if value.get("is_error").and_then(Value::as_bool) == Some(false)
+        || matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("success" | "completed" | "ok")
+        )
+    {
+        ToolStatus::Success
+    } else {
+        ToolStatus::Unknown
+    }
+}
+
+fn assistant_meta(value: &Value) -> Option<MessageMeta> {
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let stop_reason = value
+        .get("stop_reason")
+        .or_else(|| value.get("finish_reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let duration_ms = value
+        .get("duration_ms")
+        .or_else(|| value.get("durationMs"))
+        .and_then(Value::as_u64);
+
+    let mut meta = MessageMeta {
+        model,
+        duration_ms,
+        stop_reason,
+        ..MessageMeta::default()
+    };
+
+    if let Some(usage) = value.get("usage") {
+        let cached_prompt = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .or_else(|| usage.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        meta.cache_read_tokens = usage
+            .get("cache_read_tokens")
+            .or_else(|| usage.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64)
+            .or(cached_prompt);
+        meta.cache_write_tokens = usage
+            .get("cache_write_tokens")
+            .or_else(|| usage.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64);
+        meta.input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|prompt| prompt.saturating_sub(cached_prompt.unwrap_or(0)))
+            });
+        meta.output_tokens = usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .and_then(Value::as_u64);
+        meta.reasoning_tokens = usage
+            .get("reasoning_tokens")
+            .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+            .and_then(Value::as_u64);
+        meta.cost_usd = usage
+            .get("cost_usd")
+            .or_else(|| usage.get("cost"))
+            .and_then(Value::as_f64);
+    }
+
+    meta.into_option()
 }
 
 /// Read-only adaptation of xai-org/grok-build main storage/mod.rs chat_rebuild.
@@ -224,7 +347,7 @@ fn read_update_messages(reader: impl BufRead) -> Result<Vec<SessionMessage>, Str
     }
     impl Reducer {
         fn emit(&mut self, value: Value) {
-            if let Some(message) = conversation_message(&value) {
+            if let Some(message) = conversation_message(&value, None) {
                 self.output.push(message);
             }
         }
@@ -374,15 +497,23 @@ fn read_update_messages(reader: impl BufRead) -> Result<Vec<SessionMessage>, Str
                         .map(Value::to_string)
                         .unwrap_or_default();
                 }
-                state.emit(
-                    serde_json::json!({"type":"tool_result","tool_call_id":id,"content":text}),
-                );
+                let status = update
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                state.emit(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_call_id": id,
+                    "status": status,
+                    "content": text,
+                }));
             }
             _ => {}
         }
     }
     state.flush_user();
     state.flush_agent();
+    assign_turn_ids(&mut state.output);
     Ok(state.output)
 }
 
@@ -1484,12 +1615,22 @@ mod tests {
         let messages = super::read_chat_messages(std::io::Cursor::new(input)).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
-        assert!(messages[0]
-            .content
-            .contains("[Tool: exec_cmd] {\"cmd\":\"cargo check\"}"));
-        assert!(messages[0]
-            .content
-            .contains("[Tool: write_json] {\"ok\":true,\"items\":[1,2]}"));
+        assert!(messages[0].content.contains("[Tool: exec_cmd] cargo check"));
+        assert!(messages[0].content.contains("[Tool: write_json]"));
+        assert_eq!(messages[0].blocks.len(), 2);
+        match &messages[0].blocks[1] {
+            SessionBlock::ToolCall {
+                id,
+                raw_name,
+                input_preview,
+                ..
+            } => {
+                assert_eq!(id, "c2");
+                assert_eq!(raw_name, "write_json");
+                assert!(input_preview.contains("\"ok\":true"));
+            }
+            other => panic!("expected ToolCall block, got {other:?}"),
+        }
 
         // Fallback to updates.jsonl when chat_format_version is None and updates.jsonl exists
         let temp = tempdir().unwrap();
@@ -1499,7 +1640,89 @@ mod tests {
         let rebuilt = load_messages(&summary).unwrap();
         assert_eq!(rebuilt.len(), 4);
         assert_eq!(rebuilt[0].content, "hello");
+        assert_eq!(rebuilt[0].turn_id.as_deref(), Some("t1"));
         assert_eq!(rebuilt[3].content, "done");
+        assert_eq!(rebuilt[3].turn_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn grokbuild_blocks_thinking_tool_pairing_jsonl_refs_and_usage_meta() {
+        use crate::session_manager::model::ContentRef;
+
+        let temp = tempdir().expect("tempdir");
+        let summary_path = temp.path().join("summary.json");
+        std::fs::write(&summary_path, "{}").expect("write summary placeholder");
+        let long_output: String = (1..=20).map(|i| format!("output line {i}\n")).collect();
+        let tool_line = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": long_output,
+        })
+        .to_string();
+        let history = format!(
+            concat!(
+                "{{\"type\":\"system\",\"content\":\"You are Grok.\"}}\n",
+                "{{\"type\":\"user\",\"content\":\"clean journal\"}}\n",
+                "{{\"id\":\"msg_a1\",\"role\":\"assistant\",\"model\":\"grok-4\",\"reasoning_content\":\"Let me inspect journal disk usage first.\",\"content\":\"\",\"tool_calls\":[{{\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"run_terminal_cmd\",\"arguments\":\"{{\\\"command\\\":\\\"journalctl --vacuum-time=3d\\\"}}\"}}}}],\"finish_reason\":\"tool_calls\",\"usage\":{{\"prompt_tokens\":120,\"completion_tokens\":35,\"prompt_tokens_details\":{{\"cached_tokens\":20}},\"completion_tokens_details\":{{\"reasoning_tokens\":10}}}}}}\n",
+                "{}\n",
+                "{{\"type\":\"tool\",\"content\":\"unpaired output\"}}\n",
+                "{{\"type\":\"assistant\",\"content\":\"freed 2.1G\"}}\n"
+            ),
+            tool_line
+        );
+        std::fs::write(temp.path().join("chat_history.jsonl"), history)
+            .expect("write chat history");
+
+        let messages = load_messages(&summary_path).expect("load messages");
+        assert_eq!(messages.len(), 6);
+        assert!(messages[0].injected);
+        assert_eq!(messages[0].turn_id.as_deref(), Some("t0"));
+        assert_eq!(messages[1].turn_id.as_deref(), Some("t1"));
+
+        assert_eq!(messages[2].id.as_deref(), Some("msg_a1"));
+        assert_eq!(
+            messages[2].content,
+            "[Tool: run_terminal_cmd] journalctl --vacuum-time=3d"
+        );
+        assert!(matches!(
+            &messages[2].blocks[0],
+            SessionBlock::Thinking { text, redacted: false, .. }
+                if text == "Let me inspect journal disk usage first."
+        ));
+        assert!(matches!(
+            &messages[2].blocks[1],
+            SessionBlock::ToolCall { id, raw_name, .. }
+                if id == "call_1" && raw_name == "run_terminal_cmd"
+        ));
+        let meta = messages[2].meta.as_ref().expect("assistant usage meta");
+        assert_eq!(meta.model.as_deref(), Some("grok-4"));
+        assert_eq!(meta.input_tokens, Some(100));
+        assert_eq!(meta.cache_read_tokens, Some(20));
+        assert_eq!(meta.output_tokens, Some(35));
+        assert_eq!(meta.reasoning_tokens, Some(10));
+        assert_eq!(meta.stop_reason.as_deref(), Some("tool_calls"));
+
+        match &messages[3].blocks[0] {
+            SessionBlock::ToolResult {
+                call_id,
+                status,
+                truncated,
+                full: Some(ContentRef::Jsonl { pointer, .. }),
+                ..
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(*status, ToolStatus::Unknown);
+                assert!(*truncated);
+                assert_eq!(pointer, "/content");
+            }
+            other => panic!("expected truncated ToolResult with Jsonl ref, got {other:?}"),
+        }
+        assert!(matches!(
+            &messages[4].blocks[0],
+            SessionBlock::ToolResult { call_id, status: ToolStatus::Unknown, .. }
+                if call_id.is_empty()
+        ));
+        assert_eq!(messages[5].turn_id.as_deref(), Some("t1"));
     }
 
     #[test]

@@ -1,10 +1,13 @@
 pub mod cache;
+pub mod content;
 mod deletion;
+pub mod model;
 pub mod providers;
-pub mod reader_meta;
 pub mod search_index;
 pub mod terminal;
 pub mod wire;
+
+pub use model::SessionMessage;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -56,17 +59,6 @@ pub struct SessionMeta {
 pub struct SidebarSection {
     pub id: String,
     pub name: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Box<reader_meta::MessageReaderMeta>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1927,20 +1919,17 @@ mod tests {
             SessionMessage {
                 role: "user".into(),
                 content: "Fix Rust TranscriptCache race".into(),
-                ts: None,
-                meta: None,
+                ..SessionMessage::default()
             },
             SessionMessage {
                 role: "assistant".into(),
                 content: "Updated transcriptcache generation counter".into(),
-                ts: None,
-                meta: None,
+                ..SessionMessage::default()
             },
             SessionMessage {
                 role: "tool".into(),
                 content: "Cargo check passed".into(),
-                ts: None,
-                meta: None,
+                ..SessionMessage::default()
             },
         ];
         assert_eq!(

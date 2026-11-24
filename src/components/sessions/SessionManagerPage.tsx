@@ -15,6 +15,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { AlertTriangle } from "lucide-react";
 import {
+  clearSessionImageCache,
   useSessionMessagesQuery,
   useSessionsQuery,
 } from "@/lib/query/sessions";
@@ -1131,6 +1132,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           throw result.error;
         }
         const nextSessions = result.data ?? [];
+        queryClient.removeQueries({ queryKey: ["sessionBlockContent"] });
+        clearSessionImageCache();
         await queryClient.invalidateQueries({ queryKey: ["sessionMessages"] });
         await queryClient.invalidateQueries({
           queryKey: piKeys.sessionDiscovery,
@@ -1310,6 +1313,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 isCodexSession={isCodexSession}
                 selectedSessionChildCount={selectedSessionChildCount}
                 sessionTitles={sessionTitles}
+                rawMessages={messages}
                 visibleMessages={visibleMessages}
                 isLoadingMessages={isLoadingMessages}
                 isFetchingMessages={isFetchingMessages}

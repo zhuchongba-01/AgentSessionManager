@@ -1,22 +1,31 @@
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde_json::Value;
 
 use crate::session_manager::cache::TranscriptSources;
+use crate::session_manager::content::parse_file_url;
+use crate::session_manager::model::{
+    ContentRef, DiffFile, DiffOp, DiffSummary, EventKind, ImageRef, ImageSource, MessageMeta,
+    SessionBlock, ToolStatus,
+};
 use crate::session_manager::{SessionMessage, SessionMeta};
 use crate::session_paths::{configured_dir, kimi_home};
 
+use super::blocks::{
+    assign_turn_ids, count_diff_lines, estimate_base64_size, large_text_block, line_change_counts,
+    one_line_title, parse_arguments, summary_event_block, thinking_block, tool_call_block,
+    tool_result_block, ToolSource,
+};
 use super::utils::{
     checked_storage_child, ensure_readable_size, extract_text, is_reparse_or_symlink,
     is_safe_session_id, parse_timestamp_to_ms, path_basename, read_head_tail_lines,
-    remove_path_if_exists, scan_warning, truncate_summary, FileParseCache, TITLE_MAX_CHARS,
+    remove_path_if_exists, scan_warning, truncate_summary, FileParseCache, JsonlSpan, LineSpans,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "kimi";
@@ -40,6 +49,7 @@ pub fn session_roots() -> Vec<PathBuf> {
     vec![kimi_home().join("sessions")]
 }
 
+#[allow(dead_code)]
 pub fn transcript_sources(path: &Path) -> Result<TranscriptSources, String> {
     Ok(vec![(path.to_path_buf(), None)])
 }
@@ -419,25 +429,6 @@ fn extract_kimi_visible_text(content: &Value) -> String {
     }
 }
 
-fn extract_kimi_think_text(content: &Value) -> String {
-    let Value::Array(items) = content else {
-        return String::new();
-    };
-    items
-        .iter()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("think") => part.get("think").and_then(Value::as_str),
-            Some("thinking" | "reasoning") => part
-                .get("thinking")
-                .or_else(|| part.get("text"))
-                .and_then(Value::as_str),
-            _ => None,
-        })
-        .filter(|s| !s.trim().is_empty())
-        .collect::<Vec<&str>>()
-        .join("\n")
-}
-
 struct BranchSegment {
     start: usize,
     end: usize,
@@ -445,11 +436,13 @@ struct BranchSegment {
 }
 
 /// Resolve `agent.switched` branch switches before projecting messages so undone/forked turns stay hidden.
-fn active_record_indices(records: &[Value]) -> Result<Vec<usize>, String> {
+fn active_record_indices(records: &[(JsonlSpan, Value)]) -> Result<Vec<usize>, String> {
     let switches: Vec<_> = records
         .iter()
         .enumerate()
-        .filter(|(_, record)| record.get("type").and_then(Value::as_str) == Some("agent.switched"))
+        .filter(|(_, (_, record))| {
+            record.get("type").and_then(Value::as_str) == Some("agent.switched")
+        })
         .collect();
     if switches.is_empty() {
         return Ok((0..records.len()).collect());
@@ -460,7 +453,7 @@ fn active_record_indices(records: &[Value]) -> Result<Vec<usize>, String> {
     let mut start = 0usize;
     let mut base: Option<(String, usize)> = None;
 
-    for (index, record) in switches {
+    for (index, (_, record)) in switches {
         segments.insert(
             branch,
             BranchSegment {
@@ -521,41 +514,207 @@ fn active_record_indices(records: &[Value]) -> Result<Vec<usize>, String> {
     Ok(active)
 }
 
-fn format_kimi_tool_call(call: &Value) -> Option<(Option<String>, String, String)> {
-    let name = call
-        .get("name")
-        .or_else(|| call.pointer("/function/name"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let id = call
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let args = match call
-        .get("arguments")
-        .or_else(|| call.pointer("/function/arguments"))
-    {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(v) if !v.is_null() => v.to_string(),
-        _ => String::new(),
-    };
-    let formatted = if args.is_empty() {
-        format!("[Tool: {name}]")
-    } else {
-        format!("[Tool: {name}]\n{args}")
-    };
-    Some((id, name, formatted))
+#[derive(Default)]
+struct RequestIndex {
+    step_to_turn_step: HashMap<String, String>,
+    turn_step_to_model: HashMap<String, String>,
+    last_loop_model: Option<String>,
+    msg_step_and_latency: HashMap<String, (Option<String>, Option<u64>)>,
 }
 
-fn emit_raw_chat_message(
+impl RequestIndex {
+    fn observe(&mut self, record: &Value) {
+        match record.get("type").and_then(Value::as_str) {
+            Some("context.append_loop_event") => {
+                let event = &record["event"];
+                match event.get("type").and_then(Value::as_str) {
+                    Some("step.begin") => {
+                        if let (Some(uuid), Some(turn_id), Some(step)) = (
+                            event.get("uuid").and_then(Value::as_str),
+                            event.get("turnId").and_then(Value::as_str),
+                            event.get("step").and_then(Value::as_u64),
+                        ) {
+                            self.step_to_turn_step
+                                .insert(uuid.to_string(), format!("{turn_id}.{step}"));
+                        }
+                    }
+                    Some("step.end") => {
+                        if let Some(msg_id) = event.get("messageId").and_then(Value::as_str) {
+                            let step_uuid = event
+                                .get("uuid")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            let first = event
+                                .get("llmFirstTokenLatencyMs")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let stream = event
+                                .get("llmStreamDurationMs")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let total = first.saturating_add(stream);
+                            self.msg_step_and_latency.insert(
+                                msg_id.to_string(),
+                                (step_uuid, (total > 0).then_some(total)),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("llm.request") if record.get("kind").and_then(Value::as_str) == Some("loop") => {
+                if let Some(model) = record
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(turn_step) = record.get("turnStep").and_then(Value::as_str) {
+                        self.turn_step_to_model
+                            .insert(turn_step.to_string(), model.to_string());
+                    }
+                    if record
+                        .get("agentId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id == "main")
+                    {
+                        self.last_loop_model = Some(model.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn model(&self, meta: &Value) -> Option<String> {
+        let provider = meta.pointer("/model/provider").and_then(Value::as_str);
+        if provider != Some("agent-loop") {
+            if let Some(m) = meta
+                .pointer("/model/model")
+                .or_else(|| meta.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "agent-loop")
+            {
+                return Some(m.to_string());
+            }
+        }
+        if let Some(msg_id) = meta.get("messageId").and_then(Value::as_str) {
+            if let Some((Some(step_uuid), _)) = self.msg_step_and_latency.get(msg_id) {
+                if let Some(turn_step) = self.step_to_turn_step.get(step_uuid) {
+                    if let Some(model) = self.turn_step_to_model.get(turn_step) {
+                        return Some(model.clone());
+                    }
+                }
+            }
+        }
+        self.last_loop_model.clone()
+    }
+
+    fn duration_ms(&self, meta: &Value) -> Option<u64> {
+        let msg_id = meta.get("messageId").and_then(Value::as_str)?;
+        self.msg_step_and_latency
+            .get(msg_id)
+            .and_then(|(_, latency)| *latency)
+    }
+}
+
+fn image_media_type_from_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn kimi_image_ref(
+    part: &Value,
+    part_ptr: &str,
+    ref_fn: &dyn Fn(String) -> Option<ContentRef>,
+) -> Option<ImageRef> {
+    let (raw_url, url_ptr) = if let Some(u) = part
+        .pointer("/image_url/url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        (u.trim(), format!("{part_ptr}/image_url/url"))
+    } else if let Some(u) = part
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        (u.trim(), format!("{part_ptr}/url"))
+    } else {
+        return None;
+    };
+
+    if let Some(rest) = raw_url.strip_prefix("data:") {
+        let (header, data) = rest.split_once(',')?;
+        let mime = header
+            .split(';')
+            .next()
+            .filter(|m| m.starts_with("image/"))
+            .unwrap_or("image/png");
+        let content = ref_fn(url_ptr)?;
+        return Some(ImageRef {
+            source: ImageSource::Inline { content },
+            media_type: mime.to_string(),
+            size: estimate_base64_size(data.len()),
+            alt: None,
+        });
+    }
+
+    let fs_path = if raw_url.starts_with("file://") {
+        parse_file_url(raw_url).ok()?
+    } else {
+        let p = PathBuf::from(raw_url);
+        p.is_absolute().then_some(p)?
+    };
+    let media_type = image_media_type_from_path(&fs_path)?;
+    let size = fs::metadata(&fs_path)
+        .ok()
+        .map(|m| u32::try_from(m.len()).unwrap_or(u32::MAX))
+        .unwrap_or(0);
+    Some(ImageRef {
+        source: ImageSource::LocalFile {
+            path: raw_url.to_string(),
+        },
+        media_type: media_type.to_string(),
+        size,
+        alt: None,
+    })
+}
+
+fn build_kimi_meta(meta: Option<&Value>, requests: &RequestIndex) -> Option<MessageMeta> {
+    let meta = meta?;
+    let usage = meta.get("usage")?;
+    let u64_of = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| usage.get(*k).and_then(Value::as_u64))
+    };
+    MessageMeta {
+        model: requests.model(meta),
+        input_tokens: u64_of(&["inputOther", "input_other", "input_tokens"]),
+        output_tokens: u64_of(&["output", "output_tokens"]),
+        cache_read_tokens: u64_of(&["inputCacheRead", "input_cache_read"]),
+        cache_write_tokens: u64_of(&["inputCacheCreation", "input_cache_creation"]),
+        duration_ms: requests.duration_ms(meta),
+        ..MessageMeta::default()
+    }
+    .into_option()
+}
+
+fn emit_chat_message_blocks(
     raw: &Value,
+    pointer: &str,
     meta: Option<&Value>,
     ts: Option<i64>,
-    call_names: &mut HashMap<String, String>,
+    requests: &RequestIndex,
+    ref_fn: &dyn Fn(String) -> Option<ContentRef>,
     messages: &mut Vec<SessionMessage>,
 ) {
     let Some(role @ ("user" | "assistant" | "tool" | "system")) =
@@ -568,148 +727,480 @@ fn emit_raw_chat_message(
         .and_then(|m| m.pointer("/origin/kind"))
         .or_else(|| raw.pointer("/origin/kind"))
         .and_then(Value::as_str);
-
-    if matches!(origin_kind, Some("injection" | "system_trigger" | "retry")) {
-        return;
-    }
+    let injected = role == "system"
+        || matches!(
+            origin_kind,
+            Some("injection" | "system_trigger" | "retry" | "compaction_summary")
+        );
 
     if origin_kind == Some("compaction_summary") {
         let text = raw
             .get("content")
             .map(extract_kimi_visible_text)
             .unwrap_or_default();
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            let content = if trimmed.starts_with("[Compacted Summary]") {
-                trimmed.to_string()
+        if !text.trim().is_empty() {
+            let content_ptr = if pointer.is_empty() {
+                "/content".to_string()
             } else {
-                format!("[Compacted Summary]\n{trimmed}")
+                format!("{pointer}/content")
             };
-            messages.push(SessionMessage {
-                role: "system".to_string(),
-                content,
-                ts,
-                meta: None,
-            });
+            let block = summary_event_block(EventKind::Compaction, &text, || ref_fn(content_ptr));
+            let mut msg = SessionMessage::from_blocks("system", ts, vec![block]);
+            msg.injected = true;
+            messages.push(msg);
         }
         return;
     }
+
+    let mut message_blocks = Vec::new();
+    let base_prefix = if pointer.is_empty() {
+        String::new()
+    } else {
+        pointer.to_string()
+    };
 
     if role == "tool" {
         let call_id = raw
             .get("toolCallId")
             .or_else(|| raw.get("tool_call_id"))
             .and_then(Value::as_str)
-            .unwrap_or("");
-        let tool_name = call_names.get(call_id).map(String::as_str).unwrap_or("");
+            .unwrap_or_default();
+        let status = if raw.get("isError").and_then(Value::as_bool) == Some(true)
+            || raw.get("is_error").and_then(Value::as_bool) == Some(true)
+        {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Success
+        };
         let text = raw.get("content").map(extract_text).unwrap_or_default();
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            let content = if tool_name.is_empty() {
-                trimmed.to_string()
-            } else {
-                format!("[Result: {tool_name}]\n{trimmed}")
-            };
-            messages.push(SessionMessage {
-                role: "tool".to_string(),
-                content,
-                ts,
-                meta: None,
-            });
+        let content_ptr = format!("{base_prefix}/content");
+        message_blocks.push(tool_result_block(call_id, status, &text, || {
+            ref_fn(content_ptr)
+        }));
+    } else {
+        match raw.get("content") {
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                if injected {
+                    let ptr = format!("{base_prefix}/content");
+                    message_blocks.push(large_text_block(text.clone(), || ref_fn(ptr)));
+                } else {
+                    message_blocks.push(SessionBlock::text(text));
+                }
+            }
+            Some(Value::Array(parts)) => {
+                for (i, part) in parts.iter().enumerate() {
+                    let part_ptr = format!("{base_prefix}/content/{i}");
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    if injected {
+                                        let ptr = format!("{part_ptr}/text");
+                                        message_blocks
+                                            .push(large_text_block(text.to_string(), || {
+                                                ref_fn(ptr)
+                                            }));
+                                    } else {
+                                        message_blocks.push(SessionBlock::text(text));
+                                    }
+                                }
+                            }
+                        }
+                        Some("think" | "thinking" | "reasoning") => {
+                            let field = if part.get("think").is_some() {
+                                "think"
+                            } else if part.get("thinking").is_some() {
+                                "thinking"
+                            } else {
+                                "text"
+                            };
+                            message_blocks.push(thinking_block(
+                                part.get(field).and_then(Value::as_str).unwrap_or_default(),
+                                None,
+                                None,
+                                || ref_fn(format!("{part_ptr}/{field}")),
+                            ));
+                        }
+                        Some("image_url") => {
+                            if let Some(image) = kimi_image_ref(part, &part_ptr, ref_fn) {
+                                message_blocks.push(SessionBlock::Image { image });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
+
+        let (calls_key, calls_opt) = if let Some(c) = raw.get("toolCalls") {
+            ("toolCalls", c.as_array())
+        } else if let Some(c) = raw.get("tool_calls") {
+            ("tool_calls", c.as_array())
+        } else {
+            ("toolCalls", None)
+        };
+        for (i, call) in calls_opt.into_iter().flatten().enumerate() {
+            let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = call
+                .pointer("/function/name")
+                .or_else(|| call.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let (args_ptr, raw_args) = if let Some(a) = call.pointer("/function/arguments") {
+                (
+                    format!("{base_prefix}/{calls_key}/{i}/function/arguments"),
+                    a,
+                )
+            } else if let Some(a) = call.get("arguments") {
+                (format!("{base_prefix}/{calls_key}/{i}/arguments"), a)
+            } else {
+                (
+                    format!("{base_prefix}/{calls_key}/{i}/arguments"),
+                    &Value::Null,
+                )
+            };
+            let input = parse_arguments(raw_args);
+            message_blocks.push(tool_call_block(
+                ToolSource::Generic,
+                id,
+                name,
+                &input,
+                || ref_fn(args_ptr),
+            ));
+        }
+    }
+
+    if message_blocks.is_empty() {
         return;
     }
 
-    if let Some(content_val) = raw.get("content") {
-        let think = extract_kimi_think_text(content_val);
-        if !think.trim().is_empty() {
-            messages.push(SessionMessage {
-                role: "thinking".to_string(),
-                content: think,
-                ts,
-                meta: None,
-            });
-        }
+    let mut message = SessionMessage::from_blocks(role, ts, message_blocks);
+    message.id = meta
+        .and_then(|m| m.get("messageId"))
+        .or_else(|| raw.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    message.injected = injected;
+    if role == "assistant" {
+        message.meta = build_kimi_meta(meta, requests);
+    }
+    messages.push(message);
+}
 
-        let visible = extract_kimi_visible_text(content_val);
-        if !visible.trim().is_empty() {
-            messages.push(SessionMessage {
-                role: role.to_string(),
-                content: visible,
-                ts,
-                meta: None,
-            });
+#[derive(Default)]
+struct WireStepBuilder {
+    ts: Option<i64>,
+    id: Option<String>,
+    think_chunks: Vec<String>,
+    single_think_ptr: Option<(JsonlSpan, String)>,
+    text_chunks: Vec<String>,
+    blocks: Vec<SessionBlock>,
+    call_slots: Vec<(String, usize)>,
+    pending_meta: Option<MessageMeta>,
+}
+
+impl WireStepBuilder {
+    fn ensure_ts(&mut self, ts: Option<i64>) {
+        if self.ts.is_none() {
+            self.ts = ts;
         }
     }
 
-    if let Some(calls) = raw
-        .get("toolCalls")
-        .or_else(|| raw.get("tool_calls"))
-        .and_then(Value::as_array)
-    {
-        for call in calls {
-            if let Some((cid, name, formatted)) = format_kimi_tool_call(call) {
-                if let Some(id) = cid {
-                    call_names.insert(id, name);
+    fn flush_think(&mut self, can_emit_refs: bool) {
+        if self.think_chunks.is_empty() {
+            return;
+        }
+        let joined = self.think_chunks.concat();
+        self.think_chunks.clear();
+        let single_ptr = self.single_think_ptr.take();
+        if !joined.trim().is_empty() {
+            self.blocks.push(thinking_block(&joined, None, None, || {
+                if can_emit_refs {
+                    single_ptr.map(|(span, ptr)| span.content_ref(ptr))
+                } else {
+                    None
                 }
-                messages.push(SessionMessage {
-                    role: "tool".to_string(),
-                    content: formatted,
-                    ts,
-                    meta: None,
+            }));
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if self.text_chunks.is_empty() {
+            return;
+        }
+        let joined = self.text_chunks.concat();
+        self.text_chunks.clear();
+        if !joined.trim().is_empty() {
+            self.blocks.push(SessionBlock::text(joined));
+        }
+    }
+
+    fn push_think(&mut self, text: &str, span: JsonlSpan, ptr: String, ts: Option<i64>) {
+        self.ensure_ts(ts);
+        self.flush_text();
+        if self.think_chunks.is_empty() {
+            self.single_think_ptr = Some((span, ptr));
+        } else {
+            self.single_think_ptr = None;
+        }
+        self.think_chunks.push(text.to_string());
+    }
+
+    fn push_text(&mut self, text: &str, can_emit_refs: bool, ts: Option<i64>) {
+        self.ensure_ts(ts);
+        self.flush_think(can_emit_refs);
+        self.text_chunks.push(text.to_string());
+    }
+
+    fn push_block(&mut self, block: SessionBlock, can_emit_refs: bool, ts: Option<i64>) {
+        self.ensure_ts(ts);
+        self.flush_think(can_emit_refs);
+        self.flush_text();
+        if let SessionBlock::ToolCall { ref id, .. } = block {
+            if !id.is_empty() {
+                self.call_slots.push((id.clone(), self.blocks.len()));
+            }
+        }
+        self.blocks.push(block);
+    }
+
+    fn finish_into(
+        &mut self,
+        can_emit_refs: bool,
+        messages: &mut Vec<SessionMessage>,
+        call_locations: &mut HashMap<String, (usize, usize)>,
+    ) {
+        self.flush_think(can_emit_refs);
+        self.flush_text();
+        let blocks = std::mem::take(&mut self.blocks);
+        let meta = self.pending_meta.take();
+        let ts = self.ts.take();
+        let id = self.id.take();
+        let slots = std::mem::take(&mut self.call_slots);
+
+        if blocks.is_empty() {
+            if let Some(m) = meta {
+                if let Some(last_assistant) = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|msg| msg.role == "assistant")
+                {
+                    if last_assistant.meta.is_none() {
+                        last_assistant.meta = Some(m);
+                    }
+                    if last_assistant.id.is_none() {
+                        last_assistant.id = id;
+                    }
+                }
+            }
+            return;
+        }
+
+        let msg_idx = messages.len();
+        for (cid, bidx) in slots {
+            call_locations.insert(cid, (msg_idx, bidx));
+        }
+        let mut msg = SessionMessage::from_blocks("assistant", ts, blocks);
+        msg.id = id;
+        msg.meta = meta;
+        messages.push(msg);
+    }
+}
+
+fn parse_status_update_meta(payload: &Value) -> Option<MessageMeta> {
+    let usage = payload
+        .get("token_usage")
+        .or_else(|| payload.get("tokenUsage"))
+        .or_else(|| payload.get("usage"))?;
+    let u64_of = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| usage.get(*k).and_then(Value::as_u64))
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    MessageMeta {
+        model,
+        input_tokens: u64_of(&["input_other", "inputOther", "input_tokens"]),
+        output_tokens: u64_of(&["output", "output_tokens"]),
+        cache_read_tokens: u64_of(&["input_cache_read", "inputCacheRead"]),
+        cache_write_tokens: u64_of(&["input_cache_creation", "inputCacheCreation"]),
+        ..MessageMeta::default()
+    }
+    .into_option()
+}
+
+fn enrich_tool_call_from_return_display(return_value: &Value, call_block: &mut SessionBlock) {
+    let SessionBlock::ToolCall {
+        diff: diff_slot,
+        detail: detail_slot,
+        title,
+        ..
+    } = call_block
+    else {
+        return;
+    };
+
+    let mut diff_files: Vec<DiffFile> = Vec::new();
+    let mut total_added = 0u32;
+    let mut total_removed = 0u32;
+    let mut brief_text: Option<String> = return_value
+        .get("brief")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    for item in return_value
+        .get("display")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("diff") => {
+                let path = item
+                    .get("path")
+                    .or_else(|| item.get("file_path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(title.as_str())
+                    .to_string();
+                let (added, removed, op) = if let (Some(old_t), Some(new_t)) = (
+                    item.get("old_text").and_then(Value::as_str),
+                    item.get("new_text").and_then(Value::as_str),
+                ) {
+                    let (a, r) = line_change_counts(old_t, new_t);
+                    let op = if old_t.is_empty() && !new_t.is_empty() {
+                        DiffOp::Add
+                    } else if !old_t.is_empty() && new_t.is_empty() {
+                        DiffOp::Delete
+                    } else {
+                        DiffOp::Update
+                    };
+                    (a, r, op)
+                } else if let Some(raw_diff) = item.get("diff").and_then(Value::as_str) {
+                    let (a, r) = count_diff_lines(raw_diff);
+                    (a, r, DiffOp::Update)
+                } else {
+                    continue;
+                };
+                total_added = total_added.saturating_add(added);
+                total_removed = total_removed.saturating_add(removed);
+                diff_files.push(DiffFile {
+                    path,
+                    op,
+                    added,
+                    removed,
                 });
+            }
+            Some("brief") if brief_text.is_none() => {
+                brief_text = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+
+    if !diff_files.is_empty() {
+        *diff_slot = Some(DiffSummary {
+            files: diff_files,
+            added: total_added,
+            removed: total_removed,
+            full: None,
+        });
+    }
+    if detail_slot.is_none() {
+        if let Some(brief) = brief_text {
+            let formatted = one_line_title(&brief);
+            if !formatted.is_empty() && formatted != *title {
+                *detail_slot = Some(formatted);
             }
         }
     }
 }
 
+fn resolve_transcript_for_load(path: &Path) -> (PathBuf, bool) {
+    if path.is_file() {
+        return (path.to_path_buf(), true);
+    }
+    if path.file_name() == Some(OsStr::new("wire.jsonl")) {
+        let mut candidates = vec![path.with_file_name("context.jsonl")];
+        if let Some(session_dir) = path.ancestors().nth(3) {
+            if path.ends_with(Path::new("agents").join("main").join("wire.jsonl")) {
+                candidates.push(session_dir.join("context.jsonl"));
+            }
+        }
+        for candidate in candidates {
+            if fs::symlink_metadata(&candidate)
+                .is_ok_and(|m| !is_reparse_or_symlink(&m) && m.file_type().is_file())
+            {
+                return (candidate, false);
+            }
+        }
+    }
+    (path.to_path_buf(), true)
+}
+
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
-    ensure_readable_size(path)?;
-    let file = File::open(path).map_err(|e| format!("Failed to open Kimi session file: {e}"))?;
-    let mut reader = BufReader::new(file);
+    let (target_path, can_emit_refs) = resolve_transcript_for_load(path);
+    ensure_readable_size(&target_path)?;
+    let file =
+        File::open(&target_path).map_err(|e| format!("Failed to open Kimi session file: {e}"))?;
+    let mut lines = LineSpans::new(BufReader::new(file));
 
     // Preserve physical 0-based line indices (including blank/malformed lines) for `agent.switched` `base.line`.
-    let mut records = Vec::new();
-    let mut line_buf = Vec::new();
-    loop {
-        line_buf.clear();
-        let n = reader
-            .read_until(b'\n', &mut line_buf)
-            .map_err(|e| format!("Failed to read Kimi transcript: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        // Ignore trailing empty EOF newline, keep actual lines
-        let slice = line_buf
-            .strip_suffix(b"\n")
-            .unwrap_or(&line_buf)
-            .strip_suffix(b"\r")
-            .unwrap_or_else(|| line_buf.strip_suffix(b"\n").unwrap_or(&line_buf));
-        let val = serde_json::from_slice::<Value>(slice).unwrap_or(Value::Null);
-        records.push(val);
+    let mut records: Vec<(JsonlSpan, Value)> = Vec::new();
+    while let Some(line) = lines
+        .next_line()
+        .map_err(|e| format!("Failed to read Kimi transcript: {e}"))?
+    {
+        records.push((
+            line.span,
+            serde_json::from_slice::<Value>(line.bytes).unwrap_or(Value::Null),
+        ));
     }
 
     let active = active_record_indices(&records)?;
+    let mut requests = RequestIndex::default();
+    for &idx in &active {
+        requests.observe(&records[idx].1);
+    }
+
     let has_human = active.iter().any(|&idx| {
         matches!(
-            records[idx].get("type").and_then(Value::as_str),
+            records[idx].1.get("type").and_then(Value::as_str),
             Some("agent.message.appended" | "human.agent.message.appended")
         )
     });
     let has_context_append = active.iter().any(|&idx| {
-        records[idx].get("type").and_then(Value::as_str) == Some("context.append_message")
+        records[idx].1.get("type").and_then(Value::as_str) == Some("context.append_message")
     });
 
-    let mut messages = Vec::new();
-    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut messages: Vec<SessionMessage> = Vec::new();
+    let mut step_builder = WireStepBuilder::default();
+    let mut wire_call_locations: HashMap<String, (usize, usize)> = HashMap::new();
 
     for idx in active {
-        let record = &records[idx];
+        let (span, record) = &records[idx];
         let ts = record
             .get("time")
             .or_else(|| record.get("timestamp"))
             .and_then(parse_timestamp_to_ms);
         let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
+        let ref_fn = |pointer: String| -> Option<ContentRef> {
+            can_emit_refs.then(|| span.content_ref(pointer))
+        };
 
         if has_human
             && matches!(
@@ -718,11 +1209,13 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             )
         {
             if let Some(raw) = record.pointer("/message/message") {
-                emit_raw_chat_message(
+                emit_chat_message_blocks(
                     raw,
+                    "/message/message",
                     record.pointer("/message/meta"),
                     ts,
-                    &mut call_names,
+                    &requests,
+                    &ref_fn,
                     &mut messages,
                 );
             }
@@ -731,107 +1224,237 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
 
         if !has_human && kind == "context.append_message" {
             if let Some(raw) = record.get("message") {
-                emit_raw_chat_message(raw, record.get("meta"), ts, &mut call_names, &mut messages);
+                emit_chat_message_blocks(
+                    raw,
+                    "/message",
+                    record.get("meta"),
+                    ts,
+                    &requests,
+                    &ref_fn,
+                    &mut messages,
+                );
             }
             continue;
         }
 
-        // Fallback for Python `kimi-cli` context.jsonl (`role` at top-level) or wire.jsonl (`message.type`)
-        if !has_human && !has_context_append {
-            if record.get("role").is_some() {
-                emit_raw_chat_message(record, None, ts, &mut call_names, &mut messages);
-            } else if let Some(msg_type) = record.pointer("/message/type").and_then(Value::as_str) {
-                let payload = &record["message"]["payload"];
-                match msg_type {
-                    "TurnBegin" => {
-                        let text = payload
-                            .get("user_input")
-                            .map(extract_kimi_visible_text)
-                            .unwrap_or_default();
-                        if !text.trim().is_empty() {
-                            messages.push(SessionMessage {
-                                role: "user".to_string(),
-                                content: text,
-                                ts,
-                                meta: None,
-                            });
-                        }
+        if has_human || has_context_append {
+            continue;
+        }
+
+        // Python `kimi-cli` context.jsonl (`role` at top-level) or wire.jsonl (`message.type` / top-level wire events)
+        if record.get("role").is_some() {
+            step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+            emit_chat_message_blocks(record, "", None, ts, &requests, &ref_fn, &mut messages);
+            continue;
+        }
+
+        let (msg_type, payload, payload_ptr) =
+            if let Some(mt) = record.pointer("/message/type").and_then(Value::as_str) {
+                if record.pointer("/message/payload").is_some() {
+                    (mt, &record["message"]["payload"], "/message/payload")
+                } else {
+                    (mt, &record["message"], "/message")
+                }
+            } else if !kind.is_empty() && kind != "metadata" {
+                if record.get("payload").is_some() {
+                    (kind, &record["payload"], "/payload")
+                } else {
+                    (kind, record, "")
+                }
+            } else {
+                continue;
+            };
+
+        match msg_type {
+            "TurnBegin" => {
+                step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+                let mut user_blocks = Vec::new();
+                match payload.get("user_input") {
+                    Some(Value::String(s)) if !s.trim().is_empty() => {
+                        user_blocks.push(SessionBlock::text(s));
                     }
-                    "ContentPart" => match payload.get("type").and_then(Value::as_str) {
-                        Some("think") => {
-                            if let Some(t) = payload
-                                .get("think")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.trim().is_empty())
-                            {
-                                messages.push(SessionMessage {
-                                    role: "thinking".to_string(),
-                                    content: t.to_string(),
-                                    ts,
-                                    meta: None,
-                                });
+                    Some(Value::Array(parts)) => {
+                        for (i, part) in parts.iter().enumerate() {
+                            let part_ptr = format!("{payload_ptr}/user_input/{i}");
+                            match part.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                        if !t.trim().is_empty() {
+                                            user_blocks.push(SessionBlock::text(t));
+                                        }
+                                    }
+                                }
+                                Some("image_url") => {
+                                    if let Some(image) = kimi_image_ref(part, &part_ptr, &ref_fn) {
+                                        user_blocks.push(SessionBlock::Image { image });
+                                    }
+                                }
+                                _ => {}
                             }
-                        }
-                        Some("text") => {
-                            if let Some(t) = payload
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.trim().is_empty())
-                            {
-                                messages.push(SessionMessage {
-                                    role: "assistant".to_string(),
-                                    content: t.to_string(),
-                                    ts,
-                                    meta: None,
-                                });
-                            }
-                        }
-                        _ => {}
-                    },
-                    "ToolCall" => {
-                        if let Some((cid, name, formatted)) = format_kimi_tool_call(payload) {
-                            if let Some(id) = cid {
-                                call_names.insert(id, name);
-                            }
-                            messages.push(SessionMessage {
-                                role: "tool".to_string(),
-                                content: formatted,
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                    "ToolResult" => {
-                        let cid = payload
-                            .get("tool_call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let name = call_names.get(cid).map(String::as_str).unwrap_or("");
-                        let out = payload
-                            .pointer("/return_value/output")
-                            .or_else(|| payload.pointer("/return_value/message"))
-                            .map(extract_text)
-                            .unwrap_or_default();
-                        if !out.trim().is_empty() {
-                            let content = if name.is_empty() {
-                                out.trim().to_string()
-                            } else {
-                                format!("[Result: {name}]\n{}", out.trim())
-                            };
-                            messages.push(SessionMessage {
-                                role: "tool".to_string(),
-                                content,
-                                ts,
-                                meta: None,
-                            });
                         }
                     }
                     _ => {}
                 }
+                if !user_blocks.is_empty() {
+                    messages.push(SessionMessage::from_blocks("user", ts, user_blocks));
+                }
             }
+            "StepBegin" | "TurnEnd" => {
+                step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+            }
+            "StepInterrupted" => {
+                step_builder.push_block(
+                    SessionBlock::event(EventKind::Aborted, None, None),
+                    can_emit_refs,
+                    ts,
+                );
+                step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+            }
+            "ThinkPart" => {
+                if let Some(t) = payload.get("think").and_then(Value::as_str) {
+                    step_builder.push_think(t, *span, format!("{payload_ptr}/think"), ts);
+                }
+            }
+            "TextPart" => {
+                if let Some(t) = payload.get("text").and_then(Value::as_str) {
+                    step_builder.push_text(t, can_emit_refs, ts);
+                }
+            }
+            "ImageURLPart" => {
+                if let Some(image) = kimi_image_ref(payload, payload_ptr, &ref_fn) {
+                    step_builder.push_block(SessionBlock::Image { image }, can_emit_refs, ts);
+                }
+            }
+            "ContentPart" => match payload.get("type").and_then(Value::as_str) {
+                Some("think") => {
+                    if let Some(t) = payload.get("think").and_then(Value::as_str) {
+                        step_builder.push_think(t, *span, format!("{payload_ptr}/think"), ts);
+                    }
+                }
+                Some("text") => {
+                    if let Some(t) = payload.get("text").and_then(Value::as_str) {
+                        step_builder.push_text(t, can_emit_refs, ts);
+                    }
+                }
+                Some("image_url") => {
+                    if let Some(image) = kimi_image_ref(payload, payload_ptr, &ref_fn) {
+                        step_builder.push_block(SessionBlock::Image { image }, can_emit_refs, ts);
+                    }
+                }
+                _ => {}
+            },
+            "ToolCall" => {
+                let id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = payload
+                    .pointer("/function/name")
+                    .or_else(|| payload.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    let (args_ptr, raw_args) =
+                        if let Some(a) = payload.pointer("/function/arguments") {
+                            (format!("{payload_ptr}/function/arguments"), a)
+                        } else if let Some(a) = payload.get("arguments") {
+                            (format!("{payload_ptr}/arguments"), a)
+                        } else {
+                            (format!("{payload_ptr}/arguments"), &Value::Null)
+                        };
+                    let input = parse_arguments(raw_args);
+                    let block =
+                        tool_call_block(ToolSource::Generic, id, name, &input, || ref_fn(args_ptr));
+                    step_builder.push_block(block, can_emit_refs, ts);
+                }
+            }
+            "StatusUpdate" => {
+                if let Some(msg_id) = payload
+                    .get("message_id")
+                    .or_else(|| payload.get("messageId"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    step_builder.id = Some(msg_id.to_string());
+                }
+                if let Some(meta) = parse_status_update_meta(payload) {
+                    step_builder.pending_meta = Some(meta);
+                }
+            }
+            "ToolResult" => {
+                step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+                let call_id = payload
+                    .get("tool_call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let return_val = &payload["return_value"];
+                if let Some(&(msg_idx, blk_idx)) = wire_call_locations.get(call_id) {
+                    if let Some(call_block) = messages
+                        .get_mut(msg_idx)
+                        .and_then(|m| m.blocks.get_mut(blk_idx))
+                    {
+                        enrich_tool_call_from_return_display(return_val, call_block);
+                    }
+                }
+                let is_error = return_val.get("is_error").and_then(Value::as_bool) == Some(true);
+                let (out_text, out_ptr) = if let Some(out) =
+                    return_val.get("output").filter(|v| !v.is_null())
+                {
+                    let t = extract_text(out);
+                    if !t.is_empty() {
+                        (t, format!("{payload_ptr}/return_value/output"))
+                    } else if let Some(msg) = return_val.get("message").and_then(Value::as_str) {
+                        (
+                            msg.to_string(),
+                            format!("{payload_ptr}/return_value/message"),
+                        )
+                    } else {
+                        (String::new(), format!("{payload_ptr}/return_value/output"))
+                    }
+                } else if let Some(msg) = return_val.get("message").and_then(Value::as_str) {
+                    (
+                        msg.to_string(),
+                        format!("{payload_ptr}/return_value/message"),
+                    )
+                } else {
+                    (String::new(), format!("{payload_ptr}/return_value/output"))
+                };
+                let block = tool_result_block(
+                    call_id,
+                    if is_error {
+                        ToolStatus::Error
+                    } else {
+                        ToolStatus::Success
+                    },
+                    &out_text,
+                    || ref_fn(out_ptr),
+                );
+                messages.push(SessionMessage::from_blocks("tool", ts, vec![block]));
+            }
+            "CompactionBegin" => {
+                step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+                let summary = payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let block = match summary {
+                    Some(s) => summary_event_block(EventKind::Compaction, s, || {
+                        ref_fn(format!("{payload_ptr}/summary"))
+                    }),
+                    None => SessionBlock::event(EventKind::Compaction, None, None),
+                };
+                let mut msg = SessionMessage::from_blocks("system", ts, vec![block]);
+                msg.injected = true;
+                messages.push(msg);
+            }
+            _ => {}
         }
     }
 
+    step_builder.finish_into(can_emit_refs, &mut messages, &mut wire_call_locations);
+    assign_turn_ids(&mut messages);
     Ok(messages)
 }
 
@@ -961,6 +1584,7 @@ fn validate_kimi_delete(
     Ok((canonical_root, checked_session_dir))
 }
 
+#[allow(dead_code)]
 pub fn preflight_delete(root: &Path, path: &Path, session_id: &str) -> Result<(), String> {
     validate_kimi_delete(root, path, session_id).map(|_| ())
 }
@@ -1121,14 +1745,24 @@ mod tests {
             json!({"type":"agent.message.appended","time":1000,"message":{"message":{"role":"user","content":[{"type":"text","text":"Keep prompt"}]}}}),
             json!({"type":"agent.message.appended","time":1001,"message":{"message":{"role":"user","content":[{"type":"text","text":"Abandoned prompt"}]}}}),
             json!({"type":"agent.switched","branch":"fork1","base":{"branch":"main","line":3}}),
-            json!({"type":"agent.message.appended","time":1002,"message":{"message":{
-                "role":"assistant",
-                "content":[
-                    {"type":"think","think":"Let me check main.rs"},
-                    {"type":"text","text":"Reading file"}
-                ],
-                "toolCalls":[{"id":"tc1","name":"read_file","arguments":{"path":"main.rs"}}]
-            }}}),
+            json!({"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step1","turnId":"0","step":1}}),
+            json!({"type":"llm.request","agentId":"main","kind":"loop","turnStep":"0.1","model":"kimi-k2"}),
+            json!({"type":"agent.message.appended","time":1002,"message":{
+                "message":{
+                    "role":"assistant",
+                    "content":[
+                        {"type":"think","think":"Let me check main.rs"},
+                        {"type":"text","text":"Reading file"}
+                    ],
+                    "toolCalls":[{"id":"tc1","name":"read_file","arguments":{"path":"main.rs"}}]
+                },
+                "meta":{
+                    "messageId":"resp1",
+                    "model":{"provider":"agent-loop","model":"agent-loop"},
+                    "usage":{"inputOther":10,"output":20,"inputCacheRead":30,"inputCacheCreation":0}
+                }
+            }}),
+            json!({"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step1","messageId":"resp1","llmFirstTokenLatencyMs":300,"llmStreamDurationMs":700}}),
             json!({"type":"agent.message.appended","time":1003,"message":{"message":{
                 "role":"tool",
                 "toolCallId":"tc1",
@@ -1144,21 +1778,120 @@ mod tests {
         .unwrap();
 
         let msgs = load_messages(&wire).unwrap();
-        let pairs: Vec<(&str, &str)> = msgs
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_str()))
-            .collect();
+        let roles: Vec<(&str, bool)> = msgs.iter().map(|m| (m.role.as_str(), m.injected)).collect();
         assert_eq!(
-            pairs,
+            roles,
             vec![
-                ("user", "Keep prompt"),
-                ("thinking", "Let me check main.rs"),
-                ("assistant", "Reading file"),
-                ("tool", "[Tool: read_file]\n{\"path\":\"main.rs\"}"),
-                ("tool", "[Result: read_file]\nfn main() {}"),
-                ("assistant", "All set."),
+                ("user", false),
+                ("assistant", false),
+                ("tool", false),
+                ("user", true),
+                ("assistant", false),
             ]
         );
+        assert_eq!(msgs[0].content, "Keep prompt");
+        assert!(matches!(
+            &msgs[1].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "Let me check main.rs"
+        ));
+        assert!(matches!(
+            &msgs[1].blocks[1],
+            SessionBlock::Text { text, .. } if text == "Reading file"
+        ));
+        assert!(matches!(
+            &msgs[1].blocks[2],
+            SessionBlock::ToolCall { id, raw_name, title, .. }
+                if id == "tc1" && raw_name == "read_file" && title == "main.rs"
+        ));
+        let meta = msgs[1].meta.as_ref().unwrap();
+        assert_eq!(meta.model.as_deref(), Some("kimi-k2"));
+        assert_eq!(meta.input_tokens, Some(10));
+        assert_eq!(meta.output_tokens, Some(20));
+        assert_eq!(meta.cache_read_tokens, Some(30));
+        assert_eq!(meta.duration_ms, Some(1000));
+        assert!(matches!(
+            &msgs[2].blocks[0],
+            SessionBlock::ToolResult { call_id, preview, .. }
+                if call_id == "tc1" && preview == "fn main() {}"
+        ));
+        assert_eq!(msgs[4].content, "All set.");
+    }
+
+    #[test]
+    fn parses_wire_protocol_events_display_diff_brief_and_context_fallback() {
+        let temp = tempdir().unwrap();
+        let wire = temp.path().join("wire.jsonl");
+        let lines = [
+            json!({"timestamp":1000.0,"message":{"type":"TurnBegin","payload":{"user_input":[{"type":"text","text":"Edit app.rs"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}}}),
+            json!({"timestamp":1001.0,"message":{"type":"ThinkPart","payload":{"think":"Inspecting file"}}}),
+            json!({"timestamp":1001.5,"message":{"type":"TextPart","payload":{"text":"Applying patch"}}}),
+            json!({"timestamp":1002.0,"message":{"type":"ToolCall","payload":{"id":"call_edit","function":{"name":"str_replace_file","arguments":"{\"path\":\"src/app.rs\"}"}}}}),
+            json!({"timestamp":1002.5,"message":{"type":"StatusUpdate","payload":{"model":"kimi-latest","token_usage":{"input_other":80,"output":25,"input_cache_read":200}}}}),
+            json!({"timestamp":1003.0,"message":{"type":"ToolResult","payload":{"tool_call_id":"call_edit","return_value":{"is_error":false,"output":"Replaced 1 block","display":[{"type":"brief","text":"Updated handler"},{"type":"diff","path":"src/app.rs","old_text":"fn old() {}\n","new_text":"fn new_a() {}\nfn new_b() {}\n"}]}}}}),
+            json!({"timestamp":1004.0,"message":{"type":"CompactionBegin","payload":{"summary":"Compacted turn"}}}),
+        ];
+        fs::write(
+            &wire,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+
+        let msgs = load_messages(&wire).unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, "user");
+        assert!(matches!(&msgs[0].blocks[1], SessionBlock::Image { .. }));
+
+        let assistant = &msgs[1];
+        assert!(
+            matches!(&assistant.blocks[0], SessionBlock::Thinking { text, .. } if text == "Inspecting file")
+        );
+        assert!(
+            matches!(&assistant.blocks[1], SessionBlock::Text { text, .. } if text == "Applying patch")
+        );
+        match &assistant.blocks[2] {
+            SessionBlock::ToolCall {
+                id,
+                detail,
+                diff: Some(diff),
+                ..
+            } => {
+                assert_eq!(id, "call_edit");
+                assert_eq!(detail.as_deref(), Some("Updated handler"));
+                assert_eq!((diff.added, diff.removed), (2, 1));
+            }
+            other => panic!("expected enriched ToolCall, got {other:?}"),
+        }
+        let meta = assistant.meta.as_ref().unwrap();
+        assert_eq!(meta.model.as_deref(), Some("kimi-latest"));
+        assert_eq!(meta.input_tokens, Some(80));
+        assert_eq!(meta.output_tokens, Some(25));
+        assert_eq!(meta.cache_read_tokens, Some(200));
+
+        assert!(matches!(
+            &msgs[2].blocks[0],
+            SessionBlock::ToolResult { call_id, preview, .. }
+                if call_id == "call_edit" && preview == "Replaced 1 block"
+        ));
+        assert!(matches!(
+            &msgs[3].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::Compaction,
+                ..
+            }
+        ));
+
+        // Fallback to context.jsonl when wire.jsonl is absent
+        let fb_dir = temp.path().join("fallback-sess");
+        fs::create_dir_all(fb_dir.join("agents/main")).unwrap();
+        fs::write(
+            fb_dir.join("context.jsonl"),
+            "{\"role\":\"user\",\"content\":\"from context\"}\n{\"role\":\"assistant\",\"content\":\"reply from context\"}\n",
+        )
+        .unwrap();
+        let fb_msgs = load_messages(&fb_dir.join("agents/main/wire.jsonl")).unwrap();
+        assert_eq!(fb_msgs.len(), 2);
+        assert_eq!(fb_msgs[0].content, "from context");
+        assert_eq!(fb_msgs[1].content, "reply from context");
     }
 
     #[test]

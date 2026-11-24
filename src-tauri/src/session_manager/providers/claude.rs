@@ -1,19 +1,36 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 use serde_json::Value;
 
+use crate::session_manager::content::parse_file_url;
+use crate::session_manager::model::{
+    ContentRef, DiffFile, DiffOp, DiffSummary, EventKind, ImageRef, ImageSource, MessageMeta,
+    SessionBlock, ToolKind, ToolStatus,
+};
 use crate::session_manager::{SessionMessage, SessionMeta};
 use crate::session_paths::claude_config_dir;
 
+use super::blocks::{
+    assign_turn_ids, diff_from_input, estimate_base64_size, first_string_field, large_text_block,
+    normalize_tool, one_line_title, preview, preview_chars, refine_shell_kind, split_mcp_name,
+    summary_event_block, title_agent, title_ask, title_mcp, title_other, title_path, title_read,
+    title_search, title_shell, title_todo, title_web, tool_result_block as make_tool_result_block,
+    NormalizedTool, ToolSource, INPUT_PREVIEW_CHARS, THINKING_PREVIEW_CHARS,
+};
 use super::utils::{
     atomic_write_json, checked_storage_child, ensure_readable_size, extract_text,
-    extract_thinking_text, is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms,
-    path_basename, read_head_tail_lines, remove_path_if_exists, scan_warning, truncate_summary,
-    FileParseCache, TITLE_MAX_CHARS,
+    is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms, path_basename,
+    read_head_tail_lines, remove_path_if_exists, scan_warning, truncate_summary, FileParseCache,
+    JsonlSpan, LineSpans, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "claude";
@@ -44,310 +61,33 @@ fn scan_sessions_in_root(root: &Path, cache: &FileParseCache) -> Vec<SessionMeta
     sessions
 }
 
+// ─── 会话正文解析（TranscriptBuilder 结构化块）─────────────────────────────
+//
+// 逐行读取 JSONL，用借用型的轻量结构体反序列化（只取需要的字段，图片 base64、
+// 工具大输出等都只扫过不复制），再按记录类型转成结构化 blocks。大内容只放预览，
+// 全文给 `ContentRef::Jsonl`（行的字节区间 + JSON Pointer）或 `ContentRef::Sidecar`，由前端按需取。
+
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     ensure_readable_size(path)?;
     let file = File::open(path).map_err(|e| format!("Failed to open session file: {e}"))?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("Failed to read Claude transcript: {error}"))?;
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
-            entries.push(value);
-        }
-    }
-    let mut messages = Vec::new();
-    let mut bash_call_times: HashMap<String, i64> = HashMap::new();
+    let mut lines = LineSpans::new(BufReader::with_capacity(256 * 1024, file));
+    let mut builder = TranscriptBuilder::new(path.with_extension(""));
 
-    for value in conversation_chain(&entries) {
-        if !is_main_entry(value)
-            || (value.get("uuid").and_then(Value::as_str).is_some()
-                && !matches!(entry_kind(value), "user" | "assistant"))
-        {
+    while let Some(span) = lines
+        .next_line()
+        .map_err(|e| format!("Failed to read Claude transcript: {e}"))?
+    {
+        if span.bytes.trim_ascii().is_empty() {
             continue;
         }
-        let message = match value.get("message") {
-            Some(message) => message,
-            None => continue,
+        let record: RawRecord = match serde_json::from_slice(span.bytes) {
+            Ok(record) => record,
+            Err(_) => continue,
         };
-
-        let mut role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
-
-        if role == "assistant" {
-            let thinking_ms = value
-                .pointer("/thinkingMetadata/durationMs")
-                .or_else(|| value.get("thinkingDurationMs"))
-                .and_then(Value::as_u64);
-
-            if let Some(content_val) = message.get("content") {
-                let thinking = extract_thinking_text(content_val);
-                if !thinking.trim().is_empty() {
-                    let (summary, body) =
-                        crate::session_manager::reader_meta::split_markdown_thinking_summary(
-                            &thinking,
-                        );
-                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
-                        thinking_summary: summary.clone(),
-                        duration_ms: thinking_ms,
-                        blocks: vec![crate::session_manager::reader_meta::ReaderBlock::Thinking {
-                            text: if summary.is_some() && body.is_empty() {
-                                String::new()
-                            } else if summary.is_some() {
-                                body
-                            } else {
-                                thinking.clone()
-                            },
-                            summary,
-                            redacted: false,
-                            duration_ms: thinking_ms,
-                        }],
-                        ..Default::default()
-                    }
-                    .into_boxed_option();
-                    messages.push(SessionMessage {
-                        role: "thinking".to_string(),
-                        content: thinking,
-                        ts,
-                        meta,
-                    });
-                } else if has_redacted_claude_thinking(content_val) {
-                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
-                        redacted: true,
-                        duration_ms: thinking_ms,
-                        blocks: vec![crate::session_manager::reader_meta::ReaderBlock::Thinking {
-                            text: String::new(),
-                            summary: None,
-                            redacted: true,
-                            duration_ms: thinking_ms,
-                        }],
-                        ..Default::default()
-                    }
-                    .into_boxed_option();
-                    messages.push(SessionMessage {
-                        role: "thinking".to_string(),
-                        content: "[Redacted Thinking]".to_string(),
-                        ts,
-                        meta,
-                    });
-                }
-            }
-        }
-
-        if role == "user" {
-            if let Some(Value::Array(items)) = message.get("content") {
-                if !items.is_empty()
-                    && items.iter().all(|item| {
-                        matches!(
-                            item.get("type").and_then(Value::as_str),
-                            Some("tool_result" | "mcp_tool_result")
-                        )
-                    })
-                {
-                    role = "tool".to_string();
-                }
-            }
-        }
-        let mut content = message.get("content").map(extract_text).unwrap_or_default();
-        if !content.trim().is_empty() {
-            let mut rich_meta = crate::session_manager::reader_meta::MessageReaderMeta::default();
-
-            if role == "user"
-                && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-            {
-                let raw_summary = content
-                    .strip_prefix("[Compacted Summary]\n")
-                    .unwrap_or(&content)
-                    .trim()
-                    .to_string();
-                rich_meta
-                    .blocks
-                    .push(crate::session_manager::reader_meta::ReaderBlock::Event {
-                        kind: "compaction".to_string(),
-                        text: Some("上下文已压缩".to_string()),
-                        detail: (!raw_summary.is_empty()).then_some(raw_summary),
-                        url: None,
-                    });
-                if !content.starts_with("[Compacted Summary]") {
-                    content = format!("[Compacted Summary]\n{content}");
-                }
-            } else if role == "assistant" {
-                rich_meta.model = message
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty() && *m != "<synthetic>")
-                    .map(str::to_string);
-                if let Some(usage) = message.get("usage") {
-                    let input_tok = usage
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let output_tok = usage
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let total = input_tok.saturating_add(output_tok);
-                    if total > 0 {
-                        rich_meta.tokens = Some(total);
-                    }
-                }
-                if let Some(Value::Array(items)) = message.get("content") {
-                    rich_meta.blocks =
-                        build_claude_assistant_blocks(items, ts, &mut bash_call_times);
-                }
-            } else if role == "tool" {
-                if let Some(Value::Array(items)) = message.get("content") {
-                    rich_meta.blocks =
-                        build_claude_tool_result_blocks(value, items, ts, &bash_call_times);
-                }
-            }
-
-            messages.push(SessionMessage {
-                role,
-                content,
-                ts,
-                meta: rich_meta.into_boxed_option(),
-            });
-        }
+        builder.push(record, span.span);
     }
-    Ok(messages)
-}
 
-fn has_redacted_claude_thinking(content: &Value) -> bool {
-    let Some(items) = content.as_array() else {
-        return false;
-    };
-    items.iter().any(|item| {
-        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
-        kind == "redacted_thinking"
-            || (kind == "thinking"
-                && item
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .is_none_or(|t| t.trim().is_empty())
-                && item
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty()))
-    })
-}
-
-fn build_claude_assistant_blocks(
-    items: &[Value],
-    ts: Option<i64>,
-    bash_call_times: &mut HashMap<String, i64>,
-) -> Vec<crate::session_manager::reader_meta::ReaderBlock> {
-    use crate::session_manager::reader_meta::{build_tool_call_block, ReaderBlock};
-    let mut blocks = Vec::new();
-    let mut last_srv_id = String::new();
-    for (idx, item) in items.iter().enumerate() {
-        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
-        match kind {
-            "text" => {
-                if let Some(text) = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    blocks.push(ReaderBlock::Text {
-                        text: text.to_string(),
-                    });
-                }
-            }
-            "tool_use" | "server_tool_use" | "mcp_tool_use" => {
-                let raw_name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let id = item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("claude_call_{idx}"));
-                if kind == "server_tool_use" {
-                    last_srv_id = id.clone();
-                }
-                if raw_name == "Bash" {
-                    if let Some(t) = ts {
-                        bash_call_times.insert(id.clone(), t);
-                    }
-                }
-                let input = item.get("input").unwrap_or(&Value::Null);
-                blocks.push(build_tool_call_block(id, raw_name, None, input));
-            }
-            "web_search_tool_result" => {
-                let formatted = extract_text(item);
-                let is_err = item.get("error").is_some_and(|e| !e.is_null());
-                let line_count = formatted.lines().count() as u32;
-                blocks.push(ReaderBlock::ToolResult {
-                    call_id: std::mem::take(&mut last_srv_id),
-                    status: if is_err { "error" } else { "success" }.to_string(),
-                    output: formatted,
-                    line_count,
-                    exit_code: None,
-                    duration_ms: None,
-                });
-            }
-            _ => {}
-        }
-    }
-    blocks
-}
-
-fn build_claude_tool_result_blocks(
-    entry: &Value,
-    items: &[Value],
-    ts: Option<i64>,
-    bash_call_times: &HashMap<String, i64>,
-) -> Vec<crate::session_manager::reader_meta::ReaderBlock> {
-    use crate::session_manager::reader_meta::{parse_codex_output_envelope, ReaderBlock};
-    let single = items.len() == 1;
-    let entry_interrupted = single
-        && entry
-            .pointer("/toolUseResult/interrupted")
-            .and_then(Value::as_bool)
-            == Some(true);
-    let mut blocks = Vec::new();
-    for item in items {
-        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
-        if !matches!(kind, "tool_result" | "mcp_tool_result") {
-            continue;
-        }
-        let call_id = item
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let raw_out = item.get("content").map(extract_text).unwrap_or_default();
-        let parsed = parse_codex_output_envelope(&raw_out);
-        let is_err = item.get("is_error").and_then(Value::as_bool) == Some(true) || parsed.is_error;
-        let status = if entry_interrupted {
-            "interrupted"
-        } else if is_err {
-            "error"
-        } else {
-            "success"
-        };
-        let duration_ms = match (bash_call_times.get(&call_id).copied(), ts) {
-            (Some(start), Some(end)) if end > start => Some((end - start) as u64),
-            _ => parsed.duration_ms,
-        };
-        let line_count = parsed.body.lines().count() as u32;
-        blocks.push(ReaderBlock::ToolResult {
-            call_id,
-            status: status.to_string(),
-            output: parsed.body,
-            line_count,
-            exit_code: parsed.exit_code,
-            duration_ms,
-        });
-    }
-    blocks
+    Ok(builder.finish())
 }
 
 fn is_main_entry(entry: &Value) -> bool {
@@ -359,291 +99,1596 @@ fn is_main_entry(entry: &Value) -> bool {
             .is_none_or(str::is_empty)
 }
 
-fn entry_kind(entry: &Value) -> &str {
-    entry
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| entry.pointer("/message/role").and_then(Value::as_str))
-        .unwrap_or("")
+/// 解析中的消息；全部记录处理完后再统一投影出 `content`（结果记录会回填前面的 ToolCall）。
+struct Draft {
+    role: String,
+    ts: Option<i64>,
+    id: Option<String>,
+    injected: bool,
+    blocks: Vec<SessionBlock>,
+    meta: Option<MessageMeta>,
+    /// assistant 的 API `message.id`：Claude Code 把一次回复按内容块拆成多条记录，
+    /// 同 id 的相邻记录合并成一条消息
+    api_id: Option<String>,
 }
 
-fn response_id(entry: &Value) -> Option<&str> {
-    (entry_kind(entry) == "assistant")
-        .then(|| entry.pointer("/message/id").and_then(Value::as_str))
-        .flatten()
-        .filter(|id| !id.is_empty())
+/// 已见过的 tool_use 在 `drafts` 中的位置，供结果记录配对与回填。
+struct CallSlot {
+    draft: usize,
+    block: usize,
+    ts: Option<i64>,
+    name: String,
 }
 
-fn block_ids<'a>(entry: &'a Value, kind: &str, field: &str) -> Vec<&'a str> {
-    entry
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some(kind))
-        .filter_map(|block| block.get(field).and_then(Value::as_str))
-        .collect()
+struct TranscriptBuilder {
+    /// 会话附属目录 `<sessionId>/`（tool-results 等落盘文件）
+    sidecar_dir: PathBuf,
+    drafts: Vec<Draft>,
+    calls: HashMap<String, CallSlot>,
+    /// pr-link 会在每轮结束时重复写入，同一个 URL 只出一次
+    pr_urls: HashSet<String>,
 }
 
-/// SDK 0.2.178 (3be907ed), sessions.py:931-1245. UUID replacement is last-write-wins.
-/// Compaction follows parentUuid only: logicalParentUuid would duplicate pre-summary content.
-/// Legacy rows without UUID remain in file order, including mixed-format transcripts; a
-/// compact boundary drops only the older unlinked rows, whose ancestry cannot be proved.
-fn conversation_chain(entries: &[Value]) -> Vec<&Value> {
-    let mut by_uuid = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if !matches!(
-            entry_kind(entry),
-            "user" | "assistant" | "progress" | "system" | "attachment"
-        ) {
-            continue;
+impl TranscriptBuilder {
+    fn new(sidecar_dir: PathBuf) -> Self {
+        Self {
+            sidecar_dir,
+            drafts: Vec::new(),
+            calls: HashMap::new(),
+            pr_urls: HashSet::new(),
         }
-        if let Some(uuid) = entry
-            .get("uuid")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
+    }
+
+    fn finish(self) -> Vec<SessionMessage> {
+        let mut messages: Vec<SessionMessage> = self
+            .drafts
+            .into_iter()
+            .map(|draft| {
+                let mut message = SessionMessage::from_blocks(draft.role, draft.ts, draft.blocks);
+                message.id = draft.id;
+                message.injected = draft.injected;
+                message.meta = draft.meta;
+                message
+            })
+            .filter(|message| !message.is_empty())
+            .collect();
+        assign_turn_ids(&mut messages);
+        messages
+    }
+
+    fn push(&mut self, record: RawRecord<'_>, line: JsonlSpan) {
+        if is_true(&record.is_sidechain)
+            || record
+                .team_name
+                .as_str()
+                .is_some_and(|team| !team.is_empty())
         {
-            by_uuid.insert(uuid, index);
+            return;
         }
-    }
-    if by_uuid.is_empty() {
-        return entries.iter().collect();
-    }
-    let mut indices: Vec<usize> = by_uuid.values().copied().collect();
-    indices.sort_unstable();
-    let parents: HashSet<&str> = indices
-        .iter()
-        .filter_map(|&i| entries[i].get("parentUuid").and_then(Value::as_str))
-        .collect();
-    let mut leaves = Vec::new();
-    for &i in &indices {
-        if parents.contains(entries[i]["uuid"].as_str().unwrap_or("")) {
-            continue;
-        }
-        let mut current = Some(i);
-        let mut seen = HashSet::new();
-        while let Some(index) = current {
-            if !seen.insert(index) {
-                break;
-            }
-            let entry = &entries[index];
-            if matches!(entry_kind(entry), "user" | "assistant") {
-                leaves.push(index);
-                break;
-            }
-            current = entry
-                .get("parentUuid")
-                .and_then(Value::as_str)
-                .and_then(|id| by_uuid.get(id))
-                .copied();
-        }
-    }
-    let mut chain = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current = leaves
-        .iter()
-        .copied()
-        .filter(|&i| is_main_entry(&entries[i]))
-        .max()
-        .or_else(|| leaves.into_iter().max());
-    while let Some(index) = current {
-        if !seen.insert(index) {
-            break;
-        }
-        chain.push(index);
-        current = entries[index]
-            .get("parentUuid")
-            .and_then(Value::as_str)
-            .and_then(|id| by_uuid.get(id))
-            .copied();
-    }
-    chain.reverse();
+        let is_meta = is_true(&record.is_meta);
+        let ts = record.timestamp.as_ref().and_then(parse_timestamp_to_ms);
 
-    let mut anchors = HashMap::new();
-    let mut owners: HashMap<&str, Option<usize>> = HashMap::new();
-    for &i in &chain {
-        if let Some(id) = response_id(&entries[i]) {
-            anchors.insert(id, i);
+        match record.kind.as_str() {
+            Some("system") if !is_meta => self.push_system(&record, ts, line),
+            Some("pr-link") if !is_meta => self.push_pr_link(&record, ts),
+            Some("system") | Some("pr-link") => {}
+            Some("user") | Some("assistant") | None => {
+                let kind = record.kind.as_str().map(str::to_string);
+                let uuid = record.uuid.as_str().map(str::to_string);
+                let thinking_ms = record
+                    .thinking_metadata
+                    .0
+                    .as_ref()
+                    .and_then(|m| m.duration_ms.as_ref())
+                    .or(record.thinking_duration_ms.as_ref())
+                    .and_then(as_u64);
+                let compact_summary = is_true(&record.is_compact_summary);
+                let tool_use_result = record.tool_use_result.0;
+                let Some(message) = record.message.0 else {
+                    return;
+                };
+                let role = message
+                    .role
+                    .as_str()
+                    .map(str::to_string)
+                    .or(kind)
+                    .unwrap_or_else(|| "unknown".to_string());
+                if compact_summary {
+                    self.push_compact_summary(message.content, ts, line);
+                } else if role == "user" {
+                    self.push_user(message.content, tool_use_result, uuid, ts, line, is_meta);
+                } else if !is_meta {
+                    self.push_assistant(role, message, uuid, thinking_ms, ts, line);
+                }
+            }
+            // attachment、file-history-*、queue-operation、mode、custom-title 等：跳过
+            _ => {}
         }
     }
-    for &i in &indices {
-        if let Some(response) = response_id(&entries[i]) {
-            for call in block_ids(&entries[i], "tool_use", "id") {
-                let owner = match owners.get(call) {
-                    None => Some(i),
-                    Some(Some(old)) if response_id(&entries[*old]) == Some(response) => Some(i),
+
+    fn push_draft(
+        &mut self,
+        role: &str,
+        ts: Option<i64>,
+        id: Option<String>,
+        blocks: Vec<SessionBlock>,
+    ) {
+        self.drafts.push(Draft {
+            role: role.to_string(),
+            ts,
+            id,
+            injected: false,
+            blocks,
+            meta: None,
+            api_id: None,
+        });
+    }
+
+    fn push_event(
+        &mut self,
+        ts: Option<i64>,
+        kind: EventKind,
+        text: Option<String>,
+        url: Option<String>,
+    ) {
+        self.push_draft(
+            "system",
+            ts,
+            None,
+            vec![SessionBlock::event(kind, text, url)],
+        );
+    }
+
+    // ── system / pr-link ──
+
+    fn push_system(&mut self, record: &RawRecord<'_>, ts: Option<i64>, line: JsonlSpan) {
+        match record.subtype.as_str() {
+            Some("stop_hook_summary") => {
+                let errors: Vec<String> = match &record.hook_errors {
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .map(|item| match item {
+                            Value::String(s) => s.trim().to_string(),
+                            other => other.to_string(),
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if !errors.is_empty() {
+                    self.push_event(ts, EventKind::Hook, Some(errors.join("\n")), None);
+                }
+            }
+            Some("compact_boundary") => {
+                let text = record
+                    .content
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Conversation compacted");
+                self.push_event(ts, EventKind::Compaction, Some(text.to_string()), None);
+            }
+            Some("turn_duration") => {
+                if let Some(ms) = record
+                    .duration_ms
+                    .as_ref()
+                    .and_then(as_u64)
+                    .filter(|&n| n > 0)
+                {
+                    if let Some(last_assistant) =
+                        self.drafts.iter_mut().rev().find(|d| d.role == "assistant")
+                    {
+                        last_assistant
+                            .meta
+                            .get_or_insert_with(MessageMeta::default)
+                            .duration_ms = Some(ms);
+                    }
+                }
+            }
+            // 新版 Claude Code 把本地斜杠命令记成 system.local_command
+            Some("local_command") => {
+                if let Some(content) = record.content.as_str() {
+                    let uuid = record.uuid.as_str().map(str::to_string);
+                    self.push_user_texts(
+                        vec![(Cow::Borrowed(content), line.content_ref("/content"))],
+                        Vec::new(),
+                        Vec::new(),
+                        uuid,
+                        ts,
+                        false,
+                    );
+                }
+            }
+            // api_error、informational、away_summary…：不展示
+            _ => {}
+        }
+    }
+
+    fn push_pr_link(&mut self, record: &RawRecord<'_>, ts: Option<i64>) {
+        let Some(url) = record.pr_url.as_str().filter(|u| !u.trim().is_empty()) else {
+            return;
+        };
+        if !self.pr_urls.insert(url.to_string()) {
+            return;
+        }
+        let text = match record.pr_number.as_ref() {
+            Some(Value::Number(n)) => format!("PR #{n}"),
+            Some(Value::String(s)) if !s.is_empty() => format!("PR #{s}"),
+            _ => "PR".to_string(),
+        };
+        self.push_event(ts, EventKind::PrLink, Some(text), Some(url.to_string()));
+    }
+
+    /// `/compact` 之后的摘要记录：并入紧邻的 compact_boundary 事件，没有则单独成一条。
+    /// 摘要通常有数 KB，只放预览，全文按 `/message/content` 引用取。
+    fn push_compact_summary(&mut self, content: RawContent<'_>, ts: Option<i64>, line: JsonlSpan) {
+        let summary = content_text(&content);
+        if summary.trim().is_empty() {
+            return;
+        }
+        let block = summary_event_block(EventKind::Compaction, &summary, || {
+            Some(line.content_ref("/message/content"))
+        });
+        if let Some(last) = self.drafts.last_mut() {
+            if let [event @ SessionBlock::Event {
+                kind: EventKind::Compaction,
+                ..
+            }] = last.blocks.as_mut_slice()
+            {
+                *event = block;
+                return;
+            }
+        }
+        self.push_draft("system", ts, None, vec![block]);
+    }
+
+    // ── assistant ──
+
+    fn push_assistant(
+        &mut self,
+        role: String,
+        message: RawMessage<'_>,
+        uuid: Option<String>,
+        thinking_ms: Option<u64>,
+        ts: Option<i64>,
+        line: JsonlSpan,
+    ) {
+        let mut blocks = Vec::new();
+        // (块下标, tool_use id, 工具名)
+        let mut calls: Vec<(usize, String, String)> = Vec::new();
+        let mut last_server_tool_id: Option<String> = None;
+        match message.content {
+            RawContent::Text(text) => {
+                if !text.trim().is_empty() {
+                    blocks.push(SessionBlock::text(text.into_owned()));
+                }
+            }
+            RawContent::Items(items) => {
+                for (i, item) in items.into_iter().enumerate() {
+                    let Some(item) = item.0 else { continue };
+                    let item_kind = item.kind.as_str().unwrap_or_default().to_string();
+                    match item_kind.as_str() {
+                        "text" => {
+                            if let Some(text) = item.text.0.filter(|t| !t.trim().is_empty()) {
+                                blocks.push(SessionBlock::text(text.into_owned()));
+                            }
+                        }
+                        kind @ ("thinking" | "redacted_thinking") => {
+                            if let Some(block) = thinking_block(&item, kind, i, thinking_ms, line) {
+                                blocks.push(block);
+                            }
+                        }
+                        "tool_use" | "server_tool_use" | "mcp_tool_use" => {
+                            let block = tool_call_block(item, &item_kind, i, line);
+                            if let SessionBlock::ToolCall { id, raw_name, .. } = &block {
+                                if !id.is_empty() {
+                                    if item_kind == "server_tool_use" {
+                                        last_server_tool_id = Some(id.clone());
+                                    }
+                                    calls.push((blocks.len(), id.clone(), raw_name.clone()));
+                                }
+                            }
+                            blocks.push(block);
+                        }
+                        "web_search_tool_result" => {
+                            let call_id = item
+                                .tool_use_id
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .or_else(|| last_server_tool_id.take())
+                                .unwrap_or_default();
+                            let formatted = web_search_result_text(&item.content);
+                            let status = if item.error.as_ref().is_some_and(|e| !e.is_null()) {
+                                ToolStatus::Error
+                            } else {
+                                ToolStatus::Success
+                            };
+                            blocks.push(make_tool_result_block(
+                                call_id,
+                                status,
+                                &formatted,
+                                || Some(line.content_ref(format!("/message/content/{i}/content"))),
+                            ));
+                        }
+                        "image" => {
+                            if let Some(image) = image_ref_from_item(
+                                &item,
+                                format!("/message/content/{i}/source/data"),
+                                line,
+                            ) {
+                                blocks.push(SessionBlock::Image { image });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RawContent::None => {}
+        }
+        if blocks.is_empty() {
+            return;
+        }
+
+        let meta = message_meta(&message.model, message.usage.as_ref(), &message.stop_reason);
+        let api_id = message.id.as_str().map(str::to_string);
+        let mergeable = self
+            .drafts
+            .last()
+            .is_some_and(|last| last.role == role && api_id.is_some() && last.api_id == api_id);
+        let (draft, base) = if mergeable {
+            let last = self.drafts.last_mut().expect("checked above");
+            let base = last.blocks.len();
+            last.blocks.extend(blocks);
+            merge_meta(&mut last.meta, meta);
+            (self.drafts.len() - 1, base)
+        } else {
+            self.drafts.push(Draft {
+                role,
+                ts,
+                id: uuid,
+                injected: false,
+                blocks,
+                meta,
+                api_id,
+            });
+            (self.drafts.len() - 1, 0)
+        };
+        for (index, id, name) in calls {
+            self.calls.insert(
+                id,
+                CallSlot {
+                    draft,
+                    block: base + index,
+                    ts,
+                    name,
+                },
+            );
+        }
+    }
+
+    // ── user（提问 / 工具结果 / 注入内容）──
+
+    fn push_user(
+        &mut self,
+        content: RawContent<'_>,
+        tool_use_result: Option<ToolUseResult>,
+        uuid: Option<String>,
+        ts: Option<i64>,
+        line: JsonlSpan,
+        is_meta: bool,
+    ) {
+        let mut results = Vec::new();
+        let mut texts = Vec::new();
+        let mut images = Vec::new();
+        match content {
+            RawContent::Text(text) => texts.push((text, line.content_ref("/message/content"))),
+            RawContent::Items(items) => {
+                let result_count = items
+                    .iter()
+                    .filter(|item| {
+                        item.0.as_ref().is_some_and(|i| {
+                            matches!(i.kind.as_str(), Some("tool_result" | "mcp_tool_result"))
+                        })
+                    })
+                    .count();
+                // 顶层 toolUseResult 只描述一个结果；多结果记录不知道属于谁，不用
+                let tool_use_result = tool_use_result.filter(|_| result_count == 1);
+                for (i, item) in items.into_iter().enumerate() {
+                    let Some(item) = item.0 else { continue };
+                    match item.kind.as_str().unwrap_or_default() {
+                        "tool_result" | "mcp_tool_result" if !is_meta => {
+                            results.push(self.tool_result_block(
+                                item,
+                                i,
+                                tool_use_result.as_ref(),
+                                ts,
+                                line,
+                            ));
+                        }
+                        "tool_result" | "mcp_tool_result" => {}
+                        "text" => {
+                            if let Some(text) = item.text.0 {
+                                texts.push((
+                                    text,
+                                    line.content_ref(format!("/message/content/{i}/text")),
+                                ));
+                            }
+                        }
+                        "image" => {
+                            if let Some(image) = image_ref_from_item(
+                                &item,
+                                format!("/message/content/{i}/source/data"),
+                                line,
+                            ) {
+                                images.push(SessionBlock::Image { image });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RawContent::None => {}
+        }
+        self.push_user_texts(texts, results, images, uuid, ts, is_meta);
+    }
+
+    /// 给用户文本归类：isMeta / 中断 / 斜杠命令 / `!` 命令 / 注入内容 / 普通提问。
+    /// `texts` 每项带上它在源记录里的引用，超长注入文本只放预览 + 引用。
+    fn push_user_texts(
+        &mut self,
+        texts: Vec<(Cow<'_, str>, ContentRef)>,
+        mut blocks: Vec<SessionBlock>,
+        images: Vec<SessionBlock>,
+        uuid: Option<String>,
+        ts: Option<i64>,
+        is_meta: bool,
+    ) {
+        let has_results = !blocks.is_empty();
+        let mut injected = false;
+
+        let injected_blocks = |texts: &[(Cow<'_, str>, ContentRef)]| -> Vec<SessionBlock> {
+            texts
+                .iter()
+                .filter(|(text, _)| !text.trim().is_empty())
+                .map(|(text, full)| large_text_block(text.to_string(), || Some(full.clone())))
+                .collect()
+        };
+        if is_meta {
+            let meta_blocks = if has_results {
+                Vec::new()
+            } else {
+                injected_blocks(&texts)
+            };
+            if !meta_blocks.is_empty() {
+                injected = true;
+                blocks.extend(meta_blocks);
+            }
+        } else if let Some(first) = texts.iter().map(|(t, _)| t.trim()).find(|t| !t.is_empty()) {
+            if first.starts_with("[Request interrupted by user") {
+                blocks.push(SessionBlock::event(
+                    EventKind::Aborted,
+                    Some(first.to_string()),
+                    None,
+                ));
+            } else if let Some(command) = slash_command(first) {
+                blocks.push(SessionBlock::event(
+                    EventKind::SlashCommand,
+                    Some(command),
+                    None,
+                ));
+            } else if first.starts_with("<bash-input>") {
+                blocks.extend(user_bash_blocks(first, uuid.as_deref()));
+            } else if is_injected_text(first) {
+                // 与工具结果同记录的注入文本直接丢弃；单独成条时整条标 injected、保留原文
+                if !has_results {
+                    injected = true;
+                    blocks.extend(injected_blocks(&texts));
+                }
+            } else {
+                let stripped: Vec<String> = texts
+                    .iter()
+                    .map(|(t, _)| strip_system_reminders(t))
+                    .filter(|t| !t.trim().is_empty())
+                    .collect();
+                if !stripped.is_empty() {
+                    blocks.extend(stripped.into_iter().map(SessionBlock::text));
+                } else if !has_results && images.is_empty() {
+                    // 全是 <system-reminder>：整条注入，保留原文
+                    injected = true;
+                    blocks.extend(injected_blocks(&texts));
+                }
+            }
+        }
+        blocks.extend(images);
+        if blocks.is_empty() {
+            return;
+        }
+
+        let all_results = blocks
+            .iter()
+            .all(|b| matches!(b, SessionBlock::ToolResult { .. }));
+        let role = if all_results { "tool" } else { "user" };
+        self.push_draft(role, ts, uuid, blocks);
+        if let Some(last) = self.drafts.last_mut() {
+            last.injected = injected;
+        }
+    }
+
+    fn tool_result_block(
+        &mut self,
+        item: RawItem<'_>,
+        index: usize,
+        tool_use_result: Option<&ToolUseResult>,
+        ts: Option<i64>,
+        line: JsonlSpan,
+    ) -> SessionBlock {
+        let call_id = item.tool_use_id.as_str().unwrap_or_default().to_string();
+        let base = format!("/message/content/{index}/content");
+        let mut images = Vec::new();
+        let (text, pointer): (Cow<'_, str>, Option<String>) = match item.content {
+            RawContent::Text(text) => (text, Some(base)),
+            RawContent::Items(parts) => {
+                let mut texts: Vec<(usize, Cow<'_, str>)> = Vec::new();
+                for (j, part) in parts.into_iter().enumerate() {
+                    let Some(part) = part.0 else { continue };
+                    match part.kind.as_str().unwrap_or_default() {
+                        "text" => {
+                            if let Some(text) = part.text.0 {
+                                texts.push((j, text));
+                            }
+                        }
+                        "image" => {
+                            if let Some(image) =
+                                image_ref_from_item(&part, format!("{base}/{j}/source/data"), line)
+                            {
+                                images.push(image);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match texts.len() {
+                    0 => (Cow::Borrowed(""), None),
+                    // 只有一段文本时直接指向字符串，回取时不用再拼接
+                    1 => {
+                        let (j, text) = texts.pop().expect("len checked");
+                        (text, Some(format!("{base}/{j}/text")))
+                    }
+                    _ => {
+                        let joined = texts
+                            .iter()
+                            .map(|(_, t)| t.as_ref())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (Cow::Owned(joined), Some(base))
+                    }
+                }
+            }
+            RawContent::None => (Cow::Borrowed(""), None),
+        };
+        let text = if text.contains(SYSTEM_REMINDER_OPEN) {
+            Cow::Owned(strip_system_reminders(&text))
+        } else {
+            text
+        };
+        let p = preview(&text);
+
+        let is_error = item.is_error.as_ref().and_then(Value::as_bool) == Some(true);
+        let interrupted = tool_use_result
+            .and_then(|r| r.interrupted.as_ref())
+            .and_then(Value::as_bool)
+            == Some(true);
+        let status = if interrupted {
+            ToolStatus::Interrupted
+        } else if is_error {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Success
+        };
+
+        let slot = self.calls.get(&call_id);
+        let is_shell = slot.is_some_and(|s| s.name == "Bash");
+        // 退出码与耗时只对 Bash 有意义（其余工具的「结果时间 - 调用时间」多是排队与思考时间）
+        let exit_code = parse_exit_code(&text).or_else(|| {
+            let background = tool_use_result.is_some_and(|r| r.background_task_id.is_some());
+            (is_shell && status == ToolStatus::Success && !background).then_some(0)
+        });
+        let duration_ms = match (is_shell, slot.and_then(|s| s.ts), ts) {
+            (true, Some(start), Some(end)) if end >= start => Some((end - start) as u64),
+            _ => None,
+        };
+
+        let saved_path = tool_use_result
+            .and_then(|r| r.persisted_output_path.as_ref())
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        let full = if p.truncated {
+            saved_path
+                .as_deref()
+                .and_then(|path| self.sidecar_rel_path(path))
+                .map(|rel_path| ContentRef::Sidecar { rel_path })
+                .or_else(|| pointer.map(|ptr| line.content_ref(ptr)))
+        } else {
+            None
+        };
+
+        self.backfill_call(&call_id, status, tool_use_result);
+
+        SessionBlock::ToolResult {
+            call_id,
+            status,
+            preview: p.text,
+            total_len: p.total_len,
+            line_count: p.line_count,
+            truncated: p.truncated,
+            full,
+            exit_code,
+            duration_ms,
+            images,
+            saved_path,
+        }
+    }
+
+    /// 结果到来时回填对应 ToolCall：Edit/MultiEdit/Write 用 `structuredPatch` 修正 diff，
+    /// 失败的改动去掉 diff；Agent 用实际模型补 detail。
+    fn backfill_call(&mut self, call_id: &str, status: ToolStatus, result: Option<&ToolUseResult>) {
+        let Some(slot) = self.calls.get(call_id) else {
+            return;
+        };
+        let Some(SessionBlock::ToolCall {
+            raw_name,
+            detail,
+            diff,
+            ..
+        }) = self
+            .drafts
+            .get_mut(slot.draft)
+            .and_then(|d| d.blocks.get_mut(slot.block))
+        else {
+            return;
+        };
+
+        match raw_name.as_str() {
+            "Edit" | "MultiEdit" | "Write" => {
+                if status != ToolStatus::Success {
+                    *diff = None;
+                    return;
+                }
+                let Some(result) = result else { return };
+                let op = match result.kind.as_ref().and_then(Value::as_str) {
+                    Some("create") => Some(DiffOp::Add),
+                    Some("update") => Some(DiffOp::Update),
                     _ => None,
                 };
-                owners.insert(call, owner);
-            }
-        }
-    }
-    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut results_by_assistant: HashMap<usize, Vec<usize>> = HashMap::new();
-    for &i in &indices {
-        if let Some(response) = response_id(&entries[i]) {
-            groups.entry(response).or_default().push(i);
-        } else if entry_kind(&entries[i]) == "user" && is_main_entry(&entries[i]) {
-            let ids = block_ids(&entries[i], "tool_result", "tool_use_id");
-            if ids.is_empty() {
-                continue;
-            }
-            let mut targets = HashSet::new();
-            for field in ["parentUuid", "sourceToolAssistantUUID"] {
-                if let Some(&target) = entries[i]
-                    .get(field)
+                let path = result
+                    .file_path
+                    .as_ref()
                     .and_then(Value::as_str)
-                    .and_then(|id| by_uuid.get(id))
-                {
-                    targets.insert(target);
+                    .map(str::to_string);
+                let patch = result.structured_patch.filter(|p| p.added + p.removed > 0);
+                if op.is_none() && patch.is_none() {
+                    return;
                 }
-            }
-            for id in ids {
-                if let Some(target) = owners.get(id).copied().flatten() {
-                    targets.insert(target);
-                }
-            }
-            for target in targets {
-                results_by_assistant.entry(target).or_default().push(i);
-            }
-        }
-    }
-    let answered_on_chain: HashSet<&str> = chain
-        .iter()
-        .flat_map(|&i| block_ids(&entries[i], "tool_result", "tool_use_id"))
-        .collect();
-    let mut inserts: HashMap<usize, Vec<usize>> = HashMap::new();
-    for &anchor in &chain {
-        let Some(response) = response_id(&entries[anchor]) else {
-            continue;
-        };
-        if anchors.get(response) != Some(&anchor) {
-            continue;
-        }
-        let same_writer = |i: usize, j: usize| {
-            entries[i].get("agentId") == entries[j].get("agentId")
-                && is_main_entry(&entries[i])
-                && is_main_entry(&entries[j])
-        };
-        let group = &groups[response];
-        let members: HashSet<usize> = group
-            .iter()
-            .copied()
-            .filter(|&i| same_writer(i, anchor))
-            .collect();
-        let mut siblings: Vec<usize> = group
-            .iter()
-            .copied()
-            .filter(|i| members.contains(i) && !seen.contains(i))
-            .collect();
-        let mut candidates: Vec<usize> = members
-            .iter()
-            .filter_map(|i| results_by_assistant.get(i))
-            .flatten()
-            .copied()
-            .collect();
-        candidates.sort_unstable();
-        candidates.dedup();
-        let mut results = Vec::new();
-        let mut strays = Vec::new();
-        for i in candidates {
-            if seen.contains(&i) || !is_main_entry(&entries[i]) || entry_kind(&entries[i]) != "user"
-            {
-                continue;
-            }
-            let ids = block_ids(&entries[i], "tool_result", "tool_use_id");
-            if ids.is_empty() {
-                continue;
-            }
-            let Some(parent) = entries[i].get("parentUuid").and_then(Value::as_str) else {
-                continue;
-            };
-            if by_uuid
-                .get(parent)
-                .is_some_and(|p| members.contains(p) && same_writer(i, *p))
-            {
-                results.push(i);
-            } else {
-                let source_matches = entries[i]
-                    .get("sourceToolAssistantUUID")
-                    .and_then(Value::as_str)
-                    .and_then(|id| by_uuid.get(id))
-                    .is_some_and(|p| members.contains(p) && same_writer(i, *p));
-                let owned = ids.iter().any(|id| {
-                    owners
-                        .get(id)
-                        .copied()
-                        .flatten()
-                        .is_some_and(|p| members.contains(&p) && same_writer(i, p))
+                let summary = diff.get_or_insert_with(|| DiffSummary {
+                    files: vec![DiffFile {
+                        path: String::new(),
+                        op: DiffOp::Update,
+                        added: 0,
+                        removed: 0,
+                    }],
+                    added: 0,
+                    removed: 0,
+                    full: None,
                 });
-                if source_matches || owned {
-                    strays.push(i);
+                if let Some(file) = summary.files.first_mut() {
+                    if let Some(op) = op {
+                        file.op = op;
+                    }
+                    if let Some(path) = path {
+                        file.path = path;
+                    }
+                    if let Some(patch) = patch {
+                        file.added = patch.added;
+                        file.removed = patch.removed;
+                    }
+                    summary.added = file.added;
+                    summary.removed = file.removed;
                 }
             }
+            "Agent" | "Task" if detail.is_none() => {
+                *detail = result
+                    .and_then(|r| r.resolved_model.as_ref())
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_string);
+            }
+            _ => {}
         }
-        let mut answered: HashSet<&str> = results
-            .iter()
-            .flat_map(|&i| block_ids(&entries[i], "tool_result", "tool_use_id"))
-            .collect();
-        for i in strays {
-            let ids = block_ids(&entries[i], "tool_result", "tool_use_id");
-            if ids.iter().any(|id| {
-                !answered.contains(id)
-                    && !answered_on_chain.contains(id)
-                    && owners
-                        .get(id)
-                        .copied()
-                        .flatten()
-                        .is_some_and(|p| members.contains(&p) && same_writer(i, p))
-            }) {
-                answered.extend(ids);
-                results.push(i);
+    }
+
+    /// `persistedOutputPath` 在会话附属目录内时，转成相对路径（`ContentRef::Sidecar`）。
+    fn sidecar_rel_path(&self, saved: &str) -> Option<String> {
+        if let Ok(rel) = Path::new(saved).strip_prefix(&self.sidecar_dir) {
+            let normalized = rel.to_string_lossy().replace('\\', "/");
+            if !normalized.is_empty() {
+                return Some(normalized);
             }
         }
-        let timestamp = |i: &usize| {
-            entries[*i]
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
+        let canonical_base = self.sidecar_dir.canonicalize().ok()?;
+        let canonical_saved = Path::new(saved).canonicalize().ok()?;
+        let rel = canonical_saved.strip_prefix(&canonical_base).ok()?;
+        let normalized = rel.to_string_lossy().replace('\\', "/");
+        (!normalized.is_empty()).then_some(normalized)
+    }
+}
+
+// ─── 块构造 ──────────────────────────────────────────────────────────────
+
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+fn thinking_block(
+    item: &RawItem<'_>,
+    kind: &str,
+    index: usize,
+    duration_ms: Option<u64>,
+    line: JsonlSpan,
+) -> Option<SessionBlock> {
+    let text = item.thinking.as_str().unwrap_or_default();
+    let has_signature = item.signature.as_str().is_some_and(|s| !s.is_empty());
+    let redacted = kind == "redacted_thinking" || (text.trim().is_empty() && has_signature);
+    if text.trim().is_empty() && !redacted {
+        return None;
+    }
+    let p = preview_chars(text, THINKING_PREVIEW_CHARS);
+    Some(SessionBlock::Thinking {
+        text: p.text,
+        summary: None,
+        redacted,
+        duration_ms,
+        full: p
+            .truncated
+            .then(|| line.content_ref(format!("/message/content/{index}/thinking"))),
+    })
+}
+
+fn tool_call_block(
+    item: RawItem<'_>,
+    item_kind: &str,
+    index: usize,
+    line: JsonlSpan,
+) -> SessionBlock {
+    let id = item.id.as_str().unwrap_or_default().to_string();
+    let raw_name = item.name.as_str().unwrap_or("unknown").to_string();
+    let input = item.input.unwrap_or(Value::Null);
+    let input_json = if input.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(&input).unwrap_or_default()
+    };
+    let p = preview_chars(&input_json, INPUT_PREVIEW_CHARS);
+    let mut normalized = normalize_tool(ToolSource::Claude, &raw_name, None);
+    if item_kind == "mcp_tool_use" && normalized.kind != ToolKind::Mcp {
+        normalized.kind = ToolKind::Mcp;
+        normalized.server = item
+            .server_name
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    } else if item_kind == "server_tool_use"
+        && normalized.kind == ToolKind::Other
+        && raw_name == "web_search"
+    {
+        normalized.kind = ToolKind::Web;
+    }
+    let (kind, title, detail) = claude_tool_title(&raw_name, &normalized, &input);
+    let diff = matches!(raw_name.as_str(), "Edit" | "MultiEdit" | "Write")
+        .then(|| diff_from_input(kind, &input))
+        .flatten();
+
+    SessionBlock::ToolCall {
+        id,
+        raw_name,
+        kind,
+        title,
+        detail,
+        server: normalized.server,
+        input_preview: p.text,
+        input_total_len: p.total_len,
+        // 指向参数对象（不是字符串），取全文时由命令层序列化
+        input_full: p
+            .truncated
+            .then(|| line.content_ref(format!("/message/content/{index}/input"))),
+        diff,
+        by_user: false,
+    }
+}
+
+/// Claude Code desktop 标记章节的 MCP 工具名（完整名形如 `mcp__ccd_session__mark_chapter`）。
+const MARK_CHAPTER_TOOL: &str = "mark_chapter";
+
+/// 提炼 Claude 工具的 kind（Bash 细化为 search/read）、标题与次要信息。
+fn claude_tool_title(
+    raw_name: &str,
+    normalized: &NormalizedTool,
+    input: &Value,
+) -> (ToolKind, String, Option<String>) {
+    let s = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+    };
+    let kind = normalized.kind;
+
+    if kind == ToolKind::Mcp {
+        let (server, tool) = split_mcp_name(raw_name)
+            .unwrap_or((normalized.server.as_deref().unwrap_or_default(), raw_name));
+        if tool == MARK_CHAPTER_TOOL {
+            if let Some(title) = s("title") {
+                return (
+                    kind,
+                    one_line_title(title),
+                    s("summary").map(one_line_title),
+                );
+            }
+        }
+        let title = if server.is_empty() {
+            one_line_title(tool)
+        } else {
+            title_mcp(server, tool)
         };
-        siblings.sort_by_key(timestamp);
-        results.sort_by_key(timestamp);
-        siblings.extend(results);
-        siblings.retain(|i| seen.insert(*i));
-        inserts.insert(anchor, siblings);
+        return (kind, title, first_string_field(input));
     }
-    let compact_start = chain
-        .iter()
-        .copied()
-        .filter(|&i| {
-            entries[i].get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-                || entries[i].get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-        })
-        .min()
+
+    match raw_name {
+        "Bash" => {
+            let command = s("command").unwrap_or_default();
+            (
+                refine_shell_kind(command),
+                title_shell(command),
+                s("description").map(one_line_title),
+            )
+        }
+        "Read" => {
+            let u = |key: &str| input.get(key).and_then(Value::as_u64);
+            let (title, detail) =
+                title_read(s("file_path").unwrap_or_default(), u("offset"), u("limit"));
+            (kind, title, detail)
+        }
+        "Grep" => (
+            kind,
+            title_search(
+                s("pattern").unwrap_or_default(),
+                s("path").or_else(|| s("glob")),
+            ),
+            s("output_mode").map(str::to_string),
+        ),
+        "Glob" => (
+            kind,
+            title_search(s("pattern").unwrap_or_default(), s("path")),
+            None,
+        ),
+        "ToolSearch" => (
+            kind,
+            title_search(s("query").unwrap_or_default(), None),
+            None,
+        ),
+        "Edit" | "MultiEdit" | "Write" => {
+            (kind, title_path(s("file_path").unwrap_or_default()), None)
+        }
+        "NotebookEdit" => (
+            kind,
+            title_path(s("notebook_path").unwrap_or_default()),
+            None,
+        ),
+        "WebFetch" => (kind, title_web(&[s("url").unwrap_or_default()]), None),
+        "WebSearch" | "web_search" => (kind, title_web(&[s("query").unwrap_or_default()]), None),
+        "Agent" | "Task" => (
+            kind,
+            title_agent(s("description").or_else(|| s("prompt")).unwrap_or_default()),
+            s("model").map(str::to_string),
+        ),
+        "AskUserQuestion" => {
+            let question = input
+                .get("questions")
+                .and_then(Value::as_array)
+                .and_then(|qs| qs.first())
+                .and_then(|q| q.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (kind, title_ask(question), None)
+        }
+        "TodoWrite" => {
+            let count = input
+                .get("todos")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            (kind, title_todo(count), None)
+        }
+        _ if kind == ToolKind::Agent => (
+            kind,
+            first_string_field(input).unwrap_or_else(|| title_other(raw_name)),
+            None,
+        ),
+        _ => (kind, title_other(raw_name), first_string_field(input)),
+    }
+}
+
+fn web_search_result_text(content: &RawContent<'_>) -> String {
+    match content {
+        RawContent::Text(text) => text.to_string(),
+        RawContent::Items(items) => items
+            .iter()
+            .filter_map(|item| item.0.as_ref())
+            .filter_map(|item| {
+                let title = item.title.as_str().filter(|s| !s.is_empty());
+                let url = item.url.as_str().filter(|s| !s.is_empty());
+                match (title, url) {
+                    (Some(t), Some(u)) => Some(format!("- {t} ({u})")),
+                    (Some(t), None) => Some(format!("- {t}")),
+                    (None, Some(u)) => Some(format!("- {u}")),
+                    (None, None) => item.text.as_str().map(str::to_string),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        RawContent::None => String::new(),
+    }
+}
+
+fn image_ref_from_item(item: &RawItem<'_>, pointer: String, line: JsonlSpan) -> Option<ImageRef> {
+    if let Some(source) = item.source.0.as_ref() {
+        if source.kind.as_str() == Some("base64") {
+            let data = source.data.as_str()?;
+            return Some(ImageRef {
+                source: ImageSource::Inline {
+                    content: line.content_ref(pointer),
+                },
+                media_type: source
+                    .media_type
+                    .as_str()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                size: estimate_base64_size(data.len()),
+                alt: None,
+            });
+        }
+        if let Some(raw_path) = source
+            .path
+            .as_str()
+            .or_else(|| source.url.as_str())
+            .filter(|p| !p.trim().is_empty())
+        {
+            return local_file_image(raw_path, source.media_type.as_str());
+        }
+    }
+    let raw_path = item
+        .path
+        .as_str()
+        .or_else(|| item.file_path.as_str())
+        .or_else(|| item.url.as_str())
+        .filter(|p| !p.trim().is_empty())?;
+    local_file_image(raw_path, None)
+}
+
+fn local_file_image(raw: &str, explicit_mime: Option<&str>) -> Option<ImageRef> {
+    let resolved = if raw.starts_with("file://") {
+        parse_file_url(raw)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| raw.strip_prefix("file://").unwrap_or(raw).to_string())
+    } else {
+        let bytes = raw.as_bytes();
+        let is_win_abs = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\');
+        if raw.starts_with('/') || is_win_abs {
+            raw.to_string()
+        } else {
+            return None;
+        }
+    };
+    let media_type = match explicit_mime.filter(|m| !m.trim().is_empty()) {
+        Some(mime) => mime.to_string(),
+        None => {
+            let ext = resolved
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match ext.as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "bmp" => "image/bmp",
+                "svg" => "image/svg+xml",
+                _ => "image/png",
+            }
+            .to_string()
+        }
+    };
+    let size = std::fs::metadata(&resolved)
+        .map(|m| u32::try_from(m.len()).unwrap_or(u32::MAX))
         .unwrap_or(0);
-    let mut legacy = entries
-        .iter()
-        .enumerate()
-        .filter(|(i, entry)| {
-            *i >= compact_start
-                && entry
-                    .get("uuid")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-        })
-        .peekable();
-    let mut output = Vec::new();
-    for index in chain {
-        while legacy.peek().is_some_and(|(i, _)| *i < index) {
-            output.push(legacy.next().unwrap().1);
-        }
-        output.push(&entries[index]);
-        if let Some(recovered) = inserts.get(&index) {
-            output.extend(recovered.iter().map(|&i| &entries[i]));
-        }
+    Some(ImageRef {
+        source: ImageSource::LocalFile { path: resolved },
+        media_type,
+        size,
+        alt: None,
+    })
+}
+
+/// 用户 `!cmd`：`<bash-input>cmd</bash-input><bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>`
+fn user_bash_blocks(text: &str, uuid: Option<&str>) -> Vec<SessionBlock> {
+    let command = tag_content(text, "bash-input").unwrap_or_default();
+    let id = format!("user-bash-{}", uuid.unwrap_or_default());
+    let input = preview_chars(command, INPUT_PREVIEW_CHARS);
+    let mut blocks = vec![SessionBlock::ToolCall {
+        id: id.clone(),
+        raw_name: "Bash".to_string(),
+        kind: refine_shell_kind(command),
+        title: title_shell(command),
+        detail: None,
+        server: None,
+        input_preview: input.text,
+        input_total_len: input.total_len,
+        input_full: None,
+        diff: None,
+        by_user: true,
+    }];
+
+    let stdout = tag_content(text, "bash-stdout");
+    let stderr = tag_content(text, "bash-stderr");
+    if stdout.is_some() || stderr.is_some() {
+        let stdout = stdout.unwrap_or_default().trim_end();
+        let stderr = stderr.unwrap_or_default().trim_end();
+        let output = match (stdout.is_empty(), stderr.is_empty()) {
+            (_, true) => stdout.to_string(),
+            (true, false) => stderr.to_string(),
+            (false, false) => format!("{stdout}\n{stderr}"),
+        };
+        let p = preview(&output);
+        blocks.push(SessionBlock::ToolResult {
+            call_id: id,
+            // 只有 stderr 不代表失败，状态未知
+            status: if stderr.is_empty() {
+                ToolStatus::Success
+            } else {
+                ToolStatus::Unknown
+            },
+            preview: p.text,
+            total_len: p.total_len,
+            line_count: p.line_count,
+            truncated: p.truncated,
+            full: None,
+            exit_code: None,
+            duration_ms: None,
+            images: Vec::new(),
+            saved_path: None,
+        });
     }
-    output.extend(legacy.map(|(_, entry)| entry));
-    output
+    blocks
+}
+
+fn message_meta(
+    model: &LStr<'_>,
+    usage: Option<&Value>,
+    stop_reason: &LStr<'_>,
+) -> Option<MessageMeta> {
+    // 0 视为缺省，省掉序列化体积
+    let tokens = |key: &str| {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    };
+    let meta = MessageMeta {
+        model: model
+            .as_str()
+            .filter(|m| !m.is_empty() && *m != "<synthetic>")
+            .map(str::to_string),
+        input_tokens: tokens("input_tokens"),
+        output_tokens: tokens("output_tokens"),
+        cache_read_tokens: tokens("cache_read_input_tokens"),
+        cache_write_tokens: tokens("cache_creation_input_tokens"),
+        stop_reason: stop_reason.as_str().map(str::to_string),
+        ..MessageMeta::default()
+    };
+    (meta != MessageMeta::default()).then_some(meta)
+}
+
+/// 同一回复拆成的多条记录：后到的非空字段覆盖先前的（usage 以最后一块为准）。
+fn merge_meta(target: &mut Option<MessageMeta>, next: Option<MessageMeta>) {
+    let Some(next) = next else { return };
+    let Some(current) = target.as_mut() else {
+        *target = Some(next);
+        return;
+    };
+    macro_rules! take {
+        ($($field:ident),*) => {$(
+            if next.$field.is_some() {
+                current.$field = next.$field;
+            }
+        )*};
+    }
+    take!(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        duration_ms,
+        stop_reason
+    );
+}
+
+// ─── 文本规则 ────────────────────────────────────────────────────────────
+
+/// 去掉所有 `<system-reminder>…</system-reminder>` 片段；没有闭合标签时去到末尾。
+fn strip_system_reminders(text: &str) -> String {
+    if !text.contains(SYSTEM_REMINDER_OPEN) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(SYSTEM_REMINDER_OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + SYSTEM_REMINDER_OPEN.len()..];
+        rest = match after.find(SYSTEM_REMINDER_CLOSE) {
+            Some(end) => &after[end + SYSTEM_REMINDER_CLOSE.len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// 系统/工具注入、不是用户亲手输入的文本。
+fn is_injected_text(text: &str) -> bool {
+    text.contains("<local-command-caveat>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<local-command-stderr>")
+        || text.starts_with("<task-notification>")
+}
+
+/// `<command-name>/compact</command-name><command-args>…</command-args>` → `/compact …`
+fn slash_command(text: &str) -> Option<String> {
+    if !text.starts_with("<command-") {
+        return None;
+    }
+    let name = tag_content(text, "command-name")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = tag_content(text, "command-args").unwrap_or_default().trim();
+    Some(if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {args}")
+    })
+}
+
+/// 取 `<tag>…</tag>` 之间的内容（第一处）。
+fn tag_content<'t>(text: &'t str, tag: &str) -> Option<&'t str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close).map_or(text.len(), |i| start + i);
+    Some(&text[start..end])
+}
+
+/// `Exit code N` 开头的工具输出（Claude Bash 失败时的格式）
+fn parse_exit_code(text: &str) -> Option<i32> {
+    let first = text.trim_start().lines().next()?;
+    let rest = first.strip_prefix("Error: ").unwrap_or(first);
+    rest.strip_prefix("Exit code ")?.trim().parse().ok()
+}
+
+fn content_text(content: &RawContent<'_>) -> String {
+    match content {
+        RawContent::Text(text) => text.to_string(),
+        RawContent::Items(items) => items
+            .iter()
+            .filter_map(|item| item.0.as_ref())
+            .filter(|item| item.kind.as_str() == Some("text"))
+            .filter_map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        RawContent::None => String::new(),
+    }
+}
+
+fn is_true(value: &Option<Value>) -> bool {
+    value.as_ref().and_then(Value::as_bool) == Some(true)
+}
+
+fn as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().filter(|n| *n >= 0.0).map(|n| n as u64))
+}
+
+// ─── 原始记录（只声明用到的字段，其余由 serde 跳过）──────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRecord<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: LStr<'a>,
+    #[serde(default, borrow)]
+    subtype: LStr<'a>,
+    #[serde(default)]
+    is_meta: Option<Value>,
+    #[serde(default)]
+    is_sidechain: Option<Value>,
+    #[serde(default, borrow)]
+    team_name: LStr<'a>,
+    #[serde(default)]
+    is_compact_summary: Option<Value>,
+    #[serde(default, borrow)]
+    uuid: LStr<'a>,
+    #[serde(default)]
+    timestamp: Option<Value>,
+    #[serde(default, borrow)]
+    message: Lenient<RawMessage<'a>>,
+    #[serde(default)]
+    tool_use_result: Lenient<ToolUseResult>,
+    #[serde(default)]
+    thinking_duration_ms: Option<Value>,
+    #[serde(default)]
+    thinking_metadata: Lenient<RawThinkingMetadata>,
+    #[serde(default)]
+    duration_ms: Option<Value>,
+    #[serde(default)]
+    hook_errors: Option<Value>,
+    /// system 记录的正文（compact_boundary / local_command）
+    #[serde(default, borrow)]
+    content: LStr<'a>,
+    #[serde(default, borrow)]
+    pr_url: LStr<'a>,
+    #[serde(default)]
+    pr_number: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawThinkingMetadata {
+    #[serde(default)]
+    duration_ms: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct RawMessage<'a> {
+    #[serde(default, borrow)]
+    role: LStr<'a>,
+    #[serde(default, borrow)]
+    id: LStr<'a>,
+    #[serde(default, borrow)]
+    model: LStr<'a>,
+    #[serde(default, borrow)]
+    stop_reason: LStr<'a>,
+    #[serde(default)]
+    usage: Option<Value>,
+    #[serde(default, borrow)]
+    content: RawContent<'a>,
+}
+
+/// `message.content[]` 与 `tool_result.content[]` 的元素（字段取并集）
+#[derive(Deserialize)]
+struct RawItem<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: LStr<'a>,
+    #[serde(default, borrow)]
+    text: LStr<'a>,
+    #[serde(default, borrow)]
+    thinking: LStr<'a>,
+    #[serde(default, borrow)]
+    signature: LStr<'a>,
+    #[serde(default, borrow)]
+    id: LStr<'a>,
+    #[serde(default, borrow)]
+    name: LStr<'a>,
+    #[serde(default, borrow)]
+    server_name: LStr<'a>,
+    #[serde(default)]
+    input: Option<Value>,
+    #[serde(default, borrow)]
+    tool_use_id: LStr<'a>,
+    #[serde(default)]
+    is_error: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+    #[serde(default, borrow)]
+    title: LStr<'a>,
+    #[serde(default, borrow)]
+    url: LStr<'a>,
+    #[serde(default, borrow)]
+    path: LStr<'a>,
+    #[serde(default, borrow)]
+    file_path: LStr<'a>,
+    #[serde(default, borrow)]
+    content: RawContent<'a>,
+    #[serde(default, borrow)]
+    source: Lenient<RawSource<'a>>,
+}
+
+#[derive(Deserialize)]
+struct RawSource<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: LStr<'a>,
+    #[serde(default, borrow)]
+    media_type: LStr<'a>,
+    #[serde(default, borrow)]
+    data: LStr<'a>,
+    #[serde(default, borrow)]
+    path: LStr<'a>,
+    #[serde(default, borrow)]
+    url: LStr<'a>,
+}
+
+/// 顶层 `toolUseResult`：只取回填需要的字段（stdout、file、originalFile 等大字段跳过）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolUseResult {
+    #[serde(default)]
+    interrupted: Option<Value>,
+    #[serde(default)]
+    persisted_output_path: Option<Value>,
+    #[serde(rename = "type", default)]
+    kind: Option<Value>,
+    #[serde(default)]
+    file_path: Option<Value>,
+    #[serde(default)]
+    resolved_model: Option<Value>,
+    #[serde(default)]
+    background_task_id: Option<Value>,
+    #[serde(default)]
+    structured_patch: Option<PatchCounts>,
+}
+
+/// 宽松的借用字符串：非字符串值当作 `None`。
+#[derive(Default)]
+struct LStr<'a>(Option<Cow<'a, str>>);
+
+impl LStr<'_> {
+    fn as_str(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+/// 只接受对象的宽松包装：其他类型当作 `None`。
+struct Lenient<T>(Option<T>);
+
+impl<T> Default for Lenient<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+/// 字符串或块数组（`message.content` / `tool_result.content`）
+#[derive(Default)]
+enum RawContent<'a> {
+    #[default]
+    None,
+    Text(Cow<'a, str>),
+    Items(Vec<Lenient<RawItem<'a>>>),
+}
+
+/// `structuredPatch` 里以 `+` / `-` 开头的行数
+#[derive(Clone, Copy, Default)]
+struct PatchCounts {
+    added: u32,
+    removed: u32,
+}
+
+macro_rules! skip_other_values {
+    ($value:expr) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+    };
+}
+
+macro_rules! skip_str_values {
+    ($value:expr) => {
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+    };
+}
+
+macro_rules! skip_seq_values {
+    ($value:expr) => {
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok($value)
+        }
+    };
+}
+
+macro_rules! skip_map_values {
+    ($value:expr) => {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok($value)
+        }
+    };
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for LStr<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = LStr<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(LStr(Some(Cow::Borrowed(v))))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(LStr(Some(Cow::Owned(v.to_string()))))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(LStr(Some(Cow::Owned(v))))
+            }
+            skip_other_values!(LStr(None));
+            skip_seq_values!(LStr(None));
+            skip_map_values!(LStr(None));
+        }
+        deserializer.deserialize_any(V(PhantomData))
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Lenient<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = Lenient<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(de::value::MapAccessDeserializer::new(map)).map(|v| Lenient(Some(v)))
+            }
+            skip_other_values!(Lenient(None));
+            skip_str_values!(Lenient(None));
+            skip_seq_values!(Lenient(None));
+        }
+        deserializer.deserialize_any(V(PhantomData))
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for RawContent<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = RawContent<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("string or array")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(RawContent::Text(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(RawContent::Text(Cow::Owned(v.to_string())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(RawContent::Text(Cow::Owned(v)))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(item) = seq.next_element::<Lenient<RawItem<'a>>>()? {
+                    items.push(item);
+                }
+                Ok(RawContent::Items(items))
+            }
+            skip_other_values!(RawContent::None);
+            skip_map_values!(RawContent::None);
+        }
+        deserializer.deserialize_any(V(PhantomData))
+    }
+}
+
+impl<'de> Deserialize<'de> for PatchCounts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Hunk;
+        impl<'de> Visitor<'de> for Hunk {
+            type Value = PatchCounts;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("hunk")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut counts = PatchCounts::default();
+                while let Some(key) = map.next_key::<LStr<'_>>()? {
+                    if key.as_str() == Some("lines") {
+                        counts = map.next_value_seed(Lines)?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(counts)
+            }
+            skip_other_values!(PatchCounts::default());
+            skip_str_values!(PatchCounts::default());
+            skip_seq_values!(PatchCounts::default());
+        }
+
+        struct Lines;
+        impl<'de> de::DeserializeSeed<'de> for Lines {
+            type Value = PatchCounts;
+            fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        impl<'de> Visitor<'de> for Lines {
+            type Value = PatchCounts;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("lines")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut counts = PatchCounts::default();
+                while let Some(line) = seq.next_element::<LStr<'_>>()? {
+                    match line.as_str().and_then(|l| l.chars().next()) {
+                        Some('+') => counts.added += 1,
+                        Some('-') => counts.removed += 1,
+                        _ => {}
+                    }
+                }
+                Ok(counts)
+            }
+            skip_other_values!(PatchCounts::default());
+            skip_str_values!(PatchCounts::default());
+            skip_map_values!(PatchCounts::default());
+        }
+
+        struct Hunks;
+        impl<'de> Visitor<'de> for Hunks {
+            type Value = PatchCounts;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("structuredPatch")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut total = PatchCounts::default();
+                while let Some(hunk) = seq.next_element_seed(HunkSeed)? {
+                    total.added += hunk.added;
+                    total.removed += hunk.removed;
+                }
+                Ok(total)
+            }
+            skip_other_values!(PatchCounts::default());
+            skip_str_values!(PatchCounts::default());
+            skip_map_values!(PatchCounts::default());
+        }
+        struct HunkSeed;
+        impl<'de> de::DeserializeSeed<'de> for HunkSeed {
+            type Value = PatchCounts;
+            fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(Hunk)
+            }
+        }
+
+        deserializer.deserialize_any(Hunks)
+    }
 }
 
 fn is_valid_claude_session_id(id: &str) -> bool {
@@ -1900,92 +2945,118 @@ mod tests {
     }
 
     #[test]
-    fn compat_latest_main_chain_deduplicates_and_excludes_other_writers() {
+    fn sidechain_and_team_entries_are_excluded_while_is_meta_marks_injected() {
         let rows = vec![
-            serde_json::json!({"type":"user","uuid":"u","message":{"role":"user","content":"root"}}),
-            serde_json::json!({"type":"assistant","uuid":"old","parentUuid":"u","message":{"role":"assistant","content":"abandoned"}}),
-            serde_json::json!({"type":"assistant","uuid":"a","parentUuid":"u","message":{"role":"assistant","content":"stale"}}),
-            serde_json::json!({"type":"assistant","uuid":"a","parentUuid":"u","message":{"role":"assistant","content":"latest"}}),
-            serde_json::json!({"type":"progress","uuid":"p","parentUuid":"a"}),
-            serde_json::json!({"type":"user","uuid":"side","isSidechain":true,"message":{"role":"user","content":"side"}}),
-            serde_json::json!({"type":"user","uuid":"team","teamName":"team","message":{"role":"user","content":"team"}}),
-            serde_json::json!({"type":"user","uuid":"meta","isMeta":true,"message":{"role":"user","content":"meta"}}),
-        ];
-        let messages = compat_load(rows);
-        assert_eq!(
-            messages
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>(),
-            ["root", "latest"]
-        );
-    }
-
-    #[test]
-    fn compat_meta_terminal_keeps_visible_parent_chain() {
-        let messages = compat_load(vec![
-            serde_json::json!({"type":"user","uuid":"u","message":{"role":"user","content":"visible"}}),
-            serde_json::json!({"type":"user","uuid":"meta","parentUuid":"u","isMeta":true,"message":{"role":"user","content":"hidden"}}),
-        ]);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "visible");
-    }
-
-    #[test]
-    fn compat_parallel_calls_results_and_strays_are_retained_not_all_branches() {
-        let rows = vec![
-            serde_json::json!({"type":"user","uuid":"u","message":{"role":"user","content":"root"}}),
-            serde_json::json!({"type":"assistant","uuid":"a1","parentUuid":"u","message":{"id":"response","role":"assistant","content":[{"type":"tool_use","id":"c1","name":"Read","input":{}}]}}),
-            serde_json::json!({"type":"assistant","uuid":"a2","parentUuid":"a1","message":{"id":"response","role":"assistant","content":[{"type":"tool_use","id":"c2","name":"Search","input":{}}]}}),
-            serde_json::json!({"type":"user","uuid":"r2","parentUuid":"a2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c2","content":"second result"}]}}),
-            serde_json::json!({"type":"user","uuid":"r1","parentUuid":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"first result"}]}}),
-            serde_json::json!({"type":"assistant","uuid":"end","parentUuid":"r1","message":{"id":"next","role":"assistant","content":"done"}}),
-        ];
-        let messages = compat_load(rows);
-        assert_eq!(messages.len(), 6);
-        assert!(messages[2].content.contains("Search"));
-        assert_eq!(messages[3].content, "second result");
-        assert_eq!(messages[4].role, "tool");
-        assert_eq!(messages[5].content, "done");
-    }
-
-    #[test]
-    fn compat_parallel_stray_answers_only_open_same_writer_call() {
-        let rows = vec![
-            serde_json::json!({"type":"assistant","uuid":"call","message":{"id":"response","role":"assistant","content":[{"type":"tool_use","id":"c","name":"Read","input":{}}]}}),
-            serde_json::json!({"type":"user","uuid":"wrong-writer","parentUuid":"unrelated","agentId":"other","sourceToolAssistantUUID":"call","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"wrong agent"}]}}),
-            serde_json::json!({"type":"user","uuid":"stray","parentUuid":"unrelated","sourceToolAssistantUUID":"call","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"recovered"}]}}),
-            serde_json::json!({"type":"user","uuid":"duplicate","parentUuid":"unrelated","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"duplicate"}]}}),
-            serde_json::json!({"type":"assistant","uuid":"end","parentUuid":"call","message":{"id":"next","role":"assistant","content":"done"}}),
+            json!({"type":"user","uuid":"u","message":{"role":"user","content":"root"}}),
+            json!({"type":"assistant","uuid":"a","parentUuid":"u","message":{"id":"m1","role":"assistant","content":"latest"}}),
+            json!({"type":"progress","uuid":"p","parentUuid":"a"}),
+            json!({"type":"user","uuid":"side","isSidechain":true,"message":{"role":"user","content":"side"}}),
+            json!({"type":"user","uuid":"team","teamName":"team","message":{"role":"user","content":"team"}}),
+            json!({"type":"user","uuid":"meta","isMeta":true,"message":{"role":"user","content":"expanded skill prompt"}}),
         ];
         let messages = compat_load(rows);
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1].content, "recovered");
-        assert_eq!(messages[2].content, "done");
+        assert_eq!(messages[0].content, "root");
+        assert!(!messages[0].injected);
+        assert_eq!(messages[1].content, "latest");
+        assert!(!messages[1].injected);
+        assert_eq!(messages[2].content, "expanded skill prompt");
+        assert!(messages[2].injected);
+        assert_eq!(messages[2].turn_id.as_deref(), Some("t1"));
     }
 
     #[test]
-    fn compat_compaction_does_not_follow_logical_parent_and_keeps_legacy_rows() {
+    fn adjacent_same_message_id_records_merge_blocks_and_meta() {
         let rows = vec![
-            serde_json::json!({"message":{"role":"user","content":"legacy before compact"}}),
-            serde_json::json!({"type":"user","uuid":"old","message":{"role":"user","content":"old context"}}),
-            serde_json::json!({"type":"system","uuid":"boundary","subtype":"compact_boundary","logicalParentUuid":"old"}),
-            serde_json::json!({"type":"user","uuid":"summary","parentUuid":"boundary","isCompactSummary":true,"message":{"role":"user","content":"summary"}}),
-            serde_json::json!({"message":{"role":"user","content":"legacy mixed"}}),
-            serde_json::json!({"type":"assistant","uuid":"end","parentUuid":"summary","message":{"role":"assistant","content":"answer"}}),
+            json!({"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}),
+            json!({
+                "type":"assistant",
+                "uuid":"a1",
+                "thinkingMetadata":{"durationMs":2400},
+                "message":{
+                    "id":"msg_same",
+                    "role":"assistant",
+                    "model":"claude-opus-4-6",
+                    "usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":20},
+                    "content":[{"type":"thinking","thinking":"plan step","signature":"sig1"}]
+                }
+            }),
+            json!({
+                "type":"assistant",
+                "uuid":"a2",
+                "message":{
+                    "id":"msg_same",
+                    "role":"assistant",
+                    "model":"claude-opus-4-6",
+                    "stop_reason":"tool_use",
+                    "usage":{"input_tokens":10,"output_tokens":42,"cache_read_input_tokens":100,"cache_creation_input_tokens":20},
+                    "content":[
+                        {"type":"text","text":"Let me read the files."},
+                        {"type":"tool_use","id":"c1","name":"Read","input":{"file_path":"/p/a.rs"}},
+                        {"type":"tool_use","id":"c2","name":"Grep","input":{"pattern":"foo","path":"src"}}
+                    ]
+                }
+            }),
+            json!({"type":"system","subtype":"turn_duration","durationMs":3750}),
+            json!({"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"first result"}]}}),
+            json!({"type":"user","uuid":"r2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c2","content":"second result"}]}}),
+            json!({"type":"assistant","uuid":"end","message":{"id":"msg_next","role":"assistant","content":"done"}}),
         ];
         let messages = compat_load(rows);
-        assert_eq!(
-            messages
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>(),
-            ["[Compacted Summary]\nsummary", "legacy mixed", "answer"]
-        );
-        let legacy = compat_load(vec![
-            serde_json::json!({"message":{"role":"user","content":"old schema"}}),
-        ]);
-        assert_eq!(legacy[0].content, "old schema");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].id.as_deref(), Some("a1"));
+        assert_eq!(messages[1].blocks.len(), 4);
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::Thinking { text, duration_ms: Some(2400), redacted: false, .. }
+                if text == "plan step"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[1],
+            SessionBlock::Text { text, .. } if text == "Let me read the files."
+        ));
+        assert!(matches!(
+            &messages[1].blocks[2],
+            SessionBlock::ToolCall { id, kind: ToolKind::Read, .. } if id == "c1"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[3],
+            SessionBlock::ToolCall { id, kind: ToolKind::Search, .. } if id == "c2"
+        ));
+        let meta = messages[1].meta.as_ref().expect("merged meta");
+        assert_eq!(meta.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(meta.input_tokens, Some(10));
+        assert_eq!(meta.output_tokens, Some(42));
+        assert_eq!(meta.cache_read_tokens, Some(100));
+        assert_eq!(meta.cache_write_tokens, Some(20));
+        assert_eq!(meta.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(meta.duration_ms, Some(3750));
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].content, "first result");
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].content, "second result");
+        assert_eq!(messages[4].content, "done");
+    }
+
+    #[test]
+    fn compact_boundary_merges_with_following_compact_summary() {
+        let rows = vec![
+            json!({"message":{"role":"user","content":"before compact"}}),
+            json!({"type":"system","uuid":"boundary","subtype":"compact_boundary","content":"Conversation compacted"}),
+            json!({"type":"user","uuid":"summary","isCompactSummary":true,"message":{"role":"user","content":"Compacted summary text"}}),
+            json!({"type":"assistant","uuid":"end","message":{"role":"assistant","content":"answer"}}),
+        ];
+        let messages = compat_load(rows);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "before compact");
+        assert_eq!(messages[1].role, "system");
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::Event { kind: EventKind::Compaction, text: Some(t), .. }
+                if t == "Compacted summary text"
+        ));
+        assert_eq!(messages[1].content, "Compacted summary text");
+        assert_eq!(messages[2].content, "answer");
     }
 
     #[test]
@@ -2652,7 +3723,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_emits_thinking_before_assistant_and_handles_rich_blocks() {
+    fn load_messages_emits_thinking_and_handles_rich_blocks() {
         let messages = compat_load(vec![
             json!({
                 "type": "user",
@@ -2660,7 +3731,7 @@ mod tests {
                 "message": {
                     "role": "user",
                     "content": [
-                        {"type": "image"},
+                        {"type": "image", "source": {"type": "file", "path": "/tmp/diagram.png"}},
                         {"type": "document"},
                         {"type": "text", "text": "Inspect these"}
                     ]
@@ -2675,26 +3746,340 @@ mod tests {
                     "role": "assistant",
                     "content": [
                         {"type": "thinking", "thinking": "Analyzing attachments"},
-                        {"type": "server_tool_use", "id": "srv_1", "name": "web_search"},
+                        {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "docs"}},
                         {
                             "type": "web_search_tool_result",
                             "content": [{"title": "Docs", "url": "https://docs.example.com"}]
                         },
-                        {"type": "mcp_tool_use", "id": "mcp_1", "name": "linear_get_issue"},
+                        {"type": "mcp_tool_use", "id": "mcp_1", "name": "linear_get_issue", "server_name": "linear"},
                         {"type": "text", "text": "All set."}
                     ]
                 }
             }),
         ]);
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "[Image]\n[Document]\nInspect these");
-        assert_eq!(messages[1].role, "thinking");
-        assert_eq!(messages[1].content, "Analyzing attachments");
-        assert_eq!(messages[2].role, "assistant");
+        assert!(messages[0]
+            .content
+            .starts_with("Inspect these\n\n[Image: image/png"));
+        assert!(matches!(
+            &messages[0].blocks[1],
+            SessionBlock::Image { image } if matches!(&image.source, ImageSource::LocalFile { path } if path == "/tmp/diagram.png")
+        ));
+
+        assert_eq!(messages[1].role, "assistant");
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::Thinking { text, redacted: false, .. } if text == "Analyzing attachments"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[1],
+            SessionBlock::ToolCall { id, kind: ToolKind::Web, title, .. }
+                if id == "srv_1" && title == "docs"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[2],
+            SessionBlock::ToolResult { call_id, preview, .. }
+                if call_id == "srv_1" && preview == "- Docs (https://docs.example.com)"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[3],
+            SessionBlock::ToolCall { id, kind: ToolKind::Mcp, server: Some(srv), title, .. }
+                if id == "mcp_1" && srv == "linear" && title == "linear.linear_get_issue"
+        ));
         assert_eq!(
-            messages[2].content,
-            "[Tool: web_search]\n- Docs (https://docs.example.com)\n[Tool: linear_get_issue]\nAll set."
+            messages[1].content,
+            "[Tool: web_search] docs\n\n- Docs (https://docs.example.com)\n\n[Tool: linear_get_issue] linear.linear_get_issue\n\nAll set."
+        );
+    }
+
+    fn parse_claude_lines(
+        lines: &[Value],
+    ) -> (tempfile::TempDir, PathBuf, Vec<SessionMessage>, Vec<u64>) {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        let mut body = String::new();
+        let mut offsets = Vec::new();
+        for line in lines {
+            offsets.push(body.len() as u64);
+            body.push_str(&serde_json::to_string(line).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).expect("write");
+        let messages = load_messages(&path).expect("load");
+        (temp, path, messages, offsets)
+    }
+
+    fn claude_user(uuid: &str, content: Value) -> Value {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": "2026-10-03T10:00:00Z",
+            "message": { "role": "user", "content": content }
+        })
+    }
+
+    fn claude_assistant(uuid: &str, msg_id: &str, content: Value) -> Value {
+        json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "timestamp": "2026-10-03T10:00:01Z",
+            "message": {
+                "id": msg_id,
+                "role": "assistant",
+                "model": "claude-opus-4-6",
+                "content": content
+            }
+        })
+    }
+
+    #[test]
+    fn structured_patch_mark_chapter_sidecar_slash_command_and_stop_hook_summary() {
+        use crate::session_manager::model::project_content;
+
+        let long_out: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let img = "QUJD".repeat(500);
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        let sidecar = path.with_extension("");
+        let persisted = sidecar
+            .join("tool-results")
+            .join("toolu_bash.txt")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut edit_result = claude_user(
+            "u2",
+            json!([{ "type": "tool_result", "tool_use_id": "toolu_edit", "content": "Updated /p/a.rs" }]),
+        );
+        edit_result["toolUseResult"] = json!({
+            "filePath": "/p/a.rs",
+            "structuredPatch": [
+                { "lines": [" a", "-b", "+c", "+d"] },
+                { "lines": ["-e", "+f"] }
+            ]
+        });
+
+        let mut bash_result = claude_user(
+            "u3",
+            json!([{ "type": "tool_result", "tool_use_id": "toolu_bash", "content": long_out }]),
+        );
+        bash_result["toolUseResult"] = json!({
+            "interrupted": true,
+            "persistedOutputPath": persisted
+        });
+
+        let lines = vec![
+            claude_user("u1", json!([
+                { "type": "text", "text": "<system-reminder>opened file</system-reminder>\n\nFix bug" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": img } }
+            ])),
+            claude_assistant(
+                "a1",
+                "m1",
+                json!([
+                    { "type": "thinking", "thinking": "t".repeat(THINKING_PREVIEW_CHARS + 40), "signature": "sig" },
+                    { "type": "redacted_thinking", "thinking": "" },
+                    { "type": "tool_use", "id": "toolu_chap", "name": "mcp__ccd_session__mark_chapter", "input": { "title": "修复阶段", "summary": "更新配置\n补充单测" } },
+                    { "type": "tool_use", "id": "toolu_edit", "name": "Edit", "input": { "file_path": "/p/a.rs", "old_string": "b", "new_string": "c" } },
+                    { "type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": { "command": "cargo test" } }
+                ]),
+            ),
+            edit_result,
+            bash_result,
+            claude_user(
+                "u4",
+                json!("<command-name>/compact</command-name>\n<command-args>keep context</command-args>"),
+            ),
+            claude_user(
+                "u5",
+                json!("<local-command-caveat>Caveat: local command</local-command-caveat>"),
+            ),
+            claude_user(
+                "u6",
+                json!("<bash-input>git status</bash-input><bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>"),
+            ),
+            claude_user("u7", json!("[Request interrupted by user for tool use]")),
+            json!({ "type": "system", "subtype": "stop_hook_summary", "hookErrors": [] }),
+            json!({ "type": "system", "subtype": "stop_hook_summary", "hookErrors": ["hook.sh exited with code 1"] }),
+            json!({ "type": "pr-link", "prNumber": 42, "prUrl": "https://github.com/o/r/pull/42" }),
+            json!({ "type": "pr-link", "prNumber": 42, "prUrl": "https://github.com/o/r/pull/42" }),
+        ];
+
+        let mut body = String::new();
+        for line in &lines {
+            body.push_str(&serde_json::to_string(line).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+        let msgs = load_messages(&path).unwrap();
+
+        // Turn 1: user prompt stripped reminder + inline image
+        assert_eq!(msgs[0].turn_id.as_deref(), Some("t1"));
+        assert!(!msgs[0].injected);
+        assert!(msgs[0].content.starts_with("Fix bug\n\n[Image: image/png"));
+        assert!(matches!(
+            &msgs[0].blocks[1],
+            SessionBlock::Image { image } if matches!(image.source, ImageSource::Inline { content: ContentRef::Jsonl { offset: 0, .. } })
+        ));
+
+        // Assistant thinking preview + redacted_thinking + mark_chapter + Edit backfilled from structuredPatch
+        assert!(matches!(
+            &msgs[1].blocks[0],
+            SessionBlock::Thinking { text, redacted: false, full: Some(ContentRef::Jsonl { pointer, .. }), .. }
+                if text.chars().count() == THINKING_PREVIEW_CHARS && pointer == "/message/content/0/thinking"
+        ));
+        assert!(matches!(
+            &msgs[1].blocks[1],
+            SessionBlock::Thinking { redacted: true, .. }
+        ));
+        assert!(matches!(
+            &msgs[1].blocks[2],
+            SessionBlock::ToolCall { kind: ToolKind::Mcp, title, detail: Some(d), .. }
+                if title == "修复阶段" && d == "更新配置…"
+        ));
+        match &msgs[1].blocks[3] {
+            SessionBlock::ToolCall { diff, .. } => {
+                let d = diff.as_ref().expect("backfilled structuredPatch diff");
+                assert_eq!((d.added, d.removed), (3, 2));
+                assert_eq!(d.files[0].path, "/p/a.rs");
+                assert_eq!(d.files[0].op, DiffOp::Update);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Persisted output becomes ContentRef::Sidecar relative to <sessionId>/
+        assert!(matches!(
+            &msgs[3].blocks[0],
+            SessionBlock::ToolResult {
+                status: ToolStatus::Interrupted,
+                truncated: true,
+                full: Some(ContentRef::Sidecar { rel_path }),
+                ..
+            } if rel_path == "tool-results/toolu_bash.txt"
+        ));
+
+        // <command-name> -> EventKind::SlashCommand starts turn t2
+        assert_eq!(msgs[4].turn_id.as_deref(), Some("t2"));
+        assert!(matches!(
+            &msgs[4].blocks[0],
+            SessionBlock::Event { kind: EventKind::SlashCommand, text: Some(t), .. }
+                if t == "/compact keep context"
+        ));
+
+        // <local-command-caveat> -> injected: true, stays in turn t2
+        assert!(msgs[5].injected);
+        assert_eq!(msgs[5].turn_id.as_deref(), Some("t2"));
+
+        // <bash-input> -> by_user: true ToolCall + ToolResult
+        assert!(matches!(
+            &msgs[6].blocks[0],
+            SessionBlock::ToolCall { by_user: true, title, .. } if title == "git status"
+        ));
+        assert!(matches!(
+            &msgs[6].blocks[1],
+            SessionBlock::ToolResult { status: ToolStatus::Success, preview, .. } if preview == "clean"
+        ));
+
+        // [Request interrupted by user...] -> EventKind::Aborted
+        assert!(matches!(
+            &msgs[7].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::Aborted,
+                ..
+            }
+        ));
+
+        // stop_hook_summary with errors -> EventKind::Hook (empty errors skipped)
+        assert!(matches!(
+            &msgs[8].blocks[0],
+            SessionBlock::Event { kind: EventKind::Hook, text: Some(t), .. }
+                if t == "hook.sh exited with code 1"
+        ));
+
+        // pr-link deduplicated -> EventKind::PrLink
+        assert_eq!(msgs.len(), 10);
+        assert!(matches!(
+            &msgs[9].blocks[0],
+            SessionBlock::Event { kind: EventKind::PrLink, text: Some(t), url: Some(u), .. }
+                if t == "PR #42" && u == "https://github.com/o/r/pull/42"
+        ));
+
+        for msg in &msgs {
+            assert_eq!(msg.content, project_content(&msg.blocks));
+        }
+    }
+
+    #[test]
+    fn jsonl_content_refs_resolve_exact_line_slices() {
+        let data = "QUJD".repeat(400);
+        let (_temp, path, msgs, offsets) = parse_claude_lines(&[
+            claude_user("u1", json!("screenshot")),
+            claude_assistant(
+                "a1",
+                "m1",
+                json!([{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": { "command": "echo hi", "description": "x".repeat(INPUT_PREVIEW_CHARS + 100) }
+                }]),
+            ),
+            claude_user(
+                "u2",
+                json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        { "type": "text", "text": "captured" },
+                        { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": data } }
+                    ]
+                }]),
+            ),
+        ]);
+        let raw = std::fs::read(&path).unwrap();
+        let SessionBlock::ToolCall {
+            input_full:
+                Some(ContentRef::Jsonl {
+                    offset,
+                    len,
+                    pointer,
+                    segment: None,
+                }),
+            ..
+        } = &msgs[1].blocks[0]
+        else {
+            panic!("expected tool_call jsonl ref");
+        };
+        assert_eq!(*offset, offsets[1]);
+        assert_eq!(pointer, "/message/content/0/input");
+        let parsed_line: Value =
+            serde_json::from_slice(&raw[*offset as usize..(*offset + u64::from(*len)) as usize])
+                .unwrap();
+        assert!(parsed_line.pointer(pointer).is_some());
+
+        let SessionBlock::ToolResult { images, .. } = &msgs[2].blocks[0] else {
+            panic!("expected tool_result");
+        };
+        let ImageSource::Inline {
+            content:
+                ContentRef::Jsonl {
+                    offset,
+                    len,
+                    pointer,
+                    segment: None,
+                },
+        } = &images[0].source
+        else {
+            panic!("expected inline image jsonl ref");
+        };
+        assert_eq!(*offset, offsets[2]);
+        let img_line: Value =
+            serde_json::from_slice(&raw[*offset as usize..(*offset + u64::from(*len)) as usize])
+                .unwrap();
+        assert_eq!(
+            img_line.pointer(pointer).and_then(Value::as_str),
+            Some(data.as_str())
         );
     }
 }

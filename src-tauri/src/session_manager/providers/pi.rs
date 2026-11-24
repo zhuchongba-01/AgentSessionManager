@@ -9,9 +9,10 @@ use serde_json::Value;
 
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
+use super::pi_blocks::PiTranscript;
 use super::utils::{
-    extract_text, order_selected_children, parse_timestamp_to_ms, path_basename, truncate_summary,
-    FileParseCache, TITLE_MAX_CHARS,
+    ensure_readable_size, extract_text, for_each_jsonl_value, order_selected_children,
+    parse_timestamp_to_ms, path_basename, truncate_summary, FileParseCache, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "pi";
@@ -839,26 +840,17 @@ fn read_tree(path: &Path) -> Result<SessionTree, String> {
 
 fn read_active_messages(path: &Path, tree: &SessionTree) -> Result<Vec<SessionMessage>, String> {
     validate_file_size(path)?;
-    let reader = BufReader::new(
-        File::open(path).map_err(|error| format!("Failed to open Pi session: {error}"))?,
-    );
-    let mut messages = Vec::new();
+    ensure_readable_size(path)?;
+    let mut transcript = PiTranscript::new();
     let mut saw_header = false;
     let mut entry_index = 0usize;
     let mut legacy_previous_id = None;
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("Failed to read Pi session: {error}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for_each_jsonl_value(path, |span, value| {
         if !saw_header {
             if value.get("type").and_then(Value::as_str) == Some("session") {
                 saw_header = true;
             }
-            continue;
+            return Ok(());
         }
         entry_index += 1;
         if entry_index > MAX_TREE_ENTRIES {
@@ -872,79 +864,16 @@ fn read_active_messages(path: &Path, tree: &SessionTree) -> Result<Vec<SessionMe
             entry_index,
             legacy_previous_id.as_deref(),
         ) else {
-            continue;
+            return Ok(());
         };
         legacy_previous_id = Some(id.clone());
-        if !tree.active_entry_indexes.contains(&entry_index) {
-            continue;
+        if tree.active_entry_indexes.contains(&entry_index) {
+            transcript.push_entry(&value, span, Some(id));
         }
-        let entry_timestamp = value.get("timestamp").and_then(parse_timestamp_to_ms);
-        match value.get("type").and_then(Value::as_str) {
-            Some("session_info") => {}
-            Some("message") => {
-                let Some(message) = value.get("message") else {
-                    continue;
-                };
-                let timestamp = message
-                    .get("timestamp")
-                    .and_then(parse_timestamp_to_ms)
-                    .or(entry_timestamp);
-                if message.get("role").and_then(Value::as_str) == Some("assistant") {
-                    if let Some(msg_content) = message.get("content") {
-                        let thinking = super::utils::extract_thinking_text(msg_content);
-                        if !thinking.trim().is_empty() {
-                            messages.push(SessionMessage {
-                                role: "thinking".to_string(),
-                                content: thinking,
-                                ts: timestamp,
-                                meta: None,
-                            });
-                        }
-                    }
-                }
-                if let Some((role, content)) = parse_message(message) {
-                    messages.push(SessionMessage {
-                        role,
-                        content,
-                        ts: timestamp,
-                        meta: None,
-                    });
-                }
-            }
-            Some("compaction") | Some("branch_summary") => {
-                push_system(
-                    &mut messages,
-                    value
-                        .get("summary")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    entry_timestamp,
-                );
-            }
-            Some("custom_message")
-                if value.get("display").and_then(Value::as_bool) != Some(false) =>
-            {
-                push_system(
-                    &mut messages,
-                    &value.get("content").map(extract_text).unwrap_or_default(),
-                    entry_timestamp,
-                );
-            }
-            _ => {}
-        }
-    }
-    Ok(messages)
-}
-
-fn push_system(messages: &mut Vec<SessionMessage>, content: &str, ts: Option<i64>) {
-    if !content.trim().is_empty() {
-        messages.push(SessionMessage {
-            role: "system".to_string(),
-            content: content.to_string(),
-            ts,
-            meta: None,
-        });
-    }
+        Ok(())
+    })
+    .map_err(|error| error.replace("session file", "Pi session"))?;
+    Ok(transcript.finish())
 }
 
 fn parse_header(value: &Value) -> Result<SessionHeader, String> {
@@ -1518,9 +1447,15 @@ mod tests {
         assert_eq!(
             messages
                 .iter()
-                .map(|m| m.content.as_str())
+                .map(|m| (m.content.as_str(), m.injected))
                 .collect::<Vec<_>>(),
-            vec!["legacy hook", "custom role", "custom entry"]
+            vec![
+                ("legacy hook", false),
+                ("custom role", false),
+                ("hidden role", true),
+                ("custom entry", false),
+                ("hidden entry", true),
+            ]
         );
         assert!(messages.iter().all(|m| m.role == "system"));
     }
@@ -2170,7 +2105,7 @@ mod tests {
             serde_json::json!({"type":"session","version":3,"id":"rich-session","cwd":"/work"}),
             serde_json::json!({
                 "type":"message","id":"m1","parentId":null,"timestamp":1700000000000i64,
-                "message":{"role":"user","content":[{"type":"image"}]}
+                "message":{"role":"user","content":[{"type":"image","data":"AAAAAAAA","mimeType":"image/png"}]}
             }),
             serde_json::json!({
                 "type":"message","id":"m2","parentId":"m1","timestamp":1700000001000i64,
@@ -2206,20 +2141,36 @@ mod tests {
         )
         .unwrap();
 
+        use crate::session_manager::model::{EventKind, SessionBlock};
+
         let messages = load_messages_with_layout(&root, &path, SessionLayout::Flat).unwrap();
         assert_eq!(
             messages
                 .iter()
-                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .map(|m| (m.role.as_str(), m.content.as_str(), m.turn_id.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
-                ("user", "[Image]"),
-                ("thinking", "only thinking"),
-                ("thinking", "plan step"),
-                ("assistant", "visible reply"),
-                ("assistant", "[Error] 429 rate limit exceeded"),
+                ("user", "[Image: image/png 6]", Some("t1")),
+                ("assistant", "", Some("t1")),
+                ("assistant", "visible reply", Some("t1")),
+                ("assistant", "429 rate limit exceeded", Some("t1")),
             ]
         );
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "only thinking"
+        ));
+        assert!(matches!(
+            &messages[2].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "plan step"
+        ));
+        assert!(matches!(
+            &messages[3].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::Error,
+                ..
+            }
+        ));
 
         let meta = parse_session(&path).unwrap();
         assert_eq!(

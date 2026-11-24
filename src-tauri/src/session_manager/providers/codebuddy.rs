@@ -1,21 +1,26 @@
-#![allow(dead_code)]
-
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde_json::Value;
 
 use crate::session_manager::cache::TranscriptSources;
+use crate::session_manager::content::parse_file_url;
+use crate::session_manager::model::{
+    EventKind, ImageRef, ImageSource, MessageMeta, SessionBlock, ToolStatus,
+};
 use crate::session_manager::{SessionMessage, SessionMeta};
 use crate::session_paths::codebuddy_config_dir;
 
+use super::blocks::{
+    assign_turn_ids, estimate_base64_size, large_text_block, parse_arguments, summary_event_block,
+    thinking_block, tool_call_block, tool_result_block, ToolSource,
+};
 use super::utils::{
-    checked_storage_child, ensure_readable_size, extract_text, extract_thinking_text,
-    is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms, path_basename,
-    read_head_tail_lines, remove_path_if_exists, scan_warning, truncate_summary, FileParseCache,
+    checked_storage_child, extract_text, for_each_jsonl_value, is_reparse_or_symlink,
+    is_safe_session_id, parse_timestamp_to_ms, path_basename, read_head_tail_lines,
+    remove_path_if_exists, scan_warning, truncate_summary, FileParseCache, JsonlSpan,
     TITLE_MAX_CHARS,
 };
 
@@ -29,6 +34,7 @@ pub fn session_roots() -> Vec<PathBuf> {
     vec![codebuddy_config_dir().join("projects")]
 }
 
+#[allow(dead_code)]
 pub fn transcript_sources(path: &Path) -> Result<TranscriptSources, String> {
     Ok(vec![(path.to_path_buf(), None)])
 }
@@ -415,266 +421,987 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
     }))
 }
 
-fn extract_reasoning(record: &Value) -> String {
+fn non_empty_field<'a>(record: &'a Value, field: &str) -> Option<&'a str> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn image_media_type_from_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn local_image_ref(raw_path: &str, alt: Option<String>) -> Option<ImageRef> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let fs_path = if trimmed.starts_with("file://") {
+        parse_file_url(trimmed).ok()?
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if !fs_path.is_absolute() {
+        return None;
+    }
+    let media_type = image_media_type_from_path(&fs_path)?;
+    let size = fs::metadata(&fs_path)
+        .ok()
+        .map(|m| u32::try_from(m.len()).unwrap_or(u32::MAX))
+        .unwrap_or(0);
+    Some(ImageRef {
+        source: ImageSource::LocalFile {
+            path: trimmed.to_string(),
+        },
+        media_type: media_type.to_string(),
+        size,
+        alt,
+    })
+}
+
+fn xml_attr_value<'a>(tag_attrs: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = tag_attrs;
+    while let Some(pos) = rest.find(key) {
+        let before_ok = pos == 0 || rest.as_bytes()[pos - 1].is_ascii_whitespace();
+        let after = &rest[pos + key.len()..];
+        let after_trimmed = after.trim_start();
+        if before_ok {
+            if let Some(after_eq) = after_trimmed.strip_prefix('=') {
+                let val_start = after_eq.trim_start();
+                if let Some(quote) = val_start.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    let inner = &val_start[quote.len_utf8()..];
+                    if let Some(end) = inner.find(quote) {
+                        return Some(&inner[..end]);
+                    }
+                }
+            }
+        }
+        rest = &rest[pos + key.len()..];
+    }
+    None
+}
+
+fn extract_attachment_images(raw: &str) -> (String, Vec<ImageRef>) {
+    const TAG_OPEN: &str = "<attachment";
+    const TAG_CLOSE: &str = "</attachment>";
+    if !raw.contains(TAG_OPEN) {
+        return (raw.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut images = Vec::new();
+    let mut cursor = raw;
+
+    while let Some(start) = cursor.find(TAG_OPEN) {
+        let after_name = &cursor[start + TAG_OPEN.len()..];
+        let valid_tag = after_name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_whitespace() || ch == '>' || ch == '/');
+        if !valid_tag {
+            out.push_str(&cursor[..start + TAG_OPEN.len()]);
+            cursor = after_name;
+            continue;
+        }
+        let Some(gt_rel) = after_name.find('>') else {
+            out.push_str(cursor);
+            cursor = "";
+            break;
+        };
+        let header = &after_name[..gt_rel];
+        let self_closing = header.trim_end().ends_with('/');
+        let attrs = header.trim_end().trim_end_matches('/');
+
+        let (body, consumed_end) = if self_closing {
+            ("", start + TAG_OPEN.len() + gt_rel + 1)
+        } else {
+            let body_start = start + TAG_OPEN.len() + gt_rel + 1;
+            if let Some(close_rel) = cursor[body_start..].find(TAG_CLOSE) {
+                (
+                    &cursor[body_start..body_start + close_rel],
+                    body_start + close_rel + TAG_CLOSE.len(),
+                )
+            } else {
+                ("", start + TAG_OPEN.len() + gt_rel + 1)
+            }
+        };
+
+        let alt = ["name", "filename", "title"]
+            .into_iter()
+            .find_map(|k| xml_attr_value(attrs, k))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let attr_path = ["path", "file_path", "filepath", "file", "src", "url"]
+            .into_iter()
+            .find_map(|k| xml_attr_value(attrs, k));
+
+        let body_candidate = body.lines().find_map(|line| {
+            let t = line.trim();
+            t.strip_prefix("Path:")
+                .or_else(|| t.strip_prefix("path:"))
+                .map(str::trim)
+                .or((!t.is_empty()).then_some(t))
+        });
+
+        let matched_image = attr_path
+            .and_then(|p| local_image_ref(p, alt.clone()))
+            .or_else(|| body_candidate.and_then(|p| local_image_ref(p, alt)));
+
+        out.push_str(&cursor[..start]);
+        if let Some(image) = matched_image {
+            images.push(image);
+        } else {
+            out.push_str(&cursor[start..consumed_end]);
+        }
+        cursor = &cursor[consumed_end..];
+    }
+    out.push_str(cursor);
+    (out, images)
+}
+
+fn is_input_from_hook(record: &Value) -> bool {
+    record
+        .pointer("/extra/input_from_hook")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || record
+            .pointer("/providerData/extra/input_from_hook")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || record
+            .pointer("/providerData/input_from_hook")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+fn is_interrupted(record: &Value) -> bool {
+    record
+        .pointer("/extra/interrupted")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || record
+            .pointer("/providerData/extra/interrupted")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || record
+            .pointer("/providerData/interrupted")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || record.get("status").and_then(Value::as_str) == Some("interrupted")
+}
+
+fn has_non_empty_str(val: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|k| {
+        val.get(*k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    })
+}
+
+fn extract_reasoning_with_pointer(record: &Value) -> (String, Option<String>, bool) {
+    let mut redacted_sig = has_non_empty_str(record, &["signature", "encrypted_content"]);
     for key in ["rawContent", "content", "summary"] {
-        if let Some(val) = record.get(key) {
-            let text = match val {
-                Value::String(s) => s.clone(),
-                Value::Array(items) => items
+        let Some(val) = record.get(key) else {
+            continue;
+        };
+        match val {
+            Value::String(s) if !s.trim().is_empty() => {
+                return (s.clone(), Some(format!("/{key}")), redacted_sig);
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if item.get("type").and_then(Value::as_str) == Some("redacted_thinking")
+                        || has_non_empty_str(item, &["signature", "encrypted_content", "data"])
+                    {
+                        redacted_sig = true;
+                    }
+                }
+                let parts: Vec<&str> = items
                     .iter()
                     .filter_map(|item| match item {
-                        Value::String(s) => Some(s.clone()),
+                        Value::String(s) => Some(s.as_str()),
                         Value::Object(_) => item
                             .get("text")
                             .or_else(|| item.get("thinking"))
                             .or_else(|| item.get("input_text"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
+                            .and_then(Value::as_str),
                         _ => None,
                     })
                     .filter(|s| !s.trim().is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                Value::Object(_) => val
-                    .get("text")
-                    .or_else(|| val.get("thinking"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                _ => String::new(),
-            };
-            if !text.trim().is_empty() {
-                return text;
-            }
-        }
-    }
-    record
-        .get("text")
-        .or_else(|| record.get("thinking"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
-
-fn format_function_call(record: &Value) -> Option<(Option<String>, String, String)> {
-    let name = record
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let call_id = record
-        .get("callId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let args = match record.get("arguments") {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(v) if !v.is_null() => v.to_string(),
-        _ => String::new(),
-    };
-    let formatted = if args.is_empty() {
-        format!("[Tool: {name}]")
-    } else {
-        format!("[Tool: {name}]\n{args}")
-    };
-    Some((call_id, name, formatted))
-}
-
-fn format_function_call_result(
-    record: &Value,
-    call_names: &HashMap<String, String>,
-) -> Option<String> {
-    let call_id = record
-        .get("callId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    let name = record
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| call_names.get(call_id).map(String::as_str))
-        .unwrap_or("");
-
-    let is_error = matches!(
-        record.get("status").and_then(Value::as_str),
-        Some("failed" | "error")
-    ) || record
-        .pointer("/providerData/toolResult/error")
-        .is_some_and(|v| !v.is_null());
-
-    let output_text = match record.get("output") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Object(map)) => map
-            .get("text")
-            .or_else(|| map.get("content"))
-            .or_else(|| map.get("error"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| Value::Object(map.clone()).to_string()),
-        Some(Value::Array(arr)) => extract_text(&Value::Array(arr.clone())),
-        Some(v) if !v.is_null() => v.to_string(),
-        _ => String::new(),
-    };
-    let trimmed = output_text.trim();
-    if trimmed.is_empty() && !is_error {
-        return None;
-    }
-    let label = if is_error { "Error" } else { "Result" };
-    Some(match (!name.is_empty(), !trimmed.is_empty()) {
-        (true, true) => format!("[{label}: {name}]\n{trimmed}"),
-        (true, false) => format!("[{label}: {name}]"),
-        (false, true) => trimmed.to_string(),
-        (false, false) => format!("[{label}]"),
-    })
-}
-
-/// Deduplicate streaming updates sharing the same `(id, parentId)` in-place while preserving
-/// the chronological order of all events (including teammate sessions without `parentId`).
-fn deduplicate_records(entries: &[Value]) -> Vec<&Value> {
-    let mut nodes: Vec<&Value> = Vec::new();
-    let mut last_by_id: HashMap<&str, usize> = HashMap::new();
-
-    for entry in entries {
-        if let Some(id) = entry
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if let Some(&prev_idx) = last_by_id.get(id) {
-                let prev = nodes[prev_idx];
-                if prev.get("parentId") == entry.get("parentId")
-                    && record_kind(prev) == record_kind(entry)
-                {
-                    nodes[prev_idx] = entry;
-                    continue;
+                    .collect();
+                if !parts.is_empty() {
+                    let pointer = if items.len() == 1 && items[0].get("text").is_some() {
+                        format!("/{key}/0/text")
+                    } else if items.len() == 1 && items[0].get("thinking").is_some() {
+                        format!("/{key}/0/thinking")
+                    } else {
+                        format!("/{key}")
+                    };
+                    return (parts.join("\n"), Some(pointer), redacted_sig);
                 }
             }
-            let idx = nodes.len();
-            nodes.push(entry);
-            last_by_id.insert(id, idx);
-        } else {
-            nodes.push(entry);
-        }
-    }
-    nodes
-}
-
-pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
-    ensure_readable_size(path)?;
-    let file =
-        File::open(path).map_err(|e| format!("Failed to open CodeBuddy session file: {e}"))?;
-    let reader = BufReader::new(file);
-
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read CodeBuddy transcript: {e}"))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-            entries.push(val);
-        }
-    }
-
-    let mut messages = Vec::new();
-    let mut call_names: HashMap<String, String> = HashMap::new();
-
-    for record in deduplicate_records(&entries) {
-        let ts = record.get("timestamp").and_then(parse_timestamp_to_ms);
-        match record_kind(record) {
-            "reasoning" => {
-                let thinking = extract_reasoning(record);
-                if !thinking.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "thinking".to_string(),
-                        content: thinking,
-                        ts,
-                        meta: None,
-                    });
+            Value::Object(_) => {
+                if has_non_empty_str(val, &["signature", "encrypted_content", "data"]) {
+                    redacted_sig = true;
                 }
-            }
-            "function_call" => {
-                if let Some((call_id, name, formatted)) = format_function_call(record) {
-                    if let Some(cid) = call_id {
-                        call_names.insert(cid, name);
-                    }
-                    messages.push(SessionMessage {
-                        role: "tool".to_string(),
-                        content: formatted,
-                        ts,
-                        meta: None,
-                    });
-                }
-            }
-            "function_call_result" => {
-                if let Some(formatted) = format_function_call_result(record, &call_names) {
-                    messages.push(SessionMessage {
-                        role: "tool".to_string(),
-                        content: formatted,
-                        ts,
-                        meta: None,
-                    });
-                }
-            }
-            "message" => {
-                if is_meta(record) {
-                    continue;
-                }
-                if is_compaction_summary(record) {
-                    let body = extract_message_text(record);
-                    let trimmed = body.trim();
-                    if !trimmed.is_empty() {
-                        let content = if trimmed.starts_with("[Compacted Summary]") {
-                            trimmed.to_string()
-                        } else {
-                            format!("[Compacted Summary]\n{trimmed}")
-                        };
-                        messages.push(SessionMessage {
-                            role: "system".to_string(),
-                            content,
-                            ts,
-                            meta: None,
-                        });
-                    }
-                    continue;
-                }
-
-                let role = record_role(record);
-                if role == "assistant" {
-                    if let Some(content_val) = record.get("content") {
-                        let inline_thinking = extract_thinking_text(content_val);
-                        if !inline_thinking.trim().is_empty() {
-                            messages.push(SessionMessage {
-                                role: "thinking".to_string(),
-                                content: inline_thinking,
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                }
-                if matches!(role, "user" | "assistant" | "system") {
-                    let content = extract_message_text(record);
-                    if !content.trim().is_empty() {
-                        messages.push(SessionMessage {
-                            role: role.to_string(),
-                            content,
-                            ts,
-                            meta: None,
-                        });
+                for sub in ["text", "thinking"] {
+                    if let Some(s) = val
+                        .get(sub)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        return (s.to_string(), Some(format!("/{key}/{sub}")), redacted_sig);
                     }
                 }
             }
             _ => {}
         }
     }
+    for top in ["text", "thinking"] {
+        if let Some(s) = record
+            .get(top)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return (s.to_string(), Some(format!("/{top}")), redacted_sig);
+        }
+    }
+    (String::new(), None, redacted_sig)
+}
 
+fn strip_custom_prefix(model: &str) -> &str {
+    match model.split_once(':') {
+        Some((prefix, id)) if prefix.starts_with("custom-") && !id.trim().is_empty() => id.trim(),
+        _ => model,
+    }
+}
+
+fn u64_at(value: Option<&Value>, key: &str) -> u64 {
+    value
+        .and_then(|v| v.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn usage_meta(record: &Value) -> Option<MessageMeta> {
+    if record_role(record) == "user" {
+        return None;
+    }
+    let data = record.get("providerData");
+    let model = data
+        .and_then(|d| d.get("model").or_else(|| d.get("requestModelId")))
+        .or_else(|| record.get("model"))
+        .and_then(Value::as_str)
+        .map(|m| strip_custom_prefix(m.trim()))
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    let stop_reason = data
+        .and_then(|d| d.get("stopReason").or_else(|| d.get("stop_reason")))
+        .or_else(|| record.get("stop_reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let positive = |n: u64| (n > 0).then_some(n);
+
+    if let Some(raw) = data
+        .and_then(|d| d.get("rawUsage"))
+        .filter(|v| v.is_object())
+    {
+        let details = raw.get("prompt_tokens_details");
+        let cache_read = [
+            u64_at(Some(raw), "prompt_cache_hit_tokens"),
+            u64_at(Some(raw), "cache_read_input_tokens"),
+            u64_at(Some(raw), "cached_tokens"),
+            u64_at(details, "cached_tokens"),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let cache_write = u64_at(Some(raw), "cache_creation_input_tokens")
+            .max(u64_at(Some(raw), "prompt_cache_write_tokens"));
+        let reasoning = u64_at(Some(raw), "completion_thinking_tokens").max(u64_at(
+            raw.get("completion_tokens_details"),
+            "reasoning_tokens",
+        ));
+        let fresh_input = if raw.get("prompt_tokens").is_some() {
+            u64_at(Some(raw), "prompt_tokens")
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write)
+        } else {
+            u64_at(Some(raw), "input_tokens")
+        };
+        let output = u64_at(Some(raw), "completion_tokens").max(u64_at(Some(raw), "output_tokens"));
+        return MessageMeta {
+            model,
+            input_tokens: positive(fresh_input),
+            output_tokens: positive(output),
+            cache_read_tokens: positive(cache_read),
+            cache_write_tokens: positive(cache_write),
+            reasoning_tokens: positive(reasoning),
+            stop_reason,
+            ..MessageMeta::default()
+        }
+        .into_option();
+    }
+
+    if record_kind(record) == "message" && record_role(record) == "assistant" {
+        if let Some(usage) = data
+            .and_then(|d| d.get("usage"))
+            .or_else(|| record.get("usage"))
+        {
+            let cache_read = usage
+                .get("inputTokensDetails")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|detail| u64_at(Some(detail), "cached_tokens"))
+                .sum::<u64>()
+                .max(u64_at(Some(usage), "cache_read_input_tokens"));
+            let cache_write = u64_at(Some(usage), "cache_creation_input_tokens");
+            let reasoning = usage
+                .get("outputTokensDetails")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|detail| u64_at(Some(detail), "reasoning_tokens"))
+                .sum::<u64>();
+            let fresh_input = if usage.get("inputTokens").is_some() {
+                u64_at(Some(usage), "inputTokens").saturating_sub(cache_read)
+            } else {
+                u64_at(Some(usage), "input_tokens")
+            };
+            let output =
+                u64_at(Some(usage), "outputTokens").max(u64_at(Some(usage), "output_tokens"));
+            return MessageMeta {
+                model,
+                input_tokens: positive(fresh_input),
+                output_tokens: positive(output),
+                cache_read_tokens: positive(cache_read),
+                cache_write_tokens: positive(cache_write),
+                reasoning_tokens: positive(reasoning),
+                stop_reason,
+                ..MessageMeta::default()
+            }
+            .into_option();
+        }
+    }
+
+    MessageMeta {
+        model: (record_kind(record) == "message" && record_role(record) == "assistant")
+            .then_some(model)
+            .flatten(),
+        stop_reason,
+        ..MessageMeta::default()
+    }
+    .into_option()
+}
+
+fn tool_status(record: &Value) -> ToolStatus {
+    if is_interrupted(record) {
+        return ToolStatus::Interrupted;
+    }
+    if record
+        .pointer("/providerData/toolResult/error")
+        .is_some_and(|error| !error.is_null())
+        || record
+            .pointer("/providerData/toolResult/rawResponse/is_error")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || record.get("is_error").and_then(Value::as_bool) == Some(true)
+        || record.pointer("/output/is_error").and_then(Value::as_bool) == Some(true)
+    {
+        return ToolStatus::Error;
+    }
+    match record.get("status").and_then(Value::as_str) {
+        Some("completed" | "success") => ToolStatus::Success,
+        Some("failed" | "error") => ToolStatus::Error,
+        Some("incomplete" | "cancelled" | "canceled" | "interrupted") => ToolStatus::Interrupted,
+        Some("in_progress" | "pending") => ToolStatus::Pending,
+        _ => ToolStatus::Unknown,
+    }
+}
+
+fn extract_tool_result_output(record: &Value) -> (String, Option<&'static str>) {
+    match record.get("output") {
+        Some(Value::String(text)) => (text.clone(), Some("/output")),
+        Some(Value::Object(map)) => {
+            if let Some(Value::String(text)) = map.get("text") {
+                (text.clone(), Some("/output/text"))
+            } else if let Some(Value::String(text)) = map.get("content") {
+                (text.clone(), Some("/output/content"))
+            } else if let Some(Value::String(text)) = map.get("error") {
+                (text.clone(), Some("/output/error"))
+            } else if let Some(arr @ Value::Array(_)) = map.get("content") {
+                (extract_text(arr), Some("/output/content"))
+            } else {
+                (Value::Object(map.clone()).to_string(), Some("/output"))
+            }
+        }
+        Some(arr @ Value::Array(_)) => (extract_text(arr), Some("/output")),
+        Some(Value::Null) | None => (String::new(), None),
+        Some(other) => (other.to_string(), None),
+    }
+}
+
+#[derive(Default)]
+struct AnonCallTracker {
+    next_seq: usize,
+    pending: VecDeque<(String, String)>,
+}
+
+impl AnonCallTracker {
+    fn resolve_call_id(&mut self, record: &Value, name: &str) -> String {
+        if let Some(id) = record
+            .get("callId")
+            .or_else(|| record.get("call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return id.to_string();
+        }
+        self.next_seq += 1;
+        let generated = format!("call_{}", self.next_seq);
+        self.pending
+            .push_back((name.to_string(), generated.clone()));
+        generated
+    }
+
+    fn resolve_result_call_id(&mut self, record: &Value) -> String {
+        if let Some(id) = record
+            .get("callId")
+            .or_else(|| record.get("call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return id.to_string();
+        }
+        let target_name = record
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(name) = target_name {
+            if let Some(idx) = self.pending.iter().position(|(n, _)| n == name) {
+                return self
+                    .pending
+                    .remove(idx)
+                    .map(|(_, id)| id)
+                    .unwrap_or_default();
+            }
+        }
+        self.pending
+            .pop_front()
+            .map(|(_, id)| id)
+            .unwrap_or_default()
+    }
+}
+
+fn build_content_image_block(
+    item: &Value,
+    span: JsonlSpan,
+    item_ptr: &str,
+) -> Option<SessionBlock> {
+    let alt = item
+        .get("original_filename")
+        .or_else(|| item.get("filename"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    for key in ["path", "file_path", "filePath", "url"] {
+        if let Some(raw_path) = item.get(key).and_then(Value::as_str) {
+            if let Some(image) = local_image_ref(raw_path, alt.clone()) {
+                return Some(SessionBlock::Image { image });
+            }
+        }
+    }
+
+    if item.pointer("/source/type").and_then(Value::as_str) == Some("base64") {
+        if let Some(data) = item
+            .pointer("/source/data")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            let media_type = item
+                .pointer("/source/media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png")
+                .to_string();
+            return Some(SessionBlock::Image {
+                image: ImageRef {
+                    source: ImageSource::Inline {
+                        content: span.content_ref(format!("{item_ptr}/source/data")),
+                    },
+                    media_type,
+                    size: estimate_base64_size(data.len()),
+                    alt,
+                },
+            });
+        }
+    }
+
+    if let Some(data) = item
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let media_type = item
+            .get("media_type")
+            .or_else(|| item.get("mimeType"))
+            .and_then(Value::as_str)
+            .unwrap_or("image/png")
+            .to_string();
+        return Some(SessionBlock::Image {
+            image: ImageRef {
+                source: ImageSource::Inline {
+                    content: span.content_ref(format!("{item_ptr}/data")),
+                },
+                media_type,
+                size: estimate_base64_size(data.len()),
+                alt,
+            },
+        });
+    }
+
+    None
+}
+
+fn build_message_blocks(
+    record: &Value,
+    span: JsonlSpan,
+    role: &str,
+    input_from_hook: bool,
+    anon_calls: &mut AnonCallTracker,
+) -> (Vec<SessionBlock>, bool) {
+    let mut blocks = Vec::new();
+    let is_user = role == "user";
+    let mut saw_real_prompt = false;
+    let mut saw_system_reminder_only = false;
+
+    match record.get("content") {
+        Some(Value::String(raw)) => {
+            if is_user {
+                let (without_attachments, attachment_images) = extract_attachment_images(raw);
+                if !attachment_images.is_empty() {
+                    saw_real_prompt = true;
+                }
+                let has_user_query = without_attachments.contains("<user_query>");
+                let has_reminder = without_attachments.contains("<system-reminder>");
+                let unwrapped = unwrap_user_query(&without_attachments);
+                let trimmed = unwrapped.trim();
+                if !trimmed.is_empty() {
+                    saw_real_prompt = true;
+                    if input_from_hook {
+                        blocks.push(large_text_block(trimmed.to_string(), || {
+                            Some(span.content_ref("/content"))
+                        }));
+                    } else {
+                        blocks.push(SessionBlock::text(trimmed.to_string()));
+                    }
+                } else if !has_user_query && has_reminder {
+                    let reminder_trimmed = without_attachments.trim();
+                    if !reminder_trimmed.is_empty() {
+                        saw_system_reminder_only = true;
+                        blocks.push(large_text_block(reminder_trimmed.to_string(), || {
+                            Some(span.content_ref("/content"))
+                        }));
+                    }
+                }
+                for image in attachment_images {
+                    blocks.push(SessionBlock::Image { image });
+                }
+            } else if !raw.trim().is_empty() {
+                blocks.push(SessionBlock::text(raw.clone()));
+            }
+        }
+        Some(Value::Array(items)) => {
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut single_text_ptr: Option<String> = None;
+            let flush_text = |parts: &mut Vec<String>,
+                              single_ptr: &mut Option<String>,
+                              blocks: &mut Vec<SessionBlock>| {
+                if parts.is_empty() {
+                    return;
+                }
+                let joined = parts.join("\n");
+                parts.clear();
+                let ptr = single_ptr.take();
+                if !joined.trim().is_empty() {
+                    if input_from_hook {
+                        blocks.push(large_text_block(joined, || {
+                            ptr.map(|p| span.content_ref(p))
+                        }));
+                    } else {
+                        blocks.push(SessionBlock::text(joined));
+                    }
+                }
+            };
+
+            for (idx, item) in items.iter().enumerate() {
+                let item_ptr = format!("/content/{idx}");
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                match item_type {
+                    "thinking" | "reasoning" | "reasoning_text" | "summary_text" => {
+                        flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+                        let (field, text) =
+                            if let Some(s) = item.get("thinking").and_then(Value::as_str) {
+                                ("thinking", s)
+                            } else if let Some(s) = item.get("text").and_then(Value::as_str) {
+                                ("text", s)
+                            } else {
+                                ("thinking", "")
+                            };
+                        let has_sig = has_non_empty_str(item, &["signature", "encrypted_content"]);
+                        if !text.trim().is_empty() || has_sig {
+                            let ptr = format!("{item_ptr}/{field}");
+                            blocks.push(thinking_block(text, None, None, || {
+                                Some(span.content_ref(ptr))
+                            }));
+                        }
+                    }
+                    "redacted_thinking" => {
+                        flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+                        blocks.push(thinking_block("", None, None, || None));
+                    }
+                    "image_blob_ref" | "input_image" | "image" => {
+                        if let Some(img_block) = build_content_image_block(item, span, &item_ptr) {
+                            flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+                            saw_real_prompt = true;
+                            blocks.push(img_block);
+                        } else if let Some(placeholder) =
+                            extract_codebuddy_content_item(item, is_user)
+                        {
+                            saw_real_prompt = true;
+                            single_text_ptr = None;
+                            text_parts.push(placeholder);
+                        }
+                    }
+                    "tool_use" => {
+                        flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+                        if let Some(name) = item.get("name").and_then(Value::as_str) {
+                            let id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| anon_calls.resolve_call_id(item, name));
+                            let input = item.get("input").unwrap_or(&Value::Null);
+                            let ptr = format!("{item_ptr}/input");
+                            blocks.push(tool_call_block(
+                                ToolSource::Claude,
+                                id,
+                                name,
+                                input,
+                                || Some(span.content_ref(ptr)),
+                            ));
+                        }
+                    }
+                    "tool_result" => {
+                        flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+                        let call_id = item
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| anon_calls.resolve_result_call_id(item));
+                        let status = if item.get("is_error").and_then(Value::as_bool) == Some(true)
+                        {
+                            ToolStatus::Error
+                        } else {
+                            ToolStatus::Success
+                        };
+                        let text = item.get("content").map(extract_text).unwrap_or_default();
+                        let ptr = format!("{item_ptr}/content");
+                        blocks.push(tool_result_block(call_id, status, &text, || {
+                            Some(span.content_ref(ptr))
+                        }));
+                    }
+                    "input_text" | "output_text" | "text" | "" => {
+                        let (sub_key, raw_opt) = if let Some(s) =
+                            item.get("text").and_then(Value::as_str)
+                        {
+                            ("text", Some(s))
+                        } else if let Some(s) = item.get("input_text").and_then(Value::as_str) {
+                            ("input_text", Some(s))
+                        } else if let Some(s) = item.get("output_text").and_then(Value::as_str) {
+                            ("output_text", Some(s))
+                        } else {
+                            ("text", None)
+                        };
+                        if let Some(raw) = raw_opt {
+                            let text_ptr = format!("{item_ptr}/{sub_key}");
+                            if is_user {
+                                let (without_attachments, attachment_images) =
+                                    extract_attachment_images(raw);
+                                let has_user_query = without_attachments.contains("<user_query>");
+                                let has_reminder =
+                                    without_attachments.contains("<system-reminder>");
+                                let unwrapped = unwrap_user_query(&without_attachments);
+                                let trimmed = unwrapped.trim();
+                                if !trimmed.is_empty() {
+                                    saw_real_prompt = true;
+                                    if text_parts.is_empty() {
+                                        single_text_ptr = Some(text_ptr);
+                                    } else {
+                                        single_text_ptr = None;
+                                    }
+                                    text_parts.push(trimmed.to_string());
+                                } else if !has_user_query && has_reminder {
+                                    let reminder_trimmed = without_attachments.trim();
+                                    if !reminder_trimmed.is_empty() {
+                                        saw_system_reminder_only = true;
+                                        if text_parts.is_empty() {
+                                            single_text_ptr = Some(text_ptr);
+                                        } else {
+                                            single_text_ptr = None;
+                                        }
+                                        text_parts.push(reminder_trimmed.to_string());
+                                    }
+                                }
+                                if !attachment_images.is_empty() {
+                                    saw_real_prompt = true;
+                                    flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+                                    for image in attachment_images {
+                                        blocks.push(SessionBlock::Image { image });
+                                    }
+                                }
+                            } else if !raw.trim().is_empty() {
+                                if text_parts.is_empty() {
+                                    single_text_ptr = Some(text_ptr);
+                                } else {
+                                    single_text_ptr = None;
+                                }
+                                text_parts.push(raw.to_string());
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(fallback) = extract_codebuddy_content_item(item, is_user) {
+                            saw_real_prompt = true;
+                            single_text_ptr = None;
+                            text_parts.push(fallback);
+                        }
+                    }
+                }
+            }
+            flush_text(&mut text_parts, &mut single_text_ptr, &mut blocks);
+        }
+        Some(obj @ Value::Object(_)) => {
+            if let Some(img_block) = build_content_image_block(obj, span, "/content") {
+                saw_real_prompt = true;
+                blocks.push(img_block);
+            } else if let Some(text) = extract_codebuddy_content_item(obj, is_user) {
+                saw_real_prompt = true;
+                blocks.push(SessionBlock::text(text));
+            }
+        }
+        _ => {}
+    }
+
+    let injected = role == "system"
+        || input_from_hook
+        || (is_user && !saw_real_prompt && saw_system_reminder_only);
+    (blocks, injected)
+}
+
+/// Deduplicate streaming updates sharing the same `(id, parentId)` in-place while preserving
+/// the chronological order and JSONL byte spans of all events (including teammate sessions).
+fn deduplicate_records(entries: &[(JsonlSpan, Value)]) -> Vec<(JsonlSpan, &Value)> {
+    let mut nodes: Vec<(JsonlSpan, &Value)> = Vec::new();
+    let mut last_by_id: HashMap<&str, usize> = HashMap::new();
+
+    for (span, entry) in entries {
+        if let Some(id) = non_empty_field(entry, "id") {
+            if let Some(&prev_idx) = last_by_id.get(id) {
+                let (_, prev) = nodes[prev_idx];
+                if prev.get("parentId") == entry.get("parentId")
+                    && record_kind(prev) == record_kind(entry)
+                {
+                    nodes[prev_idx] = (*span, entry);
+                    continue;
+                }
+            }
+            let idx = nodes.len();
+            nodes.push((*span, entry));
+            last_by_id.insert(id, idx);
+        } else {
+            nodes.push((*span, entry));
+        }
+    }
+    nodes
+}
+
+pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+    let mut entries = Vec::new();
+    for_each_jsonl_value(path, |span, val| {
+        entries.push((span, val));
+        Ok(())
+    })?;
+
+    let mut messages = Vec::new();
+    let mut anon_calls = AnonCallTracker::default();
+
+    for (span, record) in deduplicate_records(&entries) {
+        let ts = record.get("timestamp").and_then(parse_timestamp_to_ms);
+        let record_id = non_empty_field(record, "id").map(str::to_string);
+
+        match record_kind(record) {
+            "reasoning" => {
+                let (thinking, pointer, has_sig) = extract_reasoning_with_pointer(record);
+                if thinking.trim().is_empty() && !has_sig {
+                    continue;
+                }
+                let block = thinking_block(&thinking, None, None, || {
+                    pointer.map(|p| span.content_ref(p))
+                });
+                let mut msg = SessionMessage::from_blocks("assistant", ts, vec![block]);
+                msg.id = record_id;
+                msg.meta = usage_meta(record);
+                messages.push(msg);
+            }
+            "function_call" => {
+                let Some(name) = non_empty_field(record, "name") else {
+                    continue;
+                };
+                let call_id = anon_calls.resolve_call_id(record, name);
+                let input = parse_arguments(record.get("arguments").unwrap_or(&Value::Null));
+                let block = tool_call_block(ToolSource::Claude, call_id, name, &input, || {
+                    Some(span.content_ref("/arguments"))
+                });
+                let mut msg = SessionMessage::from_blocks("assistant", ts, vec![block]);
+                msg.id = record_id;
+                msg.meta = usage_meta(record);
+                messages.push(msg);
+            }
+            "function_call_result" => {
+                let call_id = anon_calls.resolve_result_call_id(record);
+                let (text, pointer) = extract_tool_result_output(record);
+                let block = tool_result_block(call_id, tool_status(record), &text, || {
+                    pointer.map(|p| span.content_ref(p))
+                });
+                let mut msg = SessionMessage::from_blocks("tool", ts, vec![block]);
+                msg.id = record_id;
+                messages.push(msg);
+            }
+            "compact_boundary" => {
+                let (summary, ptr) = if let Some(s) = record.get("summary").and_then(Value::as_str)
+                {
+                    (s, Some("/summary"))
+                } else if let Some(s) = record.get("content").and_then(Value::as_str) {
+                    (s, Some("/content"))
+                } else {
+                    ("", None)
+                };
+                let block = if summary.trim().is_empty() {
+                    SessionBlock::event(EventKind::Compaction, None, None)
+                } else {
+                    summary_event_block(EventKind::Compaction, summary, || {
+                        ptr.map(|p| span.content_ref(p))
+                    })
+                };
+                let mut msg = SessionMessage::from_blocks("system", ts, vec![block]);
+                msg.id = record_id;
+                msg.injected = true;
+                messages.push(msg);
+            }
+            "system" => {
+                let subtype = record.get("subtype").and_then(Value::as_str).unwrap_or("");
+                if subtype == "compact_boundary" || is_compaction_summary(record) {
+                    let (summary, ptr) =
+                        if let Some(s) = record.get("content").and_then(Value::as_str) {
+                            (s.to_string(), Some("/content"))
+                        } else if let Some(s) = record.get("summary").and_then(Value::as_str) {
+                            (s.to_string(), Some("/summary"))
+                        } else {
+                            (extract_message_text(record), Some("/content"))
+                        };
+                    let block = if summary.trim().is_empty() {
+                        SessionBlock::event(EventKind::Compaction, None, None)
+                    } else {
+                        summary_event_block(EventKind::Compaction, &summary, || {
+                            ptr.map(|p| span.content_ref(p))
+                        })
+                    };
+                    let mut msg = SessionMessage::from_blocks("system", ts, vec![block]);
+                    msg.id = record_id;
+                    msg.injected = true;
+                    messages.push(msg);
+                } else if is_interrupted(record) {
+                    let mut msg = SessionMessage::from_blocks(
+                        "system",
+                        ts,
+                        vec![SessionBlock::event(EventKind::Aborted, None, None)],
+                    );
+                    msg.id = record_id;
+                    messages.push(msg);
+                }
+            }
+            "message" => {
+                let input_from_hook = is_input_from_hook(record);
+                let interrupted = is_interrupted(record);
+                let is_meta_record =
+                    is_meta(record) || record.get("isMeta").and_then(Value::as_bool) == Some(true);
+                if is_meta_record && !input_from_hook && !interrupted {
+                    continue;
+                }
+                if is_compaction_summary(record) {
+                    let body = extract_message_text(record);
+                    let block = if body.trim().is_empty() {
+                        SessionBlock::event(EventKind::Compaction, None, None)
+                    } else {
+                        summary_event_block(EventKind::Compaction, &body, || {
+                            Some(span.content_ref("/content"))
+                        })
+                    };
+                    let mut msg = SessionMessage::from_blocks("system", ts, vec![block]);
+                    msg.id = record_id;
+                    msg.injected = true;
+                    messages.push(msg);
+                    continue;
+                }
+
+                let role = record_role(record);
+                if !matches!(role, "user" | "assistant" | "system") {
+                    continue;
+                }
+
+                let (mut blocks, injected) =
+                    build_message_blocks(record, span, role, input_from_hook, &mut anon_calls);
+                if interrupted {
+                    blocks.push(SessionBlock::event(EventKind::Aborted, None, None));
+                }
+
+                let meta = (role == "assistant").then(|| usage_meta(record)).flatten();
+                let mut msg = SessionMessage::from_blocks(role, ts, blocks);
+                if msg.is_empty() && meta.is_none() {
+                    continue;
+                }
+                msg.id = record_id;
+                msg.injected = injected;
+                msg.meta = meta;
+                messages.push(msg);
+            }
+            _ => {}
+        }
+    }
+
+    assign_turn_ids(&mut messages);
     Ok(messages)
 }
 
@@ -813,6 +1540,7 @@ fn validate_codebuddy_session_path(
     Ok((canonical_root, resolved_path, file_exists))
 }
 
+#[allow(dead_code)]
 pub fn preflight_delete(root: &Path, path: &Path, session_id: &str) -> Result<(), String> {
     validate_codebuddy_session_path(root, path, session_id).map(|_| ())
 }
@@ -956,20 +1684,139 @@ mod tests {
         fs::write(&path, SESSION).unwrap();
 
         let messages = load_messages(&path).unwrap();
-        let pairs: Vec<(&str, &str)> = messages
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_str()))
-            .collect();
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(
-            pairs,
-            vec![
-                ("user", "list the txt files"),
-                ("thinking", "Use a glob."),
-                ("tool", "[Tool: Bash]\n{\"command\":\"ls *.txt\"}"),
-                ("tool", "[Result: Bash]\na.txt"),
-                ("assistant", "Found a.txt."),
-            ]
+            roles,
+            vec!["user", "assistant", "assistant", "tool", "assistant"]
         );
+        assert_eq!(messages[0].content, "list the txt files");
+        assert_eq!(messages[0].turn_id.as_deref(), Some("t1"));
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::Thinking { text, redacted: false, .. } if text == "Use a glob."
+        ));
+        assert!(matches!(
+            &messages[2].blocks[0],
+            SessionBlock::ToolCall { id, raw_name, title, .. }
+                if id == "call_1" && raw_name == "Bash" && title == "ls *.txt"
+        ));
+        assert!(matches!(
+            &messages[3].blocks[0],
+            SessionBlock::ToolResult { call_id, status: ToolStatus::Success, preview, .. }
+                if call_id == "call_1" && preview == "a.txt"
+        ));
+        assert_eq!(messages[4].content, "Found a.txt.");
+        assert!(messages
+            .iter()
+            .all(|m| !m.content.contains("system-reminder")));
+    }
+
+    #[test]
+    fn load_messages_pairs_omitted_call_ids_extracts_attachments_diffs_and_usage() {
+        let temp = tempdir().unwrap();
+        let img = temp.path().join("diagram.png");
+        fs::write(&img, b"pngbytes").unwrap();
+        let img_str = img.to_string_lossy().to_string();
+        let path = temp.path().join("cb-rich.jsonl");
+        let lines = [
+            serde_json::json!({
+                "id": "u1",
+                "timestamp": 100,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": format!("<attachment>{img_str}</attachment>\n<user_query>write file</user_query>")}]
+            }),
+            serde_json::json!({
+                "id": "fc1",
+                "timestamp": 200,
+                "type": "function_call",
+                "name": "Write",
+                "arguments": "{\"file_path\":\"src/new.rs\",\"content\":\"line1\\nline2\"}",
+                "providerData": {
+                    "model": "hy4-preview",
+                    "rawUsage": {
+                        "prompt_tokens": 1200,
+                        "completion_tokens": 40,
+                        "prompt_cache_hit_tokens": 1000,
+                        "completion_thinking_tokens": 12
+                    }
+                }
+            }),
+            serde_json::json!({
+                "id": "fcr1",
+                "timestamp": 300,
+                "type": "function_call_result",
+                "name": "Write",
+                "status": "completed",
+                "output": {"type": "text", "text": "Created"}
+            }),
+            serde_json::json!({
+                "id": "rem1",
+                "timestamp": 350,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<system-reminder>hook context</system-reminder>"}]
+            }),
+            serde_json::json!({
+                "id": "cb1",
+                "timestamp": 360,
+                "type": "compact_boundary",
+                "summary": "Compacted history"
+            }),
+            serde_json::json!({
+                "id": "a1",
+                "timestamp": 400,
+                "type": "message",
+                "role": "assistant",
+                "extra": {"interrupted": true},
+                "content": [{"type": "output_text", "text": "Stopped"}]
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let messages = load_messages(&path).unwrap();
+        assert_eq!(messages.len(), 6);
+        assert!(matches!(
+            &messages[0].blocks[1],
+            SessionBlock::Image { image } if matches!(&image.source, ImageSource::LocalFile { path } if path == &img_str)
+        ));
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::ToolCall { id, diff: Some(diff), .. } if id == "call_1" && diff.added == 2 && diff.removed == 0
+        ));
+        let meta = messages[1].meta.as_ref().unwrap();
+        assert_eq!(meta.model.as_deref(), Some("hy4-preview"));
+        assert_eq!(meta.input_tokens, Some(200));
+        assert_eq!(meta.cache_read_tokens, Some(1000));
+        assert_eq!(meta.output_tokens, Some(40));
+        assert_eq!(meta.reasoning_tokens, Some(12));
+        assert!(matches!(
+            &messages[2].blocks[0],
+            SessionBlock::ToolResult { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(messages[3].injected);
+        assert!(matches!(
+            &messages[4].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::Compaction,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &messages[5].blocks[1],
+            SessionBlock::Event {
+                kind: EventKind::Aborted,
+                ..
+            }
+        ));
     }
 
     #[test]

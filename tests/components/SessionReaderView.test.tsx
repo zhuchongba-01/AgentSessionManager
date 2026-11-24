@@ -1,177 +1,146 @@
-import { useState } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ReaderContext } from "@/components/sessions/reader/context";
+import { getAgentReaderStyle } from "@/components/sessions/reader/agentStyles";
+import { parseDiff, SessionDiff } from "@/components/sessions/reader/SessionDiff";
+import {
+  SessionMarkdown,
+  SessionPlainText,
+} from "@/components/sessions/reader/SessionMarkdown";
+import { SessionReader } from "@/components/sessions/reader/SessionReader";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { getAgentReaderStyle } from "@/components/sessions/agentReaderStyles";
+import { clearSessionImageCache } from "@/lib/query/sessions";
+import type { ContentRef, ImageRef, SessionMessage, SessionMeta } from "@/types";
 import {
-  ReaderAgentLane,
-  ReaderEventRow,
-  ReaderFinalReplyRow,
-  ReaderQuestionRow,
-  ReaderStepRow,
-  ReaderTimelineRow,
-} from "@/components/sessions/ReaderTurnRows";
-import {
-  extractDiffPayload,
-  parseUnifiedDiff,
-  SessionDiffView,
-} from "@/components/sessions/SessionDiffView";
-import {
-  buildReaderLayout,
-  groupMessagesIntoTurns,
-} from "@/components/sessions/turnGrouping";
-import type { SessionMessage } from "@/types";
+  resetProviderState,
+  setBlockContentFixture,
+  setSessionImageFixture,
+} from "../msw/state";
 
-function HarnessReader({
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({
+    count,
+    getItemKey,
+  }: {
+    count: number;
+    getItemKey?: (index: number) => string | number;
+  }) => ({
+    getVirtualItems: () =>
+      Array.from({ length: count }, (_, index) => ({
+        index,
+        key: getItemKey ? getItemKey(index) : index,
+        start: index * 80,
+        end: (index + 1) * 80,
+      })),
+    getTotalSize: () => count * 80,
+    measureElement: () => undefined,
+    scrollToIndex: () => undefined,
+    scrollOffset: 0,
+    range: { startIndex: 0, endIndex: Math.max(0, count - 1) },
+  }),
+}));
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(),
+}));
+
+function renderSessionReader({
+  session,
   messages,
-  providerId,
-  providerLabel,
+  appName = "Codex",
+  listQuery = "",
+  initialFind,
 }: {
+  session: SessionMeta;
   messages: SessionMessage[];
-  providerId: string;
-  providerLabel: string;
+  appName?: string;
+  listQuery?: string;
+  initialFind?: { query: string; messageIndex?: number };
 }) {
-  const [expandedTurns, setExpandedTurns] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [collapsedTurns, setCollapsedTurns] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [stepOverrides, setStepOverrides] = useState<Map<string, boolean>>(
-    () => new Map(),
-  );
-
-  const style = getAgentReaderStyle(providerId);
-  const turns = groupMessagesIntoTurns(messages, providerId);
-  const layout = buildReaderLayout({
-    messages,
-    turns,
-    viewMode: "all",
-    expandAllTimelines: false,
-    expandedTurnKeys: expandedTurns,
-    collapsedTurnKeys: collapsedTurns,
-    stepOverrides,
-    matchedMessageSet: new Set(),
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+    },
   });
-  const turnsByIndex = new Map(turns.map((t) => [t.turnIndex, t]));
   const onCopy = vi.fn();
+  const onBack = vi.fn();
+  const onReload = vi.fn();
+  const onDelete = vi.fn();
+  const onPrev = vi.fn();
+  const onNext = vi.fn();
 
-  return (
-    <TooltipProvider>
-      <div>
-        {layout.items.map((item) => {
-          if (item.kind === "divider") {
-            return <div key={item.key} className="asm-ccs-turn-divider" />;
-          }
-          if (item.kind === "event") {
-            return <ReaderEventRow key={item.key} event={item.event} />;
-          }
-          if (item.kind === "question") {
-            return (
-              <ReaderQuestionRow
-                key={item.key}
-                message={item.message}
-                onCopy={onCopy}
-              />
-            );
-          }
-          if (item.kind === "timeline") {
-            return (
-              <ReaderAgentLane
-                key={item.key}
-                providerId={providerId}
-                providerLabel={providerLabel}
-                isAgentStart={item.isAgentStart}
-                agentStartTs={item.turn.agentStartTs}
-                model={item.turn.model}
-              >
-                <ReaderTimelineRow
-                  turn={item.turn}
-                  expanded={item.expanded}
-                  hiddenFailures={item.hiddenFailures}
-                  onToggle={() => {
-                    if (item.expanded) {
-                      setCollapsedTurns(
-                        (prev) => new Set([...prev, item.turnKey]),
-                      );
-                      setExpandedTurns((prev) => {
-                        const next = new Set(prev);
-                        next.delete(item.turnKey);
-                        return next;
-                      });
-                    } else {
-                      setExpandedTurns(
-                        (prev) => new Set([...prev, item.turnKey]),
-                      );
-                      setCollapsedTurns((prev) => {
-                        const next = new Set(prev);
-                        next.delete(item.turnKey);
-                        return next;
-                      });
-                    }
-                  }}
-                />
-              </ReaderAgentLane>
-            );
-          }
-          if (item.kind === "step") {
-            return (
-              <ReaderAgentLane
-                key={item.key}
-                providerId={providerId}
-                providerLabel={providerLabel}
-                isAgentStart={item.isAgentStart}
-                agentStartTs={turnsByIndex.get(item.turnIndex)?.agentStartTs}
-                model={turnsByIndex.get(item.turnIndex)?.model}
-              >
-                <ReaderStepRow
-                  step={item.step}
-                  style={style}
-                  depth={item.depth}
-                  inTimeline={item.inTimeline}
-                  expanded={item.expanded}
-                  previewLines={item.previewLines}
-                  onToggleStep={(stepId, cur) => {
-                    setStepOverrides((prev) => {
-                      const next = new Map(prev);
-                      next.set(stepId, !cur);
-                      return next;
-                    });
-                  }}
-                  onCopy={onCopy}
-                />
-              </ReaderAgentLane>
-            );
-          }
-          if (item.kind === "final") {
-            return (
-              <ReaderAgentLane
-                key={item.key}
-                providerId={providerId}
-                providerLabel={providerLabel}
-                isAgentStart={item.isAgentStart}
-                agentStartTs={turnsByIndex.get(item.turnIndex)?.agentStartTs}
-                model={turnsByIndex.get(item.turnIndex)?.model}
-              >
-                <ReaderFinalReplyRow
-                  message={item.message}
-                  overrideText={item.overrideText}
-                  onCopy={onCopy}
-                />
-              </ReaderAgentLane>
-            );
-          }
-          return null;
-        })}
-      </div>
-    </TooltipProvider>
+  const view = render(
+    <QueryClientProvider client={client}>
+      <TooltipProvider>
+        <SessionReader
+          session={session}
+          appName={appName}
+          transcript={{
+            messages,
+            isStreaming: false,
+            progress: { loaded: messages.length, total: messages.length },
+            isLoading: false,
+            isError: false,
+            error: null,
+            refetch: async () => undefined,
+          }}
+          listQuery={listQuery}
+          initialFind={initialFind}
+          hasPrev={true}
+          hasNext={true}
+          onPrev={onPrev}
+          onNext={onNext}
+          onBack={onBack}
+          onCopy={onCopy}
+          onReload={onReload}
+          onDelete={onDelete}
+        />
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
+
+  return {
+    client,
+    onCopy,
+    onBack,
+    onReload,
+    onDelete,
+    onPrev,
+    onNext,
+    ...view,
+  };
 }
 
-describe("cc-switch style conversation & chain-of-thought reader", () => {
-  it("parses unified diffs and apply_patch payloads with old/new line numbers", () => {
+describe("cc-switch aligned SessionReader suite", () => {
+  beforeEach(() => {
+    resetProviderState();
+    clearSessionImageCache();
+    window.localStorage.removeItem("cc-switch.sessionReader.expandTimelines");
+    window.localStorage.removeItem("cc-switch.sessionReader.outline");
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  it("maps all 13 providers to appropriate reader visual styles", () => {
+    expect(getAgentReaderStyle("claude").id).toBe("claude");
+    expect(getAgentReaderStyle("workbuddy").id).toBe("claude");
+    expect(getAgentReaderStyle("codebuddy").id).toBe("claude");
+    expect(getAgentReaderStyle("codex").id).toBe("codex");
+    expect(getAgentReaderStyle("gemini").id).toBe("gemini");
+    expect(getAgentReaderStyle("opencode").id).toBe("opencode");
+    expect(getAgentReaderStyle("zcode").id).toBe("opencode");
+    expect(getAgentReaderStyle("pi").id).toBe("pi");
+    expect(getAgentReaderStyle("openclaw").id).toBe("pi");
+    expect(getAgentReaderStyle("deepseek").id).toBe("generic");
+    expect(getAgentReaderStyle("kimi").id).toBe("generic");
+    expect(getAgentReaderStyle("grokbuild").id).toBe("generic");
+    expect(getAgentReaderStyle("copilot").id).toBe("generic");
+  });
+
+  it("parses unified diffs and Codex apply_patch payloads with file PathChip headers and line numbers", () => {
     const patch = [
-      "[Tool: apply_patch]",
       "*** Begin Patch",
       "*** Update File: /repo/app/src/login.ts",
       "@@ -12,2 +12,3 @@",
@@ -182,218 +151,394 @@ describe("cc-switch style conversation & chain-of-thought reader", () => {
       "*** End Patch",
     ].join("\n");
 
-    const payload = extractDiffPayload(patch);
-    expect(payload).not.toBeNull();
-    expect(payload?.added).toBe(2);
-    expect(payload?.removed).toBe(1);
-
-    const parsed = parseUnifiedDiff(payload!.diffText);
+    const parsed = parseDiff(patch);
     expect(parsed[0]).toEqual({
       type: "file",
       path: "/repo/app/src/login.ts",
     });
 
+    const client = new QueryClient();
     const { container } = render(
-      <SessionDiffView diffText={payload!.diffText} projectDir="/repo/app" />,
+      <QueryClientProvider client={client}>
+        <TooltipProvider>
+          <ReaderContext.Provider
+            value={{
+              providerId: "codex",
+              sourcePath: "/mock/codex/session.jsonl",
+              projectDir: "/repo/app",
+              style: getAgentReaderStyle("codex"),
+              appName: "Codex",
+              onCopy: vi.fn(),
+            }}
+          >
+            <SessionDiff text={patch} projectDir="/repo/app" showViewToggle />
+          </ReaderContext.Provider>
+        </TooltipProvider>
+      </QueryClientProvider>,
     );
+
     expect(screen.getByText("src/login.ts")).toBeInTheDocument();
-    const addRows = container.querySelectorAll(".asm-ccs-diff-row.is-add");
-    const delRows = container.querySelectorAll(".asm-ccs-diff-row.is-del");
-    expect(addRows).toHaveLength(2);
-    expect(delRows).toHaveLength(1);
-    expect(delRows[0]).toHaveTextContent("13");
-    expect(addRows[0]).toHaveTextContent("13");
-    expect(addRows[1]).toHaveTextContent("14");
+    expect(container.querySelectorAll(".bg-diff-add")).toHaveLength(2);
+    expect(container.querySelectorAll(".bg-diff-del")).toHaveLength(1);
   });
 
-  it("renders per-agent thinking labels, inline summaries, redacted static rows, and expandable italic reasoning", () => {
-    const messages: SessionMessage[] = [
-      { role: "user", content: "为什么 JWT 校验失败？", ts: 1000 },
-      // 单步思考（无工具）：按 cc-switch 规则直接平铺思考行，不套一层多余的「执行过程 · 1 步」
-      {
-        role: "thinking",
-        content:
-          "**核对时钟偏移与签名密钥**\n先排查服务端 exp 与签发端密钥是否一致。",
-        ts: 1002,
-        meta: {
-          thinkingSummary: "核对时钟偏移与签名密钥",
-          durationMs: 4200,
-          model: "gpt-5-codex",
-        },
-      },
-      { role: "assistant", content: "原因是签发端使用了旧版私钥。", ts: 1006 },
-      { role: "user", content: "再检查加密推理块", ts: 2000 },
-      {
-        role: "thinking",
-        content: "[Redacted Thinking]",
-        ts: 2001,
-        meta: { redacted: true, durationMs: 3000 },
-      },
-      { role: "assistant", content: "加密思考块已安全处理。", ts: 2005 },
-    ];
-
+  it("renders user plain text preserving Markdown symbols while formatting fenced code, and renders assistant GFM + PathChips", () => {
+    const client = new QueryClient();
     render(
-      <HarnessReader
-        messages={messages}
-        providerId="codex"
-        providerLabel="Codex"
-      />,
+      <QueryClientProvider client={client}>
+        <TooltipProvider>
+          <ReaderContext.Provider
+            value={{
+              providerId: "claude",
+              sourcePath: "/mock/claude/s.jsonl",
+              projectDir: "/repo/app",
+              style: getAgentReaderStyle("claude"),
+              appName: "Claude Code",
+              onCopy: vi.fn(),
+            }}
+          >
+            <div data-testid="plain-box">
+              <SessionPlainText
+                content={
+                  "# Literal heading *not italic*\n```ts\nconst x = 1;\n```"
+                }
+              />
+            </div>
+            <div data-testid="md-box">
+              <SessionMarkdown
+                content={
+                  "请查看 `/repo/app/src/auth.ts:42` 并核对表格：\n\n| 字段 | 状态 |\n| --- | --- |\n| exp | 正常 |"
+                }
+                projectDir="/repo/app"
+              />
+            </div>
+          </ReaderContext.Provider>
+        </TooltipProvider>
+      </QueryClientProvider>,
     );
 
-    // 模型名展示在 Agent 标题行
-    expect(screen.getByText("· gpt-5-codex")).toBeInTheDocument();
-
-    // 单步思考不包「执行过程 · 1 步」，直接渲染 Codex 原生「推理」标签 + 同行摘要 + 字数与耗时
-    expect(screen.queryByText(/执行过程/)).not.toBeInTheDocument();
-    const thinkingBtn = screen.getByRole("button", { name: "展开思考过程" });
-    expect(thinkingBtn).toHaveTextContent("推理");
-    expect(thinkingBtn).toHaveTextContent("核对时钟偏移与签名密钥");
-    expect(thinkingBtn).toHaveTextContent("4.2s");
     expect(
-      screen.queryByText("先排查服务端 exp 与签发端密钥是否一致。"),
+      screen.getByText("# Literal heading *not italic*"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: /Literal heading/ }),
     ).not.toBeInTheDocument();
+    expect(screen.getByText("ts")).toBeInTheDocument();
 
-    // 点击展开次级斜体思考区域（role="region"）
-    fireEvent.click(thinkingBtn);
-    const region = screen.getByRole("region", { name: "推理" });
-    expect(region).toHaveTextContent("先排查服务端 exp 与签发端密钥是否一致。");
-
-    // 第二轮 redacted_thinking 静态展示「思考内容不可见」，不可点开
-    expect(screen.getByText("思考内容不可见")).toBeInTheDocument();
+    expect(screen.getByText("src/auth.ts:42")).toBeInTheDocument();
+    expect(screen.getByRole("table")).toBeInTheDocument();
+    expect(screen.getByText("exp")).toBeInTheDocument();
   });
 
-  it("pairs tool_call + tool_result by callId, merges Codex Explored runs, clamps intermediate notes, and pins failures", () => {
+  it("renders chain-of-thought preview, lazy loads full thinking via ContentRef, and keeps redacted thinking static", async () => {
+    const fullThinkingRef: ContentRef = {
+      kind: "jsonl",
+      offset: 128,
+      len: 1024,
+      pointer: "/message/content/0/thinking",
+    };
+    setBlockContentFixture(
+      "codex",
+      "/mock/codex/session-1.jsonl",
+      fullThinkingRef,
+      "完整深度推理正文：服务端 JWT 公钥轮换后未同步到边缘网关。",
+    );
+
+    const session: SessionMeta = {
+      providerId: "codex",
+      sessionId: "codex-session-1",
+      title: "JWT 校验排查",
+      projectDir: "/repo/app",
+      sourcePath: "/mock/codex/session-1.jsonl",
+      resumeCommand: "codex resume codex-session-1",
+    };
+
     const messages: SessionMessage[] = [
       {
-        role: "system",
-        content: "[Compacted Summary]\n已归纳前 20 轮架构讨论摘要。",
-        ts: 500,
+        role: "user",
+        content: "为什么 JWT 校验失败？",
+        ts: 1000,
+        blocks: [{ type: "text", text: "为什么 JWT 校验失败？" }],
       },
-      { role: "user", content: "排查并运行单测", ts: 1000 },
       {
         role: "assistant",
-        content:
-          "第一行中间过程说明\n第二行中间过程说明\n第三行中间过程说明\n第四行超长中间说明用于触发三行渐隐折叠",
-        ts: 1002,
+        content: "原因是边缘网关未刷新公钥。",
+        ts: 1005,
         meta: {
-          blocks: [
-            {
-              type: "text",
-              text: "第一行中间过程说明\n第二行中间过程说明\n第三行中间过程说明\n第四行超长中间说明用于触发三行渐隐折叠",
-            },
-            {
-              type: "tool_call",
-              id: "call_r1",
-              rawName: "read_file",
-              title: "src/a.ts",
-              inputPreview: '{"path":"src/a.ts"}',
-              inputTruncated: false,
-            },
-            {
-              type: "tool_call",
-              id: "call_r2",
-              rawName: "grep",
-              title: "verifyToken",
-              inputPreview: '{"pattern":"verifyToken"}',
-              inputTruncated: false,
-            },
-            {
-              type: "tool_call",
-              id: "call_sh",
-              rawName: "exec_command",
-              title: "pnpm test",
-              inputPreview: '{"cmd":"pnpm test"}',
-              inputTruncated: false,
-            },
-          ],
+          model: "gpt-5-codex",
+          inputTokens: 1200,
+          outputTokens: 340,
+          durationMs: 4200,
         },
+        blocks: [
+          {
+            type: "thinking",
+            text: "预览摘要片段",
+            summary: "**核对时钟偏移与签名密钥**",
+            durationMs: 4200,
+            full: fullThinkingRef,
+          },
+          { type: "text", text: "原因是边缘网关未刷新公钥。" },
+        ],
       },
       {
-        role: "tool",
-        content: "file a content",
-        meta: {
-          blocks: [
-            {
-              type: "tool_result",
-              callId: "call_r1",
-              status: "success",
-              output: "export const a = 1;",
-              lineCount: 1,
-            },
-            {
-              type: "tool_result",
-              callId: "call_r2",
-              status: "success",
-              output: "src/a.ts:1:verifyToken",
-              lineCount: 1,
-            },
-            {
-              type: "tool_result",
-              callId: "call_sh",
-              status: "error",
-              output: "FAIL src/a.test.ts\nExpected 200, received 401",
-              lineCount: 2,
-              exitCode: 1,
-              durationMs: 1500,
-            },
-          ],
-        },
+        role: "user",
+        content: "再检查加密推理块",
+        ts: 2000,
+        blocks: [{ type: "text", text: "再检查加密推理块" }],
       },
-      { role: "assistant", content: "发现单测返回 401，准备修复。", ts: 1010 },
+      {
+        role: "assistant",
+        content: "加密思考块已安全处理。",
+        ts: 2005,
+        blocks: [
+          {
+            type: "thinking",
+            text: "",
+            redacted: true,
+            durationMs: 1800,
+          },
+          { type: "text", text: "加密思考块已安全处理。" },
+        ],
+      },
     ];
 
-    render(
-      <HarnessReader
-        messages={messages}
-        providerId="codex"
-        providerLabel="Codex"
-      />,
+    renderSessionReader({ session, messages, appName: "Codex" });
+
+    const thinkingBtn = screen.getByRole("button", {
+      name: /推理.*核对时钟偏移与签名密钥/,
+    });
+    expect(thinkingBtn).toHaveAttribute("aria-expanded", "false");
+
+    expect(screen.getByText("思考内容不可见")).toBeInTheDocument();
+
+    fireEvent.click(thinkingBtn);
+    expect(thinkingBtn).toHaveAttribute("aria-expanded", "true");
+    // Stage 1: inline preview renders immediately with "显示全部" trigger
+    expect(screen.getByText(/预览摘要片段/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "显示全部" }));
+    // Stage 2: full thinking text fetched via get_session_block_content
+    expect(
+      await screen.findByText(
+        "完整深度推理正文：服务端 JWT 公钥轮换后未同步到边缘网关。",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("merges consecutive Codex read/search steps into Explored, pins failed commands in collapsed timeline, filters modes, and supports outline + inline search", async () => {
+    const inlineImg: ImageRef = {
+      source: {
+        kind: "local_file",
+        path: "/repo/app/screenshot.png",
+      },
+      mediaType: "image/png",
+      size: 1024,
+      alt: "UI 截图",
+    };
+    setSessionImageFixture(
+      "codex",
+      "/mock/codex/session-2.jsonl",
+      inlineImg,
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
     );
 
-    // 1. 顶部居中可展开事件分隔行「上下文已压缩」
-    const compactBtn = screen.getByRole("button", { name: /上下文已压缩/ });
+    const diffFullRef: ContentRef = {
+      kind: "jsonl",
+      offset: 512,
+      len: 200,
+      pointer: "/payload/input",
+    };
+    setBlockContentFixture(
+      "codex",
+      "/mock/codex/session-2.jsonl",
+      diffFullRef,
+      "*** Begin Patch\n*** Update File: /repo/app/src/auth.ts\n@@ -1,1 +1,1 @@\n-export const verify = () => false;\n+export const verify = () => true;\n*** End Patch",
+    );
+
+    const session: SessionMeta = {
+      providerId: "codex",
+      sessionId: "codex-session-2",
+      title: "单测与补丁修复",
+      projectDir: "/repo/app",
+      sourcePath: "/mock/codex/session-2.jsonl",
+      resumeCommand: "codex resume codex-session-2",
+    };
+
+    const messages: SessionMessage[] = [
+      {
+        role: "user",
+        content: "# AGENTS.md injected instructions",
+        injected: true,
+        blocks: [{ type: "text", text: "# AGENTS.md injected instructions" }],
+      },
+      {
+        role: "system",
+        content: "已归纳前序上下文摘要。",
+        blocks: [
+          {
+            type: "event",
+            kind: "compaction",
+            text: "已归纳前序上下文摘要。",
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: "排查并修复 auth.ts",
+        ts: 1000,
+        blocks: [
+          { type: "text", text: "排查并修复 auth.ts" },
+          { type: "image", image: inlineImg },
+        ],
+      },
+      {
+        role: "assistant",
+        content: "已定位并应用补丁修复。",
+        ts: 1010,
+        blocks: [
+          { type: "text", text: "先读取文件并搜索验证逻辑" },
+          {
+            type: "tool_call",
+            id: "c_read",
+            rawName: "read_file",
+            kind: "read",
+            title: "/repo/app/src/auth.ts",
+            inputPreview: '{"path":"/repo/app/src/auth.ts"}',
+            inputTotalLen: 32,
+          },
+          {
+            type: "tool_result",
+            callId: "c_read",
+            status: "success",
+            preview: "export const verify = () => false;",
+            totalLen: 34,
+            lineCount: 1,
+            truncated: false,
+          },
+          {
+            type: "tool_call",
+            id: "c_search",
+            rawName: "grep",
+            kind: "search",
+            title: "verify",
+            inputPreview: '{"pattern":"verify"}',
+            inputTotalLen: 20,
+          },
+          {
+            type: "tool_result",
+            callId: "c_search",
+            status: "success",
+            preview: "src/auth.ts:1:verify",
+            totalLen: 20,
+            lineCount: 1,
+            truncated: false,
+          },
+          {
+            type: "tool_call",
+            id: "c_patch",
+            rawName: "apply_patch",
+            kind: "edit",
+            title: "/repo/app/src/auth.ts",
+            inputPreview: '{"path":"/repo/app/src/auth.ts"}',
+            inputTotalLen: 32,
+            diff: {
+              files: [
+                {
+                  path: "/repo/app/src/auth.ts",
+                  op: "update",
+                  added: 1,
+                  removed: 1,
+                },
+              ],
+              added: 1,
+              removed: 1,
+              full: diffFullRef,
+            },
+          },
+          {
+            type: "tool_result",
+            callId: "c_patch",
+            status: "success",
+            preview: "Success. Updated 1 file.",
+            totalLen: 24,
+            lineCount: 1,
+            truncated: false,
+          },
+          {
+            type: "tool_call",
+            id: "c_sh",
+            rawName: "exec_command",
+            kind: "shell",
+            title: "pnpm test",
+            inputPreview: '{"cmd":"pnpm test"}',
+            inputTotalLen: 19,
+          },
+          {
+            type: "tool_result",
+            callId: "c_sh",
+            status: "error",
+            preview: "FAIL src/auth.test.ts\nExpected 200, received 401",
+            totalLen: 48,
+            lineCount: 2,
+            truncated: false,
+            exitCode: 1,
+          },
+          { type: "text", text: "已定位并应用补丁修复。" },
+        ],
+      },
+    ];
+
+    renderSessionReader({ session, messages, appName: "Codex" });
+
+    // Injected message is hidden by default
     expect(
-      screen.queryByText("已归纳前 20 轮架构讨论摘要。"),
+      screen.queryByText(/# AGENTS\.md injected instructions/),
     ).not.toBeInTheDocument();
+
+    // Right-hand SessionOutline is open by default
+    expect(
+      screen.getByRole("navigation", { name: "对话目录" }),
+    ).toBeInTheDocument();
+
+    // Compaction event row expands on click
+    const compactBtn = screen.getByRole("button", { name: /上下文已压缩/ });
     fireEvent.click(compactBtn);
-    expect(
-      screen.getByText("已归纳前 20 轮架构讨论摘要。"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("已归纳前序上下文摘要。")).toBeInTheDocument();
 
-    // 2. 折叠态时间线：1 条说明 + 2 条探索 + 1 条命令 = 4 步，1 个命令，1 处异常
-    const timelineBtn = screen.getByRole("button", {
-      name: /执行过程 · 4 步/,
-    });
+    // Collapsed timeline pins the failed command step directly underneath
+    const timelineBtn = screen.getByRole("button", { name: /执行过程/ });
     expect(timelineBtn).toHaveAttribute("aria-expanded", "false");
-    expect(timelineBtn).toHaveTextContent("1 个命令");
-    expect(timelineBtn).toHaveTextContent("1 处异常");
-
-    // 3. 折叠态下失败步骤「Ran pnpm test」按 cc-switch 规则直接拎在摘要条下方常显并展开报错预览！
     expect(
-      screen.getByRole("button", { name: /Ran pnpm test/ }),
+      screen.getByRole("button", { name: /Ran.*pnpm test/ }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Expected 200, received 401/)).toBeInTheDocument();
-    expect(screen.getByText("exit 1")).toBeInTheDocument();
 
-    // 4. 点开时间线：看到连续读/搜合并成的 Explored 行 + 3 行渐隐折叠的中间说明
+    // Expanding timeline reveals merged Explored step
     fireEvent.click(timelineBtn);
     const exploredBtn = screen.getByRole("button", {
       name: /Explored.*查看了 1 个文件、搜索 1 次/,
     });
     expect(exploredBtn).toBeInTheDocument();
-
-    const expandNoteBtn = screen.getByRole("button", { name: "展开说明" });
-    expect(expandNoteBtn).toBeInTheDocument();
-    fireEvent.click(expandNoteBtn);
-    expect(screen.getByRole("button", { name: "收起" })).toBeInTheDocument();
-
-    // 5. 点开合并的 Explored 步骤：展开缩进子步骤 Read src/a.ts 与 Search verifyToken
     fireEvent.click(exploredBtn);
     expect(
-      screen.getByRole("button", { name: /Read src\/a\.ts/ }),
+      screen.getByRole("button", { name: /Read.*src\/auth\.ts/ }),
+    ).toBeInTheDocument();
+
+    // Filter switching: "改动" shows only file changes
+    fireEvent.click(screen.getByRole("radio", { name: "改动" }));
+    expect(
+      screen.getByRole("button", { name: /Edited.*src\/auth\.ts/ }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Search verifyToken/ }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: /Ran.*pnpm test/ }),
+    ).not.toBeInTheDocument();
+
+    // Switch back to "全部" and test inline find
+    fireEvent.click(screen.getByRole("radio", { name: "全部" }));
+    fireEvent.click(screen.getByRole("button", { name: "在会话中查找" }));
+    const findInput = screen.getByRole("textbox", { name: "查找内容" });
+    await userEvent.type(findInput, "补丁修复");
+    await waitFor(() =>
+      expect(screen.getByText(/1 \/ \d+/)).toBeInTheDocument(),
+    );
   });
 });

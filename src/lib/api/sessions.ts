@@ -1,10 +1,25 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  ContentRef,
   ContentSearchResult,
+  ImageRef,
   SessionIndexStatus,
   SessionMessage,
   SessionMeta,
+  TurnIndex,
 } from "@/types";
+
+export interface BlockContent {
+  text: string;
+  totalLen: number;
+  truncated: boolean;
+  nextOffset?: number;
+}
+
+export interface BlockContentPage {
+  offset?: number;
+  limit?: number;
+}
 
 export interface DeleteSessionOptions {
   providerId: string;
@@ -15,7 +30,12 @@ export interface DeleteSessionOptions {
 
 /** 后端 `TranscriptChunk` 的分块消息，字段一一对应。 */
 export type TranscriptChunk =
-  | { kind: "header"; total: number; approxBytes: number }
+  | {
+      kind: "header";
+      total: number;
+      approxBytes: number;
+      turns?: TurnIndex[];
+    }
   | { kind: "messages"; start: number; messages: SessionMessage[] }
   | { kind: "done"; delivered: number }
   | { kind: "error"; message: string };
@@ -57,8 +77,36 @@ export const sessionsApi = {
     });
     return messages.map((msg, idx) => ({
       ...msg,
+      content: msg.content ?? "",
       transcriptIndex: msg.transcriptIndex ?? msg.index ?? idx,
     }));
+  },
+
+  async getBlockContent(
+    providerId: string,
+    sourcePath: string,
+    contentRef: ContentRef,
+    page: BlockContentPage = {},
+  ): Promise<BlockContent> {
+    return await invoke<BlockContent>("get_session_block_content", {
+      providerId,
+      sourcePath,
+      contentRef,
+      offset: page.offset,
+      limit: page.limit,
+    });
+  },
+
+  async getImage(
+    providerId: string,
+    sourcePath: string,
+    image: ImageRef,
+  ): Promise<string> {
+    return await invoke<string>("get_session_image", {
+      providerId,
+      sourcePath,
+      image,
+    });
   },
 
   /**
@@ -186,6 +234,7 @@ export const sessionsApi = {
               for (const [offset, message] of chunk.messages.entries()) {
                 messages.push({
                   ...message,
+                  content: message.content ?? "",
                   transcriptIndex:
                     message.transcriptIndex ??
                     message.index ??

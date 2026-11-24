@@ -1,3 +1,4 @@
+import "./msw/tauriMocks";
 import "@testing-library/jest-dom";
 import { afterAll, afterEach, beforeAll, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
@@ -6,7 +7,6 @@ import { initReactI18next } from "react-i18next";
 import zh from "@/i18n/session-zh.json";
 import { server } from "./msw/server";
 import { resetProviderState } from "./msw/state";
-import "./msw/tauriMocks";
 
 beforeAll(async () => {
   server.listen({ onUnhandledRequest: "warn" });

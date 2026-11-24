@@ -983,6 +983,123 @@ pub fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Resul
     Ok(())
 }
 
+/// 一行 JSONL 在文件内的字节区间（含行尾 `\n`），供生成 [`crate::session_manager::model::ContentRef::Jsonl`] 使用。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JsonlSpan {
+    pub offset: u64,
+    pub len: u32,
+    pub segment: Option<u16>,
+}
+
+impl JsonlSpan {
+    pub fn content_ref(
+        &self,
+        pointer: impl Into<String>,
+    ) -> crate::session_manager::model::ContentRef {
+        crate::session_manager::model::ContentRef::Jsonl {
+            offset: self.offset,
+            len: self.len,
+            pointer: pointer.into(),
+            segment: self.segment,
+        }
+    }
+}
+
+pub struct LineSpan<'a> {
+    pub span: JsonlSpan,
+    pub bytes: &'a [u8],
+}
+
+/// 逐行读取并累计字节偏移，供需要按需回取原文的 JSONL 解析器共用。
+pub struct LineSpans<R> {
+    reader: R,
+    buf: Vec<u8>,
+    offset: u64,
+    segment: Option<u16>,
+}
+
+impl<R: BufRead> LineSpans<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::with_capacity(64 * 1024),
+            offset: 0,
+            segment: None,
+        }
+    }
+
+    pub fn with_segment(reader: R, segment: Option<u16>) -> Self {
+        Self {
+            reader,
+            buf: Vec::with_capacity(64 * 1024),
+            offset: 0,
+            segment,
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn next_line(&mut self) -> io::Result<Option<LineSpan<'_>>> {
+        self.buf.clear();
+        let read = (&mut self.reader)
+            .take(MAX_SCAN_LINE_BYTES + 1)
+            .read_until(b'\n', &mut self.buf)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if read as u64 > MAX_SCAN_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Session JSONL record exceeds 4 MiB line budget",
+            ));
+        }
+        let offset = self.offset;
+        self.offset += read as u64;
+
+        let mut end = self.buf.len();
+        if end > 0 && self.buf[end - 1] == b'\n' {
+            end -= 1;
+            if end > 0 && self.buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+        }
+        Ok(Some(LineSpan {
+            span: JsonlSpan {
+                offset,
+                len: u32::try_from(read).unwrap_or(u32::MAX),
+                segment: self.segment,
+            },
+            bytes: &self.buf[..end],
+        }))
+    }
+}
+
+/// 逐行读取 JSONL，跳过空行与损坏行，回调接收 `(字节区间, Value)`。
+pub fn for_each_jsonl_value(
+    path: &Path,
+    mut f: impl FnMut(JsonlSpan, Value) -> Result<(), String>,
+) -> Result<(), String> {
+    ensure_readable_size(path)?;
+    let file = File::open(path).map_err(|e| format!("Failed to open session file: {e}"))?;
+    let mut lines = LineSpans::new(BufReader::new(file));
+    while let Some(line) = lines
+        .next_line()
+        .map_err(|e| format!("Failed to read session file: {e}"))?
+    {
+        let bytes = line.bytes.trim_ascii();
+        if bytes.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            continue;
+        };
+        f(line.span, value)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

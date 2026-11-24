@@ -11,9 +11,14 @@ const buttonVariants = cva(
         // 主按钮：蓝底白字（对应旧版 primary）
         default:
           "bg-blue-500 text-white hover:bg-blue-600 dark:bg-blue-600 dark:hover:bg-blue-700",
+        primary: "bg-action text-[var(--action-fg)] hover:opacity-90",
+        neutral: "border border-border bg-surface text-fg-1 hover:bg-subtle",
+        quiet: "text-fg-2 hover:bg-subtle hover:text-fg-1",
         // 危险按钮：红底白字（对应旧版 danger）
         destructive:
           "bg-red-500 text-white hover:bg-red-600 dark:bg-red-600 dark:hover:bg-red-700",
+        "destructive-subtle":
+          "border border-danger/35 bg-danger/10 text-danger-text hover:bg-danger/15",
         // 轮廓按钮
         outline:
           "border border-border-default bg-background text-muted-foreground hover:bg-gray-100 hover:text-gray-900 hover:border-border-hover dark:hover:bg-gray-800 dark:hover:text-gray-100",
@@ -30,9 +35,12 @@ const buttonVariants = cva(
       },
       size: {
         default: "h-9 px-4 py-2",
+        regular: "h-8 rounded-control px-3 text-body",
+        compact: "h-7 rounded-control px-2.5 text-caption",
         sm: "h-8 rounded-md px-3 text-xs",
         lg: "h-10 rounded-md px-8",
         icon: "h-9 w-9 p-1.5",
+        "icon-compact": "h-7 w-7 rounded-control p-0",
       },
     },
     defaultVariants: {

@@ -3,9 +3,12 @@ import { APP_VERSION } from "@/lib/githubRelease";
 import {
   contentIdentityHex,
   deleteSession,
+  getBlockContentFixture,
+  getSessionImageFixture,
   getSessionMessages,
   listSessions,
 } from "./state";
+import type { ContentRef, ImageRef } from "@/types";
 
 const TAURI_ENDPOINT = "http://tauri.local";
 const GITHUB_RELEASE_ENDPOINT =
@@ -34,20 +37,22 @@ export const handlers = [
     }>(request);
     const wireMessages = getSessionMessages(providerId, sourcePath).map(
       (message, index) => {
+        const content = message.content ?? "";
         if (
           !message.truncated &&
-          message.content.length > WIRE_TRUNCATE_THRESHOLD
+          (!message.blocks || message.blocks.length === 0) &&
+          content.length > WIRE_TRUNCATE_THRESHOLD
         ) {
           return {
             ...message,
-            content: message.content.slice(0, WIRE_PREVIEW_CHARS),
+            content: content.slice(0, WIRE_PREVIEW_CHARS),
             index,
             truncated: true,
-            contentChars: message.content.length,
+            contentChars: content.length,
             contentIdentity: contentIdentityHex(message),
           };
         }
-        return message;
+        return { ...message, content };
       },
     );
     return success(wireMessages);
@@ -99,6 +104,64 @@ export const handlers = [
       return new HttpResponse("会话已更新，请重新打开", { status: 400 });
     }
     return success(message.content);
+  }),
+  http.post(
+    `${TAURI_ENDPOINT}/get_session_block_content`,
+    async ({ request }) => {
+      const {
+        providerId,
+        sourcePath,
+        contentRef,
+        offset = 0,
+        limit = 512 * 1024,
+      } = await readJson<{
+        providerId: string;
+        sourcePath: string;
+        contentRef: ContentRef;
+        offset?: number;
+        limit?: number;
+      }>(request);
+      const fullText = getBlockContentFixture(
+        providerId,
+        sourcePath,
+        contentRef,
+      );
+      if (fullText === undefined) {
+        return new HttpResponse("未找到块内容", { status: 404 });
+      }
+      const chars = Array.from(fullText);
+      const start = Math.min(Math.max(0, offset), chars.length);
+      const end = Math.min(start + Math.max(1, limit), chars.length);
+      const truncated = end < chars.length;
+      return success({
+        text: chars.slice(start, end).join(""),
+        totalLen: chars.length,
+        truncated,
+        ...(truncated ? { nextOffset: end } : {}),
+      });
+    },
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_session_image`, async ({ request }) => {
+    const { providerId, sourcePath, image } = await readJson<{
+      providerId: string;
+      sourcePath: string;
+      image: ImageRef;
+    }>(request);
+    const fixture = getSessionImageFixture(providerId, sourcePath, image);
+    if (fixture !== undefined) {
+      return success(fixture);
+    }
+    if (image.source.kind === "inline") {
+      const base64 = getBlockContentFixture(
+        providerId,
+        sourcePath,
+        image.source.content,
+      );
+      if (base64 !== undefined) {
+        return success(`data:${image.mediaType};base64,${base64}`);
+      }
+    }
+    return new HttpResponse("未找到图片资源", { status: 404 });
   }),
   http.post(`${TAURI_ENDPOINT}/delete_session`, async ({ request }) => {
     const input = await readJson<{
@@ -155,8 +218,18 @@ export const handlers = [
         }> = [];
         let matchCount = 0;
         msgs.forEach((msg, idx) => {
+          if (msg.injected) return;
           if (msg.role !== "user" && msg.role !== "assistant") return;
-          const lower = msg.content.toLocaleLowerCase();
+          const blockText =
+            msg.blocks
+              ?.filter(
+                (b): b is Extract<typeof b, { type: "text" }> =>
+                  b.type === "text",
+              )
+              .map((b) => b.text)
+              .join("\n\n") ?? "";
+          const searchable = blockText || msg.content || "";
+          const lower = searchable.toLocaleLowerCase();
           if (!terms.every((term) => lower.includes(term))) return;
           matchCount += 1;
           if (snippets.length < 3) {
@@ -166,7 +239,7 @@ export const handlers = [
               start >= 0 ? [{ start, end: start + firstTerm.length }] : [];
             snippets.push({
               messageIndex: idx,
-              text: msg.content,
+              text: searchable,
               highlights,
             });
           }

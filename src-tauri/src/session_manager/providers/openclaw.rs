@@ -1,9 +1,7 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -13,9 +11,10 @@ use crate::session_manager::cache::TranscriptSources;
 use crate::session_manager::{SessionMessage, SessionMeta};
 use crate::session_paths::openclaw_state_dir;
 
+use super::pi_blocks::PiTranscript;
 use super::utils::{
     atomic_write_json, checked_storage_child, ensure_readable_size, extract_text,
-    extract_thinking_text, is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms,
+    for_each_jsonl_value, is_reparse_or_symlink, is_safe_session_id, parse_timestamp_to_ms,
     path_basename, read_head_tail_lines, remove_path_if_exists, scan_warning, truncate_summary,
     FileParseCache, TITLE_MAX_CHARS,
 };
@@ -397,253 +396,16 @@ fn extract_visible_without_tools(content: &Value) -> String {
     }
 }
 
-fn format_tool_call_item(item: &Value) -> Option<(Option<String>, String, String)> {
-    let name = item
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let id = item
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let args = match item.get("arguments").or_else(|| item.get("input")) {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(Value::Object(map)) if !map.is_empty() => Value::Object(map.clone()).to_string(),
-        Some(other) if !other.is_null() && other != &Value::Object(serde_json::Map::new()) => {
-            other.to_string()
-        }
-        _ => String::new(),
-    };
-    let formatted = if args.is_empty() {
-        format!("[Tool: {name}]")
-    } else {
-        format!("[Tool: {name}]\n{args}")
-    };
-    Some((id, name, formatted))
-}
-
+/// OpenClaw 与 Pi 同构，复用 [`PiTranscript`] 按文件顺序解析完整结构化块。
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     ensure_readable_size(path)?;
-    let file =
-        File::open(path).map_err(|e| format!("Failed to open OpenClaw session file: {e}"))?;
-    let reader = BufReader::new(file);
-
-    let mut messages = Vec::new();
-    let mut call_names: HashMap<String, String> = HashMap::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read OpenClaw transcript: {e}"))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let entry_ts = value.get("timestamp").and_then(parse_timestamp_to_ms);
-
-        match value.get("type").and_then(Value::as_str) {
-            Some("message") => {
-                let Some(msg) = value.get("message") else {
-                    continue;
-                };
-                let ts = msg
-                    .get("timestamp")
-                    .and_then(parse_timestamp_to_ms)
-                    .or(entry_ts);
-                let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
-
-                match role {
-                    "user" => {
-                        let raw = msg.get("content").map(extract_text).unwrap_or_default();
-                        let cleaned = strip_message_id_suffix(&raw);
-                        if !cleaned.trim().is_empty() {
-                            messages.push(SessionMessage {
-                                role: "user".to_string(),
-                                content: cleaned.to_string(),
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                    "assistant" => {
-                        let mut emitted_text = false;
-                        if let Some(content_val) = msg.get("content") {
-                            let thinking = extract_thinking_text(content_val);
-                            if !thinking.trim().is_empty() {
-                                messages.push(SessionMessage {
-                                    role: "thinking".to_string(),
-                                    content: thinking,
-                                    ts,
-                                    meta: None,
-                                });
-                            }
-
-                            let visible = extract_visible_without_tools(content_val);
-                            if !visible.trim().is_empty() {
-                                emitted_text = true;
-                                messages.push(SessionMessage {
-                                    role: "assistant".to_string(),
-                                    content: visible,
-                                    ts,
-                                    meta: None,
-                                });
-                            }
-
-                            if let Value::Array(items) = content_val {
-                                for item in items {
-                                    if matches!(
-                                        item.get("type").and_then(Value::as_str),
-                                        Some(
-                                            "toolCall"
-                                                | "tool_use"
-                                                | "server_tool_use"
-                                                | "mcp_tool_use"
-                                        )
-                                    ) {
-                                        if let Some((cid, name, formatted)) =
-                                            format_tool_call_item(item)
-                                        {
-                                            if let Some(id) = cid {
-                                                call_names.insert(id, name);
-                                            }
-                                            messages.push(SessionMessage {
-                                                role: "tool".to_string(),
-                                                content: formatted,
-                                                ts,
-                                                meta: None,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if !emitted_text {
-                            if let Some(err) = msg
-                                .get("errorMessage")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                            {
-                                messages.push(SessionMessage {
-                                    role: "assistant".to_string(),
-                                    content: format!("[Error] {err}"),
-                                    ts,
-                                    meta: None,
-                                });
-                            }
-                        }
-                    }
-                    "toolResult" => {
-                        let call_id = msg.get("toolCallId").and_then(Value::as_str).unwrap_or("");
-                        let name = msg
-                            .get("toolName")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| call_names.get(call_id).map(String::as_str))
-                            .unwrap_or("");
-                        let is_error = msg.get("isError").and_then(Value::as_bool) == Some(true);
-                        let text = msg.get("content").map(extract_text).unwrap_or_default();
-                        let trimmed_text = text.trim();
-                        if !trimmed_text.is_empty() || is_error {
-                            let label = if is_error { "Error" } else { "Result" };
-                            let content = match (!name.is_empty(), !trimmed_text.is_empty()) {
-                                (true, true) => format!("[{label}: {name}]\n{trimmed_text}"),
-                                (true, false) => format!("[{label}: {name}]"),
-                                (false, true) => trimmed_text.to_string(),
-                                (false, false) => format!("[{label}]"),
-                            };
-                            messages.push(SessionMessage {
-                                role: "tool".to_string(),
-                                content,
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                    "bashExecution" => {
-                        let cmd = msg.get("command").and_then(Value::as_str).unwrap_or("");
-                        let out = msg.get("output").and_then(Value::as_str).unwrap_or("");
-                        let combined = format!("$ {cmd}\n{out}");
-                        if !combined.trim().is_empty() {
-                            messages.push(SessionMessage {
-                                role: "tool".to_string(),
-                                content: combined.trim().to_string(),
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                    "branchSummary" | "compactionSummary" => {
-                        if let Some(s) = msg
-                            .get("summary")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            messages.push(SessionMessage {
-                                role: "system".to_string(),
-                                content: format!("[Compacted Summary]\n{s}"),
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                    "custom" | "hookMessage"
-                        if msg.get("display").and_then(Value::as_bool) != Some(false) =>
-                    {
-                        let text = msg.get("content").map(extract_text).unwrap_or_default();
-                        if !text.trim().is_empty() {
-                            messages.push(SessionMessage {
-                                role: "system".to_string(),
-                                content: text,
-                                ts,
-                                meta: None,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("compaction" | "branch_summary") => {
-                if let Some(s) = value
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    messages.push(SessionMessage {
-                        role: "system".to_string(),
-                        content: format!("[Compacted Summary]\n{s}"),
-                        ts: entry_ts,
-                        meta: None,
-                    });
-                }
-            }
-            Some("custom_message")
-                if value.get("display").and_then(Value::as_bool) != Some(false) =>
-            {
-                let text = value.get("content").map(extract_text).unwrap_or_default();
-                if !text.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "system".to_string(),
-                        content: text,
-                        ts: entry_ts,
-                        meta: None,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(messages)
+    let mut transcript = PiTranscript::for_openclaw();
+    for_each_jsonl_value(path, |span, value| {
+        let id = value.get("id").and_then(Value::as_str).map(str::to_string);
+        transcript.push_entry(&value, span, id);
+        Ok(())
+    })?;
+    Ok(transcript.finish())
 }
 
 fn validate_openclaw_session_path(
@@ -1070,22 +832,47 @@ mod tests {
         )
         .unwrap();
 
+        use crate::session_manager::model::{EventKind, SessionBlock, ToolKind, ToolStatus};
+
         let msgs = load_messages(&path).unwrap();
-        let pairs: Vec<(&str, &str)> = msgs
+        let pairs: Vec<(&str, &str, Option<&str>)> = msgs
             .iter()
-            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .map(|m| (m.role.as_str(), m.content.as_str(), m.turn_id.as_deref()))
             .collect();
         assert_eq!(
             pairs,
             vec![
-                ("user", "Deploy app"),
-                ("thinking", "Checking package.json"),
-                ("assistant", "Let me read the config."),
-                ("tool", "[Tool: read]\n{\"path\":\"package.json\"}"),
-                ("tool", "[Result: read]\n{\"name\":\"app\"}"),
-                ("system", "[Compacted Summary]\nConfig verified."),
+                ("user", "Deploy app", Some("t1")),
+                (
+                    "assistant",
+                    "Let me read the config.\n\n[Tool: read] package.json",
+                    Some("t1")
+                ),
+                ("tool", "{\"name\":\"app\"}", Some("t1")),
+                ("system", "Config verified.", Some("t1")),
             ]
         );
+        assert!(matches!(
+            &msgs[1].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "Checking package.json"
+        ));
+        assert!(matches!(
+            &msgs[1].blocks[2],
+            SessionBlock::ToolCall { id, kind: ToolKind::Read, title, .. }
+                if id == "c1" && title == "package.json"
+        ));
+        assert!(matches!(
+            &msgs[2].blocks[0],
+            SessionBlock::ToolResult { call_id, status: ToolStatus::Success, .. }
+                if call_id == "c1"
+        ));
+        assert!(matches!(
+            &msgs[3].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::Compaction,
+                ..
+            }
+        ));
     }
 
     #[test]

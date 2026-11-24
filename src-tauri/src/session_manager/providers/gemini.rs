@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -10,9 +8,18 @@ use std::sync::LazyLock;
 use serde_json::Value;
 
 use crate::session_manager::cache::TranscriptSources;
+use crate::session_manager::content::parse_file_url;
+use crate::session_manager::model::{
+    ContentRef, DiffOp, EventKind, ImageRef, ImageSource, MessageMeta, SessionBlock, ToolStatus,
+};
 use crate::session_manager::{SessionMessage, SessionMeta};
 use crate::session_paths::gemini_home;
 
+use super::blocks::{
+    assign_turn_ids, count_diff_lines, estimate_base64_size, large_text_block, parse_arguments,
+    single_file_diff, summary_event_block, thinking_block, tool_call_block, tool_result_block,
+    ToolSource,
+};
 use super::utils::{
     checked_storage_child, ensure_readable_size, is_reparse_or_symlink, is_safe_session_id,
     parse_timestamp_to_ms, path_basename, remove_path_if_exists, scan_warning, truncate_summary,
@@ -28,6 +35,7 @@ pub fn session_roots() -> Vec<PathBuf> {
     vec![gemini_home().join("tmp")]
 }
 
+#[allow(dead_code)]
 pub fn transcript_sources(path: &Path) -> Result<TranscriptSources, String> {
     Ok(vec![(path.to_path_buf(), None)])
 }
@@ -283,7 +291,20 @@ fn content_text(content: Option<&Value>) -> String {
     }
 }
 
-fn format_thoughts(value: &Value) -> Option<String> {
+pub(crate) fn parse_session_document_for_content(raw: &str) -> Option<Value> {
+    parse_session_document(raw)
+}
+
+pub(crate) fn format_thoughts_for_content(thoughts: &Value) -> Option<String> {
+    format_thoughts(thoughts).map(|merged| merged.text)
+}
+
+pub(crate) struct MergedThoughts {
+    pub summary: String,
+    pub text: String,
+}
+
+pub(crate) fn format_thoughts(value: &Value) -> Option<MergedThoughts> {
     let items = value.as_array()?;
     let mut thoughts = Vec::new();
     for item in items {
@@ -297,6 +318,12 @@ fn format_thoughts(value: &Value) -> Option<String> {
     if thoughts.is_empty() {
         return None;
     }
+    let summary = thoughts
+        .iter()
+        .map(|(subject, _)| *subject)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
     let text = thoughts
         .iter()
         .map(
@@ -308,60 +335,335 @@ fn format_thoughts(value: &Value) -> Option<String> {
         )
         .collect::<Vec<_>>()
         .join("\n\n");
-    Some(text)
+    Some(MergedThoughts { summary, text })
 }
 
-fn format_tool_call(name: &str, args: Option<&Value>) -> String {
-    let args_str = match args {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(Value::Object(map)) if !map.is_empty() => Value::Object(map.clone()).to_string(),
-        Some(other) if !other.is_null() && other != &Value::Object(serde_json::Map::new()) => {
-            other.to_string()
+fn relative_to_tmp_root(path: &Path) -> String {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .rev()
+        .take(3)
+        .collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+fn image_from_gemini_part(
+    part: &Value,
+    part_ptr: &str,
+    file_ref: &dyn Fn(String) -> Option<ContentRef>,
+) -> Option<ImageRef> {
+    if let Some(inline) = part.get("inlineData").and_then(Value::as_object) {
+        let mime = inline
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        if mime.starts_with("image/") {
+            if let Some(data) = inline
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                let content = file_ref(format!("{part_ptr}/inlineData/data"))?;
+                return Some(ImageRef {
+                    source: ImageSource::Inline { content },
+                    media_type: mime.to_string(),
+                    size: estimate_base64_size(data.len()),
+                    alt: None,
+                });
+            }
         }
-        _ => String::new(),
-    };
-    if args_str.is_empty() {
-        format!("[Tool: {name}]")
-    } else {
-        format!("[Tool: {name}]\n{args_str}")
     }
-}
 
-fn extract_tool_output(call: &Value) -> String {
-    match call.get("resultDisplay") {
-        Some(Value::String(text)) if !text.trim().is_empty() => return text.clone(),
-        Some(display @ Value::Object(_)) => {
-            if let Some(diff) = display.get("fileDiff").and_then(Value::as_str) {
-                if !diff.trim().is_empty() {
-                    return diff.to_string();
+    if let Some(file_data) = part.get("fileData").and_then(Value::as_object) {
+        let mime = file_data
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        if mime.starts_with("image/") {
+            if let Some(uri) = file_data
+                .get("fileUri")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let fs_path = if uri.starts_with("file://") {
+                    parse_file_url(uri).ok()
+                } else {
+                    let p = PathBuf::from(uri);
+                    p.is_absolute().then_some(p)
+                };
+                if let Some(fs_path) = fs_path {
+                    let size = fs::metadata(&fs_path)
+                        .ok()
+                        .map(|m| u32::try_from(m.len()).unwrap_or(u32::MAX))
+                        .unwrap_or(0);
+                    return Some(ImageRef {
+                        source: ImageSource::LocalFile {
+                            path: uri.to_string(),
+                        },
+                        media_type: mime.to_string(),
+                        size,
+                        alt: None,
+                    });
                 }
             }
-            return display.to_string();
+        }
+    }
+
+    None
+}
+
+fn content_blocks(
+    content: Option<&Value>,
+    base_ptr: &str,
+    injected: bool,
+    file_ref: &dyn Fn(String) -> Option<ContentRef>,
+) -> Vec<SessionBlock> {
+    let mut blocks = Vec::new();
+    match content {
+        Some(Value::String(s)) if !s.trim().is_empty() => {
+            if injected {
+                let ptr = base_ptr.to_string();
+                blocks.push(large_text_block(s.clone(), || file_ref(ptr)));
+            } else {
+                blocks.push(SessionBlock::text(s.clone()));
+            }
+        }
+        Some(Value::Array(items)) => {
+            let mut text_parts: Vec<&str> = Vec::new();
+            let flush_text = |parts: &mut Vec<&str>, blocks: &mut Vec<SessionBlock>| {
+                if parts.is_empty() {
+                    return;
+                }
+                let joined = parts.join("\n");
+                parts.clear();
+                if !joined.trim().is_empty() {
+                    if injected {
+                        let ptr = base_ptr.to_string();
+                        blocks.push(large_text_block(joined, || file_ref(ptr)));
+                    } else {
+                        blocks.push(SessionBlock::text(joined));
+                    }
+                }
+            };
+            for (k, item) in items.iter().enumerate() {
+                let part_ptr = format!("{base_ptr}/{k}");
+                if let Some(image) = image_from_gemini_part(item, &part_ptr, file_ref) {
+                    flush_text(&mut text_parts, &mut blocks);
+                    blocks.push(SessionBlock::Image { image });
+                } else if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    text_parts.push(text);
+                }
+            }
+            flush_text(&mut text_parts, &mut blocks);
         }
         _ => {}
     }
-    for item in call
+    blocks
+}
+
+fn extract_tool_result_images(
+    call: &Value,
+    call_base: &str,
+    file_ref: &dyn Fn(String) -> Option<ContentRef>,
+) -> Vec<ImageRef> {
+    let mut images = Vec::new();
+    for (k, item) in call
         .get("result")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .enumerate()
+    {
+        let item_ptr = format!("{call_base}/result/{k}");
+        if let Some(img) = image_from_gemini_part(item, &item_ptr, file_ref) {
+            images.push(img);
+        }
+        for (p, nested) in item
+            .pointer("/functionResponse/parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let nested_ptr = format!("{item_ptr}/functionResponse/parts/{p}");
+            if let Some(img) = image_from_gemini_part(nested, &nested_ptr, file_ref) {
+                images.push(img);
+            }
+        }
+    }
+    images
+}
+
+fn tool_output(call: &Value, call_base: &str) -> (String, Option<String>) {
+    match call.get("resultDisplay") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            return (text.clone(), Some(format!("{call_base}/resultDisplay")));
+        }
+        Some(display @ Value::Object(_)) => {
+            if let Some(diff) = display.get("fileDiff").and_then(Value::as_str) {
+                return (
+                    diff.to_string(),
+                    Some(format!("{call_base}/resultDisplay/fileDiff")),
+                );
+            }
+            return (display.to_string(), None);
+        }
+        _ => {}
+    }
+    for (k, item) in call
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
     {
         for key in ["output", "error"] {
             if let Some(text) = item
                 .pointer(&format!("/functionResponse/response/{key}"))
                 .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
             {
-                return text.to_string();
+                return (
+                    text.to_string(),
+                    Some(format!(
+                        "{call_base}/result/{k}/functionResponse/response/{key}"
+                    )),
+                );
             }
         }
     }
     match call.get("result") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Null) | None => String::new(),
-        Some(Value::Array(arr)) if arr.is_empty() => String::new(),
-        Some(other) => other.to_string(),
+        Some(Value::String(text)) => (text.clone(), Some(format!("{call_base}/result"))),
+        Some(Value::Null) | None => (String::new(), None),
+        Some(Value::Array(arr)) if arr.iter().all(|item| item.get("inlineData").is_some()) => {
+            (String::new(), None)
+        }
+        Some(other) => (other.to_string(), None),
     }
+}
+
+fn gemini_blocks(
+    msg: &Value,
+    base: &str,
+    file_ref: &dyn Fn(String) -> Option<ContentRef>,
+) -> Vec<SessionBlock> {
+    let mut blocks = Vec::new();
+
+    if let Some(thoughts) = msg.get("thoughts").and_then(format_thoughts) {
+        blocks.push(thinking_block(
+            &thoughts.text,
+            (!thoughts.summary.is_empty()).then_some(thoughts.summary),
+            None,
+            || file_ref(format!("{base}/thoughts")),
+        ));
+    }
+
+    blocks.extend(content_blocks(
+        msg.get("content"),
+        &format!("{base}/content"),
+        false,
+        file_ref,
+    ));
+
+    for (j, call) in msg
+        .get("toolCalls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(name) = call
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let call_base = format!("{base}/toolCalls/{j}");
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{name}-{j}"));
+        let args = call.get("args").map(parse_arguments).unwrap_or(Value::Null);
+        let mut call_block = tool_call_block(ToolSource::Gemini, id.clone(), name, &args, || {
+            file_ref(format!("{call_base}/args"))
+        });
+
+        let (output, pointer) = tool_output(call, &call_base);
+        if let Some(diff_text) = call
+            .pointer("/resultDisplay/fileDiff")
+            .and_then(Value::as_str)
+        {
+            if let SessionBlock::ToolCall { diff, title, .. } = &mut call_block {
+                let (added, removed) = count_diff_lines(diff_text);
+                let path = call
+                    .pointer("/resultDisplay/filePath")
+                    .or_else(|| call.pointer("/resultDisplay/fileName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(title.as_str())
+                    .to_string();
+                let op = diff
+                    .as_ref()
+                    .and_then(|d| d.files.first())
+                    .map_or(DiffOp::Update, |f| f.op);
+                let mut summary = single_file_diff(&path, op, added, removed);
+                summary.full = file_ref(format!("{call_base}/resultDisplay/fileDiff"));
+                *diff = Some(summary);
+            }
+        }
+        blocks.push(call_block);
+
+        let status = match call.get("status").and_then(Value::as_str) {
+            Some("success" | "completed") => ToolStatus::Success,
+            Some("error") => ToolStatus::Error,
+            Some("cancelled" | "canceled") => ToolStatus::Interrupted,
+            Some("executing" | "scheduled" | "validating" | "awaiting_approval") => {
+                ToolStatus::Pending
+            }
+            _ => ToolStatus::Unknown,
+        };
+        let mut res_block = tool_result_block(id, status, &output, || pointer.and_then(file_ref));
+        let inline_imgs = extract_tool_result_images(call, &call_base, file_ref);
+        if !inline_imgs.is_empty() {
+            if let SessionBlock::ToolResult { images, .. } = &mut res_block {
+                *images = inline_imgs;
+            }
+        }
+        blocks.push(res_block);
+    }
+
+    blocks
+}
+
+fn gemini_meta(msg: &Value) -> Option<MessageMeta> {
+    let tokens = msg.get("tokens");
+    let count = |key: &str| {
+        tokens
+            .and_then(|t| t.get(key))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    };
+    MessageMeta {
+        model: msg
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        input_tokens: count("input"),
+        output_tokens: count("output"),
+        cache_read_tokens: count("cached"),
+        reasoning_tokens: count("thoughts"),
+        ..MessageMeta::default()
+    }
+    .into_option()
 }
 
 fn read_session_document(path: &Path) -> Result<Value, String> {
@@ -379,169 +681,64 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "No messages array found in Gemini session".to_string())?;
 
+    let rel_path = relative_to_tmp_root(path);
+    let file_ref = |pointer: String| -> Option<ContentRef> {
+        (!rel_path.is_empty()).then(|| ContentRef::File {
+            rel_path: rel_path.clone(),
+            pointer,
+        })
+    };
+
     let mut result = Vec::new();
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         let ts = msg.get("timestamp").and_then(parse_timestamp_to_ms);
-        match msg.get("type").and_then(Value::as_str) {
+        let base = format!("/messages/{index}");
+        let mut message = match msg.get("type").and_then(Value::as_str) {
             Some("user") => {
                 let text = content_text(msg.get("content"));
-                if text.trim().is_empty() || is_injected_user_text(&text) {
-                    continue;
-                }
-                result.push(SessionMessage {
-                    role: "user".to_string(),
-                    content: text,
-                    ts,
-                    meta: None,
-                });
+                let injected = is_injected_user_text(&text);
+                let blocks = content_blocks(
+                    msg.get("content"),
+                    &format!("{base}/content"),
+                    injected,
+                    &file_ref,
+                );
+                let mut message = SessionMessage::from_blocks("user", ts, blocks);
+                message.injected = injected;
+                message
             }
             Some("gemini") => {
-                let model = msg
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-
-                if let Some(thoughts) = msg.get("thoughts").and_then(format_thoughts) {
-                    if !thoughts.trim().is_empty() {
-                        let (summary, body) =
-                            crate::session_manager::reader_meta::split_markdown_thinking_summary(
-                                &thoughts,
-                            );
-                        let meta = crate::session_manager::reader_meta::MessageReaderMeta {
-                            thinking_summary: summary.clone(),
-                            blocks: vec![
-                                crate::session_manager::reader_meta::ReaderBlock::Thinking {
-                                    text: if summary.is_some() {
-                                        body
-                                    } else {
-                                        thoughts.clone()
-                                    },
-                                    summary,
-                                    redacted: false,
-                                    duration_ms: None,
-                                },
-                            ],
-                            ..Default::default()
-                        }
-                        .into_boxed_option();
-                        result.push(SessionMessage {
-                            role: "thinking".to_string(),
-                            content: thoughts,
-                            ts,
-                            meta,
-                        });
-                    }
-                }
-
-                let text = content_text(msg.get("content"));
-                if !text.trim().is_empty() {
-                    let meta = crate::session_manager::reader_meta::MessageReaderMeta {
-                        model: model.clone(),
-                        ..Default::default()
-                    }
-                    .into_boxed_option();
-                    result.push(SessionMessage {
-                        role: "assistant".to_string(),
-                        content: text,
-                        ts,
-                        meta,
-                    });
-                }
-
-                for (call_idx, call) in msg
-                    .get("toolCalls")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .enumerate()
-                {
-                    let Some(name) = call
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    else {
-                        continue;
-                    };
-                    let call_id = call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("gemini_call_{}_{call_idx}", result.len()));
-                    let args_val = call.get("args").unwrap_or(&Value::Null);
-                    let call_content = format_tool_call(name, call.get("args"));
-                    let call_meta = crate::session_manager::reader_meta::MessageReaderMeta {
-                        model: model.clone(),
-                        blocks: vec![crate::session_manager::reader_meta::build_tool_call_block(
-                            call_id.clone(),
-                            name,
-                            None,
-                            args_val,
-                        )],
-                        ..Default::default()
-                    }
-                    .into_boxed_option();
-                    result.push(SessionMessage {
-                        role: "tool".to_string(),
-                        content: call_content,
-                        ts,
-                        meta: call_meta,
-                    });
-
-                    let output = extract_tool_output(call);
-                    let trimmed_out = output.trim();
-                    if !trimmed_out.is_empty() {
-                        let is_err = call.get("status").and_then(Value::as_str) == Some("error");
-                        let label = if is_err { "Error" } else { "Result" };
-                        let line_count = trimmed_out.lines().count() as u32;
-                        let res_meta = crate::session_manager::reader_meta::MessageReaderMeta {
-                            blocks: vec![
-                                crate::session_manager::reader_meta::ReaderBlock::ToolResult {
-                                    call_id,
-                                    status: if is_err { "error" } else { "success" }.to_string(),
-                                    output: trimmed_out.to_string(),
-                                    line_count,
-                                    exit_code: None,
-                                    duration_ms: None,
-                                },
-                            ],
-                            ..Default::default()
-                        }
-                        .into_boxed_option();
-                        result.push(SessionMessage {
-                            role: "tool".to_string(),
-                            content: format!("[{label}: {name}]\n{trimmed_out}"),
-                            ts,
-                            meta: res_meta,
-                        });
-                    }
-                }
+                let blocks = gemini_blocks(msg, &base, &file_ref);
+                let mut message = SessionMessage::from_blocks("assistant", ts, blocks);
+                message.meta = gemini_meta(msg);
+                message
             }
-            Some(kind @ ("info" | "error")) => {
+            Some(kind @ ("info" | "warning" | "error")) => {
                 let text = content_text(msg.get("content"));
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
+                if text.trim().is_empty() {
                     continue;
                 }
-                let formatted = if kind == "error" && !trimmed.starts_with("[Error]") {
-                    format!("[Error] {trimmed}")
+                let event_kind = if kind == "error" {
+                    EventKind::Error
                 } else {
-                    trimmed.to_string()
+                    EventKind::Info
                 };
-                result.push(SessionMessage {
-                    role: "system".to_string(),
-                    content: formatted,
-                    ts,
-                    meta: None,
-                });
+                let block =
+                    summary_event_block(event_kind, &text, || file_ref(format!("{base}/content")));
+                let mut message = SessionMessage::from_blocks("system", ts, vec![block]);
+                message.injected = kind == "info";
+                message
             }
-            _ => {}
+            _ => continue,
+        };
+        if message.is_empty() && message.meta.is_none() {
+            continue;
         }
+        message.id = msg.get("id").and_then(Value::as_str).map(str::to_string);
+        result.push(message);
     }
 
+    assign_turn_ids(&mut result);
     Ok(result)
 }
 
@@ -802,6 +999,7 @@ fn validate_gemini_session_path(
     Ok((canonical_root, resolved_path, checked_sibling, file_exists))
 }
 
+#[allow(dead_code)]
 pub fn preflight_delete(root: &Path, path: &Path, session_id: &str) -> Result<(), String> {
     validate_gemini_session_path(root, path, session_id).map(|_| ())
 }
@@ -945,7 +1143,10 @@ mod tests {
     #[test]
     fn jsonl_replay_separates_thinking_tool_calls_results_and_system_events() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("session-2026-10-04.jsonl");
+        let chats = temp.path().join("tmp").join("hash1").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let path = chats.join("session-2026-10-04.jsonl");
+        let long_output: String = (1..=20).map(|i| format!("line {i}\n")).collect();
         write_jsonl(
             &path,
             &[
@@ -957,9 +1158,12 @@ mod tests {
                     "id": "g1",
                     "timestamp": "2026-10-04T10:00:03Z",
                     "type": "gemini",
+                    "model": "gemini-2.5-pro",
+                    "tokens": {"input": 1200, "output": 85, "cached": 400, "thoughts": 30},
                     "content": "answer one",
                     "thoughts": [
-                        {"subject": "Inspecting main", "description": "Read src/main.rs first."}
+                        {"subject": "Inspecting main", "description": "Read src/main.rs first."},
+                        {"subject": "Planning edit", "description": "Update config.ts."}
                     ],
                     "toolCalls": [
                         {
@@ -967,32 +1171,99 @@ mod tests {
                             "name": "read_file",
                             "args": {"path": "src/main.rs"},
                             "status": "success",
-                            "resultDisplay": "fn main() {}"
+                            "resultDisplay": long_output,
+                            "result": [
+                                {"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}}
+                            ]
+                        },
+                        {
+                            "id": "c2",
+                            "name": "replace",
+                            "args": {"file_path": "config.ts", "old_string": "a", "new_string": "b"},
+                            "status": "success",
+                            "resultDisplay": {"fileName": "config.ts", "fileDiff": "--- a\n+++ b\n-a\n+b\n+c\n"}
                         }
                     ]
                 }),
                 json!({"id": "u2", "type": "user", "content": "dropped"}),
                 json!({"$rewindTo": "u2"}),
+                json!({"id": "i1", "timestamp": "2026-10-04T10:00:03Z", "type": "info", "content": "Token refreshed"}),
+                json!({"id": "w1", "timestamp": "2026-10-04T10:00:03Z", "type": "warning", "content": "Rate limit near"}),
                 json!({"id": "e1", "timestamp": "2026-10-04T10:00:04Z", "type": "error", "content": "MCP timeout"}),
             ],
         );
 
+        let raw = fs::read_to_string(&path).unwrap();
+        let doc = parse_session_document_for_content(&raw).unwrap();
+        let formatted_thoughts =
+            format_thoughts_for_content(doc.pointer("/messages/2/thoughts").unwrap()).unwrap();
+        assert!(formatted_thoughts.contains("**Inspecting main**"));
+        assert!(formatted_thoughts.contains("**Planning edit**"));
+
         let msgs = load_messages(&path).expect("load messages");
-        let roles_and_text: Vec<(&str, &str)> = msgs
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_str()))
-            .collect();
-        assert_eq!(
-            roles_and_text,
-            vec![
-                ("user", "first question"),
-                ("thinking", "**Inspecting main**\n\nRead src/main.rs first."),
-                ("assistant", "answer one"),
-                ("tool", "[Tool: read_file]\n{\"path\":\"src/main.rs\"}"),
-                ("tool", "[Result: read_file]\nfn main() {}"),
-                ("system", "[Error] MCP timeout"),
-            ]
-        );
+        assert_eq!(msgs.len(), 6);
+        assert_eq!((msgs[0].role.as_str(), msgs[0].injected), ("user", true));
+        assert_eq!(msgs[0].turn_id.as_deref(), Some("t0"));
+        assert_eq!((msgs[1].role.as_str(), msgs[1].injected), ("user", false));
+        assert_eq!(msgs[1].content, "first question");
+        assert_eq!(msgs[1].turn_id.as_deref(), Some("t1"));
+
+        let assistant = &msgs[2];
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.id.as_deref(), Some("g1"));
+        assert!(matches!(
+            &assistant.blocks[0],
+            SessionBlock::Thinking { summary: Some(sum), .. }
+                if sum == "Inspecting main · Planning edit"
+        ));
+        assert!(matches!(
+            &assistant.blocks[1],
+            SessionBlock::Text { text, .. } if text == "answer one"
+        ));
+        assert!(matches!(
+            &assistant.blocks[2],
+            SessionBlock::ToolCall { id, raw_name, .. } if id == "c1" && raw_name == "read_file"
+        ));
+        match &assistant.blocks[3] {
+            SessionBlock::ToolResult {
+                call_id,
+                status,
+                truncated,
+                full,
+                images,
+                ..
+            } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(*status, ToolStatus::Success);
+                assert!(*truncated);
+                assert_eq!(
+                    full,
+                    &Some(ContentRef::File {
+                        rel_path: "hash1/chats/session-2026-10-04.jsonl".into(),
+                        pointer: "/messages/2/toolCalls/0/resultDisplay".into(),
+                    })
+                );
+                assert_eq!(images.len(), 1);
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+        assert!(matches!(
+            &assistant.blocks[4],
+            SessionBlock::ToolCall { diff: Some(diff), .. } if diff.added == 2 && diff.removed == 1
+        ));
+        let meta = assistant.meta.as_ref().unwrap();
+        assert_eq!(meta.model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(meta.input_tokens, Some(1200));
+        assert_eq!(meta.cache_read_tokens, Some(400));
+        assert_eq!(meta.output_tokens, Some(85));
+        assert_eq!(meta.reasoning_tokens, Some(30));
+
+        assert_eq!((msgs[3].role.as_str(), msgs[3].injected), ("system", true));
+        assert_eq!((msgs[4].role.as_str(), msgs[4].injected), ("system", false));
+        assert!(matches!(
+            &msgs[5].blocks[0],
+            SessionBlock::Event { kind: EventKind::Error, text: Some(t), .. } if t == "MCP timeout"
+        ));
     }
 
     #[test]

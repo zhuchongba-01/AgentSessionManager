@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
+use super::model::{EventKind, SessionBlock, ToolStatus, TurnIndex};
 use super::SessionMessage;
 
 /// 最多缓存的会话数
 pub const MAX_ENTRIES: usize = 8;
 /// 缓存内所有会话正文的合计字节上限（按内容长度估算，见 [`Transcript::new`]）
 pub const MAX_TOTAL_BYTES: usize = 96 * 1024 * 1024;
+const QUESTION_PREVIEW_CHARS: usize = 80;
 
 /// 单个源的身份。
 ///
@@ -236,33 +238,175 @@ pub fn cache_key(
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub messages: Vec<SessionMessage>,
+    pub turns: Vec<TurnIndex>,
     /// 每条消息的估算字节数，流式分块按它切包，避免为了统计再序列化一遍
     pub message_bytes: Vec<usize>,
     /// 正文的估算字节数，只用于容量控制
     pub approx_bytes: usize,
     /// 本次解析结果是否进了缓存，因而「展开取全文」不必重新解析整个会话。
-    ///
-    /// 下发形态据此决定能否只发预览：按形态（provider + source_path）推断是不够的，
-    /// Codex 的分页链读不出来时会退化成不缓存，那种情况下截断会让展开变成一次全量
-    /// 重解析。由解析结果自己携带这个事实，判定就没有第二处可以走偏。
     pub cacheable: bool,
 }
 
 impl Transcript {
     pub fn new(messages: Vec<SessionMessage>) -> Self {
-        // role/content 长度加上每条消息的固定开销（JSON 键名、引号、时间戳）
         let message_bytes = messages
             .iter()
-            .map(|message| message.role.len() + message.content.len() + 32)
+            .map(serialized_message_len)
             .collect::<Vec<_>>();
         let approx_bytes = message_bytes.iter().sum();
+        let turns = build_turns(&messages);
         Self {
             messages,
+            turns,
             message_bytes,
             approx_bytes,
             cacheable: false,
         }
     }
+}
+
+fn serialized_message_len(message: &SessionMessage) -> usize {
+    if message.blocks.is_empty() {
+        return message.role.len() + message.content.len() + 32;
+    }
+    #[derive(Default)]
+    struct ByteCounter(usize);
+    impl io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, message)
+        .map(|()| counter.0)
+        .unwrap_or_else(|_| message.role.len() + message.content.len() + 32)
+}
+
+pub fn build_turns(messages: &[SessionMessage]) -> Vec<TurnIndex> {
+    struct Building {
+        index: TurnIndex,
+        has_visible: bool,
+        reply_pending: bool,
+    }
+
+    let mut turns: Vec<Building> = Vec::new();
+    let mut generated = 0usize;
+    let mut current_key: Option<String> = None;
+
+    for (i, message) in messages.iter().enumerate() {
+        let is_question = message.role == "user" && !message.injected && !message.is_empty();
+        let key = match &message.turn_id {
+            Some(turn_id) => turn_id.clone(),
+            None if is_question => {
+                generated += 1;
+                format!("t{generated}")
+            }
+            None => current_key.clone().unwrap_or_else(|| "t0".to_string()),
+        };
+
+        if current_key.as_deref() != Some(key.as_str()) || turns.is_empty() {
+            turns.push(Building {
+                index: TurnIndex {
+                    turn_id: key.clone(),
+                    first_message_index: i,
+                    last_message_index: i,
+                    question_preview: String::new(),
+                    ts: None,
+                    step_count: 0,
+                    error_count: 0,
+                    has_final_reply: false,
+                    aborted: false,
+                },
+                has_visible: false,
+                reply_pending: false,
+            });
+            current_key = Some(key);
+        }
+
+        let Some(turn) = turns.last_mut() else {
+            continue;
+        };
+        turn.index.last_message_index = i;
+        if !message.injected {
+            turn.has_visible = true;
+        }
+        if is_question && turn.index.question_preview.is_empty() {
+            turn.index.question_preview = question_preview(message);
+            turn.index.ts = message.ts;
+        }
+
+        for block in &message.blocks {
+            match block {
+                SessionBlock::ToolCall { .. } => {
+                    turn.index.step_count += 1;
+                    turn.reply_pending = false;
+                }
+                SessionBlock::ToolResult { status, .. } if *status == ToolStatus::Error => {
+                    turn.index.error_count += 1;
+                }
+                SessionBlock::Text { text, .. }
+                    if message.role == "assistant" && !text.trim().is_empty() =>
+                {
+                    turn.reply_pending = true;
+                }
+                SessionBlock::Event {
+                    kind: EventKind::Aborted,
+                    ..
+                } => turn.index.aborted = true,
+                _ => {}
+            }
+        }
+        if message.blocks.is_empty() && message.role == "assistant" {
+            let content = message.content.trim();
+            if content.starts_with("[Tool:") {
+                turn.reply_pending = false;
+            } else if !content.is_empty() {
+                turn.reply_pending = true;
+            }
+        }
+        turn.index.has_final_reply = turn.reply_pending;
+    }
+
+    turns
+        .into_iter()
+        .filter(|turn| turn.has_visible)
+        .map(|turn| turn.index)
+        .collect()
+}
+
+fn question_preview(message: &SessionMessage) -> String {
+    let text_blocks = message.blocks.iter().filter_map(|block| match block {
+        SessionBlock::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    });
+    let has_text = text_blocks.clone().next().is_some();
+    let sources = text_blocks.chain((!has_text).then_some(message.content.as_str()));
+    let mut out = String::with_capacity(QUESTION_PREVIEW_CHARS);
+    let mut count = 0;
+    let mut space = false;
+    for ch in sources.flat_map(|text| text.chars().chain(std::iter::once(' '))) {
+        if ch.is_whitespace() {
+            space = count > 0;
+            continue;
+        }
+        if space && count < QUESTION_PREVIEW_CHARS {
+            out.push(' ');
+            count += 1;
+        }
+        if count == QUESTION_PREVIEW_CHARS {
+            out.pop();
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        count += 1;
+        space = false;
+    }
+    out
 }
 
 /// 流式分块的粒度：单块最多 256 KB 或 150 条消息，取先到者。
@@ -433,8 +577,7 @@ mod tests {
         Transcript::new(vec![SessionMessage {
             role: "user".to_string(),
             content: content.to_string(),
-            ts: None,
-            meta: None,
+            ..SessionMessage::default()
         }])
     }
 
@@ -568,14 +711,12 @@ mod tests {
                 SessionMessage {
                     role: "user".into(),
                     content: content.clone(),
-                    ts: None,
-                    meta: None,
+                    ..SessionMessage::default()
                 },
                 SessionMessage {
                     role: "assistant".into(),
                     content: content.clone(),
-                    ts: None,
-                    meta: None,
+                    ..SessionMessage::default()
                 },
             ])
         };
@@ -763,14 +904,13 @@ mod tests {
             SessionMessage {
                 role: "user".to_string(),
                 content: "a".to_string(),
-                ts: None,
-                meta: None,
+                ..SessionMessage::default()
             },
             SessionMessage {
                 role: "assistant".to_string(),
                 content: "bb".to_string(),
                 ts: Some(1),
-                meta: None,
+                ..SessionMessage::default()
             },
         ]);
 

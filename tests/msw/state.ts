@@ -1,4 +1,21 @@
-import type { SessionMessage, SessionMeta } from "@/types";
+import type {
+  ContentRef,
+  ImageRef,
+  SessionMessage,
+  SessionMeta,
+} from "@/types";
+
+const stableKey = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableKey).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableKey(item)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const messageKey = (providerId: string, sourcePath: string) =>
@@ -53,6 +70,14 @@ let messages: Record<string, SessionMessage[]> = {
     { role: "user", content: "First codex message" },
   ],
 };
+let blockContents: Record<string, string> = {};
+let imageDataUrls: Record<string, string> = {};
+
+const blockKey = (providerId: string, sourcePath: string, ref: ContentRef) =>
+  `${providerId}|${sourcePath}|${stableKey(ref)}`;
+
+const imageKey = (providerId: string, sourcePath: string, image: ImageRef) =>
+  `${providerId}|${sourcePath}|${stableKey(image)}`;
 
 export const resetProviderState = () => {
   sessions = defaultSessions();
@@ -61,6 +86,8 @@ export const resetProviderState = () => {
       { role: "user", content: "First codex message" },
     ],
   };
+  blockContents = {};
+  imageDataUrls = {};
 };
 
 export const listSessions = () => clone(sessions);
@@ -90,3 +117,33 @@ export const setSessionFixtures = (
   sessions = clone(nextSessions);
   messages = clone(nextMessages);
 };
+
+export const setBlockContentFixture = (
+  providerId: string,
+  sourcePath: string,
+  ref: ContentRef,
+  fullText: string,
+) => {
+  blockContents[blockKey(providerId, sourcePath, ref)] = fullText;
+};
+
+export const getBlockContentFixture = (
+  providerId: string,
+  sourcePath: string,
+  ref: ContentRef,
+): string | undefined => blockContents[blockKey(providerId, sourcePath, ref)];
+
+export const setSessionImageFixture = (
+  providerId: string,
+  sourcePath: string,
+  image: ImageRef,
+  dataUrl: string,
+) => {
+  imageDataUrls[imageKey(providerId, sourcePath, image)] = dataUrl;
+};
+
+export const getSessionImageFixture = (
+  providerId: string,
+  sourcePath: string,
+  image: ImageRef,
+): string | undefined => imageDataUrls[imageKey(providerId, sourcePath, image)];

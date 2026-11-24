@@ -1712,22 +1712,23 @@ describe("SessionManagerPage", () => {
     renderPage("claude");
     await screen.findByRole("heading", { name: "Thinking Session" });
 
-    // 工具计数只算真正的 tool 消息，不含 thinking；思考 + 工具共 2 步默认折叠为「执行过程 · 2 步」
+    // 工具计数只算真正的 tool 消息，不含 thinking；思考 + 工具按 cc-switch 规则收纳进「执行过程 · 1 步」
     const hideToolsButton = await screen.findByRole("button", {
       name: "隐藏工具 (1)",
     });
     expect(
-      screen.getByRole("button", { name: /执行过程 · 2 步/ }),
+      screen.getByRole("button", { name: /执行过程 · 1 步/ }),
     ).toHaveAttribute("aria-expanded", "false");
 
     fireEvent.click(hideToolsButton);
     expect(
       screen.getByRole("button", { name: "显示工具 (1)" }),
     ).toBeInTheDocument();
-    // 隐藏工具后仅剩单条思考过程，直接平铺展示「展开思考过程」（不再包一层多余时间线）
-    expect(
-      screen.getByRole("button", { name: "展开思考过程" }),
-    ).toHaveAttribute("aria-expanded", "false");
+    // 隐藏工具后仅剩单条思考过程，直接平铺展示「思考中…」（不再包一层多余时间线）
+    expect(screen.getByRole("button", { name: /思考中/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 
   it("searches >4096-char server-truncated messages via IPC and advances Enter navigation after >2s pause", async () => {
@@ -1971,12 +1972,12 @@ describe("SessionManagerPage", () => {
     renderPage("all");
     await screen.findByRole("heading", { name: "Multi Step Session" });
 
-    // 多步执行过程默认收纳为「执行过程 · 3 步」摘要条，并标注 1 处改动
+    // 多步执行过程默认收纳为「执行过程 · 2 步」摘要条，并标注改了 1 个文件
     const timelineBar = await screen.findByRole("button", {
-      name: /执行过程 · 3 步/,
+      name: /执行过程 · 2 步/,
     });
     expect(timelineBar).toHaveAttribute("aria-expanded", "false");
-    expect(timelineBar).toHaveTextContent("1 处改动");
+    expect(timelineBar).toHaveTextContent("改了 1 个文件");
     expect(screen.queryByText(/src\/auth\.ts/)).not.toBeInTheDocument();
 
     // 点击摘要条展开中间步骤
@@ -1989,16 +1990,12 @@ describe("SessionManagerPage", () => {
     expect(screen.getByText("已完成登录鉴权修复")).toBeInTheDocument();
     expect(screen.queryByText(/src\/auth\.ts/)).not.toBeInTheDocument();
 
-    // 切换到「改动」视图仅展示含文件修改的步骤与行号 Diff 视图
+    // 切换到「改动」视图仅展示含文件修改的步骤与 Diff 视图
     fireEvent.click(screen.getByRole("button", { name: "改动" }));
     expect(screen.getByText("+1")).toBeInTheDocument();
     expect(screen.getByText("−1")).toBeInTheDocument();
-    expect(
-      document.querySelector(".asm-ccs-diff-row.is-add .asm-ccs-diff-code"),
-    ).toHaveTextContent("new");
-    expect(
-      document.querySelector(".asm-ccs-diff-row.is-del .asm-ccs-diff-code"),
-    ).toHaveTextContent("old");
+    expect(document.querySelector(".bg-diff-add")).toHaveTextContent("new");
+    expect(document.querySelector(".bg-diff-del")).toHaveTextContent("old");
     expect(screen.queryByText(/src\/auth\.ts/)).not.toBeInTheDocument();
 
     // 切换右侧 cc-switch 风格「对话目录」抽屉并校验问答预览卡片

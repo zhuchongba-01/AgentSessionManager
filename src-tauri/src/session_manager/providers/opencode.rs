@@ -8,11 +8,13 @@ use serde_json::Value;
 use crate::session_manager::cache;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
+use super::blocks::assign_turn_ids;
+use super::opencode_blocks::{messages_from_parts, v2_row_messages, PartLocator};
 use super::utils::{
-    check_sqlite_message_budget, checked_storage_child, collect_files_where, extract_thinking_text,
-    is_safe_session_id, order_selected_children, parse_timestamp_to_ms, path_basename,
-    quote_sqlite_identifier, remove_path_if_exists, sqlite_table_has_column, sqlite_table_names,
-    truncate_summary, validate_parent_graph, TITLE_MAX_CHARS,
+    check_sqlite_message_budget, checked_storage_child, collect_files_where, is_safe_session_id,
+    order_selected_children, parse_timestamp_to_ms, path_basename, quote_sqlite_identifier,
+    remove_path_if_exists, sqlite_table_has_column, sqlite_table_names, truncate_summary,
+    validate_parent_graph, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "opencode";
@@ -377,15 +379,17 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
         .parent()
         .and_then(|p| p.parent())
         .ok_or_else(|| "Cannot determine storage root from message path".to_string())?;
-    checked_storage_child(storage, path)?;
+    let canonical_storage = storage
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve OpenCode storage: {e}"))?;
+    let actual_msg_dir = checked_storage_child(&canonical_storage, path)?;
     let mut remaining_bytes = super::utils::MAX_QUERY_BYTES as u64;
 
     let mut msg_files = Vec::new();
-    collect_json_files(path, &mut msg_files);
+    collect_json_files(&actual_msg_dir, &mut msg_files);
     msg_files.sort();
 
-    // Parse all messages and collect (created_ts, message_id, role, thinking_text, visible_text)
-    let mut entries: Vec<(i64, String, String, String, String)> = Vec::new();
+    let mut entries: Vec<(i64, String, Vec<SessionMessage>)> = Vec::new();
 
     for msg_path in &msg_files {
         let value = read_json_bounded(msg_path, &mut remaining_bytes)?;
@@ -407,48 +411,47 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             .and_then(parse_timestamp_to_ms)
             .unwrap_or(0);
 
-        // Collect parts from storage/part/{messageID}/
-        let part_dir = checked_storage_child(storage, &storage.join("part").join(&msg_id))?;
-        let mut parsed = collect_parts(&part_dir, &mut remaining_bytes)?;
-        if role == "assistant" {
-            if let Some(err) = value.get("error").and_then(format_error_value) {
-                parsed.visible.push(format!("[Error: {err}]"));
-            }
+        let part_dir = checked_storage_child(
+            &canonical_storage,
+            &canonical_storage.join("part").join(&msg_id),
+        )?;
+        let parts = collect_part_locators(&canonical_storage, &part_dir, &mut remaining_bytes)?;
+        let msg_locator = file_locator_under(&canonical_storage, msg_path);
+        let ts = (created_ts > 0).then_some(created_ts);
+        let built = messages_from_parts(
+            &role,
+            Some(msg_id.clone()),
+            ts,
+            &value,
+            &msg_locator,
+            &parts,
+        );
+        if !built.is_empty() {
+            entries.push((created_ts, msg_id, built));
         }
-        let thinking = parsed.thinking.join("\n");
-        let text = parsed.visible.join("\n");
-        if thinking.trim().is_empty() && text.trim().is_empty() {
-            continue;
-        }
-
-        entries.push((created_ts, msg_id, role, thinking, text));
     }
 
     // Sort deterministically by (created timestamp, message_id)
     entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    let mut messages = Vec::new();
-    for (ts, _, role, thinking, content) in entries {
-        let msg_ts = (ts > 0).then_some(ts);
-        if !thinking.trim().is_empty() {
-            messages.push(SessionMessage {
-                role: "thinking".to_string(),
-                content: thinking,
-                ts: msg_ts,
-                meta: None,
-            });
-        }
-        if !content.trim().is_empty() {
-            messages.push(SessionMessage {
-                role,
-                content,
-                ts: msg_ts,
-                meta: None,
-            });
-        }
-    }
-
+    let mut messages: Vec<SessionMessage> = entries
+        .into_iter()
+        .flat_map(|(_, _, built)| built)
+        .collect();
+    assign_turn_ids(&mut messages);
     Ok(messages)
+}
+
+pub(crate) fn validate_sqlite_source_for_content(
+    source: &str,
+) -> Result<(PathBuf, String), String> {
+    let (db_path, session_id) = parse_sqlite_source(source)
+        .ok_or_else(|| format!("Invalid SQLite source reference: {source}"))?;
+    if !is_safe_session_id(&session_id) {
+        return Err("Invalid OpenCode session ID".into());
+    }
+    let canonical_db = validate_database_path(&db_path)?;
+    Ok((canonical_db, session_id))
 }
 
 /// 正文实际依赖的文件：库文件与 WAL 边车。引用无法解析时返回 `None`，由读取器报错。
@@ -457,23 +460,14 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
 /// `part/` 目录就得先读消息文件取出 id，等于把读取本身做一遍，缓存没有意义，因此那种
 /// 形态每次都重新读取。
 pub fn sqlite_transcript_sources(source: &str) -> Option<cache::TranscriptSources> {
-    let (db_path, session_id) = parse_sqlite_source(source)?;
-    if !is_safe_session_id(&session_id) {
-        return None;
-    }
-    let db_path = validate_database_path(&db_path).ok()?;
+    let (db_path, _) = validate_sqlite_source_for_content(source).ok()?;
     Some(cache::sqlite_transcript_sources(&db_path))
 }
 
 /// Load messages from the OpenCode SQLite database for a given source reference.
 /// Joins the `message` and `part` tables in memory to reconstruct full messages.
 pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String> {
-    let (db_path, session_id) = parse_sqlite_source(source)
-        .ok_or_else(|| format!("Invalid SQLite source reference: {source}"))?;
-    if !is_safe_session_id(&session_id) {
-        return Err("Invalid OpenCode session ID".into());
-    }
-    let db_path = validate_database_path(&db_path)?;
+    let (db_path, session_id) = validate_sqlite_source_for_content(source)?;
 
     let conn = Connection::open_with_flags(
         &db_path,
@@ -528,81 +522,88 @@ fn load_messages_connection(
         })
         .map_err(|e| format!("Failed to query messages: {e}"))?;
 
-    let part_order = if sqlite_table_has_column(conn, "part", "id")? {
-        "time_created ASC, id ASC"
+    let mut parts_map: HashMap<String, Vec<(PartLocator, Value)>> = HashMap::new();
+    if sqlite_table_has_column(conn, "part", "id")? {
+        let mut part_stmt = conn
+            .prepare(
+                "SELECT id, message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
+            )
+            .map_err(|e| format!("Failed to prepare part query: {e}"))?;
+        let part_rows = part_stmt
+            .query_map([session_id], |row| {
+                let part_id: String = row.get(0)?;
+                let message_id: String = row.get(1)?;
+                let data: String = row.get(2)?;
+                Ok((part_id, message_id, data))
+            })
+            .map_err(|e| format!("Failed to query parts: {e}"))?;
+        for part in part_rows {
+            let (part_id, message_id, data) = part.map_err(|e| e.to_string())?;
+            let Ok(part_value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let locator = PartLocator::Sqlite {
+                table: "part",
+                id: part_id,
+                base: String::new(),
+            };
+            parts_map
+                .entry(message_id)
+                .or_default()
+                .push((locator, part_value));
+        }
     } else {
-        "time_created ASC, rowid ASC"
-    };
-    let mut part_stmt = conn
-        .prepare(&format!(
-            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY {part_order}"
-        ))
-        .map_err(|e| format!("Failed to prepare part query: {e}"))?;
-
-    let part_rows = part_stmt
-        .query_map([session_id], |row| {
-            let message_id: String = row.get(0)?;
-            let data: String = row.get(1)?;
-            Ok((message_id, data))
-        })
-        .map_err(|e| format!("Failed to query parts: {e}"))?;
-
-    let mut parts_map: HashMap<String, Vec<String>> = HashMap::new();
-    for part in part_rows {
-        let (message_id, data) = part.map_err(|e| e.to_string())?;
-        parts_map.entry(message_id).or_default().push(data);
+        let mut part_stmt = conn
+            .prepare(
+                "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created ASC, rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare part query: {e}"))?;
+        let part_rows = part_stmt
+            .query_map([session_id], |row| {
+                let message_id: String = row.get(0)?;
+                let data: String = row.get(1)?;
+                Ok((message_id, data))
+            })
+            .map_err(|e| format!("Failed to query parts: {e}"))?;
+        for part in part_rows {
+            let (message_id, data) = part.map_err(|e| e.to_string())?;
+            let Ok(part_value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            parts_map
+                .entry(message_id)
+                .or_default()
+                .push((PartLocator::None, part_value));
+        }
     }
 
     let mut messages = Vec::new();
     for row in msg_rows {
         let (msg_id, ts, data) = row.map_err(|e| e.to_string())?;
-        let msg_value: Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(msg_value) = serde_json::from_str::<Value>(&data) else {
+            continue;
         };
         let role = msg_value
             .get("role")
             .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let mut parsed = ParsedParts::default();
-        if let Some(parts) = parts_map.get(&msg_id) {
-            for part_data in parts {
-                let part_value: Value = match serde_json::from_str(part_data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                append_part_value(&part_value, &mut parsed);
-            }
-        }
-        if role == "assistant" {
-            if let Some(err) = msg_value.get("error").and_then(format_error_value) {
-                parsed.visible.push(format!("[Error: {err}]"));
-            }
-        }
-
-        let thinking = parsed.thinking.join("\n");
-        if !thinking.trim().is_empty() {
-            messages.push(SessionMessage {
-                role: "thinking".to_string(),
-                content: thinking,
-                ts: Some(ts),
-                meta: None,
-            });
-        }
-
-        let content = parsed.visible.join("\n");
-        if !content.trim().is_empty() {
-            messages.push(SessionMessage {
-                role,
-                content,
-                ts: Some(ts),
-                meta: None,
-            });
-        }
+            .unwrap_or("unknown");
+        let parts = parts_map.remove(&msg_id).unwrap_or_default();
+        let msg_locator = PartLocator::Sqlite {
+            table: "message",
+            id: msg_id.clone(),
+            base: String::new(),
+        };
+        messages.extend(messages_from_parts(
+            role,
+            Some(msg_id),
+            Some(ts),
+            &msg_value,
+            &msg_locator,
+            &parts,
+        ));
     }
 
+    assign_turn_ids(&mut messages);
     Ok(messages)
 }
 
@@ -619,189 +620,27 @@ fn load_v2_messages(conn: &Connection, session_id: &str) -> Result<Vec<SessionMe
     }
     let mut statement = conn
         .prepare(
-            "SELECT type, time_created, data FROM session_message WHERE session_id=?1 ORDER BY seq ASC, id ASC",
+            "SELECT id, type, time_created, data FROM session_message WHERE session_id=?1 ORDER BY seq ASC, id ASC",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let mut messages = Vec::new();
     for row in rows {
-        let (kind, ts, data) = row.map_err(|error| error.to_string())?;
+        let (row_id, kind, ts, data) = row.map_err(|error| error.to_string())?;
         let value: Value = serde_json::from_str(&data)
             .map_err(|error| format!("Invalid OpenCode V2 message: {error}"))?;
-        match kind.as_str() {
-            "user" | "system" | "synthetic" => {
-                let role = if kind == "user" { "user" } else { "system" };
-                let mut segments = Vec::new();
-                if let Some(text) = value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    segments.push(text.to_string());
-                }
-                if let Some(files) = value.get("files").and_then(Value::as_array) {
-                    for file in files {
-                        segments.push(format_file_label(file));
-                    }
-                }
-                let content = segments.join("\n");
-                if !content.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: role.into(),
-                        content,
-                        ts: Some(ts),
-                        meta: None,
-                    });
-                }
-            }
-            "assistant" => {
-                let mut thinking_parts = Vec::new();
-                let mut visible_parts = Vec::new();
-                if let Some(parts) = value.get("content").and_then(Value::as_array) {
-                    for part in parts {
-                        match part.get("type").and_then(Value::as_str) {
-                            Some("reasoning" | "thinking") => {
-                                if let Some(reasoning) = extract_reasoning_part(part) {
-                                    thinking_parts.push(reasoning);
-                                }
-                            }
-                            Some("text") => {
-                                if let Some(text) = part
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.trim().is_empty())
-                                {
-                                    visible_parts.push(text.to_owned());
-                                }
-                            }
-                            Some("tool") => {
-                                visible_parts.push(format_tool_part(part, "unknown"));
-                            }
-                            Some("file") => {
-                                visible_parts.push(format_file_label(part));
-                            }
-                            Some("subtask") => {
-                                visible_parts.push(format_subtask_part(part));
-                            }
-                            Some("patch") => {
-                                visible_parts.push(format_patch_part(part));
-                            }
-                            Some("compaction") => {
-                                visible_parts.push(format_compaction_part(part));
-                            }
-                            Some("step-start" | "step-finish" | "snapshot") => {}
-                            _ => {
-                                visible_parts
-                                    .push(format!("[Unsupported assistant content] {part}"));
-                            }
-                        }
-                    }
-                }
-                if let Some(err) = value.get("error").and_then(format_error_value) {
-                    visible_parts.push(format!("[Error: {err}]"));
-                }
-                let thinking = thinking_parts.join("\n");
-                if !thinking.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "thinking".into(),
-                        content: thinking,
-                        ts: Some(ts),
-                        meta: None,
-                    });
-                }
-                let content = visible_parts.join("\n");
-                if !content.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "assistant".into(),
-                        content,
-                        ts: Some(ts),
-                        meta: None,
-                    });
-                }
-            }
-            "shell" => {
-                let content = format!(
-                    "$ {}\n{}",
-                    value
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    value
-                        .get("output")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                );
-                if !content.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "tool".into(),
-                        content,
-                        ts: Some(ts),
-                        meta: None,
-                    });
-                }
-            }
-            "compaction" => {
-                let content = if let Some(summary) = value
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    summary.to_string()
-                } else if let Some(err) = value.get("error").and_then(format_error_value) {
-                    format!("[Compaction failed: {err}]")
-                } else if matches!(
-                    value.get("status").and_then(Value::as_str),
-                    Some("failed" | "error" | "aborted")
-                ) || value.get("failed").and_then(Value::as_bool) == Some(true)
-                {
-                    "[Compaction failed]".to_string()
-                } else {
-                    String::new()
-                };
-                if !content.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "system".into(),
-                        content,
-                        ts: Some(ts),
-                        meta: None,
-                    });
-                }
-            }
-            "agent-switched" => {
-                messages.push(SessionMessage {
-                    role: "system".into(),
-                    content: format!(
-                        "[Agent: {}]",
-                        value
-                            .get("agent")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                    ),
-                    ts: Some(ts),
-                    meta: None,
-                });
-            }
-            "model-switched" => {
-                messages.push(SessionMessage {
-                    role: "system".into(),
-                    content: format_model_switched(&value),
-                    ts: Some(ts),
-                    meta: None,
-                });
-            }
-            _ => {
-                log::debug!("Skipping unknown OpenCode V2 message type: {kind}");
-            }
-        }
+        messages.extend(v2_row_messages(&row_id, &kind, ts, &value));
     }
+    assign_turn_ids(&mut messages);
     Ok(messages)
 }
 
@@ -1386,7 +1225,12 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
     if !is_safe_session_id(session_id) {
         return None;
     }
-    let msg_dir = checked_storage_child(storage, &storage.join("message").join(session_id)).ok()?;
+    let canonical_storage = storage.canonicalize().ok()?;
+    let msg_dir = checked_storage_child(
+        &canonical_storage,
+        &canonical_storage.join("message").join(session_id),
+    )
+    .ok()?;
     if !msg_dir.is_dir() {
         return None;
     }
@@ -1422,289 +1266,61 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
 
     // Take first user message and get its parts
     let (_, first_id) = user_msgs.first()?;
-    let part_dir = checked_storage_child(storage, &storage.join("part").join(first_id)).ok()?;
-    let text = collect_parts_text(&part_dir, &mut remaining_bytes).ok()?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(truncate_summary(&text, 160))
+    let part_dir = checked_storage_child(
+        &canonical_storage,
+        &canonical_storage.join("part").join(first_id),
+    )
+    .ok()?;
+    let parts = collect_part_locators(&canonical_storage, &part_dir, &mut remaining_bytes).ok()?;
+    let built = messages_from_parts("user", None, None, &Value::Null, &PartLocator::None, &parts);
+    let text = built
+        .iter()
+        .find(|m| !m.injected && !m.content.trim().is_empty())
+        .or_else(|| built.iter().find(|m| !m.content.trim().is_empty()))
+        .map(|m| m.content.as_str())?;
+    Some(truncate_summary(text, 160))
 }
 
-#[derive(Default)]
-struct ParsedParts {
-    thinking: Vec<String>,
-    visible: Vec<String>,
-}
-
-fn format_error_value(err: &Value) -> Option<String> {
-    match err {
-        Value::Null => None,
-        Value::String(s) => {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
-        Value::Object(map) => {
-            let name = map
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let message = map
-                .get("data")
-                .and_then(|d| d.get("message"))
-                .or_else(|| map.get("message"))
-                .or_else(|| map.get("error"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            match (name, message) {
-                (Some(n), Some(m)) => Some(format!("{n}: {m}")),
-                (None, Some(m)) => Some(m.to_string()),
-                (Some(n), None) => Some(n.to_string()),
-                (None, None) => (!map.is_empty()).then(|| Value::Object(map.clone()).to_string()),
+fn file_locator_under(canonical_storage: &Path, path: &Path) -> PartLocator {
+    match path.strip_prefix(canonical_storage) {
+        Ok(rel) => {
+            let rel_path = rel
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            if rel_path.is_empty() {
+                PartLocator::None
+            } else {
+                PartLocator::File { rel_path }
             }
         }
-        other => {
-            let rendered = other.to_string();
-            (!rendered.trim().is_empty()).then_some(rendered)
-        }
+        Err(_) => PartLocator::None,
     }
 }
 
-fn format_file_label(item: &Value) -> String {
-    let candidate = item
-        .get("filename")
-        .or_else(|| item.get("name"))
-        .or_else(|| item.get("source").and_then(|s| s.get("path")))
-        .or_else(|| item.get("path"))
-        .or_else(|| item.get("uri"))
-        .or_else(|| item.get("url"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with("data:"));
-    format!("[File: {}]", candidate.unwrap_or("attachment"))
-}
-
-fn format_tool_part(part: &Value, name_fallback: &str) -> String {
-    let name = part
-        .get("name")
-        .or_else(|| part.get("tool"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(name_fallback);
-    let mut text = format!("[Tool: {name}]");
-    if let Some(state) = part.get("state") {
-        let mut has_structured_content = false;
-        if let Some(content) = state.get("content").and_then(Value::as_array) {
-            for item in content {
-                let output = match item.get("type").and_then(Value::as_str) {
-                    Some("text") => item
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    Some("file") => format_file_label(item),
-                    _ => format!("[Unsupported tool content] {item}"),
-                };
-                if !output.trim().is_empty() {
-                    has_structured_content = true;
-                    text.push('\n');
-                    text.push_str(&output);
-                }
-            }
-        }
-        if !has_structured_content {
-            if let Some(output) = state
-                .get("output")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-            {
-                text.push('\n');
-                text.push_str(output);
-            }
-        }
-        if let Some(err) = state.get("error").and_then(format_error_value) {
-            text.push_str(&format!("\n[Error: {err}]"));
-        }
-    }
-    text
-}
-
-fn format_subtask_part(part: &Value) -> String {
-    let agent = part
-        .get("agent")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let desc = part
-        .get("description")
-        .or_else(|| part.get("prompt"))
-        .or_else(|| part.get("text"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    match (agent, desc) {
-        (Some(a), Some(d)) => format!("[Subtask ({a}): {d}]"),
-        (None, Some(d)) => format!("[Subtask: {d}]"),
-        (Some(a), None) => format!("[Subtask: {a}]"),
-        (None, None) => "[Subtask]".to_string(),
-    }
-}
-
-fn format_compaction_part(part: &Value) -> String {
-    if let Some(summary) = part
-        .get("summary")
-        .or_else(|| part.get("text"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return summary.to_string();
-    }
-    if let Some(err) = part.get("error").and_then(format_error_value) {
-        return format!("[Compaction failed: {err}]");
-    }
-    "[Compaction]".to_string()
-}
-
-fn format_patch_part(part: &Value) -> String {
-    if let Some(files) = part.get("files").and_then(Value::as_array) {
-        let names = files
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        if !names.is_empty() {
-            return format!("[Patch: {}]", names.join(", "));
-        }
-    }
-    "[Patch]".to_string()
-}
-
-fn format_model_switched(value: &Value) -> String {
-    if let Some(model) = value.get("model") {
-        match model {
-            Value::String(s) if !s.trim().is_empty() => {
-                return format!("[Model: {}]", s.trim());
-            }
-            Value::Object(map) => {
-                let provider = map
-                    .get("providerID")
-                    .or_else(|| map.get("providerId"))
-                    .or_else(|| map.get("provider_id"))
-                    .or_else(|| map.get("provider"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let model_id = map
-                    .get("modelID")
-                    .or_else(|| map.get("modelId"))
-                    .or_else(|| map.get("model_id"))
-                    .or_else(|| map.get("id"))
-                    .or_else(|| map.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                return match (provider, model_id) {
-                    (Some(p), Some(m)) => format!("[Model: {p}/{m}]"),
-                    (None, Some(m)) => format!("[Model: {m}]"),
-                    (Some(p), None) => format!("[Model: {p}]"),
-                    (None, None) => format!("[Model: {model}]"),
-                };
-            }
-            _ => {}
-        }
-    }
-    let provider = value
-        .get("providerID")
-        .or_else(|| value.get("providerId"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let model_id = value
-        .get("modelID")
-        .or_else(|| value.get("modelId"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    match (provider, model_id) {
-        (Some(p), Some(m)) => format!("[Model: {p}/{m}]"),
-        (None, Some(m)) => format!("[Model: {m}]"),
-        (Some(p), None) => format!("[Model: {p}]"),
-        (None, None) => "[Model: unknown]".to_string(),
-    }
-}
-
-fn extract_reasoning_part(part_value: &Value) -> Option<String> {
-    let extracted = extract_thinking_text(part_value);
-    if !extracted.trim().is_empty() {
-        return Some(extracted);
-    }
-    part_value
-        .get("text")
-        .or_else(|| part_value.get("thinking"))
-        .and_then(Value::as_str)
-        .filter(|t| !t.trim().is_empty())
-        .map(str::to_string)
-}
-
-fn append_part_value(part_value: &Value, parsed: &mut ParsedParts) {
-    match part_value.get("type").and_then(Value::as_str) {
-        Some("reasoning" | "thinking") => {
-            if let Some(thinking) = extract_reasoning_part(part_value) {
-                parsed.thinking.push(thinking);
-            }
-        }
-        Some("text") => {
-            if let Some(text) = part_value
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|t| !t.trim().is_empty())
-            {
-                parsed.visible.push(text.to_string());
-            }
-        }
-        Some("tool") => {
-            parsed.visible.push(format_tool_part(part_value, "unknown"));
-        }
-        Some("file") => {
-            parsed.visible.push(format_file_label(part_value));
-        }
-        Some("subtask") => {
-            parsed.visible.push(format_subtask_part(part_value));
-        }
-        Some("compaction") => {
-            parsed.visible.push(format_compaction_part(part_value));
-        }
-        Some("patch") => {
-            parsed.visible.push(format_patch_part(part_value));
-        }
-        _ => {}
-    }
-}
-
-fn collect_parts(part_dir: &Path, remaining_bytes: &mut u64) -> Result<ParsedParts, String> {
+fn collect_part_locators(
+    canonical_storage: &Path,
+    part_dir: &Path,
+    remaining_bytes: &mut u64,
+) -> Result<Vec<(PartLocator, Value)>, String> {
     if !part_dir.is_dir() {
-        return Ok(ParsedParts::default());
+        return Ok(Vec::new());
     }
+    let mut part_files = Vec::new();
+    collect_json_files(part_dir, &mut part_files);
+    part_files.sort();
 
-    let mut parts = Vec::new();
-    collect_json_files(part_dir, &mut parts);
-    parts.sort();
-
-    let mut parsed = ParsedParts::default();
-    for part_path in &parts {
+    let mut out = Vec::with_capacity(part_files.len());
+    for part_path in &part_files {
         let value = read_json_bounded(part_path, remaining_bytes)?;
-        append_part_value(&value, &mut parsed);
+        let locator = file_locator_under(canonical_storage, part_path);
+        out.push((locator, value));
     }
-
-    Ok(parsed)
-}
-
-fn collect_parts_text(part_dir: &Path, remaining_bytes: &mut u64) -> Result<String, String> {
-    let parsed = collect_parts(part_dir, remaining_bytes)?;
-    Ok(parsed.visible.join("\n"))
+    Ok(out)
 }
 
 fn read_json_bounded(path: &Path, remaining_bytes: &mut u64) -> Result<Value, String> {
@@ -1812,12 +1428,17 @@ mod compat_tests {
         let new = load_messages_connection(&conn, "ses_new").unwrap();
         assert_eq!(new.len(), 2);
         assert_eq!(
-            (&*new[0].role, &*new[0].content, new[0].ts),
-            ("user", "question", Some(20))
+            (
+                &*new[0].role,
+                &*new[0].content,
+                new[0].ts,
+                new[0].turn_id.as_deref()
+            ),
+            ("user", "question", Some(20), Some("t1"))
         );
         assert_eq!(
-            (&*new[1].role, &*new[1].content),
-            ("assistant", "answer\n[Tool: bash]")
+            (&*new[1].role, &*new[1].content, new[1].turn_id.as_deref()),
+            ("assistant", "answer\n\n[Tool: bash]", Some("t1"))
         );
         assert_eq!(
             load_messages_connection(&conn, "ses_old").unwrap()[0].content,
@@ -1857,16 +1478,17 @@ mod compat_tests {
         let messages = load_messages_connection(&conn, "ses_new").unwrap();
         assert_eq!(
             (&*messages[0].role, &*messages[0].content),
-            ("tool", "$ pwd\n/project")
+            ("tool", "[Tool: shell] pwd\n\n/project")
         );
         assert_eq!(
             (&*messages[1].role, &*messages[1].content),
             ("system", "saved summary")
         );
-        assert_eq!(
-            messages[2].content,
-            "[Tool: read]\nfile result\n[File: image.png]"
-        );
+        assert_eq!(messages[2].content, "[Tool: read]\n\nfile result");
+        assert!(matches!(
+            &messages[2].blocks[1],
+            crate::session_manager::model::SessionBlock::ToolResult { images, .. } if images.len() == 1
+        ));
         conn.execute("INSERT INTO session_message VALUES ('4','ses_new','future',4,0,'{\"text\":\"visible?\"}')",[]).unwrap();
         let after_future = load_messages_connection(&conn, "ses_new").unwrap();
         assert_eq!(
@@ -2577,6 +2199,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn load_messages_sqlite_reads_messages_and_parts() {
         let _env_guard = opencode_env_lock().lock().expect("env lock");
         let temp = tempdir().expect("tempdir");
@@ -2638,9 +2261,11 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "Hello");
         assert_eq!(messages[0].ts, Some(1000));
+        assert_eq!(messages[0].turn_id.as_deref(), Some("t1"));
         assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "[Tool: bash]\nDone");
+        assert_eq!(messages[1].content, "[Tool: bash]\n\nDone");
         assert_eq!(messages[1].ts, Some(2000));
+        assert_eq!(messages[1].turn_id.as_deref(), Some("t1"));
         if let Some(value) = original_xdg {
             std::env::set_var("XDG_DATA_HOME", value);
         } else {
@@ -2993,37 +2618,61 @@ mod tests {
                 .unwrap();
         }
 
+        use crate::session_manager::model::{EventKind, SessionBlock, ToolStatus};
+
         let v2_msgs = load_messages_connection(&v2_conn, "s_v2").unwrap();
-        assert_eq!(v2_msgs.len(), 6);
+        assert_eq!(v2_msgs.len(), 5);
         assert_eq!(
             (&*v2_msgs[0].role, &*v2_msgs[0].content),
-            ("user", "[File: design.png]")
+            ("user", "design.png")
         );
         assert_eq!(
             (&*v2_msgs[1].role, &*v2_msgs[1].content, v2_msgs[1].ts),
-            ("thinking", "Analyzing image", Some(200))
-        );
-        assert_eq!(
-            (&*v2_msgs[2].role, &*v2_msgs[2].content),
             (
                 "assistant",
-                "[Tool: bash]\npartial log\n[Error: ExecError: exit 2]\nFixed command"
+                "[Tool: bash]\n\npartial log\nExecError: exit 2\n\nFixed command",
+                Some(200)
             )
         );
+        assert!(matches!(
+            &v2_msgs[1].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "Analyzing image"
+        ));
+        assert!(matches!(
+            &v2_msgs[1].blocks[2],
+            SessionBlock::ToolResult {
+                status: ToolStatus::Error,
+                ..
+            }
+        ));
+        assert_eq!(
+            (&*v2_msgs[2].role, &*v2_msgs[2].content),
+            ("assistant", "Rate limit exceeded")
+        );
+        assert!(matches!(
+            &v2_msgs[2].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::Error,
+                ..
+            }
+        ));
         assert_eq!(
             (&*v2_msgs[3].role, &*v2_msgs[3].content),
-            ("assistant", "[Error: APIError: Rate limit exceeded]")
+            ("system", "Compaction failed: Context window exceeded")
         );
         assert_eq!(
             (&*v2_msgs[4].role, &*v2_msgs[4].content),
-            ("system", "[Compaction failed: Context window exceeded]")
+            ("system", "anthropic/claude-sonnet-4")
         );
-        assert_eq!(
-            (&*v2_msgs[5].role, &*v2_msgs[5].content),
-            ("system", "[Model: anthropic/claude-sonnet-4]")
-        );
+        assert!(matches!(
+            &v2_msgs[4].blocks[0],
+            SessionBlock::Event {
+                kind: EventKind::ModelChange,
+                ..
+            }
+        ));
 
-        // Legacy JSON deterministic ordering + V1 rich part types + thinking role
+        // Legacy JSON deterministic ordering + V1 rich part types + Thinking block
         let temp = tempdir().unwrap();
         let storage = temp.path();
         let msg_dir = storage.join("message").join("ses_rich");
@@ -3072,21 +2721,19 @@ mod tests {
         .unwrap();
 
         let json_msgs = load_messages(&msg_dir).unwrap();
-        assert_eq!(json_msgs.len(), 3);
+        assert_eq!(json_msgs.len(), 2);
         assert_eq!(
             (&*json_msgs[0].role, &*json_msgs[0].content),
-            ("user", "[File: notes.md]")
+            ("user", "notes.md")
         );
+        assert_eq!(json_msgs[1].role, "assistant");
+        assert!(matches!(
+            &json_msgs[1].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "Planning patch"
+        ));
         assert_eq!(
-            (&*json_msgs[1].role, &*json_msgs[1].content),
-            ("thinking", "Planning patch")
-        );
-        assert_eq!(
-            (&*json_msgs[2].role, &*json_msgs[2].content),
-            (
-                "assistant",
-                "[Subtask (explore): Inspect workspace]\n[Patch: src/lib.rs, src/main.rs]\n[Compaction]"
-            )
+            json_msgs[1].content,
+            "@explore: Inspect workspace\n\n[Tool: patch] src/lib.rs\n\nsrc/lib.rs\nsrc/main.rs\n\nCompaction"
         );
     }
 

@@ -8,10 +8,12 @@ use serde_json::Value;
 use crate::session_manager::cache;
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
+use super::blocks::assign_turn_ids;
+use super::opencode_blocks::{messages_from_parts, PartLocator};
 use super::utils::{
-    extract_thinking_text, is_safe_session_id, order_selected_children, path_basename,
-    quote_sqlite_identifier, sqlite_table_has_column, sqlite_table_names, truncate_summary,
-    validate_parent_graph, TITLE_MAX_CHARS,
+    is_safe_session_id, order_selected_children, path_basename, quote_sqlite_identifier,
+    sqlite_table_has_column, sqlite_table_names, truncate_summary, validate_parent_graph,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "zcode";
@@ -571,20 +573,26 @@ pub fn deletion_order(requests: &[DeleteSessionRequest], initial: &[usize]) -> V
     deletion_order_with_relations(requests, initial, &parents)
 }
 
+pub(crate) fn validate_sqlite_source_for_content(
+    source: &str,
+) -> Result<(PathBuf, String), String> {
+    let (_, session_id) = parse_source(source)
+        .ok_or_else(|| format!("Invalid ZCode SQLite source reference: {source}"))?;
+    let canonical_db = validate_source_database(source, &session_id)?;
+    Ok((canonical_db, session_id))
+}
+
 /// 正文实际依赖的文件：主库与 WAL 边车。引用无法解析或未通过路径安全校验时返回 `None`，由读取器报错。
 ///
 /// ZCode 的会话正文全部在 `message` / `part` 表里（`load_messages` 只打开主库），
 /// 桌面任务索引库不参与正文，因此不计入指纹。
 pub fn transcript_sources(source: &str) -> Option<cache::TranscriptSources> {
-    let (_, session_id) = parse_source(source)?;
-    let db = validate_source_database(source, &session_id).ok()?;
+    let (db, _) = validate_sqlite_source_for_content(source).ok()?;
     Some(cache::sqlite_transcript_sources(&db))
 }
 
 pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
-    let (_, session_id) = parse_source(source)
-        .ok_or_else(|| format!("Invalid ZCode SQLite source reference: {source}"))?;
-    let db = validate_source_database(source, &session_id)?;
+    let (db, session_id) = validate_sqlite_source_for_content(source)?;
     let connection = Connection::open_with_flags(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -592,112 +600,6 @@ pub fn load_messages(source: &str) -> Result<Vec<SessionMessage>, String> {
     .map_err(|error| format!("Failed to open ZCode database: {error}"))?;
 
     read_messages_from_connection(&connection, &session_id)
-}
-
-#[derive(Default)]
-struct ZCodeMessageParts {
-    thinking: Vec<String>,
-    visible: Vec<String>,
-}
-
-fn format_zcode_error(err: &Value) -> Option<String> {
-    match err {
-        Value::Null => None,
-        Value::String(s) => {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
-        Value::Object(map) => {
-            let name = map
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let message = map
-                .get("data")
-                .and_then(|d| d.get("message"))
-                .or_else(|| map.get("message"))
-                .or_else(|| map.get("error"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            match (name, message) {
-                (Some(n), Some(m)) => Some(format!("{n}: {m}")),
-                (None, Some(m)) => Some(m.to_string()),
-                (Some(n), None) => Some(n.to_string()),
-                (None, None) => (!map.is_empty()).then(|| Value::Object(map.clone()).to_string()),
-            }
-        }
-        other => {
-            let rendered = other.to_string();
-            (!rendered.trim().is_empty()).then_some(rendered)
-        }
-    }
-}
-
-fn format_zcode_tool_part(value: &Value) -> String {
-    let name = value
-        .get("tool")
-        .or_else(|| value.get("name"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown");
-    let mut text = format!("[Tool: {name}]");
-    let state = value.get("state");
-
-    let mut has_structured_content = false;
-    if let Some(items) = state
-        .and_then(|s| s.get("content"))
-        .and_then(Value::as_array)
-    {
-        for item in items {
-            let out = match item.get("type").and_then(Value::as_str) {
-                Some("text") => item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                Some("file") => format!(
-                    "[File: {}]",
-                    item.get("filename")
-                        .or_else(|| item.get("name"))
-                        .or_else(|| item.get("uri"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty() && !s.starts_with("data:"))
-                        .unwrap_or("attachment")
-                ),
-                _ => String::new(),
-            };
-            if !out.trim().is_empty() {
-                has_structured_content = true;
-                text.push('\n');
-                text.push_str(&out);
-            }
-        }
-    }
-
-    if !has_structured_content {
-        if let Some(output) = state
-            .and_then(|s| s.get("output"))
-            .or_else(|| value.get("output"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-        {
-            text.push('\n');
-            text.push_str(output);
-        }
-    }
-
-    if let Some(err) = state
-        .and_then(|s| s.get("error"))
-        .or_else(|| value.get("error"))
-        .and_then(format_zcode_error)
-    {
-        text.push_str(&format!("\n[Error: {err}]"));
-    }
-
-    text
 }
 
 fn read_messages_from_connection(
@@ -714,136 +616,104 @@ fn read_messages_from_connection(
 
     let mut message_statement = connection
         .prepare(
-            "SELECT id, data, time_created FROM message WHERE session_id=?1 ORDER BY time_created ASC, id ASC",
+            "SELECT id, time_created, data FROM message WHERE session_id=?1 ORDER BY time_created ASC, id ASC",
         )
         .map_err(|error| format!("Failed to prepare ZCode message query: {error}"))?;
     let messages = message_statement
         .query_map([session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
             ))
         })
         .map_err(|error| format!("Failed to query ZCode messages: {error}"))?;
 
-    let part_order = if sqlite_table_has_column(connection, "part", "id")? {
-        "time_created ASC, id ASC"
+    let mut parts_map: HashMap<String, Vec<(PartLocator, Value)>> = HashMap::new();
+    if sqlite_table_has_column(connection, "part", "id")? {
+        let mut part_statement = connection
+            .prepare(
+                "SELECT id, message_id, data FROM part WHERE session_id=?1 ORDER BY time_created ASC, id ASC",
+            )
+            .map_err(|error| format!("Failed to prepare ZCode part query: {error}"))?;
+        let parts = part_statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| format!("Failed to query ZCode parts: {error}"))?;
+        for row in parts {
+            let (part_id, message_id, raw) = row.map_err(|e| e.to_string())?;
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let locator = PartLocator::Sqlite {
+                table: "part",
+                id: part_id,
+                base: String::new(),
+            };
+            parts_map
+                .entry(message_id)
+                .or_default()
+                .push((locator, value));
+        }
     } else {
-        "time_created ASC, rowid ASC"
-    };
-    let mut part_statement = connection
-        .prepare(&format!(
-            "SELECT message_id, data FROM part WHERE session_id=?1 ORDER BY {part_order}"
-        ))
-        .map_err(|error| format!("Failed to prepare ZCode part query: {error}"))?;
-    let parts = part_statement
-        .query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| format!("Failed to query ZCode parts: {error}"))?;
-
-    let mut message_parts: HashMap<String, ZCodeMessageParts> = HashMap::new();
-    for row in parts {
-        let (message_id, raw) = row.map_err(|e| e.to_string())?;
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        match value.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(text) = value.get("text").and_then(Value::as_str) {
-                    if !text.trim().is_empty() {
-                        message_parts
-                            .entry(message_id)
-                            .or_default()
-                            .visible
-                            .push(text.to_string());
-                    }
-                }
-            }
-            Some("reasoning" | "thinking") => {
-                let extracted = extract_thinking_text(&value);
-                let thinking = if !extracted.trim().is_empty() {
-                    Some(extracted)
-                } else {
-                    value
-                        .get("text")
-                        .or_else(|| value.get("thinking"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                        .map(str::to_string)
-                };
-                if let Some(thinking) = thinking {
-                    message_parts
-                        .entry(message_id)
-                        .or_default()
-                        .thinking
-                        .push(thinking);
-                }
-            }
-            Some("tool") => {
-                message_parts
-                    .entry(message_id)
-                    .or_default()
-                    .visible
-                    .push(format_zcode_tool_part(&value));
-            }
-            Some("file") => {
-                let label = value
-                    .get("filename")
-                    .or_else(|| value.get("name"))
-                    .or_else(|| value.get("path"))
-                    .or_else(|| value.get("uri"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && !s.starts_with("data:"))
-                    .unwrap_or("attachment");
-                message_parts
-                    .entry(message_id)
-                    .or_default()
-                    .visible
-                    .push(format!("[File: {label}]"));
-            }
-            _ => {}
+        let mut part_statement = connection
+            .prepare(
+                "SELECT message_id, data FROM part WHERE session_id=?1 ORDER BY time_created ASC, rowid ASC",
+            )
+            .map_err(|error| format!("Failed to prepare ZCode part query: {error}"))?;
+        let parts = part_statement
+            .query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("Failed to query ZCode parts: {error}"))?;
+        for row in parts {
+            let (message_id, raw) = row.map_err(|e| e.to_string())?;
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            parts_map
+                .entry(message_id)
+                .or_default()
+                .push((PartLocator::None, value));
         }
     }
 
     let mut output = Vec::new();
     for row in messages {
-        let (message_id, raw, timestamp) = row.map_err(|e| e.to_string())?;
+        let (message_id, timestamp, raw) = row.map_err(|e| e.to_string())?;
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
         let role = value
             .get("role")
             .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
+            .unwrap_or("unknown");
         let ts = (timestamp > 0).then_some(timestamp);
-        let parts = message_parts.remove(&message_id).unwrap_or_default();
-        let thinking = parts.thinking.join("\n");
-        if !thinking.trim().is_empty() {
-            output.push(SessionMessage {
-                role: "thinking".to_string(),
-                content: thinking,
-                ts,
-                meta: None,
-            });
-        }
-        let content = parts.visible.join("\n");
-        if !content.trim().is_empty() {
-            output.push(SessionMessage {
-                role,
-                content,
-                ts,
-                meta: None,
-            });
-        }
+        let parts = parts_map.remove(&message_id).unwrap_or_default();
+        let msg_locator = PartLocator::Sqlite {
+            table: "message",
+            id: message_id.clone(),
+            base: String::new(),
+        };
+        output.extend(messages_from_parts(
+            role,
+            Some(message_id),
+            ts,
+            &value,
+            &msg_locator,
+            &parts,
+        ));
     }
 
     // Distinct persisted message IDs are distinct messages. Identical text or
     // an empty/error assistant row does not prove an automatic retry; no stable
     // retry identity is available in this schema, so preserve the original rows.
+    assign_turn_ids(&mut output);
     Ok(output)
 }
 
@@ -1566,8 +1436,19 @@ mod tests {
     #[test]
     fn regression_empty_error_assistant_rows_do_not_prove_user_retry() {
         let messages = repeated_user_fixture(true);
-        assert_eq!(messages.len(), 5);
-        assert!(messages.iter().all(|message| message.role == "user"));
+        let user_messages: Vec<&SessionMessage> = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect();
+        assert_eq!(user_messages.len(), 5);
+        assert!(user_messages
+            .iter()
+            .all(|message| message.content == "怎么这么多"));
+        assert_eq!(messages.len(), 10);
+        assert!(messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .all(|message| message.content == "APIError"));
     }
 
     #[test]
@@ -1965,18 +1846,46 @@ mod tests {
             )
             .unwrap();
 
+        use crate::session_manager::model::{ContentRef, SessionBlock, ToolStatus};
+
+        let long_log: String = (1..=20).map(|i| format!("ok line {i}\n")).collect();
+        connection
+            .execute(
+                "UPDATE part SET data = ?1 WHERE id = 'p3'",
+                [serde_json::json!({
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {
+                        "output": long_log,
+                        "error": { "message": "exit 1" }
+                    }
+                })
+                .to_string()],
+            )
+            .unwrap();
+
         let messages = read_messages_from_connection(&connection, "s1").unwrap();
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "Run tests");
-        assert_eq!(messages[1].role, "thinking");
-        assert_eq!(messages[1].content, "Checking test suite");
+        assert_eq!(messages[0].turn_id.as_deref(), Some("t1"));
+        assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].ts, Some(20));
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(
-            messages[2].content,
-            "[Tool: bash]\nok 12 passed\n[Error: exit 1]\nTests finished."
-        );
-        assert_eq!(messages[2].ts, Some(20));
+        assert_eq!(messages[1].turn_id.as_deref(), Some("t1"));
+        assert!(matches!(
+            &messages[1].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "Checking test suite"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[2],
+            SessionBlock::ToolResult {
+                status: ToolStatus::Error,
+                truncated: true,
+                full: Some(ContentRef::Sqlite { table, id, column, pointer }),
+                ..
+            } if table == "part" && id == "p3" && column == "data" && pointer == "/state/output"
+        ));
+        assert!(messages[1].content.starts_with("[Tool: bash]\n\nok line 1"));
+        assert!(messages[1].content.ends_with("\n\nTests finished."));
     }
 }

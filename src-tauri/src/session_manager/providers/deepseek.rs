@@ -1,18 +1,24 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde_json::Value;
 
+use crate::session_manager::model::{ContentRef, EventKind, MessageMeta, SessionBlock, ToolStatus};
 use crate::session_manager::{DeleteSessionRequest, SessionMessage, SessionMeta};
 
+use super::blocks::{
+    assign_turn_ids, large_text_block, openai_tool_calls, parse_arguments, summary_event_block,
+    thinking_block, tool_call_block, tool_result_block, ToolSource,
+};
 use super::utils::{
-    atomic_write_json, checked_storage_child, is_reparse_or_symlink, is_safe_session_id,
-    order_selected_children, path_basename, quote_sqlite_identifier, remove_path_if_exists,
-    scan_warning, sqlite_table_has_column, truncate_summary, FileParseCache,
-    MAX_MESSAGES_FILE_BYTES, TITLE_MAX_CHARS,
+    atomic_write_json, checked_storage_child, extract_text, is_reparse_or_symlink,
+    is_safe_session_id, order_selected_children, parse_timestamp_to_ms, path_basename,
+    quote_sqlite_identifier, remove_path_if_exists, scan_warning, sqlite_table_has_column,
+    truncate_summary, FileParseCache, JsonlSpan, LineSpans, MAX_MESSAGES_FILE_BYTES,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "deepseek";
@@ -543,41 +549,17 @@ fn validate_header(header: &Value, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SurfaceOp {
-    Append,
-    Replace { range: Option<(u64, u64)> },
-}
-
-fn parse_surface_op(event: &Value) -> Option<SurfaceOp> {
-    match event.get("surfaceOp")? {
-        Value::String(op) if op == "append" => Some(SurfaceOp::Append),
-        Value::Object(map) => match map.get("op").and_then(Value::as_str) {
-            Some("append") => Some(SurfaceOp::Append),
-            Some("replace") => {
-                let start = map
-                    .get("startSeq")
-                    .or_else(|| map.get("fromSeq"))
-                    .and_then(Value::as_u64);
-                let end = map
-                    .get("endSeq")
-                    .or_else(|| map.get("toSeq"))
-                    .and_then(Value::as_u64);
-                let range = match (start, end) {
-                    (Some(s), Some(e)) if s <= e => Some((s, e)),
-                    (None, Some(e)) => Some((0, e)),
-                    _ => None,
-                };
-                Some(SurfaceOp::Replace { range })
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn append_or_replace_surface_event(event: &Value) -> bool {
-    parse_surface_op(event).is_some()
+    match event.get("surfaceOp") {
+        Some(Value::String(op)) => op == "append",
+        Some(Value::Object(map)) => {
+            matches!(
+                map.get("op").and_then(Value::as_str),
+                Some("append" | "replace")
+            )
+        }
+        _ => false,
+    }
 }
 
 fn is_visible_user_source(event: &Value) -> bool {
@@ -636,180 +618,11 @@ fn assistant_text(event: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-fn format_tool_call_block(block: &Value) -> Option<String> {
-    let name = block
-        .get("name")
-        .or_else(|| block.get("toolName"))
-        .or_else(|| block.pointer("/function/name"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("tool");
-    let args = match block
-        .get("arguments")
-        .or_else(|| block.get("args"))
-        .or_else(|| block.get("input"))
-        .or_else(|| block.pointer("/function/arguments"))
-    {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(other) if !other.is_null() => other.to_string(),
-        _ => String::new(),
-    };
-    if args.is_empty() {
-        Some(format!("[Tool: {name}]"))
-    } else {
-        Some(format!("[Tool: {name}] {args}"))
-    }
-}
-
-fn assistant_transcript_text(event: &Value) -> Option<String> {
-    if let Some(text) = assistant_text(event) {
-        return Some(text);
-    }
-    if event.get("type").and_then(Value::as_str) != Some("assistant/message")
-        || !append_or_replace_surface_event(event)
-    {
-        return None;
-    }
-    let mut lines = Vec::new();
-    if let Some(content) = event.pointer("/data/message/content") {
-        match content {
-            Value::Array(blocks) => {
-                for block in blocks {
-                    if matches!(
-                        block.get("type").and_then(Value::as_str),
-                        Some("tool-call" | "tool_call" | "toolCall" | "tool_use")
-                    ) {
-                        if let Some(formatted) = format_tool_call_block(block) {
-                            lines.push(formatted);
-                        }
-                    }
-                }
-            }
-            Value::Object(_) => {
-                if matches!(
-                    content.get("type").and_then(Value::as_str),
-                    Some("tool-call" | "tool_call" | "toolCall" | "tool_use")
-                ) {
-                    if let Some(formatted) = format_tool_call_block(content) {
-                        lines.push(formatted);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if lines.is_empty() {
-        if let Some(calls) = event
-            .pointer("/data/message/toolCalls")
-            .or_else(|| event.pointer("/data/message/tool_calls"))
-            .and_then(Value::as_array)
-        {
-            for call in calls {
-                if let Some(formatted) = format_tool_call_block(call) {
-                    lines.push(formatted);
-                }
-            }
-        }
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-fn extract_tool_result_value(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .map(extract_tool_result_value)
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Object(map) => {
-            if matches!(
-                map.get("type").and_then(Value::as_str),
-                Some("reasoning" | "thinking" | "redacted_thinking")
-            ) {
-                return String::new();
-            }
-            if let Some(text) = map
-                .get("text")
-                .or_else(|| map.get("value"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-            {
-                return text.to_string();
-            }
-            for key in ["content", "output", "result", "error"] {
-                if let Some(nested) = map.get(key) {
-                    let extracted = extract_tool_result_value(nested);
-                    if !extracted.trim().is_empty() {
-                        return extracted;
-                    }
-                }
-            }
-            value.to_string()
-        }
-        other => other.to_string(),
-    }
-}
-
-fn tool_result_text(event: &Value) -> Option<String> {
-    if event.get("type").and_then(Value::as_str) != Some("tool/result") {
-        return None;
-    }
-    if event.get("surfaceOp").is_some() && !append_or_replace_surface_event(event) {
-        return None;
-    }
-    if event.pointer("/data/hidden").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    let data = event.get("data")?;
-    for candidate in [
-        data.get("content"),
-        data.get("output"),
-        data.get("result"),
-        data.pointer("/message/content"),
-        data.get("error"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let text = extract_tool_result_value(candidate);
-        if !text.trim().is_empty() {
-            return Some(text);
-        }
-    }
-    None
-}
-
-fn replacement_compaction_message(event: &Value) -> Option<(&'static str, String)> {
-    if event.get("type").and_then(Value::as_str) == Some("user/message") {
-        if let Some(text) = event.pointer("/data/content").map(visible_message_text) {
-            if !text.trim().is_empty() {
-                return Some(("user", text));
-            }
-        }
-    }
-    let data = event.get("data")?;
-    for candidate in [
-        data.get("summary"),
-        data.get("content"),
-        data.get("text"),
-        data.pointer("/message/content"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let text = visible_message_text(candidate);
-        if !text.trim().is_empty() {
-            return Some(("system", text));
-        }
-    }
-    None
-}
-
 fn event_time(event: &Value) -> Option<i64> {
-    event.get("time").and_then(Value::as_i64)
+    event
+        .get("time")
+        .or_else(|| event.get("timestamp"))
+        .and_then(parse_timestamp_to_ms)
 }
 
 fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
@@ -902,10 +715,6 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
     Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: id,
-        // Harness does not place internal subagent sessions in its ordinary
-        // workspace conversation list. Surface them as residuals here so a
-        // parent dependency can be resolved deliberately instead of making
-        // the parent permanently undeletable.
         residual,
         parent_session_id,
         archived: false,
@@ -924,66 +733,576 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
     }))
 }
 
-pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
-    let decoded = read_session(path)?;
-    let mut surface: Vec<(u64, SessionMessage)> = Vec::new();
-    for event in decoded.events {
-        let seq = event.get("seq").and_then(Value::as_u64).unwrap_or(0);
-        let surface_op = parse_surface_op(&event);
-        let message = if let Some(content) = user_text(&event) {
-            Some(("user", content))
-        } else if let Some(content) = assistant_transcript_text(&event) {
-            Some(("assistant", content))
-        } else if let Some(content) = tool_result_text(&event) {
-            Some(("tool", content))
-        } else if matches!(surface_op, Some(SurfaceOp::Replace { .. })) {
-            replacement_compaction_message(&event)
+fn extract_dsh_tool_output(raw: &Value, base_ptr: &str) -> (String, String) {
+    for key in ["content", "output", "result", "error"] {
+        if let Some(val) = raw.get(key).filter(|v| !v.is_null()) {
+            let text = match val {
+                Value::String(s) => s.clone(),
+                other => extract_text(other),
+            };
+            return (text, format!("{base_ptr}/{key}"));
+        }
+    }
+    (String::new(), format!("{base_ptr}/content"))
+}
+
+fn assistant_meta(record: &Value, raw: &Value) -> Option<MessageMeta> {
+    let model = raw
+        .pointer("/source/model")
+        .or_else(|| raw.get("model_id"))
+        .or_else(|| raw.get("modelId"))
+        .or_else(|| raw.get("model"))
+        .or_else(|| record.pointer("/data/model_id"))
+        .or_else(|| record.pointer("/data/model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let usage = record
+        .pointer("/data/usage")
+        .or_else(|| raw.get("usage"))
+        .or_else(|| record.get("usage"));
+
+    let u64_of = |keys: &[&str]| {
+        usage.and_then(|u| keys.iter().find_map(|k| u.get(*k).and_then(Value::as_u64)))
+    };
+    let f64_of = |keys: &[&str]| {
+        usage.and_then(|u| keys.iter().find_map(|k| u.get(*k).and_then(Value::as_f64)))
+    };
+
+    let duration_ms = record
+        .pointer("/data/durationMs")
+        .or_else(|| record.pointer("/data/duration_ms"))
+        .or_else(|| raw.get("durationMs"))
+        .or_else(|| raw.get("duration_ms"))
+        .or_else(|| usage.and_then(|u| u.get("durationMs").or_else(|| u.get("duration_ms"))))
+        .and_then(Value::as_u64);
+
+    let stop_reason = raw
+        .get("stopReason")
+        .or_else(|| raw.get("stop_reason"))
+        .or_else(|| record.pointer("/data/stopReason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    MessageMeta {
+        model,
+        input_tokens: u64_of(&["inputTokens", "input_tokens"]),
+        output_tokens: u64_of(&["outputTokens", "output_tokens"]),
+        cache_read_tokens: u64_of(&[
+            "cacheReadTokens",
+            "cache_read_tokens",
+            "cache_read_input_tokens",
+        ]),
+        cache_write_tokens: u64_of(&[
+            "cacheWriteTokens",
+            "cache_write_tokens",
+            "cache_creation_input_tokens",
+        ]),
+        reasoning_tokens: u64_of(&["reasoningTokens", "reasoning_tokens"]),
+        cost_usd: f64_of(&["costUsd", "cost_usd"]),
+        duration_ms,
+        stop_reason,
+    }
+    .into_option()
+}
+
+fn build_v1_message(span: JsonlSpan, record: &Value) -> Option<SessionMessage> {
+    let role = record.get("role").and_then(Value::as_str)?;
+    if !matches!(role, "user" | "assistant" | "tool" | "system") {
+        return None;
+    }
+    let ts = record
+        .get("timestamp")
+        .or_else(|| record.get("time"))
+        .or_else(|| record.get("createdAt"))
+        .and_then(parse_timestamp_to_ms);
+    let reference = |pointer: String| -> Option<ContentRef> { Some(span.content_ref(pointer)) };
+
+    let mut blocks = Vec::new();
+    if role == "tool" {
+        let call_id = record
+            .get("toolCallId")
+            .or_else(|| record.get("tool_call_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let status = if record.get("isError").and_then(Value::as_bool) == Some(true)
+            || record.get("is_error").and_then(Value::as_bool) == Some(true)
+        {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Success
+        };
+        let (text, ptr) = extract_dsh_tool_output(record, "");
+        blocks.push(tool_result_block(call_id, status, &text, || reference(ptr)));
+    } else {
+        if let Some(reasoning) = record
+            .get("reasoning_content")
+            .or_else(|| record.get("thinking"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            let ptr = if record.get("reasoning_content").is_some() {
+                "/reasoning_content"
+            } else {
+                "/thinking"
+            };
+            blocks.push(thinking_block(reasoning, None, None, || {
+                reference(ptr.into())
+            }));
+        }
+        match record.get("content") {
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                blocks.push(SessionBlock::text(text));
+            }
+            Some(Value::Array(parts)) => {
+                for (index, part) in parts.iter().enumerate() {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                if !t.trim().is_empty() {
+                                    blocks.push(SessionBlock::text(t));
+                                }
+                            }
+                        }
+                        Some("thinking" | "reasoning") => {
+                            let field = if part.get("text").is_some() {
+                                "text"
+                            } else {
+                                "thinking"
+                            };
+                            if let Some(t) = part.get(field).and_then(Value::as_str) {
+                                blocks.push(thinking_block(t, None, None, || {
+                                    reference(format!("/content/{index}/{field}"))
+                                }));
+                            }
+                        }
+                        Some("tool-call" | "tool_call" | "toolCall" | "tool_use") => {
+                            let id = part
+                                .get("id")
+                                .or_else(|| part.get("toolCallId"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let name = part
+                                .get("name")
+                                .or_else(|| part.get("toolName"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let (arg_field, raw_args) = if let Some(a) = part.get("arguments") {
+                                ("arguments", a)
+                            } else if let Some(a) = part.get("args") {
+                                ("args", a)
+                            } else if let Some(a) = part.get("input") {
+                                ("input", a)
+                            } else {
+                                ("arguments", &Value::Null)
+                            };
+                            let arguments = parse_arguments(raw_args);
+                            blocks.push(tool_call_block(
+                                ToolSource::Generic,
+                                id,
+                                name,
+                                &arguments,
+                                || reference(format!("/content/{index}/{arg_field}")),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        let calls_field = if record.get("tool_calls").is_some() {
+            Some(("tool_calls", record.get("tool_calls")))
+        } else if record.get("toolCalls").is_some() {
+            Some(("toolCalls", record.get("toolCalls")))
         } else {
             None
         };
+        if let Some((field_name, calls_val)) = calls_field {
+            blocks.extend(openai_tool_calls(calls_val, |ptr| {
+                reference(format!("/{field_name}{ptr}"))
+            }));
+        }
+    }
 
-        match surface_op {
-            Some(SurfaceOp::Replace { range }) => {
-                let insert_at = if let Some((start, end)) = range {
-                    let first = surface
-                        .iter()
-                        .position(|(item_seq, _)| (start..=end).contains(item_seq));
-                    surface.retain(|(item_seq, _)| !(start..=end).contains(item_seq));
-                    first.unwrap_or(surface.len())
-                } else {
-                    surface.len()
-                };
-                if let Some((role, content)) = message {
-                    surface.insert(
-                        insert_at,
-                        (
-                            seq,
-                            SessionMessage {
-                                role: role.to_string(),
-                                content,
-                                ts: event_time(&event),
-                                meta: None,
-                            },
-                        ),
-                    );
-                }
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut message = SessionMessage::from_blocks(role, ts, blocks);
+    message.id = record.get("id").and_then(Value::as_str).map(str::to_string);
+    message.injected = role == "system";
+    if role == "assistant" {
+        message.meta = assistant_meta(record, record);
+    }
+    Some(message)
+}
+
+pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+    let bytes = read_session_bytes(path)?;
+    parse_messages_bytes(&bytes, path)
+}
+
+fn parse_messages_bytes(data: &[u8], path: &Path) -> Result<Vec<SessionMessage>, String> {
+    let mut lines = LineSpans::new(Cursor::new(data));
+    let mut parsed_lines: Vec<(JsonlSpan, Value)> = Vec::new();
+
+    while let Some(line) = lines
+        .next_line()
+        .map_err(|e| format!("无法读取 DeepSeek Harness 会话 {}：{e}", path.display()))?
+    {
+        let end_pos = line.span.offset as usize + line.span.len as usize;
+        let ends_with_newline = end_pos > 0 && data.get(end_pos - 1) == Some(&b'\n');
+        let trimmed = line.bytes.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Value>(trimmed) {
+            Ok(val) => parsed_lines.push((line.span, val)),
+            Err(_) if !ends_with_newline && !parsed_lines.is_empty() => {
+                // Incomplete trailing JSONL line still being flushed to disk.
+                break;
             }
-            _ => {
-                if let Some((role, content)) = message {
-                    surface.push((
-                        seq,
-                        SessionMessage {
-                            role: role.to_string(),
-                            content,
-                            ts: event_time(&event),
-                            meta: None,
-                        },
-                    ));
-                }
+            Err(err) => {
+                return Err(format!(
+                    "DeepSeek Harness 会话 JSONL 损坏 {}：{err}",
+                    path.display()
+                ));
             }
         }
     }
-    Ok(surface.into_iter().map(|(_, msg)| msg).collect())
+
+    let Some((first_span, first_val)) = parsed_lines.first() else {
+        return Err(format!("DeepSeek Harness 会话为空：{}", path.display()));
+    };
+
+    // Legacy v1 fallback when transcript is raw role-based JSONL without a v2+ session header.
+    let header_type = first_val.get("type").and_then(Value::as_str);
+    if !matches!(header_type, Some("session" | "header")) {
+        if first_val.get("role").and_then(Value::as_str).is_some() {
+            let mut v1_messages: Vec<SessionMessage> = parsed_lines
+                .iter()
+                .filter_map(|(span, rec)| build_v1_message(*span, rec))
+                .collect();
+            assign_turn_ids(&mut v1_messages);
+            return Ok(v1_messages);
+        }
+        let _ = first_span;
+        return Err(format!(
+            "DeepSeek Harness 会话头字段无效：{}",
+            path.display()
+        ));
+    }
+
+    if header_type == Some("session") {
+        validate_header(first_val, path)?;
+    }
+
+    let mut messages: Vec<SessionMessage> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut known_call_ids: HashSet<String> = HashSet::new();
+    let mut unidentified_calls: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut anon_seq: usize = 0;
+
+    for (span, record) in parsed_lines.into_iter().skip(1) {
+        let kind = record
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_replace = record.pointer("/surfaceOp/op").and_then(Value::as_str) == Some("replace");
+        let ts = event_time(&record);
+        let reference = |pointer: String| -> Option<ContentRef> { Some(span.content_ref(pointer)) };
+
+        if matches!(
+            kind,
+            "compact_boundary" | "session/compact" | "system/compact_boundary"
+        ) {
+            let (summary_opt, ptr) =
+                if let Some(s) = record.pointer("/data/summary").and_then(Value::as_str) {
+                    (Some(s), "/data/summary")
+                } else if let Some(s) = record.pointer("/data/content").and_then(Value::as_str) {
+                    (Some(s), "/data/content")
+                } else if let Some(s) = record.get("summary").and_then(Value::as_str) {
+                    (Some(s), "/summary")
+                } else {
+                    (None, "/data/summary")
+                };
+            let block = match summary_opt.filter(|s| !s.trim().is_empty()) {
+                Some(summary) => {
+                    summary_event_block(EventKind::Compaction, summary, || reference(ptr.into()))
+                }
+                None => SessionBlock::event(EventKind::Compaction, None, None),
+            };
+            let mut msg = SessionMessage::from_blocks("system", ts, vec![block]);
+            msg.injected = true;
+            messages.push(msg);
+            continue;
+        }
+
+        // Replacement copies only alter the model-visible surface; keep append-origin messages
+        // and full tool outputs in the human transcript without letting replacements claim IDs.
+        if is_replace {
+            continue;
+        }
+
+        let (raw, pointer, role) = match kind {
+            "user/message" => (&record["data"], "/data", "user"),
+            "assistant/message" => {
+                if record
+                    .pointer("/data/message")
+                    .is_some_and(Value::is_object)
+                {
+                    (&record["data"]["message"], "/data/message", "assistant")
+                } else {
+                    (&record["data"], "/data", "assistant")
+                }
+            }
+            "tool/result" => {
+                if record
+                    .pointer("/data/message")
+                    .is_some_and(Value::is_object)
+                {
+                    (&record["data"]["message"], "/data/message", "tool")
+                } else {
+                    (&record["data"], "/data", "tool")
+                }
+            }
+            _ => continue,
+        };
+
+        if let Some(id) = raw
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            if !seen_ids.insert(id.to_string()) {
+                continue;
+            }
+        }
+
+        if role == "tool" {
+            if record.pointer("/data/hidden").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            let explicit_call_id = raw
+                .get("toolCallId")
+                .or_else(|| raw.get("tool_call_id"))
+                .or_else(|| record.pointer("/data/toolCallId"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+
+            let call_id = match explicit_call_id {
+                Some(cid) => {
+                    if !known_call_ids.contains(cid) {
+                        if let Some((msg_idx, blk_idx)) = unidentified_calls.pop_front() {
+                            if let Some(SessionBlock::ToolCall { id, .. }) = messages
+                                .get_mut(msg_idx)
+                                .and_then(|m| m.blocks.get_mut(blk_idx))
+                            {
+                                *id = cid.to_string();
+                            }
+                        }
+                        known_call_ids.insert(cid.to_string());
+                    }
+                    cid.to_string()
+                }
+                None => {
+                    if let Some((msg_idx, blk_idx)) = unidentified_calls.pop_front() {
+                        anon_seq += 1;
+                        let gen_id = format!("call_{anon_seq}");
+                        if let Some(SessionBlock::ToolCall { id, .. }) = messages
+                            .get_mut(msg_idx)
+                            .and_then(|m| m.blocks.get_mut(blk_idx))
+                        {
+                            *id = gen_id.clone();
+                        }
+                        known_call_ids.insert(gen_id.clone());
+                        gen_id
+                    } else {
+                        String::new()
+                    }
+                }
+            };
+
+            let is_error = raw.get("isError").and_then(Value::as_bool) == Some(true)
+                || raw.get("is_error").and_then(Value::as_bool) == Some(true)
+                || record.pointer("/data/isError").and_then(Value::as_bool) == Some(true)
+                || record.pointer("/data/error").is_some_and(|v| !v.is_null());
+            let (text, out_ptr) = extract_dsh_tool_output(raw, pointer);
+            let mut block = tool_result_block(
+                call_id,
+                if is_error {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                },
+                &text,
+                || reference(out_ptr),
+            );
+            if let SessionBlock::ToolResult {
+                duration_ms: ref mut d_slot,
+                ..
+            } = block
+            {
+                *d_slot = raw
+                    .get("durationMs")
+                    .or_else(|| raw.get("duration_ms"))
+                    .or_else(|| record.pointer("/data/durationMs"))
+                    .or_else(|| record.pointer("/data/duration_ms"))
+                    .and_then(Value::as_u64);
+            }
+            let mut message = SessionMessage::from_blocks("tool", ts, vec![block]);
+            message.id = raw.get("id").and_then(Value::as_str).map(str::to_string);
+            messages.push(message);
+            continue;
+        }
+
+        let injected = role == "user" && !is_visible_user_source(&record);
+        let mut message_blocks = Vec::new();
+        let mut new_unidentified_blocks: Vec<usize> = Vec::new();
+
+        match raw.get("content") {
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                if injected {
+                    let ptr = format!("{pointer}/content");
+                    message_blocks.push(large_text_block(text.clone(), || reference(ptr)));
+                } else {
+                    message_blocks.push(SessionBlock::text(text));
+                }
+            }
+            Some(Value::Array(parts)) => {
+                for (index, part) in parts.iter().enumerate() {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    if injected {
+                                        let ptr = format!("{pointer}/content/{index}/text");
+                                        message_blocks
+                                            .push(large_text_block(text.to_string(), || {
+                                                reference(ptr)
+                                            }));
+                                    } else {
+                                        message_blocks.push(SessionBlock::text(text));
+                                    }
+                                }
+                            }
+                        }
+                        Some("thinking" | "reasoning") => {
+                            let field = if part.get("text").is_some() {
+                                "text"
+                            } else {
+                                "thinking"
+                            };
+                            let duration = part
+                                .get("durationMs")
+                                .or_else(|| part.get("duration_ms"))
+                                .and_then(Value::as_u64);
+                            message_blocks.push(thinking_block(
+                                part.get(field).and_then(Value::as_str).unwrap_or_default(),
+                                None,
+                                duration,
+                                || reference(format!("{pointer}/content/{index}/{field}")),
+                            ));
+                        }
+                        Some("tool-call" | "tool_call" | "toolCall" | "tool_use") => {
+                            let id = part
+                                .get("id")
+                                .or_else(|| part.get("toolCallId"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let name = part
+                                .get("name")
+                                .or_else(|| part.get("toolName"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let (arg_field, raw_args) = if let Some(a) = part.get("arguments") {
+                                ("arguments", a)
+                            } else if let Some(a) = part.get("args") {
+                                ("args", a)
+                            } else if let Some(a) = part.get("input") {
+                                ("input", a)
+                            } else {
+                                ("arguments", &Value::Null)
+                            };
+                            let arguments = parse_arguments(raw_args);
+                            let blk_idx = message_blocks.len();
+                            message_blocks.push(tool_call_block(
+                                ToolSource::Generic,
+                                id,
+                                name,
+                                &arguments,
+                                || reference(format!("{pointer}/content/{index}/{arg_field}")),
+                            ));
+                            if id.is_empty() {
+                                new_unidentified_blocks.push(blk_idx);
+                            } else {
+                                known_call_ids.insert(id.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(obj @ Value::Object(_))
+                if obj.get("type").and_then(Value::as_str) == Some("text") =>
+            {
+                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        message_blocks.push(SessionBlock::text(text));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if role == "assistant" {
+            let calls_field = if raw.get("tool_calls").is_some() {
+                Some(("tool_calls", raw.get("tool_calls")))
+            } else if raw.get("toolCalls").is_some() {
+                Some(("toolCalls", raw.get("toolCalls")))
+            } else {
+                None
+            };
+            if let Some((field_name, calls_val)) = calls_field {
+                for blk in openai_tool_calls(calls_val, |ptr| {
+                    reference(format!("{pointer}/{field_name}{ptr}"))
+                }) {
+                    let blk_idx = message_blocks.len();
+                    if let SessionBlock::ToolCall { ref id, .. } = blk {
+                        if id.is_empty() {
+                            new_unidentified_blocks.push(blk_idx);
+                        } else {
+                            known_call_ids.insert(id.clone());
+                        }
+                    }
+                    message_blocks.push(blk);
+                }
+            }
+        }
+
+        if message_blocks.is_empty() {
+            continue;
+        }
+
+        let mut message = SessionMessage::from_blocks(role, ts, message_blocks);
+        message.id = raw.get("id").and_then(Value::as_str).map(str::to_string);
+        message.injected = injected;
+        if role == "assistant" {
+            message.meta = assistant_meta(&record, raw);
+        }
+        let msg_idx = messages.len();
+        for blk_idx in new_unidentified_blocks {
+            unidentified_calls.push_back((msg_idx, blk_idx));
+        }
+        messages.push(message);
+    }
+
+    assign_turn_ids(&mut messages);
+    Ok(messages)
 }
 
 fn read_index(home: &Path) -> Result<Option<Value>, String> {
@@ -2074,9 +2393,29 @@ mod tests {
         assert_eq!(sessions[0].summary.as_deref(), Some("answer"));
         assert_eq!(sessions[0].last_active_at, Some(1700000000200_i64));
         let messages = load_messages(&path).expect("load messages");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "real prompt");
-        assert_eq!(messages[1].content, "answer");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            (messages[0].role.as_str(), messages[0].injected),
+            ("user", true)
+        );
+        assert_eq!(messages[0].content, "hidden instructions");
+        assert_eq!(messages[0].turn_id.as_deref(), Some("t0"));
+        assert_eq!(
+            (messages[1].role.as_str(), messages[1].injected),
+            ("user", false)
+        );
+        assert_eq!(messages[1].content, "real prompt");
+        assert_eq!(messages[1].turn_id.as_deref(), Some("t1"));
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content, "answer\n\n[Tool: read]");
+        assert!(matches!(
+            &messages[2].blocks[0],
+            SessionBlock::Thinking { text, .. } if text == "private reasoning"
+        ));
+        assert!(matches!(
+            &messages[2].blocks[2],
+            SessionBlock::ToolCall { raw_name, .. } if raw_name == "read"
+        ));
     }
 
     #[test]
@@ -3110,20 +3449,120 @@ mod tests {
         .unwrap();
 
         let messages = load_messages(&path).unwrap();
-        let pairs: Vec<(&str, &str)> = messages
+        let non_injected: Vec<(&str, &str)> = messages
             .iter()
+            .filter(|m| !m.injected)
             .map(|m| (m.role.as_str(), m.content.as_str()))
             .collect();
         assert_eq!(
-            pairs,
+            non_injected,
             vec![
-                ("system", "[Compacted turns 1]"),
+                ("user", "old turn 1"),
+                ("assistant", "old reply 1"),
                 ("user", "channel prompt"),
-                ("assistant", "[Tool: bash] {\"cmd\":\"cargo test\"}"),
+                ("assistant", "[Tool: bash] cargo test"),
                 ("tool", "test result: ok"),
                 ("user", "scheduled check"),
                 ("user", "imported question"),
             ]
+        );
+        assert!(messages[..3].iter().all(|m| m.injected && m.role == "user"));
+        assert!(messages.iter().any(|m| {
+            m.role == "system"
+                && m.injected
+                && matches!(
+                    m.blocks.first(),
+                    Some(SessionBlock::Event { kind: EventKind::Compaction, text: Some(t), .. })
+                        if t == "[Compacted turns 1]"
+                )
+        }));
+        let tool_call_msg = messages
+            .iter()
+            .find(|m| m.content == "[Tool: bash] cargo test")
+            .unwrap();
+        assert!(matches!(
+            &tool_call_msg.blocks[1],
+            SessionBlock::ToolCall { id, title, .. } if id == "c1" && title == "cargo test"
+        ));
+        let tool_res_msg = messages.iter().find(|m| m.role == "tool").unwrap();
+        assert!(matches!(
+            &tool_res_msg.blocks[0],
+            SessionBlock::ToolResult { call_id, status: ToolStatus::Success, preview, .. }
+                if call_id == "c1" && preview == "test result: ok"
+        ));
+    }
+
+    #[test]
+    fn parses_usage_meta_content_refs_and_legacy_v1_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let v2_path = temp.path().join("session.v4.jsonl");
+        let long_out = "result line\n".repeat(20);
+        let rows = [
+            json!({"type":"session","version":4,"id":"s-meta","createdAt":1000}),
+            json!({"type":"user/message","seq":0,"time":1001,"surfaceOp":"append","data":{"id":"u1","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"Run check"}]}}),
+            json!({"type":"assistant/message","seq":1,"time":1002,"surfaceOp":"append","data":{"durationMs":850,"message":{"id":"a1","source":{"model":"deepseek-chat"},"content":[{"type":"thinking","thinking":"Checking"},{"type":"tool-call","id":"call-9","name":"bash","arguments":"{\"command\":\"cargo test\"}"}]},"usage":{"inputTokens":120,"outputTokens":30,"cacheReadTokens":40,"cacheWriteTokens":10,"reasoningTokens":8}}}),
+            json!({"type":"tool/result","seq":2,"time":1003,"surfaceOp":"append","data":{"message":{"id":"r1","role":"tool","toolCallId":"call-9","isError":true,"content":[{"type":"text","text":long_out}]}}}),
+        ];
+        let raw_bytes: Vec<u8> = rows
+            .iter()
+            .map(|r| format!("{r}\n"))
+            .collect::<String>()
+            .into_bytes();
+        fs::write(&v2_path, &raw_bytes).unwrap();
+
+        let msgs = load_messages(&v2_path).unwrap();
+        assert_eq!(msgs.len(), 3);
+        let meta = msgs[1].meta.as_ref().unwrap();
+        assert_eq!(meta.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(meta.input_tokens, Some(120));
+        assert_eq!(meta.output_tokens, Some(30));
+        assert_eq!(meta.cache_read_tokens, Some(40));
+        assert_eq!(meta.cache_write_tokens, Some(10));
+        assert_eq!(meta.reasoning_tokens, Some(8));
+        assert_eq!(meta.duration_ms, Some(850));
+
+        match &msgs[2].blocks[0] {
+            SessionBlock::ToolResult {
+                call_id,
+                status: ToolStatus::Error,
+                truncated: true,
+                full:
+                    Some(ContentRef::Jsonl {
+                        offset,
+                        len,
+                        pointer,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(call_id, "call-9");
+                assert_eq!(pointer, "/data/message/content");
+                let sliced: Value = serde_json::from_slice(
+                    &raw_bytes[*offset as usize..*offset as usize + *len as usize],
+                )
+                .unwrap();
+                assert!(sliced.pointer(pointer).is_some());
+            }
+            other => panic!("expected truncated ToolResult with Jsonl ref, got {other:?}"),
+        }
+
+        // Legacy v1 role-based fallback
+        let v1_path = temp.path().join("legacy.jsonl");
+        fs::write(
+            &v1_path,
+            concat!(
+                "{\"role\":\"user\",\"content\":\"v1 hello\"}\n",
+                "{\"role\":\"assistant\",\"model\":\"deepseek-v1\",\"reasoning_content\":\"think\",\"content\":\"v1 world\"}\n"
+            ),
+        )
+        .unwrap();
+        let v1_msgs = load_messages(&v1_path).unwrap();
+        assert_eq!(v1_msgs.len(), 2);
+        assert_eq!(v1_msgs[0].content, "v1 hello");
+        assert_eq!(v1_msgs[1].content, "v1 world");
+        assert_eq!(
+            v1_msgs[1].meta.as_ref().unwrap().model.as_deref(),
+            Some("deepseek-v1")
         );
     }
 
