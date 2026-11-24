@@ -74,6 +74,12 @@ html {
   overscroll-behavior: none;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   @apply m-0 p-0 text-sm;
   background-color: hsl(var(--shell-bg));
