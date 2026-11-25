@@ -10,7 +10,7 @@
 :root{
   --bg:#0b0e14;--bg2:#131822;--card:#171d29;--border:#252d3d;
   --text:#eef2f9;--muted:#94a0b8;--accent:#5b8cff;--accent2:#8b5bff;
-  --radius:14px;
+  --green:#34d399;--radius:14px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:76px}
@@ -39,12 +39,13 @@ a{color:var(--accent);text-decoration:none}
   background-size:44px 44px;
   mask-image:radial-gradient(ellipse 90% 60% at 50% 0%,#000 30%,transparent 75%);
   -webkit-mask-image:radial-gradient(ellipse 90% 60% at 50% 0%,#000 30%,transparent 75%)}
-main,header,footer,.wrap{position:relative;z-index:1}
+main,header,footer,.wrap,.stage-wrap{position:relative;z-index:1}
 
 /* 顶部导航 */
 header{position:sticky;top:0;border-bottom:1px solid transparent;transition:.25s;z-index:50}
 header.scrolled{background:rgba(11,14,20,.84);backdrop-filter:blur(12px);border-bottom-color:var(--border);box-shadow:0 6px 30px rgba(0,0,0,.38)}
 .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+.stage-wrap{max-width:1320px;margin:0 auto;padding:0 20px}
 .nav{display:flex;align-items:center;justify-content:space-between;height:64px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;color:var(--text)}
 .brand img{width:28px;height:28px;border-radius:7px;transition:transform .35s}
@@ -55,7 +56,7 @@ header.scrolled{background:rgba(11,14,20,.84);backdrop-filter:blur(12px);border-
 .nav-links a.active{color:var(--accent);background:rgba(91,140,255,.15)}
 
 /* Hero */
-.hero{text-align:center;padding:64px 0 24px}
+.hero{text-align:center;padding:64px 0 28px}
 .hero-icon{width:92px;height:92px;border-radius:22px;box-shadow:0 10px 44px rgba(91,140,255,.35);animation:float 5s ease-in-out infinite;display:inline-block}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-9px)}}
 .hero h1{font-size:40px;margin:20px 0 6px;letter-spacing:.4px;font-weight:800;
@@ -84,16 +85,17 @@ header.scrolled{background:rgba(11,14,20,.84);backdrop-filter:blur(12px);border-
 .stat .num{font-size:30px;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
 .stat .lbl{font-size:13px;color:var(--muted);margin-top:3px}
 
-/* 界面图片展示 */
-.shot{margin:40px 0 10px;perspective:1200px}
-.shot-toolbar{display:flex;justify-content:center;gap:8px;margin-bottom:14px}
-.shot-tab{appearance:none;border:1px solid var(--border);background:rgba(19,24,34,.85);color:var(--muted);padding:6px 14px;border-radius:999px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
-.shot-tab:hover{color:var(--text);border-color:rgba(91,140,255,.45)}
-.shot-tab.active{color:#fff;border-color:rgba(91,140,255,.6);background:rgba(91,140,255,.18)}
-.shot .frame{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.52);transition:transform .5s,box-shadow .5s;transform-style:preserve-3d;background:#0d1017}
-.shot:hover .frame{box-shadow:0 30px 90px rgba(91,140,255,.22)}
-.shot img{width:100%;display:block}
-.shot figcaption{text-align:center;color:var(--muted);font-size:13.5px;margin-top:14px}
+/* 1:1 真实前端内嵌交互舞台 */
+.demo-section{padding:26px 0 12px}
+.demo-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding:10px 16px;border:1px solid var(--border);border-radius:12px;background:rgba(19,24,34,.85);backdrop-filter:blur(8px)}
+.demo-bar-left{display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--muted)}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);flex:none}
+.demo-bar-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.mini-btn{appearance:none;border:1px solid var(--border);background:rgba(23,29,41,.95);color:var(--text);font-size:12.5px;font-weight:600;padding:6px 12px;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:.2s}
+.mini-btn:hover{border-color:var(--accent);color:#fff;background:rgba(91,140,255,.16)}
+.demo-frame-shell{border:1px solid rgba(91,140,255,.32);border-radius:14px;overflow:hidden;background:#0d1017;box-shadow:0 28px 80px rgba(0,0,0,.62),0 0 0 1px rgba(255,255,255,.03)}
+.demo-iframe{width:100%;height:780px;border:0;display:block;background:#0d1017}
+.demo-caption{text-align:center;color:var(--muted);font-size:13px;margin-top:12px}
 
 /* 功能与支持列表 */
 section.blocks{padding:64px 0 8px}
@@ -129,6 +131,7 @@ footer .links a:hover{color:var(--text)}
   .grid{grid-template-columns:1fr}
   .hero h1{font-size:30px}
   .stats{grid-template-columns:repeat(2,1fr)}
+  .demo-iframe{height:680px}
 }
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -150,10 +153,10 @@ footer .links a:hover{color:var(--text)}
       <span>Agent会话管理</span>
     </a>
     <nav class="nav-links">
-      <a href="#preview" class="active">界面预览</a>
+      <a href="#live-demo" class="active">1:1 交互体验</a>
       <a href="#features">核心特性</a>
       <a href="#agents">支持 Agent</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">下载安装</a>
+      <a href="./demo/" target="_blank">全屏桌面版 ↗</a>
     </nav>
   </div>
 </header>
@@ -171,6 +174,7 @@ footer .links a:hover{color:var(--text)}
     </div>
     <div class="btns">
       <a class="btn btn-primary" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">⬇️ 下载安装包 (v1.8.1)</a>
+      <a class="btn btn-ghost" href="./demo/" target="_blank" rel="noopener noreferrer">🖥️ 全屏打开 1:1 交互页面</a>
       <a class="btn btn-ghost" href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">⭐ GitHub 仓库</a>
     </div>
 
@@ -181,18 +185,35 @@ footer .links a:hover{color:var(--text)}
       <div class="stat"><div class="num" data-count="100" data-suffix="%">0</div><div class="lbl">纯本地离线隐私</div></div>
     </div>
   </section>
+</div>
 
-  <figure class="shot reveal" id="preview">
-    <div class="shot-toolbar">
-      <button type="button" class="shot-tab active" data-shot="./main-window-dark.png">🌙 暗色模式</button>
-      <button type="button" class="shot-tab" data-shot="./main-window-light.png">☀️ 亮色模式</button>
+<section class="demo-section" id="live-demo">
+  <div class="stage-wrap">
+    <div class="demo-bar reveal">
+      <div class="demo-bar-left">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span><strong style="color:var(--text)">1:1 真实前端在线交互窗口</strong> — 并非静态截图！可直接切换会话、拖拽分栏、开启「📄 正文」搜索、展开思维链与 Diff、切换亮暗主题或导出 .md</span>
+      </div>
+      <div class="demo-bar-actions">
+        <button type="button" class="mini-btn" id="resetDemoBtn">↺ 重置演示数据</button>
+        <a class="mini-btn" href="./demo/?theme=light" target="_blank" rel="noopener noreferrer">☀️ 亮色全屏</a>
+        <a class="mini-btn" href="./demo/?theme=dark" target="_blank" rel="noopener noreferrer">🌙 暗色全屏 ↗</a>
+      </div>
     </div>
-    <div class="frame" id="shotFrame">
-      <img id="shotImg" src="./main-window-dark.png" alt="Agent会话管理 v1.8.1 主界面截图">
+    <div class="demo-frame-shell reveal">
+      <iframe
+        id="demoFrame"
+        class="demo-iframe"
+        src="./demo/"
+        title="Agent会话管理 v1.8.1 1:1 在线交互预览"
+        allow="clipboard-read; clipboard-write; fullscreen"
+      ></iframe>
     </div>
-    <figcaption>左侧按 Agent / 项目 / 时间分组检索，中间轮次缩略导航，右侧两段式思维链、步骤合并与内联行号 Diff 阅读器</figcaption>
-  </figure>
+    <p class="demo-caption">提示：上方窗口由本项目真实 React 渲染层 1:1 编译驱动（内置 13 种 Agent 模拟会话数据）；试试点击 Codex 会话查看置顶报错步骤，或点击 Claude 时序图体验图片灯箱。</p>
+  </div>
+</section>
 
+<div class="wrap">
   <section class="blocks" id="features">
     <h2 class="sec reveal">核心特性</h2>
     <p class="sec-sub reveal">保留顺手的左右可拖拽分栏工作台，深度融合结构化对话阅读与本机安全治理</p>
@@ -234,6 +255,7 @@ footer .links a:hover{color:var(--text)}
     <div class="links">
       <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub 仓库</a> ·
       <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">下载安装包</a> ·
+      <a href="./demo/" target="_blank" rel="noopener noreferrer">全屏 1:1 交互桌面</a> ·
       <a href="https://github.com/zhuchongba-01/AgentSessionManager/issues" target="_blank" rel="noopener noreferrer">问题反馈</a>
     </div>
     <div>MIT License · v1.8.1 发版前 166 项前端单元测试 + 407 项 Rust 单元测试全部通过</div>
@@ -286,24 +308,16 @@ footer .links a:hover{color:var(--text)}
     });
   });
 
-  var shotImg = document.getElementById('shotImg');
-  var shotTabs = document.querySelectorAll('.shot-tab');
-  shotTabs.forEach(function(btn){
-    btn.addEventListener('click', function(){
-      shotTabs.forEach(function(b){ b.classList.remove('active'); });
-      btn.classList.add('active');
-      if (shotImg) shotImg.src = btn.dataset.shot;
+  var resetBtn = document.getElementById('resetDemoBtn');
+  var demoFrame = document.getElementById('demoFrame');
+  if (resetBtn && demoFrame) {
+    resetBtn.addEventListener('click', function(){
+      if (demoFrame.contentWindow) {
+        demoFrame.contentWindow.postMessage('asm-demo-reset', '*');
+      } else {
+        demoFrame.src = './demo/';
+      }
     });
-  });
-
-  var frame = document.getElementById('shotFrame');
-  if (frame && !reduce) {
-    frame.addEventListener('mousemove', function(ev){
-      var r = frame.getBoundingClientRect();
-      var rx = ((ev.clientY - r.top) / r.height - .5) * -4, ry = ((ev.clientX - r.left) / r.width - .5) * 4;
-      frame.style.transform = 'rotateX(' + rx + 'deg) rotateY(' + ry + 'deg)';
-    });
-    frame.addEventListener('mouseleave', function(){ frame.style.transform = ''; });
   }
 
   var links = document.querySelectorAll('.nav-links a[href^="#"]');
@@ -314,7 +328,7 @@ footer .links a:hover{color:var(--text)}
       }
     });
   }, {rootMargin:'-35% 0px -55% 0px'});
-  ['preview','features','agents'].forEach(function(id){ var s = document.getElementById(id); if (s) spy.observe(s); });
+  ['live-demo','features','agents'].forEach(function(id){ var s = document.getElementById(id); if (s) spy.observe(s); });
 
   var toTop = document.getElementById('toTop');
   addEventListener('scroll', function(){ toTop.classList.toggle('show', scrollY > 600); }, {passive:true});
