@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="src-tauri/icons/icon.png" width="112" alt="Agent会话管理图标"/>
+<img src="src-tauri/icons/icon.png" width="128" alt="Agent会话管理图标"/>
 
 # Agent会话管理
 
@@ -9,67 +9,20 @@
 <sub>Standalone desktop session manager for local coding agents — browse, full-text search, inspect chain-of-thought & diffs, export Markdown, and safely clean up Codex, Claude Code, Gemini CLI, GitHub Copilot, DeepSeek Harness, WorkBuddy, CodeBuddy, Kimi CLI, OpenClaw, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
 [![Release](https://img.shields.io/github/v/release/zhuchongba-01/AgentSessionManager?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
-[![Live Demo](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E4%BD%93%E9%AA%8C-1%3A1%20%E7%9C%9F%E5%AE%9E%E4%BA%A4%E4%BA%92%E9%A1%B5%E9%9D%A2-5b8cff?style=flat-square)](http://www.zgrnf.dpdns.org/demo/)
-[![Website](https://img.shields.io/badge/%E9%A1%B9%E7%9B%AE%E5%AE%98%E7%BD%91-%E5%86%85%E5%B5%8C%E4%BA%A4%E4%BA%92%E9%A2%84%E8%A7%88-8b5bff?style=flat-square)](http://www.zgrnf.dpdns.org/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20amd64-blue?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
 
 <br/>
 
-<h3>
-  🖥️ <a href="http://www.zgrnf.dpdns.org/demo/">点击下方界面或此处，直接进入 1:1 在线可交互桌面 →</a>
-  &nbsp;&nbsp;|&nbsp;&nbsp;
-  🌐 <a href="http://www.zgrnf.dpdns.org/">访问项目官网（内嵌 1:1 交互窗口） →</a>
-</h3>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png" />
+  <img src="docs/images/main-window-dark.png" alt="Agent会话管理主界面" width="100%" />
+</picture>
 
-<a href="http://www.zgrnf.dpdns.org/demo/" title="点击打开 Agent会话管理 v1.8.1 1:1 在线交互桌面">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window-dark.png" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png" />
-    <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.1 真实界面（点击进入 1:1 在线交互体验）" width="100%" />
-  </picture>
-</a>
-
-<sub>👆 上图随你的 GitHub 亮/暗外观自动切换；<b>点击图片即可在浏览器中 1:1 真实交互操作</b>（拖拽分栏、开启「📄 正文」全文搜索、展开两段式思维链与内联 Diff、查看图片灯箱、切换主题及导出 .md）。</sub>
+*主界面（随 GitHub 亮 / 暗外观自动切换）：左侧按 Agent / 项目 / 时间分组的会话列表（支持跨会话正文 FTS5 检索与状态快筛），中间轮次缩略导航，右侧两段式思维链、步骤合并、内联行号 Diff 阅读器与操作面板。*
 
 </div>
-
----
-
-## 🧭 核心架构与数据流（支持右上角交互缩放 / 拖拽）
-
-```mermaid
-flowchart LR
-  subgraph Agents["13 种本地 Agent 原始存储（只读解析，零格式侵入）"]
-    A1["Claude Code / WorkBuddy / CodeBuddy<br/>JSONL · SQLite · Rollback 边车"]
-    A2["Codex / Grok Build / DeepSeek<br/>Rollout JSONL · Zstd · SQLite"]
-    A3["OpenCode / ZCode / Pi / OpenClaw<br/>SQLite WAL · DAG · JSON"]
-    A4["Gemini CLI / Copilot / Kimi<br/>Chats JSONL · Events · Wire"]
-  end
-
-  subgraph Engine["Rust 本机核心引擎（Tauri v2）"]
-    B1["结构化 SessionBlock 解析器<br/>Text · Thinking · ToolCall · Diff · Image · Event"]
-    B2["ContentRef 按需分页读取<br/>单块最高 2 MB 流式拉取"]
-    B3["SQLite FTS5 全文检索引擎<br/>INDEX_VERSION = 2 纯正文索引"]
-    B4["深度安全清理与守护<br/>进程守卫 · 符号链接防越界 · 父子级联日志"]
-    B5["原生系统交互桥接<br/>独立 STA 另存为窗口 · 资源管理器定位"]
-  end
-
-  subgraph UI["分栏桌面交互界面（React + Virtualizer）"]
-    C1["左侧导航台<br/>Agent / 目录 / 时间三视图 + 摘录直达"]
-    C2["右侧结构化阅读器<br/>两段式思维链 · 步骤合并 · 内联 Diff"]
-    C3["视图控制与导出<br/>全部/对话/改动 · 隐藏工具/思考 · 导出 .md"]
-  end
-
-  Agents --> B1
-  B1 --> B2
-  B1 --> B3
-  B1 --> C1
-  B2 --> C2
-  B3 --> C1
-  B4 --> C1
-  C3 --> B5
-```
 
 ---
 
@@ -88,6 +41,43 @@ flowchart LR
   - 对话中的本地路径自动渲染为 **`[📄 相对路径 | 📂]`** 胶囊，支持一键复制路径或在系统文件管理器中精准定位（支持 `~` 展开、剥离 `:行号` 后缀及已删子路径回退父目录）；支持一键复制包含工作目录切换的跨平台会话恢复命令。
 - 🧭 **双模会话导航与精致桌面体验**：同时提供左侧轮次缩略导航条（悬停预览问答摘要）与右侧可展开「对话目录」抽屉（按提问/回复/章节跳转），配备无箭头悬浮胶囊滚动条与亮色 / 暗色 / 跟随系统三态主题。
 - 🧹 **深度安全清理**：内置进程运行守卫、NTFS 重解析点 / 符号链接防越界校验、子会话「先子后父」级联清理、50+ 条批量知情核对与崩溃可恢复的待清理日志，绝不触碰用户项目工作目录。详细安全边界见 [SAFETY.md](./SAFETY.md)。
+
+---
+
+## 🧭 核心架构
+
+```mermaid
+flowchart LR
+  subgraph Agents["13 种本地 Agent 原始存储（只读解析，零格式侵入）"]
+    A1["Claude Code / WorkBuddy / CodeBuddy<br/>JSONL · SQLite · Rollback 边车"]
+    A2["Codex / Grok Build / DeepSeek<br/>Rollout JSONL · Zstd · SQLite"]
+    A3["OpenCode / ZCode / Pi / OpenClaw<br/>SQLite WAL · DAG · JSON"]
+    A4["Gemini CLI / Copilot / Kimi<br/>Chats JSONL · Events · Wire"]
+  end
+
+  subgraph Engine["Rust 本机核心引擎（Tauri v2）"]
+    B1["结构化 SessionBlock 解析器<br/>Text · Thinking · ToolCall · Diff · Image · Event"]
+    B2["ContentRef 按需分页读取<br/>单块最高 2 MB 流式拉取"]
+    B3["SQLite FTS5 全文检索引擎<br/>INDEX_VERSION = 2 纯正文索引"]
+    B4["深度安全清理与守护<br/>进程守卫 · 符号链接防越界 · 父子级联日志"]
+    B5["原生系统交互桥接<br/>独立 STA 另存为窗口 · 资源管理器定位"]
+  end
+
+  subgraph UI["分栏桌面界面（React + Virtualizer）"]
+    C1["左侧导航台<br/>Agent / 目录 / 时间三视图 + 摘录直达"]
+    C2["右侧结构化阅读器<br/>两段式思维链 · 步骤合并 · 内联 Diff"]
+    C3["视图控制与导出<br/>全部/对话/改动 · 隐藏工具/思考 · 导出 .md"]
+  end
+
+  Agents --> B1
+  B1 --> B2
+  B1 --> B3
+  B1 --> C1
+  B2 --> C2
+  B3 --> C1
+  B4 --> C1
+  C3 --> B5
+```
 
 ---
 
