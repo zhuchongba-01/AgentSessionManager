@@ -9,8 +9,20 @@
 <sub>Standalone desktop session manager for local coding agents — browse, full-text search, inspect chain-of-thought & diffs, export Markdown, and safely clean up Codex, Claude Code, Gemini CLI, GitHub Copilot, DeepSeek Harness, WorkBuddy, CodeBuddy, Kimi CLI, OpenClaw, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
 [![Release](https://img.shields.io/github/v/release/zhuchongba-01/AgentSessionManager?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
+[![Live Demo](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E4%BD%93%E9%AA%8C-1%3A1%20%E7%9C%9F%E5%AE%9E%E4%BA%A4%E4%BA%92%E9%A1%B5%E9%9D%A2-5b8cff?style=flat-square)](http://www.zgrnf.dpdns.org/demo/)
+[![Website](https://img.shields.io/badge/%E9%A1%B9%E7%9B%AE%E5%AE%98%E7%BD%91-%E5%86%85%E5%B5%8C%E4%BA%A4%E4%BA%92%E9%A2%84%E8%A7%88-8b5bff?style=flat-square)](http://www.zgrnf.dpdns.org/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20amd64-blue?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
+
+<br/>
+
+<h3>
+  🖥️ <a href="http://www.zgrnf.dpdns.org/demo/">点击进入 1:1 真实前端在线交互桌面 →</a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  🌐 <a href="http://www.zgrnf.dpdns.org/">访问项目官网（内嵌 1:1 交互窗口） →</a>
+</h3>
+
+<sub>无需下载安装，由本项目真实 React 渲染源码 1:1 编译驱动（内置全部 13 种 Agent 模拟会话，可在浏览器中直接拖拽分栏、开启「📄 正文」全文搜索、展开两段式思维链与内联 Diff、打开图片灯箱、切换亮暗主题及导出 .md）。</sub>
 
 </div>
 
