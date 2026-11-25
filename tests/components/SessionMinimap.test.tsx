@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { SessionMinimap } from "@/components/sessions/SessionMinimap";
+import { buildUserMessageToc } from "@/components/sessions/utils";
 import type { SessionMessage } from "@/types";
 
 const buildConversation = (turnCount: number) => {
@@ -164,5 +165,69 @@ describe("SessionMinimap", () => {
     );
 
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("extracts hover previews from structured blocks when wire content is empty and skips tool_result user messages", () => {
+    const messages: SessionMessage[] = [
+      {
+        role: "user",
+        content: "",
+        blocks: [{ type: "text", text: "结构化提问：修复滚动条样式" }],
+      },
+      {
+        role: "assistant",
+        content: "",
+        blocks: [
+          {
+            type: "tool_call",
+            id: "call-1",
+            rawName: "Read",
+            kind: "read",
+            title: "src/index.css",
+            inputPreview: "{}",
+            inputTotalLen: 2,
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: "",
+        blocks: [
+          {
+            type: "tool_result",
+            callId: "call-1",
+            status: "success",
+            preview: ".asm-list-scroll {}",
+            totalLen: 19,
+            lineCount: 1,
+            truncated: false,
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: "",
+        blocks: [{ type: "text", text: "已升级为悬浮胶囊滚动条。" }],
+      },
+    ];
+
+    const toc = buildUserMessageToc(messages, false);
+    expect(toc).toHaveLength(1);
+    expect(toc[0]?.index).toBe(0);
+
+    render(
+      <SessionMinimap
+        messages={messages}
+        messageIndexes={toc.map((entry) => entry.index)}
+        visibleMessageIndexes={[0, 3]}
+        onTickClick={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    fireEvent.mouseEnter(screen.getByRole("button"));
+    const tooltip = screen.getByRole("tooltip");
+    expect(tooltip).toHaveTextContent("结构化提问：修复滚动条样式");
+    expect(tooltip).toHaveTextContent("已升级为悬浮胶囊滚动条。");
   });
 });

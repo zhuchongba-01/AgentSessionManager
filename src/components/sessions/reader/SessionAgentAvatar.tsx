@@ -1,8 +1,12 @@
 import { memo } from "react";
 
-import { AppGlyph } from "@/components/shell/AppGlyph";
 import type { SessionMessage } from "@/types";
-import { formatMessageTime, isSessionAppId } from "../utils";
+import { AgentIcon } from "../AgentIcon";
+import {
+  formatMessageTime,
+  getProviderIconName,
+  isSessionAppId,
+} from "../utils";
 import { useReaderContext } from "./context";
 import type { SessionTurn } from "./turns";
 
@@ -21,7 +25,12 @@ export const SessionAgentAvatar = memo(function SessionAgentAvatar() {
       className="inline-flex h-7 w-7 shrink-0 select-none items-center justify-center rounded-full border border-border bg-surface"
     >
       {known ? (
-        <AppGlyph app={known} size={16} badgeClassName="bg-surface" />
+        <AgentIcon
+          icon={getProviderIconName(known)}
+          name={appName || known}
+          size={16}
+          className="bg-surface"
+        />
       ) : (
         <span className="font-mono text-caption font-semibold leading-none text-[var(--reader-accent)]">
           {fallback}

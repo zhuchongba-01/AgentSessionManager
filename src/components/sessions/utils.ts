@@ -424,6 +424,16 @@ export const groupSessionsByProviderAndDirectory = (
   return providerGroups;
 };
 
+export const extractMessagePlainText = (message: SessionMessage): string => {
+  if (message.blocks && message.blocks.length > 0) {
+    const joined = message.blocks
+      .flatMap((block) => (block.type === "text" ? [block.text] : []))
+      .join("\n\n");
+    if (joined) return joined;
+  }
+  return message.content ?? "";
+};
+
 export const shouldHideCodexMessageFromToc = (content: string) => {
   const trimmed = content.trim();
   return (
@@ -445,7 +455,11 @@ export const getVisibleSessionMessages = (
     if (role === "thinking") return true;
     if (message.blocks?.some((block) => block.type === "event")) return true;
     if (role === "developer" || role === "system") return false;
-    return !(role === "user" && shouldHideCodexMessageFromToc(message.content));
+    if (role === "user") {
+      if (message.injected) return false;
+      return !shouldHideCodexMessageFromToc(extractMessagePlainText(message));
+    }
+    return true;
   });
 };
 
@@ -474,10 +488,20 @@ export const buildUserMessageToc = (
 ): UserMessageTocEntry[] => {
   const entries: UserMessageTocEntry[] = [];
   visibleMessages.forEach((message, index) => {
-    if (message.role.toLowerCase() !== "user") return;
+    if (message.role.toLowerCase() !== "user" || message.injected) return;
+    if (message.blocks && message.blocks.length > 0) {
+      const hasQuestionBlock = message.blocks.some(
+        (block) =>
+          (block.type === "text" && block.text.trim().length > 0) ||
+          block.type === "image",
+      );
+      if (!hasQuestionBlock) return;
+    }
+    const rawText = extractMessagePlainText(message);
+    if (isCodexSession && shouldHideCodexMessageFromToc(rawText)) return;
     const previewContent = isCodexSession
-      ? extractCodexPromptPreview(message.content)
-      : message.content;
+      ? extractCodexPromptPreview(rawText)
+      : rawText;
     entries.push({
       index,
       preview: formatSessionMessagePreview(previewContent),

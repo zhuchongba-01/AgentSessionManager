@@ -4,6 +4,7 @@ import { ChevronRight, ExternalLink } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import type { EventBlock, SessionMessage } from "@/types";
+import { extractErrorMessage } from "@/utils/errorUtils";
 import { highlightQueryText as highlightText } from "../utils";
 import { useReaderContext } from "./context";
 import { READER_DEFAULTS, useReaderT } from "./i18n";
@@ -115,14 +116,19 @@ const LinkButton = ({
   children: ReactNode;
 }) => {
   const rt = useReaderT();
+  const { onOpenUrl } = useReaderContext();
   return (
     <button
       type="button"
       title={url}
       aria-label={rt("link.openExternal", { url })}
       onClick={() => {
+        if (onOpenUrl) {
+          onOpenUrl(url);
+          return;
+        }
         openSessionLink(url).catch((error: unknown) =>
-          toast.error(error instanceof Error ? error.message : String(error)),
+          toast.error(extractErrorMessage(error)),
         );
       }}
       className="inline-flex items-center gap-1 rounded-[2px] text-action-text underline-offset-[3px] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"

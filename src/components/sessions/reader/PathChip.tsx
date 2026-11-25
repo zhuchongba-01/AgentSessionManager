@@ -7,7 +7,9 @@ import { sessionsApi } from "@/lib/api/sessions";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { extractErrorMessage } from "@/utils/errorUtils";
 import { highlightQueryText as highlightText } from "../utils";
+import { useReaderContext } from "./context";
 
 const MAX_DISPLAY_LENGTH = 48;
 
@@ -41,6 +43,7 @@ export const resolveRevealTargetPath = (
   const clean = stripPathLocationSuffix(fileUrlToPath(rawPath).trim());
   if (!clean) return rawPath;
   const isAbsolute =
+    clean === "~" ||
     clean.startsWith("/") ||
     clean.startsWith("~/") ||
     clean.startsWith("~\\") ||
@@ -115,9 +118,13 @@ export const PathChip = memo(function PathChip({
   className,
 }: PathChipProps) {
   const { t } = useTranslation();
+  const ctx = useReaderContext();
+  const effectiveProjectDir = projectDir ?? ctx.projectDir;
+  const effectiveSearchQuery = searchQuery ?? ctx.searchQuery;
+  const effectiveReveal = onReveal ?? ctx.onRevealPath;
   const localPath = fileUrlToPath(path);
-  const revealTarget = resolveRevealTargetPath(localPath, projectDir);
-  const display = shortenPath(localPath, projectDir);
+  const revealTarget = resolveRevealTargetPath(localPath, effectiveProjectDir);
+  const display = shortenPath(localPath, effectiveProjectDir);
 
   const handleCopy = useCallback(async () => {
     const ok = await copyText(localPath);
@@ -134,23 +141,21 @@ export const PathChip = memo(function PathChip({
   }, [localPath, t]);
 
   const handleReveal = useCallback(async () => {
-    if (onReveal) {
-      onReveal(revealTarget);
+    if (effectiveReveal) {
+      effectiveReveal(revealTarget);
       return;
     }
     try {
       await revealSessionPath(revealTarget);
     } catch (error) {
       toast.error(
-        error instanceof Error && error.message
-          ? error.message
-          : t("sessionManager.revealFailed", {
-              defaultValue: "无法在文件管理器中定位",
-              error: String(error),
-            }),
+        t("sessionManager.revealFailed", {
+          defaultValue: "无法在文件管理器中定位：{{error}}",
+          error: extractErrorMessage(error),
+        }),
       );
     }
-  }, [onReveal, revealTarget, t]);
+  }, [effectiveReveal, revealTarget, t]);
 
   const copyLabel = t("sessionManager.reader.path.copy", {
     defaultValue: "复制路径",
@@ -177,7 +182,9 @@ export const PathChip = memo(function PathChip({
         <FileText aria-hidden className="size-3 shrink-0 text-fg-3" />
         <span className="truncate">
           {label ??
-            (searchQuery ? highlightText(display, searchQuery) : display)}
+            (effectiveSearchQuery
+              ? highlightText(display, effectiveSearchQuery)
+              : display)}
         </span>
       </button>
       <HoverTip content={revealLabel}>

@@ -1,4 +1,3 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink as ExternalLinkIcon } from "lucide-react";
 import {
   createContext,
@@ -12,9 +11,12 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 
+import { sessionsApi } from "@/lib/api/sessions";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { extractErrorMessage } from "@/utils/errorUtils";
 import { highlightQueryText as highlightText } from "../utils";
+import { useReaderContext } from "./context";
 import { fileUrlToPath, PathChip, shortenPath } from "./PathChip";
 import {
   SESSION_INLINE_CODE_CLASS,
@@ -326,13 +328,13 @@ export const SessionPlainText = memo(function SessionPlainText({
 // 外部链接打开与交互 Context
 // ---------------------------------------------------------------------------
 
-/** 外链安全打开：仅允许 http: / https: / mailto: 协议，交由 @tauri-apps/plugin-opener 打开 */
+/** 外链安全打开：仅允许 http: / https: / mailto: 协议，交由后端 `open_external_url` 打开 */
 export const openSessionLink = async (url: string): Promise<void> => {
   const safe = safeExternalUrl(url);
   if (!safe) {
     throw new Error("仅允许打开 HTTP / HTTPS / mailto 链接");
   }
-  await openUrl(safe);
+  await sessionsApi.openExternalUrl(safe);
 };
 
 interface MarkdownActions {
@@ -344,9 +346,7 @@ interface MarkdownActions {
 
 const defaultOpenLink = (url: string) => {
   openSessionLink(url).catch((error: unknown) => {
-    toast.error(
-      error instanceof Error && error.message ? error.message : String(error),
-    );
+    toast.error(extractErrorMessage(error));
   });
 };
 
@@ -430,8 +430,7 @@ const RemoteImage = ({
   searchQuery?: string;
 }) => {
   const { t } = useTranslation();
-  const { autoLoadRemoteImages } = useContext(MarkdownActionsContext);
-  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
+  const { openLink, autoLoadRemoteImages } = useContext(MarkdownActionsContext);
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
 
   const label =
@@ -440,13 +439,7 @@ const RemoteImage = ({
       defaultValue: "远程图片",
     });
 
-  if (failedSrc === src) {
-    return (
-      <ExternalLink url={src}>{renderText(label, searchQuery)}</ExternalLink>
-    );
-  }
-
-  if (autoLoadRemoteImages || loadedSrc === src) {
+  if (autoLoadRemoteImages && failedSrc !== src) {
     return (
       <img
         src={src}
@@ -461,21 +454,22 @@ const RemoteImage = ({
     );
   }
 
-  const loadLabel = t("sessionManager.reader.image.loadRemote", {
-    defaultValue: "加载远程图片",
+  const openLabel = t("sessionManager.reader.image.openRemote", {
+    defaultValue: "在浏览器中打开远程图片",
   });
   return (
     <button
       type="button"
       title={src}
-      aria-label={`${loadLabel}: ${label}`}
-      onClick={() => setLoadedSrc(src)}
-      className="my-2 flex max-w-full flex-col items-start rounded-[8px] border border-dashed border-border-strong bg-subtle px-3 py-2 text-left text-caption text-fg-2 transition-colors hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      aria-label={`${openLabel}: ${label}`}
+      onClick={() => openLink(src)}
+      className="my-2 inline-flex max-w-full items-center gap-2 rounded-[8px] border border-dashed border-border-strong bg-subtle px-3 py-2 text-left text-caption text-fg-2 transition-colors hover:border-action-text/40 hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
-      <span className="max-w-full truncate font-medium">
+      <span className="min-w-0 truncate font-medium text-action-text">
         {renderText(label, searchQuery)}
       </span>
-      <span className="text-fg-3">{loadLabel}</span>
+      <span className="shrink-0 text-fg-3">{openLabel}</span>
+      <ExternalLinkIcon aria-hidden className="size-3 shrink-0 text-fg-3" />
     </button>
   );
 };
@@ -1692,21 +1686,31 @@ export const SessionMarkdown = memo(function SessionMarkdown({
   renderLocalImage,
   className,
 }: SessionMarkdownProps) {
+  const readerCtx = useReaderContext();
+  const effectiveProjectDir = projectDir ?? readerCtx.projectDir;
+  const effectiveSearchQuery = searchQuery ?? readerCtx.searchQuery;
   const actions = useMemo<MarkdownActions>(
     () => ({
-      openLink: onOpenLink ?? defaultOpenLink,
-      revealPath: onRevealPath,
+      openLink: onOpenLink ?? readerCtx.onOpenUrl ?? defaultOpenLink,
+      revealPath: onRevealPath ?? readerCtx.onRevealPath,
       autoLoadRemoteImages,
       renderLocalImage,
     }),
-    [autoLoadRemoteImages, onOpenLink, onRevealPath, renderLocalImage],
+    [
+      autoLoadRemoteImages,
+      onOpenLink,
+      onRevealPath,
+      readerCtx.onOpenUrl,
+      readerCtx.onRevealPath,
+      renderLocalImage,
+    ],
   );
 
   if (content.length > MARKDOWN_PARSE_LIMIT) {
     return (
       <SessionPlainText
         content={content}
-        searchQuery={searchQuery}
+        searchQuery={effectiveSearchQuery}
         className={cn(VARIANT_CLASS[variant], className)}
       />
     );
@@ -1724,8 +1728,8 @@ export const SessionMarkdown = memo(function SessionMarkdown({
       >
         <MarkdownTree
           content={content}
-          searchQuery={searchQuery}
-          projectDir={projectDir}
+          searchQuery={effectiveSearchQuery}
+          projectDir={effectiveProjectDir}
         />
       </div>
     </MarkdownActionsContext.Provider>

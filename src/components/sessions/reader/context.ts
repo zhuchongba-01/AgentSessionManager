@@ -16,6 +16,8 @@ export interface ReaderContextValue {
   /** 当前高亮词：查找框打开时是查找词，否则是列表搜索词 */
   searchQuery?: string;
   onCopy: (text: string, message: string) => void;
+  onOpenUrl?: (url: string) => void;
+  onRevealPath?: (path: string) => void;
 }
 
 export const ReaderContext = createContext<ReaderContextValue>({

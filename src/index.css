@@ -386,19 +386,19 @@ body {
   outline-offset: -2px;
 }
 
-/* ── 主体工作区：左侧通透导航台 + 可拖拽分隔线 + 右侧内嵌浮动阅读画布 ── */
+/* ── 主体工作区：双栏卡片式工作台 + 可拖拽分隔线 ── */
 .asm-dashboard {
   display: flex;
   min-height: 0;
   flex: 1;
   flex-direction: column;
   gap: 6px;
-  padding: 0 7px 7px 0;
+  padding: 0 8px 8px;
   overflow: hidden;
 }
 
 .asm-banner-wrap {
-  padding: 0 6px 0 12px;
+  padding: 0 4px;
 }
 
 .asm-session-grid {
@@ -428,7 +428,7 @@ body {
 
 .asm-resizer::before {
   content: "";
-  width: 2px;
+  width: 3px;
   height: 36px;
   border-radius: 999px;
   background: hsl(var(--border));
@@ -457,33 +457,45 @@ body {
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  padding-left: 6px;
-  background: transparent;
+  padding: 6px 2px 0;
+  border: 1px solid hsl(var(--border) / 0.8);
+  border-radius: 13px;
+  background: hsl(var(--card) / 0.58);
+  box-shadow: 0 1px 4px hsl(224 30% 10% / 0.025);
+  overflow: hidden;
+}
+
+.dark .asm-list {
+  border-color: hsl(var(--border) / 0.92);
+  background: hsl(var(--card) / 0.42);
+  box-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.025);
 }
 
 .asm-list-toolbar {
   display: flex;
-  min-height: 42px;
+  min-height: 34px;
   flex: none;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 5px;
-  padding: 4px 6px 8px;
+  gap: 4px;
+  padding: 2px 6px 6px;
 }
 
 .asm-agent-filter-trigger {
-  width: auto !important;
-  max-width: 148px;
-  height: 30px !important;
-  gap: 6px !important;
-  padding: 0 10px !important;
+  width: max-content !important;
+  min-width: 0;
+  max-width: 156px;
+  flex: 0 1 auto;
+  height: 28px !important;
+  gap: 5px !important;
+  padding: 0 8.5px !important;
   border: 1px solid hsl(var(--border) / 0.9) !important;
   border-radius: 8px !important;
-  background: hsl(var(--card) / 0.85) !important;
+  background: hsl(var(--card) / 0.9) !important;
   box-shadow: 0 1px 2px hsl(224 25% 10% / 0.04) !important;
   color: hsl(var(--foreground));
-  font-size: 12.5px !important;
-  font-weight: 550 !important;
+  font-size: 12px !important;
+  font-weight: 560 !important;
   transition:
     background 120ms ease,
     border-color 120ms ease;
@@ -533,8 +545,8 @@ body {
 
 .asm-list-view-option {
   height: 22px;
-  min-width: 34px;
-  padding: 0 8px;
+  min-width: 32px;
+  padding: 0 7px;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -584,15 +596,15 @@ body {
 .asm-search {
   display: flex;
   min-width: 0;
-  min-height: 34px;
+  min-height: 33px;
   flex: none;
   align-items: center;
-  gap: 8px;
-  margin: 0 6px 8px;
-  padding: 0 10px;
+  gap: 7px;
+  margin: 0 6px 6px;
+  padding: 0 9px;
   border: 1px solid hsl(var(--border) / 0.95);
-  border-radius: 9px;
-  background: hsl(var(--card) / 0.9);
+  border-radius: 8.5px;
+  background: hsl(var(--background) / 0.88);
   box-shadow: inset 0 1px 1.5px hsl(224 25% 10% / 0.03);
   color: hsl(var(--muted-foreground));
   transition:
@@ -699,27 +711,51 @@ body {
   background: hsl(var(--primary));
 }
 
-/* 状态快捷筛选胶囊 */
-.asm-status-filters {
+/* 状态快捷筛选胶囊 + 右侧折叠分组按钮 */
+.asm-list-filterbar {
   display: flex;
   flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin: 0 6px 6px;
+  min-height: 24px;
+}
+
+.asm-status-filters {
+  display: flex;
+  min-width: 0;
+  flex: 1;
   flex-wrap: wrap;
   align-items: center;
-  gap: 5px;
-  margin: 0 6px 8px;
+  gap: 4px;
+}
+
+.asm-list-fold-btn {
+  width: 24px !important;
+  height: 24px !important;
+  flex: none;
+  margin-left: auto;
+  border-radius: 6px !important;
+  color: hsl(var(--muted-foreground)) !important;
+}
+
+.asm-list-fold-btn:hover {
+  background: hsl(var(--muted) / 0.85) !important;
+  color: hsl(var(--foreground)) !important;
 }
 
 .asm-status-pill {
-  padding: 2px 8.5px;
-  border: 1px solid hsl(var(--border) / 0.9);
+  padding: 1.5px 8px;
+  border: 1px solid hsl(var(--border) / 0.85);
   border-radius: 999px;
-  background: hsl(var(--card) / 0.65);
+  background: hsl(var(--background) / 0.72);
   color: hsl(var(--muted-foreground));
   font: inherit;
   font-size: 11px;
   font-weight: 500;
   font-variant-numeric: tabular-nums;
-  line-height: 1.5;
+  line-height: 1.45;
   cursor: pointer;
   transition:
     background 120ms ease,
@@ -899,15 +935,15 @@ body {
   border-left: 1px solid hsl(var(--border) / 0.85);
 }
 
-/* 会话行：悬浮柔和、选中微浮起卡片质感 */
+/* 会话行：悬浮柔和、选中微浮起卡片质感，带状态徽章时自动两行展示以完整保留标题 */
 .asm-session-item {
   position: relative;
   display: flex;
-  height: 36px;
+  min-height: 34px;
   align-items: center;
   gap: 8px;
-  margin: 1px 0;
-  padding: 0 9px;
+  margin: 1.5px 0;
+  padding: 5px 8px;
   border: 1px solid transparent;
   border-radius: 8px;
   transition:
@@ -916,20 +952,37 @@ body {
     box-shadow 120ms ease;
 }
 
+.asm-session-item.has-badges {
+  align-items: flex-start;
+  padding: 6px 8px;
+}
+
+.asm-session-badges-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding-left: 24px;
+}
+
 .asm-session-item:hover {
-  background: hsl(var(--card) / 0.65);
+  background: hsl(var(--background) / 0.72);
 }
 
 .asm-session-item.is-selected {
-  border-color: hsl(var(--border) / 0.9);
-  background: hsl(var(--card));
+  border-color: hsl(var(--border) / 0.95);
+  background: hsl(var(--background));
   box-shadow:
     0 1px 3px hsl(224 25% 10% / 0.06),
     0 1px 1px hsl(224 25% 10% / 0.03);
 }
 
+.dark .asm-session-item:hover {
+  background: hsl(var(--muted) / 0.5);
+}
+
 .dark .asm-session-item.is-selected {
-  border-color: hsl(var(--primary) / 0.28);
+  border-color: hsl(var(--primary) / 0.32);
   background: hsl(var(--card));
   box-shadow:
     0 2px 6px hsl(225 40% 4% / 0.35),
@@ -953,18 +1006,19 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12.5px;
+  line-height: 1.38;
   color: hsl(var(--foreground) / 0.88);
 }
 
 .asm-session-item.is-selected .asm-session-title {
   color: hsl(var(--foreground));
-  font-weight: 560;
+  font-weight: 570;
 }
 
 .asm-session-time {
   flex: none;
-  font-size: 11px;
+  font-size: 10.5px;
   color: hsl(var(--muted-foreground) / 0.72);
   font-variant-numeric: tabular-nums;
 }
@@ -998,34 +1052,42 @@ body {
 
 .asm-detail-toolbar {
   display: flex;
-  min-height: 44px;
+  min-height: 40px;
   min-width: 0;
   flex: none;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 6px 20px;
-  border-bottom: 1px solid hsl(var(--border) / 0.72);
-  background: hsl(var(--muted) / 0.25);
+  gap: 5px;
+  padding: 5px 18px;
+  border-bottom: 1px solid hsl(var(--border) / 0.7);
+  background: hsl(var(--muted) / 0.22);
+}
+
+.asm-toolbar-divider {
+  width: 1px;
+  height: 15px;
+  flex: none;
+  margin: 0 2px;
+  background: hsl(var(--border) / 0.85);
 }
 
 .asm-detail-breadcrumb {
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
 }
 
 .asm-detail-provider {
   flex: none;
   color: hsl(var(--foreground) / 0.88);
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
 }
 
 .asm-detail-crumb-sep {
   color: hsl(var(--muted-foreground) / 0.42);
-  font-size: 12px;
+  font-size: 11.5px;
   user-select: none;
 }
 
@@ -1035,24 +1097,24 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: hsl(var(--muted-foreground));
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .asm-detail-tool,
 .asm-detail-icon-tool {
   display: inline-flex;
-  height: 28px;
+  height: 26px;
   flex: none;
   align-items: center;
   justify-content: center;
-  gap: 5.5px;
-  padding: 0 9px;
+  gap: 5px;
+  padding: 0 8px;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
   color: hsl(var(--muted-foreground));
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
   white-space: nowrap;
   cursor: pointer;
@@ -1063,20 +1125,32 @@ body {
 }
 
 .asm-detail-icon-tool {
-  width: 28px;
+  width: 26px;
   padding: 0;
+}
+
+.asm-detail-export-btn {
+  border-color: hsl(var(--border) / 0.82);
+  background: hsl(var(--card) / 0.82);
+  color: hsl(var(--foreground) / 0.88);
 }
 
 .asm-detail-tool:hover,
 .asm-detail-icon-tool:hover {
-  border-color: hsl(var(--border) / 0.8);
-  background: hsl(var(--muted) / 0.75);
+  border-color: hsl(var(--border) / 0.9);
+  background: hsl(var(--muted) / 0.8);
   color: hsl(var(--foreground));
+}
+
+.asm-detail-export-btn:hover {
+  border-color: hsl(var(--primary) / 0.42);
+  background: hsl(var(--primary) / 0.09);
+  color: hsl(var(--primary));
 }
 
 .asm-detail-icon-tool.is-active,
 .asm-detail-tool[aria-pressed="true"] {
-  border-color: hsl(var(--primary) / 0.3);
+  border-color: hsl(var(--primary) / 0.32);
   background: hsl(var(--primary) / 0.12);
   color: hsl(var(--primary));
 }
@@ -1084,11 +1158,11 @@ body {
 .asm-detail-head {
   flex: none;
   min-width: 0;
-  padding: 16px 26px 14px;
-  border-bottom: 1px solid hsl(var(--border) / 0.75);
+  padding: 12px 22px 11px;
+  border-bottom: 1px solid hsl(var(--border) / 0.72);
   background: linear-gradient(
     180deg,
-    hsl(var(--muted) / 0.16) 0%,
+    hsl(var(--muted) / 0.14) 0%,
     transparent 100%
   );
 }
@@ -1107,9 +1181,9 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 17.5px;
+  font-size: 16.5px;
   font-weight: 650;
-  letter-spacing: -0.018em;
+  letter-spacing: -0.016em;
   color: hsl(var(--foreground));
 }
 
@@ -1125,7 +1199,7 @@ body {
 
 .asm-delete-btn {
   border: 1px solid hsl(var(--destructive) / 0.24) !important;
-  border-radius: 8px !important;
+  border-radius: 7.5px !important;
   background: hsl(var(--destructive) / 0.06) !important;
   color: hsl(var(--destructive)) !important;
   font-weight: 550 !important;
@@ -1143,8 +1217,8 @@ body {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 8px;
-  margin-top: 10px;
+  gap: 5px 6px;
+  margin-top: 8px;
   min-width: 0;
 }
 
@@ -1153,15 +1227,15 @@ body {
   display: inline-flex;
   min-width: 0;
   max-width: 100%;
-  height: 24px;
+  height: 22px;
   align-items: center;
-  gap: 5px;
-  padding: 0 8px;
+  gap: 4.5px;
+  padding: 0 7.5px;
   border: 1px solid hsl(var(--border) / 0.72);
   border-radius: 6px;
-  background: hsl(var(--muted) / 0.42);
+  background: hsl(var(--muted) / 0.38);
   color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
+  font-size: 11px;
   line-height: 1;
   text-align: left;
   overflow-wrap: anywhere;
@@ -1359,11 +1433,11 @@ button.asm-chip:hover {
 /* ── 对话缩略导航栏（Minimap） ── */
 .asm-minimap {
   display: flex;
-  width: 52px;
+  width: 28px;
   flex: none;
   align-items: center;
   justify-content: center;
-  padding: 12px 4px 12px 14px;
+  padding: 12px 2px 12px 10px;
   overflow: visible;
 }
 
@@ -1425,506 +1499,13 @@ button.asm-chip:hover {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  padding: 24px 30px 36px;
+  padding: 0 24px;
 }
 
 .asm-messages {
   width: 100%;
   max-width: 960px;
   margin: 0 auto;
-}
-
-.asm-message {
-  position: relative;
-  padding: 4px 6px;
-  border-radius: 10px;
-  transition:
-    background 180ms ease,
-    box-shadow 180ms ease;
-}
-
-.asm-message-role {
-  display: flex;
-  min-width: 0;
-  max-width: 100%;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 5px 8px;
-  margin-bottom: 7px;
-  font-size: 11.5px;
-  font-weight: 550;
-  color: hsl(var(--muted-foreground));
-}
-
-.asm-role-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.asm-role-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: hsl(var(--muted-foreground) / 0.45);
-}
-
-.asm-message.is-assistant .asm-role-dot {
-  background: hsl(var(--primary));
-}
-
-.asm-message.is-user .asm-role-dot {
-  background: hsl(var(--primary) / 0.85);
-}
-
-.asm-message.is-thinking .asm-role-dot {
-  background: hsl(var(--thinking-accent));
-}
-
-.asm-message-role .asm-message-ts {
-  font-size: 10.5px;
-  font-weight: 400;
-  color: hsl(var(--muted-foreground) / 0.6);
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-message-role-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin: -4px 0 -4px auto;
-}
-
-.asm-message-raw-toggle {
-  display: inline-flex;
-  height: 23px;
-  align-items: center;
-  gap: 4px;
-  padding: 0 7px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11px;
-  opacity: 0;
-  cursor: pointer;
-  transition:
-    opacity 120ms ease,
-    background 120ms ease,
-    color 120ms ease,
-    border-color 120ms ease;
-}
-
-.asm-message:hover .asm-message-raw-toggle,
-.asm-message:focus-within .asm-message-raw-toggle,
-.asm-message-raw-toggle[aria-pressed="true"] {
-  opacity: 1;
-}
-
-.asm-message-raw-toggle[aria-pressed="true"] {
-  border-color: hsl(var(--border));
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-.asm-message-raw-toggle:hover {
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-.asm-message-copy {
-  display: inline-flex;
-  width: 24px;
-  height: 24px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  margin: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  opacity: 0;
-  cursor: pointer;
-  transition:
-    opacity 120ms ease,
-    color 120ms ease,
-    background 120ms ease;
-}
-
-.asm-message:hover .asm-message-copy,
-.asm-message:focus-within .asm-message-copy {
-  opacity: 1;
-}
-
-.asm-message-copy[aria-busy="true"] {
-  width: auto;
-  max-width: 100%;
-  height: auto;
-  min-height: 24px;
-  gap: 5px;
-  padding: 3px 7px;
-  opacity: 1;
-  font-size: 11.5px;
-  line-height: 1.5;
-  text-align: left;
-  overflow-wrap: anywhere;
-  cursor: progress;
-}
-
-.asm-message-copy svg {
-  flex: none;
-}
-
-.asm-message-copy[aria-busy="true"] span {
-  min-width: 0;
-}
-
-.asm-message-copy:hover {
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-.asm-message-body {
-  min-width: 0;
-  font-size: 14px;
-  line-height: 1.78;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-/* 用户提问：温润微蓝气泡卡片 */
-.asm-message.is-user {
-  display: flex;
-  width: 72%;
-  flex-direction: column;
-  align-items: flex-end;
-  margin-left: auto;
-}
-
-.asm-message.is-user .asm-message-body {
-  display: inline-block;
-  max-width: 100%;
-  padding: 10px 15px;
-  border: 1px solid hsl(var(--primary) / 0.22);
-  border-radius: 15px 15px 4px 15px;
-  background: hsl(var(--primary) / 0.07);
-  box-shadow: 0 1px 2px hsl(224 30% 10% / 0.03);
-  color: hsl(var(--foreground));
-}
-
-.dark .asm-message.is-user .asm-message-body {
-  border-color: hsl(var(--primary) / 0.28);
-  background: hsl(var(--primary) / 0.13);
-}
-
-.asm-message.is-user .asm-message-role {
-  justify-content: flex-end;
-}
-
-.asm-message.is-user .asm-message-role-actions {
-  margin-left: 2px;
-}
-
-.asm-message.is-assistant,
-.asm-message.is-tool {
-  width: 100%;
-}
-
-/* 思考过程：紫靛侧边折叠抽屉 */
-.asm-message.is-thinking {
-  width: 100%;
-  padding: 9px 13px;
-  border: 1px solid hsl(var(--thinking-accent) / 0.22);
-  border-left: 3px solid hsl(var(--thinking-accent) / 0.65);
-  border-radius: 10px;
-  background: hsl(var(--thinking-accent) / 0.045);
-}
-
-.dark .asm-message.is-thinking {
-  border-color: hsl(var(--thinking-accent) / 0.22);
-  border-left-color: hsl(var(--thinking-accent) / 0.72);
-  background: hsl(var(--thinking-accent) / 0.065);
-}
-
-.asm-message.is-thinking .asm-message-body {
-  font-size: 13px;
-  line-height: 1.72;
-  color: hsl(var(--muted-foreground));
-}
-
-.asm-thinking-preview {
-  color: hsl(var(--muted-foreground));
-  font-size: 12.5px;
-  line-height: 1.55;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.asm-thinking-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-top: 7px;
-  padding: 2px 9px;
-  border: 1px solid hsl(var(--thinking-accent) / 0.26);
-  border-radius: 999px;
-  background: hsl(var(--background) / 0.8);
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.5;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease,
-    border-color 120ms ease;
-}
-
-.asm-thinking-toggle:hover {
-  border-color: hsl(var(--thinking-accent) / 0.45);
-  background: hsl(var(--thinking-accent) / 0.1);
-  color: hsl(var(--foreground));
-}
-
-/* 工具调用与输出：紧凑终端框 */
-.asm-message.is-tool .asm-message-body {
-  padding: 8px 12px;
-  border: 1px solid hsl(var(--border) / 0.8);
-  border-left: 3px solid hsl(var(--muted-foreground) / 0.42);
-  border-radius: 8px;
-  background: hsl(var(--muted) / 0.35);
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 12px;
-  line-height: 1.65;
-  tab-size: 4;
-  color: hsl(var(--muted-foreground));
-}
-
-.asm-message.is-tool .asm-message-body.is-tool-preview {
-  mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
-  -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
-}
-
-.asm-tool-fold-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-top: 6px;
-  padding: 2px 9px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 999px;
-  background: hsl(var(--muted) / 0.48);
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.5;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease;
-}
-
-.asm-tool-fold-toggle:hover {
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-/* ── Markdown 与代码块 ── */
-.asm-md {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-  min-width: 0;
-}
-
-.asm-md-p {
-  margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.asm-md-heading {
-  font-weight: 650;
-  letter-spacing: -0.015em;
-  line-height: 1.45;
-  margin-top: 6px;
-}
-
-.asm-md-heading.is-h1 {
-  font-size: 16.5px;
-}
-
-.asm-md-heading.is-h2 {
-  font-size: 15.5px;
-}
-
-.asm-md-heading.is-h3,
-.asm-md-heading.is-h4 {
-  font-size: 14.5px;
-}
-
-.asm-md-hr {
-  border: 0;
-  border-top: 1px solid hsl(var(--border));
-  margin: 4px 0;
-}
-
-.asm-md-quote {
-  margin: 0;
-  padding: 4px 0 4px 13px;
-  border-left: 2.5px solid hsl(var(--primary) / 0.45);
-  color: hsl(var(--muted-foreground));
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.asm-md-list {
-  margin: 0;
-  padding-left: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  list-style: disc;
-}
-
-.asm-md-list.is-ordered {
-  list-style: decimal;
-}
-
-.asm-inline-code {
-  padding: 1.5px 5.5px;
-  border: 1px solid hsl(var(--border) / 0.8);
-  border-radius: 5px;
-  background: hsl(var(--muted) / 0.72);
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 0.87em;
-}
-
-.asm-code-block {
-  border: 1px solid hsl(var(--border));
-  border-radius: 10px;
-  overflow: hidden;
-  background: hsl(var(--muted) / 0.36);
-  box-shadow: 0 1px 2px hsl(224 25% 10% / 0.03);
-  text-align: left;
-}
-
-.dark .asm-code-block {
-  background: hsl(225 22% 7.6%);
-}
-
-.asm-code-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 5px 11px;
-  border-bottom: 1px solid hsl(var(--border) / 0.75);
-  background: hsl(var(--muted) / 0.58);
-}
-
-.dark .asm-code-header {
-  background: hsl(224 18% 11.4%);
-}
-
-.asm-code-lang {
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 11px;
-  font-weight: 500;
-  color: hsl(var(--muted-foreground));
-  text-transform: lowercase;
-}
-
-.asm-code-copy {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 7px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease;
-}
-
-.asm-code-copy:hover {
-  background: hsl(var(--background) / 0.85);
-  color: hsl(var(--foreground));
-}
-
-.asm-code-pre {
-  margin: 0;
-  padding: 11px 13px;
-  overflow-x: auto;
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 12.5px;
-  line-height: 1.62;
-  tab-size: 4;
-  white-space: pre;
-}
-
-.asm-code-truncated {
-  padding: 3px 13px 6px;
-  border-top: 1px dashed hsl(var(--border) / 0.7);
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  line-height: 1.3;
-  user-select: none;
-}
-
-.asm-diff-line {
-  display: block;
-  margin: 0 -13px;
-  padding: 0 13px;
-}
-
-.asm-diff-line.is-add {
-  background: hsl(142 71% 45% / 0.14);
-  color: hsl(142 64% 26%);
-}
-
-.asm-diff-line.is-del {
-  background: hsl(0 72% 51% / 0.14);
-  color: hsl(0 65% 38%);
-}
-
-.asm-diff-line.is-hunk {
-  background: hsl(228 74% 54% / 0.1);
-  color: hsl(228 70% 42%);
-}
-
-.dark .asm-diff-line.is-add {
-  background: hsl(142 70% 45% / 0.16);
-  color: hsl(142 70% 72%);
-}
-
-.dark .asm-diff-line.is-del {
-  background: hsl(0 72% 55% / 0.16);
-  color: hsl(0 82% 76%);
-}
-
-.dark .asm-diff-line.is-hunk {
-  background: hsl(226 86% 67% / 0.14);
-  color: hsl(226 86% 78%);
 }
 
 .asm-search-mark {
@@ -2066,74 +1647,6 @@ button.asm-chip:hover {
   }
 }
 
-.asm-message.is-active {
-  background: hsl(var(--primary) / 0.06);
-  box-shadow: inset 2.5px 0 0 hsl(var(--primary));
-}
-
-.asm-message.is-user.is-active {
-  box-shadow: inset -2.5px 0 0 hsl(var(--primary));
-}
-
-.asm-ide-context {
-  display: flex;
-  width: 100%;
-  margin-top: 6px;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-}
-
-.asm-message.is-user .asm-ide-context {
-  align-items: flex-end;
-}
-
-.asm-ide-context-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 2px 9px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 999px;
-  background: hsl(var(--muted) / 0.55);
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.5;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease,
-    border-color 120ms ease;
-}
-
-.asm-ide-context-toggle:hover {
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-.asm-ide-context-body {
-  width: 100%;
-  max-width: 100%;
-  max-height: 320px;
-  overflow: auto;
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 9px;
-  background: hsl(var(--muted) / 0.45);
-  color: hsl(var(--muted-foreground));
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 12px;
-  line-height: 1.6;
-  text-align: left;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
 @media (max-width: 1050px) {
   .asm-command-bar {
     padding: 0 0 0 12px;
@@ -2147,7 +1660,7 @@ button.asm-chip:hover {
     padding-inline: 14px;
   }
   .asm-detail-head {
-    padding: 14px 18px 12px;
+    padding: 12px 18px 10px;
   }
   .asm-detail-titlerow {
     flex-wrap: wrap;
@@ -2159,35 +1672,16 @@ button.asm-chip:hover {
     margin-left: auto;
   }
   .asm-detail-scroll {
-    padding: 20px;
-  }
-  .asm-message.is-user {
-    width: 82%;
+    padding-inline: 18px;
   }
 }
 
 @media (max-width: 820px) {
   .asm-detail-head {
-    padding-inline: 16px;
+    padding-inline: 14px;
   }
   .asm-detail-scroll {
-    padding-inline: 16px;
-  }
-  .asm-message.is-user {
-    width: 84%;
-  }
-}
-
-@media (max-width: 560px) {
-  .asm-message.is-user {
-    width: 92%;
-  }
-}
-
-@media (hover: none) {
-  .asm-message-copy,
-  .asm-message-raw-toggle {
-    opacity: 0.65;
+    padding-inline: 14px;
   }
 }
 
@@ -2199,47 +1693,105 @@ html.dark {
   filter: invert(1);
 }
 
-.asm-list-scroll,
-.asm-detail-scroll,
-.asm-confirm-details,
-.asm-ide-context-body,
-.asm-code-pre {
-  scrollbar-width: thin;
-  scrollbar-color: hsl(var(--border)) transparent;
+/* ── Antigravity 风格悬浮胶囊滚动条（禁用 WebView2 原生方框与上下箭头） ── */
+.asm-shell *::-webkit-scrollbar,
+[role="dialog"] *::-webkit-scrollbar,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
 }
 
-.asm-list-scroll::-webkit-scrollbar,
-.asm-detail-scroll::-webkit-scrollbar,
-.asm-confirm-details::-webkit-scrollbar,
-.asm-ide-context-body::-webkit-scrollbar,
-.asm-code-pre::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+.asm-shell *::-webkit-scrollbar-button,
+[role="dialog"] *::-webkit-scrollbar-button,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
-.asm-list-scroll::-webkit-scrollbar-track,
-.asm-detail-scroll::-webkit-scrollbar-track,
-.asm-confirm-details::-webkit-scrollbar-track,
-.asm-ide-context-body::-webkit-scrollbar-track,
-.asm-code-pre::-webkit-scrollbar-track {
+.asm-shell *::-webkit-scrollbar-track,
+.asm-shell *::-webkit-scrollbar-corner,
+[role="dialog"] *::-webkit-scrollbar-track,
+[role="dialog"] *::-webkit-scrollbar-corner,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar-track,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-.asm-list-scroll::-webkit-scrollbar-thumb,
-.asm-detail-scroll::-webkit-scrollbar-thumb,
-.asm-confirm-details::-webkit-scrollbar-thumb,
-.asm-ide-context-body::-webkit-scrollbar-thumb,
-.asm-code-pre::-webkit-scrollbar-thumb {
+.asm-shell *::-webkit-scrollbar-thumb,
+[role="dialog"] *::-webkit-scrollbar-thumb,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  min-width: 36px;
+  border: 2px solid transparent;
   border-radius: 999px;
-  background: hsl(var(--border) / 0.85);
+  background-clip: content-box;
+  background-color: hsl(var(--foreground) / 0.16);
 }
 
-.asm-list-scroll::-webkit-scrollbar-thumb:hover,
-.asm-detail-scroll::-webkit-scrollbar-thumb:hover,
-.asm-confirm-details::-webkit-scrollbar-thumb:hover,
-.asm-ide-context-body::-webkit-scrollbar-thumb:hover,
-.asm-code-pre::-webkit-scrollbar-thumb:hover {
-  background: hsl(var(--muted-foreground) / 0.45);
+.dark .asm-shell *::-webkit-scrollbar-thumb,
+.dark [role="dialog"] *::-webkit-scrollbar-thumb,
+.dark [data-radix-popper-content-wrapper] *::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--foreground) / 0.22);
+}
+
+/* 主滚动面板静止态自动隐去，悬停面板时浮现胶囊，悬停/拖拽滑块时加宽加深 */
+.asm-list-scroll::-webkit-scrollbar-thumb,
+.asm-detail-scroll::-webkit-scrollbar-thumb,
+.asm-ccs-outline ol::-webkit-scrollbar-thumb {
+  background-color: transparent;
+}
+
+.dark .asm-list-scroll::-webkit-scrollbar-thumb,
+.dark .asm-detail-scroll::-webkit-scrollbar-thumb,
+.dark .asm-ccs-outline ol::-webkit-scrollbar-thumb {
+  background-color: transparent;
+}
+
+.asm-list-scroll:hover::-webkit-scrollbar-thumb,
+.asm-list-scroll:focus-within::-webkit-scrollbar-thumb,
+.asm-detail-scroll:hover::-webkit-scrollbar-thumb,
+.asm-detail-scroll:focus-within::-webkit-scrollbar-thumb,
+.asm-ccs-outline:hover ol::-webkit-scrollbar-thumb,
+.asm-ccs-outline ol:focus-within::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--foreground) / 0.2);
+}
+
+.dark .asm-list-scroll:hover::-webkit-scrollbar-thumb,
+.dark .asm-list-scroll:focus-within::-webkit-scrollbar-thumb,
+.dark .asm-detail-scroll:hover::-webkit-scrollbar-thumb,
+.dark .asm-detail-scroll:focus-within::-webkit-scrollbar-thumb,
+.dark .asm-ccs-outline:hover ol::-webkit-scrollbar-thumb,
+.dark .asm-ccs-outline ol:focus-within::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--foreground) / 0.25);
+}
+
+.asm-shell *::-webkit-scrollbar-thumb:hover,
+[role="dialog"] *::-webkit-scrollbar-thumb:hover,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar-thumb:hover {
+  border-width: 1.5px;
+  background-color: hsl(var(--foreground) / 0.36);
+}
+
+.dark .asm-shell *::-webkit-scrollbar-thumb:hover,
+.dark [role="dialog"] *::-webkit-scrollbar-thumb:hover,
+.dark [data-radix-popper-content-wrapper] *::-webkit-scrollbar-thumb:hover {
+  border-width: 1.5px;
+  background-color: hsl(var(--foreground) / 0.44);
+}
+
+.asm-shell *::-webkit-scrollbar-thumb:active,
+[role="dialog"] *::-webkit-scrollbar-thumb:active,
+[data-radix-popper-content-wrapper] *::-webkit-scrollbar-thumb:active {
+  border-width: 1.5px;
+  background-color: hsl(var(--foreground) / 0.5);
+}
+
+.dark .asm-shell *::-webkit-scrollbar-thumb:active,
+.dark [role="dialog"] *::-webkit-scrollbar-thumb:active,
+.dark [data-radix-popper-content-wrapper] *::-webkit-scrollbar-thumb:active {
+  border-width: 1.5px;
+  background-color: hsl(var(--foreground) / 0.58);
 }
 
 *:focus-visible {
@@ -2480,7 +2032,7 @@ html.dark {
   margin-top: 2px;
 }
 
-/* ── 阅读器视图切换与轮次执行过程时间线 ── */
+/* ── 阅读器视图切换与恢复命令/路径定位胶囊 ── */
 .asm-reader-view-switch {
   display: inline-flex;
   align-items: center;
@@ -2488,102 +2040,12 @@ html.dark {
   padding: 2px;
   border: 1px solid hsl(var(--border) / 0.85);
   border-radius: 7px;
-  background: hsl(var(--shell-bg) / 0.75);
+  background: hsl(var(--background) / 0.78);
 }
 
-.asm-turn-timeline {
-  display: flex;
-  width: 100%;
-  min-height: 36px;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 12px;
-  border: 1px dashed hsl(var(--border) / 0.95);
-  border-radius: 10px;
-  background: hsl(var(--shell-bg) / 0.55);
-  color: hsl(var(--foreground) / 0.86);
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    border-color 120ms ease;
-}
-
-.asm-turn-timeline:hover {
-  border-style: solid;
-  border-color: hsl(var(--primary) / 0.35);
-  background: hsl(var(--primary) / 0.055);
-}
-
-.asm-turn-timeline.is-expanded {
-  border-style: solid;
-  border-color: hsl(var(--primary) / 0.3);
-  background: hsl(var(--primary) / 0.045);
-}
-
-.asm-turn-timeline-title {
-  font-weight: 600;
-  color: hsl(var(--foreground) / 0.9);
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-turn-timeline-chips {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 5px;
-  margin-left: 2px;
-}
-
-.asm-turn-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3.5px;
-  height: 20px;
-  padding: 0 6.5px;
-  border: 1px solid hsl(var(--border) / 0.8);
-  border-radius: 999px;
-  background: hsl(var(--card) / 0.85);
-  color: hsl(var(--muted-foreground));
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 10.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-turn-chip.is-change {
-  border-color: hsl(152 55% 42% / 0.35);
-  background: hsl(152 55% 42% / 0.1);
-  color: hsl(152 62% 32%);
-  font-family: inherit;
-  font-weight: 550;
-}
-
-.dark .asm-turn-chip.is-change {
-  color: hsl(152 65% 66%);
-}
-
-.asm-turn-chip.is-error {
-  border-color: hsl(var(--destructive) / 0.38);
-  background: hsl(var(--destructive) / 0.1);
-  color: hsl(var(--destructive));
-  font-family: inherit;
-  font-weight: 550;
-}
-
-.asm-step-message-wrap {
-  margin-left: 10px;
-  padding-left: 12px;
-  border-left: 2px solid hsl(var(--border) / 0.85);
-}
-
-/* ── 恢复命令按钮与路径定位按钮组 ── */
 .asm-resume-btn {
   border: 1px solid hsl(var(--border));
-  border-radius: 8px;
+  border-radius: 7.5px;
   background: hsl(var(--card));
   color: hsl(var(--foreground) / 0.9);
   font-weight: 550;
@@ -2609,13 +2071,13 @@ html.dark {
 
 .asm-chip-reveal {
   display: inline-flex;
-  height: 24px;
-  width: 23px;
+  height: 22px;
+  width: 22px;
   flex: none;
   align-items: center;
   justify-content: center;
   border: 1px solid hsl(var(--border) / 0.85);
-  border-radius: 0 7px 7px 0;
+  border-radius: 0 6px 6px 0;
   background: hsl(var(--shell-bg) / 0.65);
   color: hsl(var(--muted-foreground));
   cursor: pointer;
@@ -2631,93 +2093,7 @@ html.dark {
   color: hsl(var(--primary));
 }
 
-/* ── GFM 表格、任务列表、链接与删除线 ── */
-.asm-md-table-wrap {
-  margin: 8px 0;
-  overflow-x: auto;
-  border: 1px solid hsl(var(--border) / 0.85);
-  border-radius: 9px;
-  background: hsl(var(--card) / 0.7);
-}
-
-.asm-md-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-  line-height: 1.5;
-}
-
-.asm-md-table th,
-.asm-md-table td {
-  padding: 6px 10px;
-  border-bottom: 1px solid hsl(var(--border) / 0.65);
-  border-right: 1px solid hsl(var(--border) / 0.45);
-  text-align: left;
-  vertical-align: top;
-}
-
-.asm-md-table th:last-child,
-.asm-md-table td:last-child {
-  border-right: 0;
-}
-
-.asm-md-table tbody tr:last-child td {
-  border-bottom: 0;
-}
-
-.asm-md-table th {
-  background: hsl(var(--shell-bg) / 0.75);
-  font-weight: 600;
-  color: hsl(var(--foreground));
-}
-
-.asm-md-list li.asm-md-task-item {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  list-style: none;
-  margin-left: -14px;
-}
-
-.asm-md-task-box {
-  display: inline-flex;
-  width: 14px;
-  height: 14px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid hsl(var(--border));
-  border-radius: 4px;
-  background: hsl(var(--card));
-  color: hsl(var(--primary-foreground));
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  transform: translateY(1px);
-}
-
-.asm-md-task-box.is-checked {
-  border-color: hsl(var(--primary));
-  background: hsl(var(--primary));
-}
-
-.asm-md-link {
-  color: hsl(var(--primary));
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  cursor: pointer;
-}
-
-.asm-md-link:hover {
-  opacity: 0.85;
-}
-
-.asm-md-del {
-  color: hsl(var(--muted-foreground));
-  text-decoration: line-through;
-}
-
-/* ── cc-switch 对话式阅读器（左右对话流 + 原生步骤行 + 行号 Diff + 对话目录） ── */
+/* ── 对话滚动容器、底部悬浮「↓ 最新」与右侧对话目录抽屉 ── */
 .asm-detail-scroll-stage {
   position: relative;
   display: flex;
@@ -2727,514 +2103,6 @@ html.dark {
   flex-direction: column;
 }
 
-.asm-ccs-stream-inner {
-  width: 100%;
-  max-width: 840px;
-  margin: 0 auto;
-}
-
-.asm-ccs-turn-divider {
-  height: 1px;
-  margin: 14px 0;
-  background: hsl(var(--border) / 0.65);
-}
-
-.asm-ccs-question-row {
-  display: flex;
-  width: 100%;
-  justify-content: flex-end;
-  border-radius: 12px;
-  transition: background 180ms ease;
-}
-
-.asm-ccs-question-row.is-active-row,
-.asm-ccs-agent-lane.is-active-row {
-  background: hsl(var(--primary) / 0.065);
-}
-
-.asm-ccs-question-wrap {
-  display: flex;
-  max-width: 76%;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-  padding-bottom: 10px;
-}
-
-.asm-ccs-question-meta {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 3px;
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-}
-
-.asm-ccs-question-meta .asm-ccs-hover-icon {
-  opacity: 0;
-}
-
-.asm-ccs-question-row:hover .asm-ccs-question-meta .asm-ccs-hover-icon,
-.asm-ccs-question-row:focus-within .asm-ccs-question-meta .asm-ccs-hover-icon {
-  opacity: 1;
-}
-
-.asm-ccs-question-bubble {
-  max-width: 100%;
-  padding: 9px 14px;
-  border: 1px solid
-    color-mix(
-      in srgb,
-      var(--reader-accent, hsl(var(--primary))) 22%,
-      hsl(var(--border))
-    );
-  border-radius: 16px 4px 16px 16px;
-  background: color-mix(
-    in srgb,
-    var(--reader-accent, hsl(var(--primary))) 12%,
-    hsl(var(--secondary))
-  );
-  color: hsl(var(--foreground));
-  font-size: 14px;
-  line-height: 1.72;
-  overflow-wrap: anywhere;
-}
-
-.dark .asm-ccs-question-bubble {
-  border-color: color-mix(
-    in srgb,
-    var(--reader-accent, hsl(var(--primary))) 30%,
-    hsl(var(--border))
-  );
-  background: color-mix(
-    in srgb,
-    var(--reader-accent, hsl(var(--primary))) 17%,
-    hsl(var(--secondary))
-  );
-}
-
-.asm-ccs-question-text {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.asm-ccs-agent-lane {
-  position: relative;
-  padding-left: 40px;
-  padding-right: 8px;
-  border-radius: 10px;
-  transition: background 180ms ease;
-}
-
-.asm-ccs-avatar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  display: inline-flex;
-  width: 28px;
-  height: 28px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid hsl(var(--border));
-  border-radius: 999px;
-  background: hsl(var(--card));
-  box-shadow: 0 1px 2px hsl(224 25% 10% / 0.05);
-}
-
-.asm-ccs-agent-header {
-  display: flex;
-  height: 28px;
-  align-items: center;
-  gap: 8px;
-  padding: 0 6px;
-  margin-bottom: 2px;
-}
-
-.asm-ccs-agent-name {
-  font-size: 13px;
-  font-weight: 650;
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-time {
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-ccs-timeline-wrap {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.asm-ccs-row-btn {
-  display: flex;
-  height: 32px;
-  width: 100%;
-  min-width: 0;
-  flex: 1;
-  align-items: center;
-  gap: 8px;
-  padding: 0 6px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: hsl(var(--foreground) / 0.86);
-  font: inherit;
-  font-size: 12.5px;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease;
-}
-
-.asm-ccs-row-btn.is-static {
-  cursor: default;
-}
-
-.asm-ccs-row-btn:not(.is-static):hover {
-  background: hsl(var(--muted) / 0.65);
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-chevron {
-  width: 14px;
-  height: 14px;
-  flex: none;
-  color: hsl(var(--muted-foreground));
-  transition: transform 140ms ease;
-}
-
-.asm-ccs-chevron.is-subtle {
-  opacity: 0.72;
-}
-
-.asm-ccs-chevron.is-rotated {
-  transform: rotate(90deg);
-}
-
-.asm-ccs-glyph {
-  width: 14px;
-  flex: none;
-  text-align: center;
-  font-size: 12px;
-  line-height: 1;
-  user-select: none;
-}
-
-.asm-ccs-timeline-summary {
-  min-width: 0;
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: hsl(var(--muted-foreground));
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-ccs-timeline-main {
-  font-weight: 600;
-  color: hsl(var(--foreground) / 0.88);
-}
-
-.asm-ccs-dot {
-  padding: 0 6px;
-  color: hsl(var(--muted-foreground) / 0.55);
-}
-
-.asm-ccs-tone-success {
-  color: hsl(152 62% 33%);
-  font-weight: 550;
-}
-
-.dark .asm-ccs-tone-success {
-  color: hsl(152 65% 65%);
-}
-
-.asm-ccs-tone-danger {
-  color: hsl(var(--destructive));
-  font-weight: 550;
-}
-
-.asm-ccs-in-timeline {
-  margin-left: 12px;
-  padding-left: 8px;
-  border-left: 1px solid hsl(var(--border) / 0.85);
-}
-
-.asm-ccs-step-meta {
-  margin-left: auto;
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 8px;
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-ccs-step-details {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 3px 6px 8px 10px;
-}
-
-.asm-ccs-connector {
-  width: 14px;
-  flex: none;
-  padding-top: 4px;
-  color: hsl(var(--muted-foreground) / 0.72);
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  text-align: center;
-  user-select: none;
-}
-
-.asm-ccs-tool-pre {
-  margin: 0;
-  max-height: 360px;
-  overflow: auto;
-  padding: 8px 11px;
-  border: 1px solid hsl(var(--border) / 0.85);
-  border-radius: 8px;
-  background: hsl(var(--muted) / 0.42);
-  color: hsl(var(--foreground) / 0.88);
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 12px;
-  line-height: 1.58;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.dark .asm-ccs-tool-pre {
-  background: hsl(225 22% 8%);
-}
-
-.asm-ccs-tool-pre.is-error {
-  border-color: hsl(var(--destructive) / 0.35);
-  background: hsl(var(--destructive) / 0.06);
-}
-
-.asm-ccs-thinking-body {
-  padding: 4px 8px 8px 28px;
-  color: hsl(var(--muted-foreground));
-  font-size: 13px;
-  line-height: 1.68;
-  font-style: italic;
-}
-
-.asm-ccs-note {
-  padding: 4px 6px;
-  color: hsl(var(--foreground) / 0.9);
-  font-size: 13.5px;
-  line-height: 1.72;
-}
-
-.asm-ccs-note.is-in-timeline {
-  margin-left: 12px;
-  padding-left: 14px;
-  border-left: 1px solid hsl(var(--border) / 0.85);
-}
-
-/* ── 行号 Unified Diff 视图 ── */
-.asm-ccs-diff {
-  overflow-x: auto;
-  border: 1px solid hsl(var(--border) / 0.85);
-  border-radius: 8px;
-  background: hsl(var(--card) / 0.85);
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 12px;
-  line-height: 1.56;
-}
-
-.dark .asm-ccs-diff {
-  background: hsl(225 22% 7.8%);
-}
-
-.asm-ccs-diff-file {
-  padding: 5px 10px;
-  border-bottom: 1px solid hsl(var(--border) / 0.7);
-  background: hsl(var(--muted) / 0.52);
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  font-weight: 550;
-}
-
-.asm-ccs-diff-gap {
-  padding: 2px 10px;
-  background: hsl(var(--muted) / 0.35);
-  color: hsl(var(--muted-foreground));
-  font-size: 11px;
-  text-align: center;
-  user-select: none;
-}
-
-.asm-ccs-diff-row {
-  display: flex;
-  min-width: max-content;
-  align-items: stretch;
-  padding: 0 8px 0 4px;
-}
-
-.asm-ccs-diff-row.is-add {
-  background: hsl(142 71% 45% / 0.13);
-  color: hsl(142 64% 25%);
-}
-
-.asm-ccs-diff-row.is-del {
-  background: hsl(0 72% 51% / 0.13);
-  color: hsl(0 65% 36%);
-}
-
-.dark .asm-ccs-diff-row.is-add {
-  background: hsl(142 70% 45% / 0.16);
-  color: hsl(142 70% 74%);
-}
-
-.dark .asm-ccs-diff-row.is-del {
-  background: hsl(0 72% 55% / 0.16);
-  color: hsl(0 82% 77%);
-}
-
-.asm-ccs-diff-ln {
-  width: 34px;
-  flex: none;
-  padding-right: 6px;
-  color: hsl(var(--muted-foreground) / 0.58);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-  user-select: none;
-}
-
-.asm-ccs-diff-sign {
-  width: 16px;
-  flex: none;
-  text-align: center;
-  user-select: none;
-}
-
-.asm-ccs-diff-code {
-  flex: 1;
-  white-space: pre;
-}
-
-/* ── 最终回复无框文档流 ── */
-.asm-ccs-final {
-  position: relative;
-  padding: 4px 6px 6px;
-}
-
-.asm-ccs-final-actions {
-  position: absolute;
-  top: 0;
-  right: 2px;
-  z-index: 2;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.asm-ccs-final:hover .asm-ccs-final-actions,
-.asm-ccs-final:focus-within .asm-ccs-final-actions {
-  opacity: 1;
-}
-
-.asm-ccs-final-body {
-  min-width: 0;
-  padding-right: 28px;
-  font-size: 14px;
-  line-height: 1.78;
-  overflow-wrap: anywhere;
-}
-
-.asm-ccs-hover-icon {
-  display: inline-flex;
-  width: 24px;
-  height: 24px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease,
-    opacity 120ms ease;
-}
-
-.asm-ccs-hover-icon:hover {
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-hover-pill {
-  display: inline-flex;
-  height: 23px;
-  align-items: center;
-  gap: 4px;
-  padding: 0 7px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease,
-    border-color 120ms ease;
-}
-
-.asm-ccs-hover-pill:hover,
-.asm-ccs-hover-pill[aria-pressed="true"] {
-  border-color: hsl(var(--border));
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-inline-expand {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 4px;
-  padding: 2px 0;
-  border: 0;
-  background: transparent;
-  color: hsl(var(--primary));
-  font: inherit;
-  font-size: 12px;
-  font-weight: 550;
-  cursor: pointer;
-}
-
-.asm-ccs-inline-expand:hover {
-  text-decoration: underline;
-}
-
-.asm-ccs-muted-num {
-  color: hsl(var(--muted-foreground));
-  font-weight: 400;
-  font-variant-numeric: tabular-nums;
-}
-
-/* ── 底部悬浮「↓ 最新」按钮 ── */
 .asm-ccs-jump-latest {
   position: absolute;
   right: 22px;
@@ -3269,493 +2137,18 @@ html.dark {
   transform: translateY(-1px);
 }
 
-/* ── 右侧对话目录抽屉（SessionOutline） ── */
 .asm-ccs-outline {
   display: flex;
-  width: 236px;
+  width: 244px;
   flex: none;
   min-height: 0;
   flex-direction: column;
-  border-left: 1px solid hsl(var(--border) / 0.85);
-  background: hsl(var(--shell-bg) / 0.36);
-}
-
-.asm-ccs-outline-head {
-  display: flex;
-  height: 34px;
-  flex: none;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 12px;
-  border-bottom: 1px solid hsl(var(--border) / 0.65);
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  font-weight: 600;
-}
-
-.asm-ccs-outline-count {
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: hsl(var(--muted));
-  color: hsl(var(--muted-foreground));
-  font-size: 10.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-ccs-outline-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  margin: 0;
-  padding: 8px;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.asm-ccs-outline-item {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 7px 8px;
-  border-radius: 9px;
-  transition: background 120ms ease;
-}
-
-.asm-ccs-outline-item:hover {
-  background: hsl(var(--muted) / 0.45);
-}
-
-.asm-ccs-outline-item.is-active {
-  background: hsl(var(--primary) / 0.07);
-}
-
-.asm-ccs-outline-bar {
-  position: absolute;
-  top: 8px;
-  bottom: 8px;
-  left: 0;
-  width: 2.5px;
-  border-radius: 999px;
-  background: hsl(var(--primary));
-}
-
-.asm-ccs-outline-q {
-  display: flex;
-  width: 100%;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 2.5px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  text-align: right;
-  cursor: pointer;
-}
-
-.asm-ccs-outline-q-meta {
-  color: hsl(var(--muted-foreground));
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-ccs-outline-q-bubble {
-  display: -webkit-box;
-  max-width: 92%;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  padding: 4px 8px;
-  border-radius: 10px 3px 10px 10px;
-  background: color-mix(
-    in srgb,
-    var(--reader-accent, hsl(var(--primary))) 14%,
-    hsl(var(--secondary))
-  );
-  color: hsl(var(--foreground));
-  font-size: 11.5px;
-  line-height: 1.42;
-  text-align: left;
-  overflow-wrap: anywhere;
-}
-
-.asm-ccs-outline-a {
-  display: flex;
-  width: 100%;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 2px 0 0;
-  border: 0;
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-}
-
-.asm-ccs-outline-avatar {
-  display: inline-flex;
-  width: 18px;
-  height: 18px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  margin-top: 1px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 999px;
-  background: hsl(var(--card));
-}
-
-.asm-ccs-outline-steps {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-bottom: 1px;
-  color: hsl(var(--muted-foreground));
-  font-size: 10.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.asm-ccs-outline-err-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: hsl(var(--destructive));
-}
-
-.asm-ccs-outline-a-text {
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  line-height: 1.42;
-  overflow-wrap: anywhere;
-}
-
-.asm-ccs-outline-a-text.is-empty {
-  font-style: italic;
-  opacity: 0.72;
+  border-left: 1px solid hsl(var(--border) / 0.8);
+  background: hsl(var(--muted) / 0.16);
 }
 
 @media (max-width: 980px) {
   .asm-ccs-outline {
     display: none;
   }
-  .asm-ccs-question-wrap {
-    max-width: 86%;
-  }
-}
-
-/* ── cc-switch 思维链 / 中间说明 / 工具参数与框线 / 章节与事件样式 ── */
-
-.asm-ccs-row-static {
-  display: flex;
-  height: 32px;
-  width: 100%;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  padding: 0 6px;
-  font-size: 12.5px;
-}
-
-.asm-ccs-model {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 11.5px;
-  color: hsl(var(--muted-foreground));
-}
-
-.asm-ccs-chevron.is-hover-only {
-  opacity: 0;
-  transition:
-    opacity 120ms ease,
-    transform 140ms ease;
-}
-
-.asm-ccs-row-btn:hover .asm-ccs-chevron.is-hover-only,
-.asm-ccs-row-btn:focus-visible .asm-ccs-chevron.is-hover-only,
-.asm-ccs-chevron.is-forced-visible {
-  opacity: 0.85;
-}
-
-.asm-ccs-tone-warning {
-  color: hsl(36 90% 38%);
-  font-weight: 550;
-}
-
-.dark .asm-ccs-tone-warning {
-  color: hsl(38 92% 65%);
-}
-
-/* 思维链展开区：次级斜体文本流，克制安静，不抢最终回复视觉重心 */
-.asm-ccs-thinking-region {
-  padding: 2px 6px 8px 28px;
-}
-
-.asm-ccs-thinking-pre {
-  margin: 0;
-  max-height: 440px;
-  overflow: auto;
-  font-family: inherit;
-  font-size: 12.5px;
-  line-height: 1.68;
-  font-style: italic;
-  color: hsl(var(--muted-foreground));
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-/* 中间过程说明行（◦ 符号 + 3 行底部渐隐折叠） */
-.asm-ccs-note-row {
-  display: flex;
-  min-width: 0;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 4px 6px;
-}
-
-.asm-ccs-note-body {
-  position: relative;
-  min-width: 0;
-  font-size: 13px;
-  line-height: 1.65;
-  color: hsl(var(--foreground) / 0.82);
-  overflow-wrap: anywhere;
-}
-
-.asm-ccs-note-body.is-clamped {
-  max-height: 58px;
-  overflow: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, #000 58%, transparent);
-  mask-image: linear-gradient(to bottom, #000 58%, transparent);
-}
-
-/* 合并步骤展开后的子步骤缩进 */
-.asm-ccs-child-step {
-  padding-left: 18px;
-}
-
-/* 工具详情三态外框：tree（Claude/Codex/OpenCode/Kimi）| box（Gemini）| stripe（Pi/OpenClaw） */
-.asm-ccs-step-details-frame {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.asm-ccs-step-details-frame.is-frame-tree {
-  padding: 3px 6px 8px 22px;
-}
-
-.asm-ccs-step-details-frame.is-frame-box {
-  margin: 2px 6px 8px 22px;
-  padding: 10px 12px;
-  border: 1px solid hsl(var(--border));
-  border-left-width: 2.5px;
-  border-radius: 8px;
-  background: hsl(var(--card) / 0.58);
-}
-
-.asm-ccs-step-details-frame.is-frame-stripe {
-  margin: 2px 6px 8px 22px;
-  padding: 4px 6px 8px 12px;
-  border-left: 2px solid hsl(var(--border));
-}
-
-.asm-ccs-step-details-frame.is-status-success {
-  border-left-color: hsl(152 60% 42%);
-}
-
-.asm-ccs-step-details-frame.is-status-error {
-  border-left-color: hsl(var(--destructive));
-}
-
-.asm-ccs-step-details-frame.is-status-warning {
-  border-left-color: hsl(38 90% 50%);
-}
-
-.asm-ccs-subsec-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-bottom: 4px;
-  padding: 2px 4px 2px 0;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11.5px;
-  font-weight: 550;
-  cursor: pointer;
-}
-
-.asm-ccs-subsec-btn:hover {
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-subsec-title {
-  margin-bottom: 4px;
-  color: hsl(var(--muted-foreground));
-  font-size: 11.5px;
-  font-weight: 550;
-}
-
-.asm-ccs-subtle-link {
-  padding: 1px 4px;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 11.5px;
-  cursor: pointer;
-}
-
-.asm-ccs-subtle-link:hover {
-  color: hsl(var(--foreground));
-  text-decoration: underline;
-}
-
-/* 章节书签行（mark_chapter） */
-.asm-ccs-chapter {
-  display: flex;
-  min-width: 0;
-  align-items: baseline;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 6px 6px 5px;
-  border-bottom: 1px solid hsl(var(--border) / 0.65);
-}
-
-.asm-ccs-chapter-title {
-  flex: none;
-  font-size: 13px;
-  font-weight: 600;
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-chapter-summary {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  color: hsl(var(--muted-foreground));
-}
-
-/* 事件分隔行（── 上下文已压缩 ▸ ── / ── 已中断 ──） */
-.asm-ccs-event-divider-wrap {
-  padding: 6px 0;
-}
-
-.asm-ccs-event-divider {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 2px 8px;
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
-}
-
-.asm-ccs-event-line {
-  height: 1px;
-  flex: 1;
-  background: hsl(var(--border) / 0.8);
-}
-
-.asm-ccs-event-label {
-  display: inline-flex;
-  max-width: 72%;
-  min-width: 0;
-  align-items: center;
-}
-
-.asm-ccs-event-inline {
-  display: flex;
-  height: 28px;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  padding: 0 6px;
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
-}
-
-.asm-ccs-event-btn {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 4px;
-  padding: 1px 5px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-}
-
-.asm-ccs-event-btn:hover {
-  background: hsl(var(--muted) / 0.65);
-  color: hsl(var(--foreground));
-}
-
-.asm-ccs-event-btn.is-link:hover {
-  text-decoration: underline;
-}
-
-.asm-ccs-event-detail {
-  margin: 4px 0 0;
-  max-height: 224px;
-  overflow: auto;
-  padding: 8px 11px;
-  border: 1px solid hsl(var(--border) / 0.85);
-  border-radius: 8px;
-  background: hsl(var(--muted) / 0.42);
-  color: hsl(var(--muted-foreground));
-  font-family:
-    "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Consolas,
-    monospace;
-  font-size: 11.5px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.asm-ccs-event-detail.is-danger {
-  border-color: hsl(var(--destructive) / 0.35);
-  background: hsl(var(--destructive) / 0.06);
-  color: hsl(var(--destructive));
-}
-
-.asm-ccs-injected-btn {
-  display: flex;
-  height: 28px;
-  width: 100%;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  padding: 0 6px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.asm-ccs-injected-btn:hover {
-  background: hsl(var(--muted) / 0.6);
-  color: hsl(var(--foreground));
 }

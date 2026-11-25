@@ -343,4 +343,20 @@ export const sessionsApi = {
   async revealPath(path: string): Promise<void> {
     await invoke("reveal_session_path", { path });
   },
+
+  async openExternalUrl(url: string): Promise<void> {
+    await invoke("open_external_url", { url });
+  },
+
+  async saveMarkdownExport(
+    defaultFilename: string,
+    content: string,
+    defaultDir?: string,
+  ): Promise<string | null> {
+    return await invoke<string | null>("save_markdown_export", {
+      defaultFilename,
+      defaultDir,
+      content,
+    });
+  },
 };

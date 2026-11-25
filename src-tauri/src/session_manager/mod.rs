@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod content;
 mod deletion;
+pub mod export;
 pub mod model;
 pub mod providers;
 pub mod search_index;

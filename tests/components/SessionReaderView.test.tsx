@@ -3,18 +3,35 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { SessionDetailPane } from "@/components/sessions/SessionDetailPane";
 import { ReaderContext } from "@/components/sessions/reader/context";
 import { getAgentReaderStyle } from "@/components/sessions/reader/agentStyles";
-import { parseDiff, SessionDiff } from "@/components/sessions/reader/SessionDiff";
+import {
+  parseDiff,
+  SessionDiff,
+} from "@/components/sessions/reader/SessionDiff";
+import {
+  copyImage,
+  dataUrlToBlob,
+} from "@/components/sessions/reader/SessionImageLightbox";
 import {
   SessionMarkdown,
   SessionPlainText,
 } from "@/components/sessions/reader/SessionMarkdown";
-import { SessionReader } from "@/components/sessions/reader/SessionReader";
+import { getVisibleSessionMessages } from "@/components/sessions/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { sessionsApi } from "@/lib/api/sessions";
 import { clearSessionImageCache } from "@/lib/query/sessions";
-import type { ContentRef, ImageRef, SessionMessage, SessionMeta } from "@/types";
+import type {
+  ContentRef,
+  ImageRef,
+  SessionMessage,
+  SessionMeta,
+} from "@/types";
 import {
+  getExportedMarkdownRecords,
+  getOpenedExternalUrls,
+  getRevealedPaths,
   resetProviderState,
   setBlockContentFixture,
   setSessionImageFixture,
@@ -39,26 +56,17 @@ vi.mock("@tanstack/react-virtual", () => ({
     measureElement: () => undefined,
     scrollToIndex: () => undefined,
     scrollOffset: 0,
+    scrollRect: { width: 800, height: 600 },
     range: { startIndex: 0, endIndex: Math.max(0, count - 1) },
   }),
 }));
 
-vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: vi.fn(),
-}));
-
-function renderSessionReader({
+function renderDetailPane({
   session,
   messages,
-  appName = "Codex",
-  listQuery = "",
-  initialFind,
 }: {
   session: SessionMeta;
   messages: SessionMessage[];
-  appName?: string;
-  listQuery?: string;
-  initialFind?: { query: string; messageIndex?: number };
 }) {
   const client = new QueryClient({
     defaultOptions: {
@@ -66,37 +74,44 @@ function renderSessionReader({
     },
   });
   const onCopy = vi.fn();
-  const onBack = vi.fn();
-  const onReload = vi.fn();
-  const onDelete = vi.fn();
-  const onPrev = vi.fn();
-  const onNext = vi.fn();
+  const onOpenUrl = vi.fn((url: string) => {
+    void sessionsApi.openExternalUrl(url);
+  });
+  const onRevealPath = vi.fn((path: string) => {
+    void sessionsApi.revealPath(path);
+  });
+  const onNotifyExport = vi.fn();
+  const isCodexSession = session.providerId === "codex";
+  const visibleMessages = getVisibleSessionMessages(messages, isCodexSession);
 
   const view = render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <SessionReader
-          session={session}
-          appName={appName}
-          transcript={{
-            messages,
-            isStreaming: false,
-            progress: { loaded: messages.length, total: messages.length },
-            isLoading: false,
-            isError: false,
-            error: null,
-            refetch: async () => undefined,
-          }}
-          listQuery={listQuery}
-          initialFind={initialFind}
-          hasPrev={true}
-          hasNext={true}
-          onPrev={onPrev}
-          onNext={onNext}
-          onBack={onBack}
+        <SessionDetailPane
+          selectedSession={session}
+          selectedKey={`${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`}
+          isCodexSession={isCodexSession}
+          selectedSessionChildCount={0}
+          sessionTitles={new Map()}
+          rawMessages={messages}
+          visibleMessages={visibleMessages}
+          isLoadingMessages={false}
+          isFetchingMessages={false}
+          messageRevision={1}
+          messagesError={null}
+          onRefetchMessages={vi.fn()}
+          onLoadFullContent={async (msg) => msg.content}
+          hasBatchSelection={false}
+          selectedDeletableCount={0}
+          isDeleting={false}
+          onBatchDelete={vi.fn()}
+          onSingleDelete={vi.fn()}
           onCopy={onCopy}
-          onReload={onReload}
-          onDelete={onDelete}
+          onCopyMessage={vi.fn()}
+          onCopyCode={vi.fn()}
+          onOpenUrl={onOpenUrl}
+          onRevealPath={onRevealPath}
+          onNotifyExport={onNotifyExport}
         />
       </TooltipProvider>
     </QueryClientProvider>,
@@ -105,21 +120,19 @@ function renderSessionReader({
   return {
     client,
     onCopy,
-    onBack,
-    onReload,
-    onDelete,
-    onPrev,
-    onNext,
+    onOpenUrl,
+    onRevealPath,
+    onNotifyExport,
     ...view,
   };
 }
 
-describe("cc-switch aligned SessionReader suite", () => {
+describe("SessionDetailPane & reader components suite", () => {
   beforeEach(() => {
     resetProviderState();
     clearSessionImageCache();
     window.localStorage.removeItem("cc-switch.sessionReader.expandTimelines");
-    window.localStorage.removeItem("cc-switch.sessionReader.outline");
+    window.localStorage.removeItem("agent-session-manager.outlineOpen");
     Element.prototype.scrollIntoView = vi.fn();
   });
 
@@ -182,7 +195,7 @@ describe("cc-switch aligned SessionReader suite", () => {
     expect(container.querySelectorAll(".bg-diff-del")).toHaveLength(1);
   });
 
-  it("renders user plain text preserving Markdown symbols while formatting fenced code, and renders assistant GFM + PathChips", () => {
+  it("renders user plain text preserving Markdown symbols, renders assistant GFM + PathChips, and opens external links & remote images via backend", async () => {
     const client = new QueryClient();
     render(
       <QueryClientProvider client={client}>
@@ -206,10 +219,15 @@ describe("cc-switch aligned SessionReader suite", () => {
             </div>
             <div data-testid="md-box">
               <SessionMarkdown
-                content={
-                  "请查看 `/repo/app/src/auth.ts:42` 并核对表格：\n\n| 字段 | 状态 |\n| --- | --- |\n| exp | 正常 |"
-                }
-                projectDir="/repo/app"
+                content={[
+                  "请查看 `src/auth.ts:42` 与 [官方文档](https://docs.example.com/guide) 以及 `~/notes.md`：",
+                  "",
+                  "![架构图](https://cdn.example.com/arch.png)",
+                  "",
+                  "| 字段 | 状态 |",
+                  "| --- | --- |",
+                  "| exp | 正常 |",
+                ].join("\n")}
               />
             </div>
           </ReaderContext.Provider>
@@ -228,9 +246,35 @@ describe("cc-switch aligned SessionReader suite", () => {
     expect(screen.getByText("src/auth.ts:42")).toBeInTheDocument();
     expect(screen.getByRole("table")).toBeInTheDocument();
     expect(screen.getByText("exp")).toBeInTheDocument();
+
+    // Reveal relative path and ~/ path via PathChip folder buttons
+    const revealBtns = screen.getAllByRole("button", {
+      name: "在文件管理器中定位",
+    });
+    expect(revealBtns).toHaveLength(2);
+    fireEvent.click(revealBtns[0]);
+    fireEvent.click(revealBtns[1]);
+    await waitFor(() =>
+      expect(getRevealedPaths()).toEqual([
+        "/repo/app/src/auth.ts",
+        "~/notes.md",
+      ]),
+    );
+
+    // Click external Markdown link and remote image external-open card
+    fireEvent.click(screen.getByRole("link", { name: /官方文档/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /在浏览器中打开远程图片: 架构图/ }),
+    );
+    await waitFor(() =>
+      expect(getOpenedExternalUrls()).toEqual([
+        "https://docs.example.com/guide",
+        "https://cdn.example.com/arch.png",
+      ]),
+    );
   });
 
-  it("renders chain-of-thought preview, lazy loads full thinking via ContentRef, and keeps redacted thinking static", async () => {
+  it("renders chain-of-thought preview, lazy loads full thinking, toggles thinking visibility live, and syncs with copy/export", async () => {
     const fullThinkingRef: ContentRef = {
       kind: "jsonl",
       offset: 128,
@@ -239,7 +283,7 @@ describe("cc-switch aligned SessionReader suite", () => {
     };
     setBlockContentFixture(
       "codex",
-      "/mock/codex/session-1.jsonl",
+      "sqlite:/repo/app/opencode.db:codex-session-1",
       fullThinkingRef,
       "完整深度推理正文：服务端 JWT 公钥轮换后未同步到边缘网关。",
     );
@@ -249,20 +293,20 @@ describe("cc-switch aligned SessionReader suite", () => {
       sessionId: "codex-session-1",
       title: "JWT 校验排查",
       projectDir: "/repo/app",
-      sourcePath: "/mock/codex/session-1.jsonl",
+      sourcePath: "sqlite:/repo/app/opencode.db:codex-session-1",
       resumeCommand: "codex resume codex-session-1",
     };
 
     const messages: SessionMessage[] = [
       {
         role: "user",
-        content: "为什么 JWT 校验失败？",
+        content: "",
         ts: 1000,
         blocks: [{ type: "text", text: "为什么 JWT 校验失败？" }],
       },
       {
         role: "assistant",
-        content: "原因是边缘网关未刷新公钥。",
+        content: "",
         ts: 1005,
         meta: {
           model: "gpt-5-codex",
@@ -283,13 +327,13 @@ describe("cc-switch aligned SessionReader suite", () => {
       },
       {
         role: "user",
-        content: "再检查加密推理块",
+        content: "",
         ts: 2000,
         blocks: [{ type: "text", text: "再检查加密推理块" }],
       },
       {
         role: "assistant",
-        content: "加密思考块已安全处理。",
+        content: "",
         ts: 2005,
         blocks: [
           {
@@ -303,29 +347,54 @@ describe("cc-switch aligned SessionReader suite", () => {
       },
     ];
 
-    renderSessionReader({ session, messages, appName: "Codex" });
+    const { onCopy } = renderDetailPane({ session, messages });
 
     const thinkingBtn = screen.getByRole("button", {
       name: /推理.*核对时钟偏移与签名密钥/,
     });
     expect(thinkingBtn).toHaveAttribute("aria-expanded", "false");
-
     expect(screen.getByText("思考内容不可见")).toBeInTheDocument();
 
     fireEvent.click(thinkingBtn);
     expect(thinkingBtn).toHaveAttribute("aria-expanded", "true");
-    // Stage 1: inline preview renders immediately with "显示全部" trigger
     expect(screen.getByText(/预览摘要片段/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "显示全部" }));
-    // Stage 2: full thinking text fetched via get_session_block_content
     expect(
       await screen.findByText(
         "完整深度推理正文：服务端 JWT 公钥轮换后未同步到边缘网关。",
       ),
     ).toBeInTheDocument();
+
+    // Live toggle: hide thinking removes thinking steps on screen AND excludes them from export
+    const hideThinkingBtn = screen.getByRole("button", {
+      name: "隐藏思考 (2)",
+    });
+    expect(hideThinkingBtn).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(hideThinkingBtn);
+
+    expect(
+      screen.getByRole("button", { name: "显示思考 (2)" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.queryByRole("button", { name: /推理.*核对时钟偏移与签名密钥/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("思考内容不可见")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "导出 .md" }));
+    await waitFor(() => expect(getExportedMarkdownRecords()).toHaveLength(1));
+    expect(getExportedMarkdownRecords()[0]?.content).not.toContain(
+      "核对时钟偏移与签名密钥",
+    );
+
+    // SQLite virtual sourcePath chip copies real db path instead of sqlite: prefix
+    fireEvent.click(screen.getByRole("button", { name: /opencode\.db/ }));
+    expect(onCopy).toHaveBeenCalledWith(
+      "/repo/app/opencode.db",
+      "原始文件已复制",
+    );
   });
 
-  it("merges consecutive Codex read/search steps into Explored, pins failed commands in collapsed timeline, filters modes, and supports outline + inline search", async () => {
+  it("merges consecutive read/search steps, collapses even no-final turns via 收起过程, hides 改动 when only shell fails, and supports outline + search", async () => {
     const inlineImg: ImageRef = {
       source: {
         kind: "local_file",
@@ -380,11 +449,17 @@ describe("cc-switch aligned SessionReader suite", () => {
             kind: "compaction",
             text: "已归纳前序上下文摘要。",
           },
+          {
+            type: "event",
+            kind: "pr_link",
+            text: "PR #128",
+            url: "https://github.com/example/repo/pull/128",
+          },
         ],
       },
       {
         role: "user",
-        content: "排查并修复 auth.ts",
+        content: "",
         ts: 1000,
         blocks: [
           { type: "text", text: "排查并修复 auth.ts" },
@@ -393,7 +468,7 @@ describe("cc-switch aligned SessionReader suite", () => {
       },
       {
         role: "assistant",
-        content: "已定位并应用补丁修复。",
+        content: "",
         ts: 1010,
         blocks: [
           { type: "text", text: "先读取文件并搜索验证逻辑" },
@@ -488,17 +563,24 @@ describe("cc-switch aligned SessionReader suite", () => {
       },
     ];
 
-    renderSessionReader({ session, messages, appName: "Codex" });
+    renderDetailPane({ session, messages });
 
-    // Injected message is hidden by default
+    // Injected message is hidden by default until toggled
     expect(
       screen.queryByText(/# AGENTS\.md injected instructions/),
     ).not.toBeInTheDocument();
 
-    // Right-hand SessionOutline is open by default
-    expect(
-      screen.getByRole("navigation", { name: "对话目录" }),
-    ).toBeInTheDocument();
+    // PR link event button opens via backend open_external_url
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /https:\/\/github\.com\/example\/repo\/pull\/128/,
+      }),
+    );
+    await waitFor(() =>
+      expect(getOpenedExternalUrls()).toContain(
+        "https://github.com/example/repo/pull/128",
+      ),
+    );
 
     // Compaction event row expands on click
     const compactBtn = screen.getByRole("button", { name: /上下文已压缩/ });
@@ -512,33 +594,145 @@ describe("cc-switch aligned SessionReader suite", () => {
       screen.getByRole("button", { name: /Ran.*pnpm test/ }),
     ).toBeInTheDocument();
 
-    // Expanding timeline reveals merged Explored step
-    fireEvent.click(timelineBtn);
-    const exploredBtn = screen.getByRole("button", {
-      name: /Explored.*查看了 1 个文件、搜索 1 次/,
-    });
-    expect(exploredBtn).toBeInTheDocument();
-    fireEvent.click(exploredBtn);
+    // Toolbar "展开过程" expands both the timeline AND merged Explored children
+    fireEvent.click(screen.getByRole("button", { name: "展开过程" }));
     expect(
       screen.getByRole("button", { name: /Read.*src\/auth\.ts/ }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "收起过程" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
 
-    // Filter switching: "改动" shows only file changes
-    fireEvent.click(screen.getByRole("radio", { name: "改动" }));
+    // Filter switching: "改动" shows only file changes and hides tool/injected toggles
+    fireEvent.click(screen.getByRole("button", { name: "改动" }));
     expect(
       screen.getByRole("button", { name: /Edited.*src\/auth\.ts/ }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Ran.*pnpm test/ }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /隐藏工具/ }),
+    ).not.toBeInTheDocument();
 
-    // Switch back to "全部" and test inline find
-    fireEvent.click(screen.getByRole("radio", { name: "全部" }));
-    fireEvent.click(screen.getByRole("button", { name: "在会话中查找" }));
-    const findInput = screen.getByRole("textbox", { name: "查找内容" });
+    // Toggle outline and inline search
+    fireEvent.click(screen.getByRole("button", { name: "全部" }));
+    fireEvent.click(screen.getByRole("button", { name: "切换对话目录" }));
+    expect(
+      screen.getByRole("navigation", { name: "对话目录" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "在当前会话中搜索" }));
+    const findInput = screen.getByRole("searchbox", {
+      name: "在当前会话中搜索",
+    });
     await userEvent.type(findInput, "补丁修复");
     await waitFor(() =>
       expect(screen.getByText(/1 \/ \d+/)).toBeInTheDocument(),
     );
+  });
+
+  it("collapses no-final turns via 收起过程 and omits 改动 button when only non-edit steps fail", () => {
+    const session: SessionMeta = {
+      providerId: "claude",
+      sessionId: "claude-no-final",
+      title: "仅执行未收尾",
+      projectDir: "/repo/app",
+      sourcePath: "/mock/claude/no-final.jsonl",
+    };
+
+    const messages: SessionMessage[] = [
+      {
+        role: "user",
+        content: "",
+        blocks: [{ type: "text", text: "跑一下检查" }],
+      },
+      {
+        role: "assistant",
+        content: "",
+        blocks: [
+          {
+            type: "thinking",
+            text: "先跑测试看看状态",
+          },
+          {
+            type: "tool_call",
+            id: "sh-1",
+            rawName: "Bash",
+            kind: "shell",
+            title: "cargo check",
+            inputPreview: '{"command":"cargo check"}',
+            inputTotalLen: 25,
+          },
+          {
+            type: "tool_result",
+            callId: "sh-1",
+            status: "error",
+            preview: "error: failed to compile",
+            totalLen: 24,
+            lineCount: 1,
+            truncated: false,
+            exitCode: 101,
+          },
+        ],
+      },
+    ];
+
+    renderDetailPane({ session, messages });
+
+    // No edit/write/diff -> "改动" filter button must NOT appear
+    expect(
+      screen.queryByRole("button", { name: "改动" }),
+    ).not.toBeInTheDocument();
+
+    // No final reply -> timeline auto-expands initially, so toolbar button says "收起过程"
+    const collapseBtn = screen.getByRole("button", { name: "收起过程" });
+    expect(collapseBtn).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByRole("button", { name: /思考中… · 8 字/ }),
+    ).toBeInTheDocument();
+
+    // Clicking "收起过程" genuinely collapses the timeline even though !turn.final
+    fireEvent.click(collapseBtn);
+    expect(screen.getByRole("button", { name: "展开过程" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(
+      screen.queryByRole("button", { name: /思考中… · 8 字/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("decodes data:image/png;base64 URLs directly without calling fetch() when copying lightbox images", async () => {
+    const pngDataUrl =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const blob = dataUrlToBlob(pngDataUrl);
+    expect(blob).not.toBeNull();
+    expect(blob?.type).toBe("image/png");
+    expect(blob?.size).toBeGreaterThan(0);
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const writeMock = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { write: writeMock },
+    });
+    if (typeof globalThis.ClipboardItem === "undefined") {
+      vi.stubGlobal(
+        "ClipboardItem",
+        class MockClipboardItem {
+          items: Record<string, Blob>;
+          constructor(items: Record<string, Blob>) {
+            this.items = items;
+          }
+        },
+      );
+    }
+
+    await copyImage(pngDataUrl);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    fetchSpy.mockRestore();
   });
 });

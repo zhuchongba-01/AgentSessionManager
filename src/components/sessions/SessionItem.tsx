@@ -81,16 +81,23 @@ export const SessionItem = memo(function SessionItem({
   const sessionKey = getSessionKey(session);
   const providerLabel = getProviderLabel(session.providerId, t);
   const hasSnippets = Boolean(contentHit && contentHit.snippets.length > 0);
+  const hasStatusBadges = Boolean(
+    session.cleanupPending ||
+      session.archived ||
+      session.parentSessionId ||
+      (session.residual && !session.archived),
+  );
 
   return (
     <div
       className={cn(
         "asm-session-item group",
         isSelected && "is-selected",
+        hasStatusBadges && "has-badges",
         hasSnippets && "has-snippets",
       )}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-2">
+      <div className="flex min-w-0 flex-1 items-start gap-2">
         {selectionMode && (
           <Checkbox
             checked={isChecked}
@@ -101,38 +108,47 @@ export const SessionItem = memo(function SessionItem({
             onCheckedChange={(checked) =>
               onToggleChecked(session, Boolean(checked))
             }
-            className="shrink-0"
+            className={cn("shrink-0", hasStatusBadges ? "mt-1" : "self-center")}
           />
         )}
         <button
           type="button"
           aria-current={isSelected ? "true" : undefined}
           onClick={() => onSelect(sessionKey)}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+          className="flex min-w-0 flex-1 cursor-pointer flex-col gap-1 text-left"
         >
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="asm-provider-icon">
-                <AgentIcon
-                  icon={getProviderIconName(session.providerId)}
-                  name={providerLabel}
-                  size={16}
-                />
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>
-              {getProviderLabel(session.providerId, t)}
-            </TooltipContent>
-          </Tooltip>
-          <span className="asm-session-title">
-            {highlightText(title, highlightTerms)}
+          <span className="flex w-full min-w-0 items-center gap-2">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="asm-provider-icon">
+                  <AgentIcon
+                    icon={getProviderIconName(session.providerId)}
+                    name={providerLabel}
+                    size={16}
+                  />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {getProviderLabel(session.providerId, t)}
+              </TooltipContent>
+            </Tooltip>
+            <span className="asm-session-title">
+              {highlightText(title, highlightTerms)}
+            </span>
+            <span className="asm-session-time">
+              {lastActive
+                ? formatRelativeTime(lastActive, t)
+                : t("common.unknown")}
+            </span>
           </span>
-          <SessionStatusBadges session={session} parentLabel={parentLabel} />
-          <span className="asm-session-time">
-            {lastActive
-              ? formatRelativeTime(lastActive, t)
-              : t("common.unknown")}
-          </span>
+          {hasStatusBadges && (
+            <span className="asm-session-badges-row">
+              <SessionStatusBadges
+                session={session}
+                parentLabel={parentLabel}
+              />
+            </span>
+          )}
         </button>
       </div>
       {hasSnippets && contentHit && (

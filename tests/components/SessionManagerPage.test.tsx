@@ -21,7 +21,12 @@ import {
 import { piApi } from "@/lib/api/pi";
 import { sessionsApi } from "@/lib/api/sessions";
 import type { SessionMessage, SessionMeta } from "@/types";
-import { setSessionFixtures } from "../msw/state";
+import {
+  getExportedMarkdownRecords,
+  getOpenedExternalUrls,
+  setExportSaveOutcome,
+  setSessionFixtures,
+} from "../msw/state";
 import { server } from "../msw/server";
 
 const { openUrlMock } = vi.hoisted(() => ({ openUrlMock: vi.fn() }));
@@ -240,7 +245,9 @@ describe("SessionManagerPage", () => {
     ).not.toBeInTheDocument();
 
     await userEvent.click(projectLink);
-    expect(openUrlMock).toHaveBeenCalledWith(GITHUB_REPOSITORY_URL);
+    await waitFor(() =>
+      expect(getOpenedExternalUrls()).toEqual([GITHUB_REPOSITORY_URL]),
+    );
   });
 
   it("shows a download button only when GitHub has a newer stable release", async () => {
@@ -271,7 +278,9 @@ describe("SessionManagerPage", () => {
     );
     await userEvent.click(updateButton);
 
-    expect(openUrlMock).toHaveBeenCalledWith(GITHUB_LATEST_RELEASE_URL);
+    await waitFor(() =>
+      expect(getOpenedExternalUrls()).toEqual([GITHUB_LATEST_RELEASE_URL]),
+    );
   });
 
   it("surfaces a relative Pi sessionDir instead of presenting an empty scan as authoritative", async () => {
@@ -2034,5 +2043,77 @@ describe("SessionManagerPage", () => {
     expect(
       screen.getByRole("searchbox", { name: "在当前会话中搜索" }),
     ).toHaveValue("unicorn_pool_fix_42");
+  });
+
+  it("opens native Save As dialog when clicking Export .md, notifies on chosen path, and stays silent on cancel", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "claude",
+          sessionId: "export-save-1",
+          title: "网关排查: 401/JWKS",
+          projectDir: "/repo/gateway",
+          sourcePath: "/mock/claude/export-save-1.jsonl",
+        },
+      ],
+      {
+        "claude:/mock/claude/export-save-1.jsonl": [
+          {
+            role: "user",
+            content: "为什么会出现 401？",
+            ts: 1000,
+            blocks: [{ type: "text", text: "为什么会出现 401？" }],
+          },
+          {
+            role: "assistant",
+            content: "因为未知 kid 未刷新缓存。",
+            ts: 1005,
+            blocks: [{ type: "text", text: "因为未知 kid 未刷新缓存。" }],
+          },
+        ],
+      },
+    );
+
+    renderPage("all");
+
+    const exportBtn = await screen.findByRole("button", { name: "导出 .md" });
+    setExportSaveOutcome({
+      kind: "saved",
+      path: "D:/Notes/网关排查 401 JWKS.md",
+    });
+    await userEvent.click(exportBtn);
+
+    await waitFor(() =>
+      expect(toastSuccessMock).toHaveBeenCalledWith(
+        "已导出 D:/Notes/网关排查 401 JWKS.md",
+      ),
+    );
+    const records = getExportedMarkdownRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].defaultFilename).toBe("网关排查 401 JWKS.md");
+    expect(records[0].content).toContain("# 网关排查: 401/JWKS");
+    expect(records[0].content).toContain("因为未知 kid 未刷新缓存。");
+
+    // 用户取消「另存为」窗口时：不弹成功/失败提示
+    toastSuccessMock.mockReset();
+    toastErrorMock.mockReset();
+    setExportSaveOutcome({ kind: "cancelled" });
+    await userEvent.click(exportBtn);
+
+    await waitFor(() =>
+      expect(getExportedMarkdownRecords()).toHaveLength(2),
+    );
+    expect(toastSuccessMock).not.toHaveBeenCalled();
+    expect(toastErrorMock).not.toHaveBeenCalled();
+
+    // 写入失败时：弹出明确错误提示
+    setExportSaveOutcome({ kind: "error", message: "磁盘空间不足" });
+    await userEvent.click(exportBtn);
+
+    await waitFor(() =>
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        expect.stringContaining("磁盘空间不足"),
+      ),
+    );
   });
 });

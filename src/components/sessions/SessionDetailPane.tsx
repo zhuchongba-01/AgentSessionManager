@@ -44,6 +44,7 @@ import { useMoneyFormat } from "@/hooks/useMoneyFormat";
 import { sessionsApi } from "@/lib/api/sessions";
 import { isMac } from "@/lib/platform";
 import { clearSessionImageCache } from "@/lib/query/sessions";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -51,7 +52,7 @@ import { AgentIcon } from "./AgentIcon";
 import { getAgentReaderStyle } from "./reader/agentStyles";
 import { ReaderContext, type ReaderContextValue } from "./reader/context";
 import {
-  downloadMarkdownFile,
+  saveMarkdownFile,
   transcriptToMarkdown,
   turnToMarkdown,
 } from "./reader/exportMarkdown";
@@ -90,7 +91,6 @@ import { SessionStatusBadges } from "./SessionStatusBadges";
 import type { SessionReaderViewMode } from "./types";
 import {
   buildResumeShellCommand,
-  buildUserMessageToc,
   extractRevealableLocalPath,
   formatMessageTimestamp,
   formatSessionTitle,
@@ -102,20 +102,13 @@ import {
 } from "./utils";
 
 const OUTLINE_OPEN_STORAGE_KEY = "agent-session-manager.outlineOpen";
-const INCLUDE_THINKING_STORAGE_KEY = "agent-session-manager.includeThinking";
 const EXPAND_ALL_STORAGE_KEY = "cc-switch.sessionReader.expandTimelines";
+
+type TimelineExpandMode = "auto" | "expanded" | "collapsed";
 
 function readInitialOutlineOpen(): boolean {
   try {
     return window.localStorage.getItem(OUTLINE_OPEN_STORAGE_KEY) === "true";
-  } catch {
-    return false;
-  }
-}
-
-function readInitialIncludeThinking(): boolean {
-  try {
-    return window.localStorage.getItem(INCLUDE_THINKING_STORAGE_KEY) === "true";
   } catch {
     return false;
   }
@@ -251,7 +244,7 @@ export function SessionDetailPane({
   onBatchDelete,
   onSingleDelete,
   onCopy,
-  onOpenUrl: _onOpenUrl,
+  onOpenUrl,
   onRevealPath,
   onNotifyExport,
   pendingJumpTarget,
@@ -267,19 +260,19 @@ export function SessionDetailPane({
 
   const [flashRowKey, setFlashRowKey] = useState<string | null>(null);
   const [hideToolMessages, setHideToolMessages] = useState(false);
+  const [hideThinking, setHideThinking] = useState(false);
   const [showInjected, setShowInjected] = useState(false);
   const [readerViewMode, setReaderViewMode] =
     useState<SessionReaderViewMode>("all");
-  const [expandAllTimelines, setExpandAllTimelines] =
-    useState(readInitialExpandAll);
+  const [timelineExpandMode, setTimelineExpandMode] =
+    useState<TimelineExpandMode>(() =>
+      readInitialExpandAll() ? "expanded" : "auto",
+    );
   const [turnOverrides, setTurnOverrides] = useState<Map<string, boolean>>(
     () => new Map(),
   );
   const [stepOverrides, setStepOverrides] = useState<Map<string, boolean>>(
     () => new Map(),
-  );
-  const [includeThinking, setIncludeThinking] = useState(
-    readInitialIncludeThinking,
   );
   const [detailSearchOpen, setDetailSearchOpen] = useState(false);
   const [detailSearchQuery, setDetailSearchQuery] = useState("");
@@ -301,38 +294,12 @@ export function SessionDetailPane({
     });
   }, []);
 
-  const handleToggleIncludeThinking = useCallback(() => {
-    setIncludeThinking((prev) => {
-      const next = !prev;
-      try {
-        window.localStorage.setItem(INCLUDE_THINKING_STORAGE_KEY, String(next));
-      } catch {
-        // ignore
-      }
-      return next;
-    });
-  }, []);
-
   const handleToggleTurn = useCallback((turnKey: string, expanded: boolean) => {
     setTurnOverrides((prev) => new Map(prev).set(turnKey, !expanded));
   }, []);
 
   const handleToggleStep = useCallback((stepId: string, expanded: boolean) => {
     setStepOverrides((prev) => new Map(prev).set(stepId, !expanded));
-  }, []);
-
-  const handleToggleExpandAllTimelines = useCallback(() => {
-    setTurnOverrides(new Map());
-    setStepOverrides(new Map());
-    setExpandAllTimelines((prev) => {
-      const next = !prev;
-      try {
-        window.localStorage.setItem(EXPAND_ALL_STORAGE_KEY, next ? "1" : "0");
-      } catch {
-        // ignore
-      }
-      return next;
-    });
   }, []);
 
   const sessionScopeKey = `${selectedKey ?? ""}\u0000${messageRevision}`;
@@ -420,33 +387,69 @@ export function SessionDetailPane({
     return count;
   }, [baseMessages]);
 
+  const thinkingBlockCount = useMemo(() => {
+    let count = 0;
+    for (const message of baseMessages) {
+      if (message.injected) continue;
+      if (message.blocks && message.blocks.length > 0) {
+        count += message.blocks.filter(
+          (b) =>
+            b.type === "thinking" && Boolean(b.text || b.summary || b.redacted),
+        ).length;
+      } else if (
+        message.role.toLowerCase() === "thinking" &&
+        message.content.trim().length > 0
+      ) {
+        count += 1;
+      }
+    }
+    return count;
+  }, [baseMessages]);
+
   const displayedMessages = useMemo(() => {
-    if (!hideToolMessages) return baseMessages;
+    if (!hideToolMessages && !hideThinking) return baseMessages;
     const filtered: SessionMessage[] = [];
     for (const message of baseMessages) {
       const role = message.role.toLowerCase();
       if (message.blocks && message.blocks.length > 0) {
-        const nonToolBlocks = message.blocks.filter(
-          (b) => b.type !== "tool_call" && b.type !== "tool_result",
-        );
-        if (nonToolBlocks.length === 0) continue;
-        if (nonToolBlocks.length !== message.blocks.length) {
+        const keptBlocks = message.blocks.filter((b) => {
+          if (
+            hideToolMessages &&
+            (b.type === "tool_call" || b.type === "tool_result")
+          ) {
+            return false;
+          }
+          if (hideThinking && b.type === "thinking") {
+            return false;
+          }
+          return true;
+        });
+        if (keptBlocks.length === 0) continue;
+        if (keptBlocks.length !== message.blocks.length) {
           filtered.push({
             ...message,
-            blocks: nonToolBlocks,
+            blocks: keptBlocks,
           });
           continue;
         }
         filtered.push(message);
         continue;
       }
-      if (role !== "user" && role !== "assistant" && role !== "thinking") {
+      if (hideThinking && role === "thinking") {
+        continue;
+      }
+      if (
+        hideToolMessages &&
+        role !== "user" &&
+        role !== "assistant" &&
+        role !== "thinking"
+      ) {
         continue;
       }
       filtered.push(message);
     }
     return filtered;
-  }, [baseMessages, hideToolMessages]);
+  }, [baseMessages, hideThinking, hideToolMessages]);
 
   const style = useMemo(
     () => getAgentReaderStyle(selectedSession?.providerId ?? ""),
@@ -469,23 +472,13 @@ export function SessionDetailPane({
     [displayedMessages, style],
   );
 
-  const hasAnyThinking = useMemo(
-    () =>
-      fullTurns.some((turn) =>
-        turn.steps.some((step) => step.kind === "thinking"),
-      ),
-    [fullTurns],
-  );
-
   const hasAnyChanges = useMemo(
     () =>
       fullTurns.some((turn) =>
         turn.steps.some(
           (step) =>
             isChangeStep(step) ||
-            isFailureStep(step) ||
-            (step.kind === "merged" &&
-              step.children.some((c) => isChangeStep(c) || isFailureStep(c))),
+            (step.kind === "merged" && step.children.some(isChangeStep)),
         ),
       ),
     [fullTurns],
@@ -657,7 +650,8 @@ export function SessionDetailPane({
     () =>
       flattenRows(displayedTurns, {
         filter,
-        expandAll: expandAllTimelines,
+        expandAll: timelineExpandMode === "expanded",
+        forceCollapseAll: timelineExpandMode === "collapsed",
         turnOverrides,
         stepOverrides,
         search,
@@ -665,14 +659,37 @@ export function SessionDetailPane({
       }),
     [
       displayedTurns,
-      expandAllTimelines,
       filter,
       search,
       showInjected,
       stepOverrides,
+      timelineExpandMode,
       turnOverrides,
     ],
   );
+
+  const areAllTimelinesExpanded = useMemo(() => {
+    const timelineRows = rows.filter(
+      (row): row is Extract<ReaderRow, { kind: "timeline" }> =>
+        row.kind === "timeline",
+    );
+    return timelineRows.length > 0 && timelineRows.every((row) => row.expanded);
+  }, [rows]);
+
+  const handleToggleExpandAllTimelines = useCallback(() => {
+    const nextExpanded = !areAllTimelinesExpanded;
+    setTurnOverrides(new Map());
+    setStepOverrides(new Map());
+    setTimelineExpandMode(nextExpanded ? "expanded" : "collapsed");
+    try {
+      window.localStorage.setItem(
+        EXPAND_ALL_STORAGE_KEY,
+        nextExpanded ? "1" : "0",
+      );
+    } catch {
+      // ignore
+    }
+  }, [areAllTimelinesExpanded]);
 
   const agentStartKeys = useMemo(() => {
     const keys = new Set<string>();
@@ -737,8 +754,8 @@ export function SessionDetailPane({
     getItemKey: (index) =>
       `${selectedKey}:${messageRevision}:${rows[index]?.key ?? index}`,
     overscan: 8,
-    paddingStart: 8,
-    paddingEnd: 40,
+    paddingStart: 18,
+    paddingEnd: 44,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
@@ -799,6 +816,7 @@ export function SessionDetailPane({
     setFlashRowKey(null);
     setTurnOverrides(new Map());
     setStepOverrides(new Map());
+    setTimelineExpandMode(readInitialExpandAll() ? "expanded" : "auto");
     setReaderViewMode("all");
     setDetailSearchOpen(false);
     setDetailSearchQuery("");
@@ -839,13 +857,20 @@ export function SessionDetailPane({
     return () => cancelAnimationFrame(frame);
   }, [detailSearchOpen]);
 
-  const userMessagesToc = useMemo(
-    () => buildUserMessageToc(displayedMessages, isCodexSession),
-    [displayedMessages, isCodexSession],
-  );
   const minimapMessageIndexes = useMemo(
-    () => userMessagesToc.map((item) => item.index),
-    [userMessagesToc],
+    () =>
+      displayedTurns.flatMap((turn) => {
+        if (!turn.question) return [];
+        if (
+          isCodexSession &&
+          turn.question.text &&
+          turn.question.text.trim().length === 0
+        ) {
+          return [];
+        }
+        return [turn.question.messageIndex];
+      }),
+    [displayedTurns, isCodexSession],
   );
   const showSessionMinimap = shouldShowSessionMinimap(
     minimapMessageIndexes.length,
@@ -938,6 +963,10 @@ export function SessionDetailPane({
       setHideToolMessages(false);
       return;
     }
+    if (hideThinking) {
+      setHideThinking(false);
+      return;
+    }
     if (readerViewMode !== "all") {
       setReaderViewMode("all");
       return;
@@ -964,6 +993,7 @@ export function SessionDetailPane({
   }, [
     displayedMessages,
     displayedTurns,
+    hideThinking,
     hideToolMessages,
     isFetchingMessages,
     isLoadingMessages,
@@ -1035,10 +1065,10 @@ export function SessionDetailPane({
       projectDir: selectedSession?.projectDir ?? undefined,
       t: rt,
       formatCost: moneyCompact,
-      includeThinking,
+      includeThinking: !hideThinking,
     }),
     [
-      includeThinking,
+      hideThinking,
       moneyCompact,
       rt,
       selectedProviderLabel,
@@ -1061,29 +1091,59 @@ export function SessionDetailPane({
   );
 
   const handleCopyMarkdown = useCallback(() => {
-    if (!selectedSession || fullTurns.length === 0) return;
+    const turnsToExport =
+      displayedTurns.length > 0 ? displayedTurns : fullTurns;
+    if (!selectedSession || turnsToExport.length === 0) return;
     const title = formatSessionTitle(selectedSession);
     onCopy(
-      transcriptToMarkdown(title, fullTurns, exportOptions),
+      transcriptToMarkdown(title, turnsToExport, exportOptions),
       t("sessionManager.markdownCopied", {
         defaultValue: "已复制会话 Markdown",
       }),
     );
-  }, [exportOptions, fullTurns, onCopy, selectedSession, t]);
+  }, [displayedTurns, exportOptions, fullTurns, onCopy, selectedSession, t]);
 
-  const handleExportMarkdown = useCallback(() => {
-    if (!selectedSession || fullTurns.length === 0) return;
+  const revealableProjectDir = useMemo(
+    () => extractRevealableLocalPath(selectedSession?.projectDir),
+    [selectedSession?.projectDir],
+  );
+  const revealableSourcePath = useMemo(
+    () => extractRevealableLocalPath(selectedSession?.sourcePath),
+    [selectedSession?.sourcePath],
+  );
+
+  const handleExportMarkdown = useCallback(async () => {
+    const turnsToExport =
+      displayedTurns.length > 0 ? displayedTurns : fullTurns;
+    if (!selectedSession || turnsToExport.length === 0) return;
     const title = formatSessionTitle(selectedSession);
     const filename = sanitizeMarkdownFilename(title, selectedSession.sessionId);
-    downloadMarkdownFile(
-      filename,
-      transcriptToMarkdown(title, fullTurns, {
-        ...exportOptions,
-        includeThinking: true,
-      }),
-    );
-    onNotifyExport?.(filename);
-  }, [exportOptions, fullTurns, onNotifyExport, selectedSession]);
+    try {
+      const saved = await saveMarkdownFile(
+        filename,
+        transcriptToMarkdown(title, turnsToExport, exportOptions),
+        revealableProjectDir ?? undefined,
+      );
+      if (saved) {
+        onNotifyExport?.(saved);
+      }
+    } catch (error) {
+      toast.error(
+        t("sessionManager.exportFailed", {
+          defaultValue: "导出失败：{{error}}",
+          error: extractErrorMessage(error),
+        }),
+      );
+    }
+  }, [
+    displayedTurns,
+    exportOptions,
+    fullTurns,
+    onNotifyExport,
+    revealableProjectDir,
+    selectedSession,
+    t,
+  ]);
 
   const canResume = Boolean(
     selectedSession?.resumeCommand &&
@@ -1099,15 +1159,6 @@ export function SessionDetailPane({
           )
         : "",
     [selectedSession?.projectDir, selectedSession?.resumeCommand],
-  );
-
-  const revealableProjectDir = useMemo(
-    () => extractRevealableLocalPath(selectedSession?.projectDir),
-    [selectedSession?.projectDir],
-  );
-  const revealableSourcePath = useMemo(
-    () => extractRevealableLocalPath(selectedSession?.sourcePath),
-    [selectedSession?.sourcePath],
   );
 
   const handleScrollContainerScroll = useCallback(
@@ -1146,10 +1197,14 @@ export function SessionDetailPane({
       appName: selectedProviderLabel,
       searchQuery: activeQuery || undefined,
       onCopy,
+      onOpenUrl,
+      onRevealPath,
     }),
     [
       activeQuery,
       onCopy,
+      onOpenUrl,
+      onRevealPath,
       selectedProviderLabel,
       selectedSession?.projectDir,
       selectedSession?.providerId,
@@ -1389,16 +1444,16 @@ export function SessionDetailPane({
               <button
                 type="button"
                 className="asm-detail-tool"
-                aria-pressed={expandAllTimelines}
+                aria-pressed={areAllTimelinesExpanded}
                 onClick={handleToggleExpandAllTimelines}
               >
-                {expandAllTimelines ? (
+                {areAllTimelinesExpanded ? (
                   <ChevronsDownUp className="size-3.5" aria-hidden="true" />
                 ) : (
                   <ChevronsUpDown className="size-3.5" aria-hidden="true" />
                 )}
                 <span>
-                  {expandAllTimelines
+                  {areAllTimelinesExpanded
                     ? t("sessionManager.collapseAllSteps", {
                         defaultValue: "收起过程",
                       })
@@ -1408,74 +1463,90 @@ export function SessionDetailPane({
                 </span>
               </button>
             )}
-          {selectedSession && toolMessageCount > 0 && (
-            <button
-              type="button"
-              className="asm-detail-tool"
-              aria-pressed={hideToolMessages}
-              onClick={() => {
-                clearHighlightTimer();
-                navigatedCursorRef.current = null;
-                setFlashRowKey(null);
-                setActiveMatchCursor(0);
-                setHideToolMessages((prev) => !prev);
-              }}
-            >
-              <Wrench className="size-3.5" aria-hidden="true" />
-              <span>
-                {hideToolMessages
-                  ? t("sessionManager.showTools", {
-                      defaultValue: "显示工具 ({{count}})",
-                      count: toolMessageCount,
-                    })
-                  : t("sessionManager.hideTools", {
-                      defaultValue: "隐藏工具 ({{count}})",
-                      count: toolMessageCount,
-                    })}
-              </span>
-            </button>
-          )}
-          {selectedSession && hasInjectedMessages && (
-            <button
-              type="button"
-              className="asm-detail-tool"
-              aria-pressed={showInjected}
-              onClick={() => setShowInjected((prev) => !prev)}
-            >
-              <span>{rt("injectedToggle")}</span>
-            </button>
-          )}
-          {selectedSession && hasAnyThinking && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className="asm-detail-tool"
-                  aria-pressed={includeThinking}
-                  aria-label={t("sessionManager.copyIncludeThinking", {
-                    defaultValue: "复制时包含思考",
+          {selectedSession &&
+            readerViewMode === "all" &&
+            toolMessageCount > 0 && (
+              <button
+                type="button"
+                className="asm-detail-tool"
+                aria-pressed={hideToolMessages}
+                onClick={() => {
+                  clearHighlightTimer();
+                  navigatedCursorRef.current = null;
+                  setFlashRowKey(null);
+                  setActiveMatchCursor(0);
+                  setHideToolMessages((prev) => !prev);
+                }}
+              >
+                <Wrench className="size-3.5" aria-hidden="true" />
+                <span>
+                  {hideToolMessages
+                    ? t("sessionManager.showTools", {
+                        defaultValue: "显示工具 ({{count}})",
+                        count: toolMessageCount,
+                      })
+                    : t("sessionManager.hideTools", {
+                        defaultValue: "隐藏工具 ({{count}})",
+                        count: toolMessageCount,
+                      })}
+                </span>
+              </button>
+            )}
+          {selectedSession &&
+            readerViewMode === "all" &&
+            thinkingBlockCount > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className="asm-detail-tool"
+                    aria-pressed={hideThinking}
+                    onClick={() => {
+                      clearHighlightTimer();
+                      navigatedCursorRef.current = null;
+                      setFlashRowKey(null);
+                      setActiveMatchCursor(0);
+                      setHideThinking((prev) => !prev);
+                    }}
+                  >
+                    <span aria-hidden="true" className="text-xs leading-none">
+                      ✻
+                    </span>
+                    <span>
+                      {hideThinking
+                        ? t("sessionManager.showThinking", {
+                            defaultValue: "显示思考 ({{count}})",
+                            count: thinkingBlockCount,
+                          })
+                        : t("sessionManager.hideThinking", {
+                            defaultValue: "隐藏思考 ({{count}})",
+                            count: thinkingBlockCount,
+                          })}
+                    </span>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("sessionManager.toggleThinkingTooltip", {
+                    defaultValue: "在当前视图及复制/导出中显示或隐藏思考过程",
                   })}
-                  onClick={handleToggleIncludeThinking}
-                >
-                  <span aria-hidden="true" className="text-xs leading-none">
-                    ✻
-                  </span>
-                  <span>
-                    {t("sessionManager.includeThinkingShort", {
-                      defaultValue: "含思考",
-                    })}
-                  </span>
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {t("sessionManager.copyIncludeThinking", {
-                  defaultValue: "复制时包含思考过程",
-                })}
-              </TooltipContent>
-            </Tooltip>
-          )}
+                </TooltipContent>
+              </Tooltip>
+            )}
+          {selectedSession &&
+            readerViewMode === "all" &&
+            hasInjectedMessages && (
+              <button
+                type="button"
+                className="asm-detail-tool"
+                aria-pressed={showInjected}
+                onClick={() => setShowInjected((prev) => !prev)}
+              >
+                <span>{rt("injectedToggle")}</span>
+              </button>
+            )}
           {selectedSession && baseMessages.length > 0 && (
             <>
+              <span className="asm-toolbar-divider" aria-hidden="true" />
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
@@ -1499,18 +1570,23 @@ export function SessionDetailPane({
                 <TooltipTrigger asChild>
                   <button
                     type="button"
-                    className="asm-detail-icon-tool"
+                    className="asm-detail-tool asm-detail-export-btn"
                     aria-label={t("sessionManager.exportMarkdown", {
                       defaultValue: "导出 .md",
                     })}
-                    onClick={handleExportMarkdown}
+                    onClick={() => void handleExportMarkdown()}
                   >
-                    <Download className="size-3.5" />
+                    <Download className="size-3.5" aria-hidden="true" />
+                    <span>
+                      {t("sessionManager.exportMarkdown", {
+                        defaultValue: "导出 .md",
+                      })}
+                    </span>
                   </button>
                 </TooltipTrigger>
                 <TooltipContent>
-                  {t("sessionManager.exportMarkdown", {
-                    defaultValue: "导出 .md",
+                  {t("sessionManager.exportMarkdownSaveAs", {
+                    defaultValue: "选择位置导出为 Markdown (.md)",
                   })}
                 </TooltipContent>
               </Tooltip>
@@ -1548,7 +1624,7 @@ export function SessionDetailPane({
               </TooltipContent>
             </Tooltip>
           )}
-          {selectedSession && showSessionMinimap && (
+          {selectedSession && displayedTurns.length > 0 && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -1623,7 +1699,7 @@ export function SessionDetailPane({
                         <Button
                           size="sm"
                           variant="ghost"
-                          className="asm-resume-btn h-8 gap-1.5 px-2.5 text-xs"
+                          className="asm-resume-btn h-7 gap-1.5 px-2.5 text-xs"
                           onClick={() =>
                             onCopy(
                               fullResumeCommand,
@@ -1656,7 +1732,7 @@ export function SessionDetailPane({
                       <Button
                         size="sm"
                         variant="ghost"
-                        className="asm-delete-btn h-8 gap-1.5 px-3 text-xs"
+                        className="asm-delete-btn h-7 gap-1.5 px-2.5 text-xs"
                         onClick={() =>
                           hasBatchSelection
                             ? onBatchDelete()
@@ -1821,7 +1897,8 @@ export function SessionDetailPane({
                           type="button"
                           onClick={() =>
                             onCopy(
-                              selectedSession.sourcePath!,
+                              revealableSourcePath ??
+                                selectedSession.sourcePath!,
                               t("sessionManager.sourcePathCopied", {
                                 defaultValue: "原始文件已复制",
                               }),
@@ -2052,7 +2129,7 @@ export function SessionDetailPane({
                       </p>
                     </div>
                   ) : (
-                    <div className="asm-messages px-6 py-4">
+                    <div className="asm-messages">
                       {isFetchingMessages && (
                         <div
                           role="status"
@@ -2119,7 +2196,7 @@ export function SessionDetailPane({
                   </button>
                 )}
               </div>
-              {showSessionMinimap && outlineOpen && (
+              {displayedTurns.length > 0 && outlineOpen && (
                 <SessionOutline
                   turns={displayedTurns}
                   activeTurn={activeTurn}

@@ -1,3 +1,4 @@
+import { sessionsApi } from "@/lib/api/sessions";
 import { formatMessageTime } from "../utils";
 import type { AgentReaderStyle } from "./agentStyles";
 import { describeEvent } from "./SessionEventRow";
@@ -175,7 +176,7 @@ export const transcriptToMarkdown = (
   return `# ${title}\n\n${body}\n`;
 };
 
-/** 触发本地浏览器/WebView 下载 Markdown 文件 */
+/** 触发本地浏览器/WebView 下载 Markdown 文件（纯浏览器无选择器环境兜底） */
 export const downloadMarkdownFile = (
   filename: string,
   content: string,
@@ -200,4 +201,75 @@ export const downloadMarkdownFile = (
     }, 1000);
   }
   return safeName;
+};
+
+/**
+ * 弹出系统「另存为」窗口让用户选择保存路径并写入 Markdown 文件。
+ * 用户取消窗口时返回 `null`（不触发任何自动下载或提示）。
+ */
+export const saveMarkdownFile = async (
+  filename: string,
+  content: string,
+  defaultDir?: string,
+): Promise<string | null> => {
+  const trimmed = filename.trim() || "session.md";
+  const safeName = trimmed.toLowerCase().endsWith(".md")
+    ? trimmed
+    : `${trimmed}.md`;
+
+  try {
+    return await sessionsApi.saveMarkdownExport(safeName, content, defaultDir);
+  } catch (error) {
+    // 仅当运行在无 Tauri IPC 的纯浏览器环境时回退到 File System Access API
+    const isMissingTauriIpc =
+      typeof window !== "undefined" &&
+      !("__TAURI_INTERNALS__" in window) &&
+      error instanceof TypeError;
+    if (!isMissingTauriIpc) {
+      throw error;
+    }
+  }
+
+  const win = window as Window & {
+    showSaveFilePicker?: (options?: {
+      suggestedName?: string;
+      types?: Array<{
+        description: string;
+        accept: Record<string, string[]>;
+      }>;
+    }) => Promise<{
+      name?: string;
+      createWritable: () => Promise<{
+        write: (data: string) => Promise<void>;
+        close: () => Promise<void>;
+      }>;
+    }>;
+  };
+  if (typeof win.showSaveFilePicker === "function") {
+    try {
+      const handle = await win.showSaveFilePicker({
+        suggestedName: safeName,
+        types: [
+          {
+            description: "Markdown 文档",
+            accept: { "text/markdown": [".md"] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(content);
+      await writable.close();
+      return handle.name || safeName;
+    } catch (pickerError) {
+      if (
+        pickerError instanceof DOMException &&
+        pickerError.name === "AbortError"
+      ) {
+        return null;
+      }
+      throw pickerError;
+    }
+  }
+
+  return downloadMarkdownFile(safeName, content);
 };

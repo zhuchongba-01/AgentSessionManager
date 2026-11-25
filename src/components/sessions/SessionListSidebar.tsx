@@ -496,43 +496,6 @@ export function SessionListSidebar({
             })}
           </button>
         </div>
-        {listViewMode === "grouped" && groupedSessions.length > 0 && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="asm-list-tool-button"
-                aria-label={
-                  allGroupsExpanded
-                    ? t("sessionManager.collapseAllGroups", {
-                        defaultValue: "折叠全部分组",
-                      })
-                    : t("sessionManager.expandAllGroups", {
-                        defaultValue: "展开全部分组",
-                      })
-                }
-                onClick={onToggleAllGroups}
-              >
-                {allGroupsExpanded ? (
-                  <ChevronsDownUp className="size-3.5" />
-                ) : (
-                  <ChevronsUpDown className="size-3.5" />
-                )}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {allGroupsExpanded
-                ? t("sessionManager.collapseAllGroups", {
-                    defaultValue: "折叠全部分组",
-                  })
-                : t("sessionManager.expandAllGroups", {
-                    defaultValue: "展开全部分组",
-                  })}
-            </TooltipContent>
-          </Tooltip>
-        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -710,92 +673,134 @@ export function SessionListSidebar({
           )}
         </div>
       )}
-      {hasStatusOptions && (
-        <div
-          className="asm-status-filters"
-          role="group"
-          aria-label={t("sessionManager.statusFilterGroup", {
-            defaultValue: "状态筛选",
-          })}
-        >
-          <button
-            type="button"
-            className={cn(
-              "asm-status-pill",
-              statusFilter === "all" && "is-active",
-            )}
-            aria-pressed={statusFilter === "all"}
-            onClick={() => onStatusFilterChange("all")}
-          >
-            {t("sessionManager.statusFilterAll", {
-              defaultValue: "全部 {{count}}",
-              count: statusCounts.all,
-            })}
-          </button>
-          {(statusCounts.residual > 0 || statusFilter === "residual") && (
-            <button
-              type="button"
-              className={cn(
-                "asm-status-pill",
-                statusFilter === "residual" && "is-active",
-              )}
-              aria-pressed={statusFilter === "residual"}
-              onClick={() => onStatusFilterChange("residual")}
-            >
-              {t("sessionManager.statusFilterResidual", {
-                defaultValue: "残留 {{count}}",
-                count: statusCounts.residual,
+      {(hasStatusOptions ||
+        (listViewMode === "grouped" && groupedSessions.length > 0)) && (
+        <div className="asm-list-filterbar">
+          {hasStatusOptions && (
+            <div
+              className="asm-status-filters"
+              role="group"
+              aria-label={t("sessionManager.statusFilterGroup", {
+                defaultValue: "状态筛选",
               })}
-            </button>
+            >
+              <button
+                type="button"
+                className={cn(
+                  "asm-status-pill",
+                  statusFilter === "all" && "is-active",
+                )}
+                aria-pressed={statusFilter === "all"}
+                onClick={() => onStatusFilterChange("all")}
+              >
+                {t("sessionManager.statusFilterAll", {
+                  defaultValue: "全部 {{count}}",
+                  count: statusCounts.all,
+                })}
+              </button>
+              {(statusCounts.residual > 0 || statusFilter === "residual") && (
+                <button
+                  type="button"
+                  className={cn(
+                    "asm-status-pill",
+                    statusFilter === "residual" && "is-active",
+                  )}
+                  aria-pressed={statusFilter === "residual"}
+                  onClick={() => onStatusFilterChange("residual")}
+                >
+                  {t("sessionManager.statusFilterResidual", {
+                    defaultValue: "残留 {{count}}",
+                    count: statusCounts.residual,
+                  })}
+                </button>
+              )}
+              {(statusCounts.cleanupPending > 0 ||
+                statusFilter === "cleanupPending") && (
+                <button
+                  type="button"
+                  className={cn(
+                    "asm-status-pill",
+                    statusFilter === "cleanupPending" && "is-active",
+                  )}
+                  aria-pressed={statusFilter === "cleanupPending"}
+                  onClick={() => onStatusFilterChange("cleanupPending")}
+                >
+                  {t("sessionManager.statusFilterCleanupPending", {
+                    defaultValue: "待清理 {{count}}",
+                    count: statusCounts.cleanupPending,
+                  })}
+                </button>
+              )}
+              {(statusCounts.child > 0 || statusFilter === "child") && (
+                <button
+                  type="button"
+                  className={cn(
+                    "asm-status-pill",
+                    statusFilter === "child" && "is-active",
+                  )}
+                  aria-pressed={statusFilter === "child"}
+                  onClick={() => onStatusFilterChange("child")}
+                >
+                  {t("sessionManager.statusFilterChild", {
+                    defaultValue: "子会话 {{count}}",
+                    count: statusCounts.child,
+                  })}
+                </button>
+              )}
+              {(statusCounts.archived > 0 || statusFilter === "archived") && (
+                <button
+                  type="button"
+                  className={cn(
+                    "asm-status-pill",
+                    statusFilter === "archived" && "is-active",
+                  )}
+                  aria-pressed={statusFilter === "archived"}
+                  onClick={() => onStatusFilterChange("archived")}
+                >
+                  {t("sessionManager.statusFilterArchived", {
+                    defaultValue: "已归档 {{count}}",
+                    count: statusCounts.archived,
+                  })}
+                </button>
+              )}
+            </div>
           )}
-          {(statusCounts.cleanupPending > 0 ||
-            statusFilter === "cleanupPending") && (
-            <button
-              type="button"
-              className={cn(
-                "asm-status-pill",
-                statusFilter === "cleanupPending" && "is-active",
-              )}
-              aria-pressed={statusFilter === "cleanupPending"}
-              onClick={() => onStatusFilterChange("cleanupPending")}
-            >
-              {t("sessionManager.statusFilterCleanupPending", {
-                defaultValue: "待清理 {{count}}",
-                count: statusCounts.cleanupPending,
-              })}
-            </button>
-          )}
-          {(statusCounts.child > 0 || statusFilter === "child") && (
-            <button
-              type="button"
-              className={cn(
-                "asm-status-pill",
-                statusFilter === "child" && "is-active",
-              )}
-              aria-pressed={statusFilter === "child"}
-              onClick={() => onStatusFilterChange("child")}
-            >
-              {t("sessionManager.statusFilterChild", {
-                defaultValue: "子会话 {{count}}",
-                count: statusCounts.child,
-              })}
-            </button>
-          )}
-          {(statusCounts.archived > 0 || statusFilter === "archived") && (
-            <button
-              type="button"
-              className={cn(
-                "asm-status-pill",
-                statusFilter === "archived" && "is-active",
-              )}
-              aria-pressed={statusFilter === "archived"}
-              onClick={() => onStatusFilterChange("archived")}
-            >
-              {t("sessionManager.statusFilterArchived", {
-                defaultValue: "已归档 {{count}}",
-                count: statusCounts.archived,
-              })}
-            </button>
+          {listViewMode === "grouped" && groupedSessions.length > 0 && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="asm-list-fold-btn"
+                  aria-label={
+                    allGroupsExpanded
+                      ? t("sessionManager.collapseAllGroups", {
+                          defaultValue: "折叠全部分组",
+                        })
+                      : t("sessionManager.expandAllGroups", {
+                          defaultValue: "展开全部分组",
+                        })
+                  }
+                  onClick={onToggleAllGroups}
+                >
+                  {allGroupsExpanded ? (
+                    <ChevronsDownUp className="size-3.5" />
+                  ) : (
+                    <ChevronsUpDown className="size-3.5" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {allGroupsExpanded
+                  ? t("sessionManager.collapseAllGroups", {
+                      defaultValue: "折叠全部分组",
+                    })
+                  : t("sessionManager.expandAllGroups", {
+                      defaultValue: "展开全部分组",
+                    })}
+              </TooltipContent>
+            </Tooltip>
           )}
         </div>
       )}

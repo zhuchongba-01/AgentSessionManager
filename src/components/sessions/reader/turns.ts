@@ -995,6 +995,8 @@ export interface FlattenOptions {
   filter?: ReaderFilter;
   /** 「展开全部过程」（UI 偏好 sessionReader.expandTimelines） */
   expandAll?: boolean;
+  /** 「收起全部过程」：显式收起无最终回复或中断的轮次（查找命中与手动切换除外） */
+  forceCollapseAll?: boolean;
   /** 用户手动切换过的轮：true 展开 / false 收起，优先于自动规则 */
   turnOverrides?: ReadonlyMap<string, boolean>;
   /** 用户手动切换过的步骤（含合并步骤） */
@@ -1012,18 +1014,18 @@ export const isChangeStep = (step: TimelineStep): step is ToolStep =>
     Boolean(step.call?.diff));
 
 /**
- * 轮的执行过程是否展开（规则 3、4）：手动切换优先；否则「展开全部」、中断、
- * 无最终回复、查找命中在步骤内时自动展开；最后一轮不特殊处理（决策 D5）。
+ * 轮的执行过程是否展开（规则 3、4）：手动切换优先；查找命中在步骤内时始终展开；
+ * 显式「收起全部」时收起其余轮次；否则按「展开全部」、中断、无最终回复自动展开。
  */
 export const isTimelineExpanded = (
   turn: SessionTurn,
   options: FlattenOptions = {},
 ): boolean =>
   options.turnOverrides?.get(turn.key) ??
-  (Boolean(options.expandAll) ||
-    turn.aborted ||
-    !turn.final ||
-    Boolean(options.search?.turnKeys.has(turn.key)));
+  (Boolean(options.search?.turnKeys.has(turn.key)) ||
+    (options.forceCollapseAll
+      ? false
+      : Boolean(options.expandAll) || turn.aborted || !turn.final));
 
 /** 工具输出预览在前 `visible` 行之后还有没有命中（大小写不敏感，和查找一致） */
 const previewTailHasQuery = (
@@ -1051,7 +1053,11 @@ const stepRows = (
   const failure = isFailureStep(step);
   const searchHit = Boolean(options.search?.stepIds.has(step.id));
   const expanded =
-    override ?? (failure || searchHit || options.filter === "changes");
+    override ??
+    (failure ||
+      searchHit ||
+      options.filter === "changes" ||
+      (step.kind === "merged" && Boolean(options.expandAll)));
   const basePreviewLines =
     failure && override === undefined
       ? FAILURE_PREVIEW_LINES
@@ -1187,7 +1193,11 @@ const turnRows = (turn: SessionTurn, options: FlattenOptions): ReaderRow[] => {
     return rows;
   }
   if (filter === "changes") {
-    const changes = turn.steps.filter(isChangeStep);
+    const changes = turn.steps.filter(
+      (step) =>
+        isChangeStep(step) ||
+        (step.kind === "merged" && step.children.some(isChangeStep)),
+    );
     if (changes.length === 0) return rows;
     if (turn.question) rows.push(questionRow(turn, turn.question, options));
     changes.forEach((step) =>

@@ -12,7 +12,6 @@ import {
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { AlertTriangle } from "lucide-react";
 import {
   clearSessionImageCache,
@@ -22,6 +21,7 @@ import {
 import { piKeys } from "@/lib/query/pi";
 import { piApi } from "@/lib/api/pi";
 import { sessionsApi } from "@/lib/api/sessions";
+import { copyText } from "@/lib/clipboard";
 import type { SessionMessage, SessionMeta } from "@/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -711,13 +711,12 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
   const handleCopy = useCallback(
     async (text: string, successMessage: string) => {
-      try {
-        await navigator.clipboard.writeText(text);
+      const ok = await copyText(text);
+      if (ok) {
         toast.success(successMessage);
-      } catch (error) {
+      } else {
         toast.error(
-          extractErrorMessage(error) ||
-            t("sessionManager.copyFailed", { defaultValue: "复制失败" }),
+          t("sessionManager.copyFailed", { defaultValue: "复制失败" }),
         );
       }
     },
@@ -844,14 +843,18 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     async (url: string) => {
       try {
         const parsed = new URL(url);
-        if (parsed.protocol !== "https:") {
+        if (
+          parsed.protocol !== "https:" &&
+          parsed.protocol !== "http:" &&
+          parsed.protocol !== "mailto:"
+        ) {
           throw new Error(
             t("sessionManager.unsupportedUrlProtocol", {
-              defaultValue: "仅允许打开 HTTPS 链接",
+              defaultValue: "仅允许打开 HTTP / HTTPS / mailto 链接",
             }),
           );
         }
-        await openUrl(url);
+        await sessionsApi.openExternalUrl(url);
       } catch (error) {
         toast.error(
           t("sessionManager.openLinkFailed", {

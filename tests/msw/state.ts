@@ -72,6 +72,18 @@ let messages: Record<string, SessionMessage[]> = {
 };
 let blockContents: Record<string, string> = {};
 let imageDataUrls: Record<string, string> = {};
+let nextExportSaveOutcome:
+  | { kind: "saved"; path?: string }
+  | { kind: "cancelled" }
+  | { kind: "error"; message: string } = { kind: "saved" };
+let exportedMarkdownRecords: Array<{
+  defaultFilename: string;
+  defaultDir?: string;
+  content: string;
+  savedPath: string | null;
+}> = [];
+let openedExternalUrls: string[] = [];
+let revealedPaths: string[] = [];
 
 const blockKey = (providerId: string, sourcePath: string, ref: ContentRef) =>
   `${providerId}|${sourcePath}|${stableKey(ref)}`;
@@ -88,6 +100,10 @@ export const resetProviderState = () => {
   };
   blockContents = {};
   imageDataUrls = {};
+  nextExportSaveOutcome = { kind: "saved" };
+  exportedMarkdownRecords = [];
+  openedExternalUrls = [];
+  revealedPaths = [];
 };
 
 export const listSessions = () => clone(sessions);
@@ -147,3 +163,45 @@ export const getSessionImageFixture = (
   sourcePath: string,
   image: ImageRef,
 ): string | undefined => imageDataUrls[imageKey(providerId, sourcePath, image)];
+
+export const setExportSaveOutcome = (
+  outcome:
+    | { kind: "saved"; path?: string }
+    | { kind: "cancelled" }
+    | { kind: "error"; message: string },
+) => {
+  nextExportSaveOutcome = outcome;
+};
+
+export const handleExportSaveRequest = (input: {
+  defaultFilename: string;
+  defaultDir?: string;
+  content: string;
+}): { ok: true; savedPath: string | null } | { ok: false; message: string } => {
+  if (nextExportSaveOutcome.kind === "error") {
+    return { ok: false, message: nextExportSaveOutcome.message };
+  }
+  const savedPath =
+    nextExportSaveOutcome.kind === "cancelled"
+      ? null
+      : (nextExportSaveOutcome.path ?? `/mock/exports/${input.defaultFilename}`);
+  exportedMarkdownRecords.push({
+    ...input,
+    savedPath,
+  });
+  return { ok: true, savedPath };
+};
+
+export const getExportedMarkdownRecords = () => clone(exportedMarkdownRecords);
+
+export const recordOpenedExternalUrl = (url: string) => {
+  openedExternalUrls.push(url);
+};
+
+export const getOpenedExternalUrls = () => clone(openedExternalUrls);
+
+export const recordRevealedPath = (path: string) => {
+  revealedPaths.push(path);
+};
+
+export const getRevealedPaths = () => clone(revealedPaths);

@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import type { SessionMessage } from "@/types";
-import { extractCodexPromptPreview } from "./utils";
+import { extractCodexPromptPreview, extractMessagePlainText } from "./utils";
 
 interface SessionMinimapProps {
   messages: SessionMessage[];
@@ -68,16 +68,27 @@ export function SessionMinimap({
           messageIndexes[turnIndex + 1] ?? messages.length;
         const reply = messages
           .slice(messageIndex + 1, nextMessageIndex)
-          .filter((item) => item.role.toLowerCase() === "assistant")
-          .map((item) => item.content.slice(0, 220))
+          .filter(
+            (item) => !item.injected && item.role.toLowerCase() === "assistant",
+          )
+          .map((item) => extractMessagePlainText(item).trim())
+          .filter(Boolean)
           .join("\n")
           .slice(0, 220);
-        const user = isCodexSession
-          ? extractCodexPromptPreview(message.content)
-          : message.content;
+        const rawUserText = extractMessagePlainText(message);
+        const userText = isCodexSession
+          ? extractCodexPromptPreview(rawUserText)
+          : rawUserText;
+        const user =
+          userText.trim() ||
+          (message.blocks?.some((block) => block.type === "image")
+            ? t("sessionManager.imageQuestionPlaceholder", {
+                defaultValue: "[图片提问]",
+              })
+            : "");
         return [{ messageIndex, user, reply }];
       }),
-    [isCodexSession, messageIndexes, messages],
+    [isCodexSession, messageIndexes, messages, t],
   );
 
   useEffect(() => {

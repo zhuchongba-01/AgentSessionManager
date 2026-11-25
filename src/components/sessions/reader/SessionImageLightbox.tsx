@@ -26,23 +26,62 @@ export interface SessionImageLightboxProps {
   mediaType?: string;
 }
 
-/** 写剪贴板：浏览器普遍只收 image/png，其他格式先经 canvas 转一次 */
-const copyImage = async (url: string) => {
-  const blob = await fetch(url).then((response) => response.blob());
-  let png = blob;
-  if (blob.type !== "image/png") {
+/** 将 Data URL 直接解码为 Blob，绕过 `fetch(data:...)` 在严格 CSP `connect-src` 下的拦截 */
+export const dataUrlToBlob = (url: string): Blob | null => {
+  const match = /^data:([^;,]+)?(?:;(base64))?,([\s\S]*)$/i.exec(url);
+  if (!match) return null;
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] ?? "";
+  if (isBase64) {
+    const binary = atob(payload.replace(/\s+/g, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+  }
+  return new Blob([decodeURIComponent(payload)], { type: mimeType });
+};
+
+const convertBlobToPng = async (blob: Blob, srcUrl: string): Promise<Blob> => {
+  const canvas = document.createElement("canvas");
+  if (typeof createImageBitmap === "function") {
     const bitmap = await createImageBitmap(blob);
-    const canvas = document.createElement("canvas");
     canvas.width = bitmap.width;
     canvas.height = bitmap.height;
     canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
-    png = await new Promise<Blob>((resolve, reject) =>
-      canvas.toBlob(
-        (result) => (result ? resolve(result) : reject(new Error("toBlob"))),
-        "image/png",
-      ),
-    );
+  } else {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error("image decode failed"));
+      element.src = srcUrl;
+    });
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    canvas.getContext("2d")?.drawImage(img, 0, 0);
   }
+  return await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob(
+      (result) => (result ? resolve(result) : reject(new Error("toBlob"))),
+      "image/png",
+    ),
+  );
+};
+
+/** 写剪贴板：浏览器普遍只收 image/png，其他格式先经 canvas 转一次 */
+export const copyImage = async (url: string) => {
+  let blob = dataUrlToBlob(url);
+  if (!blob) {
+    const response = await fetch(url);
+    blob = await response.blob();
+  }
+  if (!blob) {
+    throw new Error("empty image blob");
+  }
+  const png =
+    blob.type === "image/png" ? blob : await convertBlobToPng(blob, url);
   await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
 };
 

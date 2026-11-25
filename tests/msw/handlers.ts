@@ -6,7 +6,10 @@ import {
   getBlockContentFixture,
   getSessionImageFixture,
   getSessionMessages,
+  handleExportSaveRequest,
   listSessions,
+  recordOpenedExternalUrl,
+  recordRevealedPath,
 } from "./state";
 import type { ContentRef, ImageRef } from "@/types";
 
@@ -267,5 +270,26 @@ export const handlers = [
     success(null),
   ),
   http.post(`${TAURI_ENDPOINT}/clear_session_index`, () => success(null)),
-  http.post(`${TAURI_ENDPOINT}/reveal_session_path`, () => success(null)),
+  http.post(`${TAURI_ENDPOINT}/reveal_session_path`, async ({ request }) => {
+    const { path } = await readJson<{ path: string }>(request);
+    recordRevealedPath(path);
+    return success(null);
+  }),
+  http.post(`${TAURI_ENDPOINT}/open_external_url`, async ({ request }) => {
+    const { url } = await readJson<{ url: string }>(request);
+    recordOpenedExternalUrl(url);
+    return success(null);
+  }),
+  http.post(`${TAURI_ENDPOINT}/save_markdown_export`, async ({ request }) => {
+    const input = await readJson<{
+      defaultFilename: string;
+      defaultDir?: string;
+      content: string;
+    }>(request);
+    const result = handleExportSaveRequest(input);
+    if (!result.ok) {
+      return new HttpResponse(result.message, { status: 500 });
+    }
+    return success(result.savedPath);
+  }),
 ];
