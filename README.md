@@ -17,170 +17,22 @@
 <br/>
 
 <h3>
-  🖥️ <a href="http://www.zgrnf.dpdns.org/demo/">点击进入 1:1 真实前端在线交互桌面 →</a>
+  🖥️ <a href="http://www.zgrnf.dpdns.org/demo/">点击下方界面或此处，直接进入 1:1 在线可交互桌面 →</a>
   &nbsp;&nbsp;|&nbsp;&nbsp;
   🌐 <a href="http://www.zgrnf.dpdns.org/">访问项目官网（内嵌 1:1 交互窗口） →</a>
 </h3>
 
-<sub>无需下载安装，由本项目真实 React 渲染源码 1:1 编译驱动（内置全部 13 种 Agent 模拟会话，可在浏览器中直接拖拽分栏、开启「📄 正文」全文搜索、展开两段式思维链与内联 Diff、打开图片灯箱、切换亮暗主题及导出 .md）。</sub>
+<a href="http://www.zgrnf.dpdns.org/demo/" title="点击打开 Agent会话管理 v1.8.1 1:1 在线交互桌面">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window-dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png" />
+    <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.1 真实界面（点击进入 1:1 在线交互体验）" width="100%" />
+  </picture>
+</a>
+
+<sub>👆 上图随你的 GitHub 亮/暗外观自动切换；<b>点击图片即可在浏览器中 1:1 真实交互操作</b>（拖拽分栏、开启「📄 正文」全文搜索、展开两段式思维链与内联 Diff、查看图片灯箱、切换主题及导出 .md）。</sub>
 
 </div>
-
----
-
-## 🎛️ 交互式界面预览（可直接点击展开 / 折叠体验）
-
-> [!TIP]
-> 下方还原了桌面端 **左右可拖拽分栏 + 右侧结构化对话阅读引擎** 的真实交互层级——直接点击任意分组、思维链、合并步骤或文件改动条目即可展开/收起详情。
-
-<table>
-<tr>
-<td width="35%" valign="top">
-
-**`全部 Agent ▾`** &nbsp; `☑` &nbsp; `列表` · **`分类`** · `时间` &nbsp; `↻`<br/>
-`🔍 搜索标题、目录或 ID` &nbsp; <kbd>Ctrl K</kbd> &nbsp; `📄 正文`<br/>
-**`[全部 7]`** &nbsp; `残留 2` &nbsp; `子会话 1`
-
-<hr/>
-
-<details open>
-<summary><b>Claude Code</b> <code>2</code></summary>
-
-- 📁 **edge-gateway** `2`
-  - 🔹 **排查网关 JWKS 密钥轮换偶发 401 并修复缓存刷新**  
-    <sub>`3 分钟前` · 当前选中</sub>
-  - ▫️ 收紧 OAuth2 PKCE 回调参数与重放校验  
-    <sub>`45 分钟前`</sub>
-
-</details>
-
-<details open>
-<summary><b>DeepSeek Harness</b> <code>1</code></summary>
-
-- 📁 **edge-gateway** `1`
-  - ▫️ 核对 RFC 7517 kid 轮换并发单飞边界  
-    <sub>`「排查网关…」的子会话` · `4 分钟前`</sub>
-
-</details>
-
-<details>
-<summary><b>Codex</b> <code>2</code> <sub>（点击展开）</sub></summary>
-
-- 📁 **session-hub** `2`
-  - ▫️ 升级 SQLite FTS5 全文检索索引与并发取消机制  
-    <sub>`1 小时前`</sub>
-  - ▫️ 清理过期调试会话快照与边车索引记录  
-    <sub>`残留` · `4 小时前`</sub>
-
-</details>
-
-<details>
-<summary><b>Gemini CLI / OpenCode</b> <code>2</code> <sub>（点击展开）</sub></summary>
-
-- 📁 **billing-worker** `1`
-  - ▫️ 账单对账幂等锁与死信队列重试策略  
-    <sub>`1 天前`</sub>
-- 📁 **web-console** `1`
-  - ▫️ 优化虚拟列表滚动帧率与胶囊滚动条体验  
-    <sub>`2 天前`</sub>
-
-</details>
-
-<hr/>
-
-<sub>🟢 `7 个会话` · `5 个 Agent` · 数据仅驻留本机</sub>
-
-</td>
-<td width="65%" valign="top">
-
-**`Claude Code`** `/` `edge-gateway` &nbsp;&nbsp; **`[全部]`** `对话` `改动` · `收起过程` · `🔧 隐藏工具 (4)` · `✻ 隐藏思考 (2)` · `📋` · **`⬇ 导出 .md`** · `🔍` · `◫`
-
-### 排查网关 JWKS 密钥轮换偶发 401 并修复缓存刷新
-
-`>_ 复制恢复命令` &nbsp; `🗑 仅删除此会话`<br/>
-<sub>`🕒 13:30` · `# claude-jwt-fix-01` · `📁 edge-gateway ↗` · `📄 claude-jwt-fix-01.jsonl ↗` · `✨ claude-opus-4-6 · 51.8k Tokens · $0.08`</sub>
-
-<hr/>
-
-<div align="right">
-
-**你** `13:25`  
-`排查为什么网关 JWT 鉴权在密钥轮换后偶发 401（unknown kid=kid-2026-11），并直接完成修复。`
-
-</div>
-
-<br/>
-
-**Claude Code** `13:26 · claude-opus-4-6`
-
-<details open>
-<summary><b>执行过程 · 4 步</b> · 1 个命令 · 改了 1 个文件 <sub>（点击收起 / 展开整轮执行链）</sub></summary>
-
-<details>
-<summary><code>✻ 思考中…</code> · <b>核对 JWKS 缓存 TTL 与未知 kid 回源刷新时机</b> <code>3.2s</code> <sub>（点击展开思维链）</sub></summary>
-
-> 签发服务每 24 小时轮换一次 RSA/Ed25519 密钥对（`kid-2026-11`）。边缘网关本地缓存了 JWKS（`TTL = 15m`），需要确认遇到缓存中不存在的 `kid` 时是否触发了单飞强制刷新，还是直接抛出了 `401 Unauthorized`……  
-> <sub>`[显示全部 — 按需经 ContentRef 分页读取最高 2 MB 完整推理正文]`</sub>
-
-</details>
-
-<details>
-<summary><code>• Explored</code> · 查看了 1 个文件、搜索 1 次 <sub>（连续读/搜步骤自动合并，点击展开）</sub></summary>
-
-- `🟢 Read(src/auth/jwt.ts)` — `2 行`
-- `🟢 Grep(refreshJwks)` — `src/auth/jwks.ts:19`
-
-</details>
-
-<details open>
-<summary><code>🟢 Update(src/auth/jwt.ts)</code> &nbsp; <code>+4</code> <code>-1</code> <sub>（点击折叠 / 展开内联 Diff 补丁）</sub></summary>
-
-```diff
---- a/src/auth/jwt.ts
-+++ b/src/auth/jwt.ts
-@@ -46,2 +46,5 @@
--const key = jwksCache.get(header.kid);
--if (!key) throw new UnauthorizedError("unknown kid");
-+let key = jwksCache.get(header.kid);
-+if (!key) {
-+  await refreshJwks({ force: true });
-+  key = jwksCache.get(header.kid);
-+}
-```
-
-</details>
-
-<details>
-<summary><code>🟢 Bash(pnpm test src/auth/jwt.test.ts)</code> &nbsp; <code>exit 0 · 820ms · 1 行</code></summary>
-
-```text
-PASS src/auth/jwt.test.ts (4 tests) 142ms
-```
-
-</details>
-
-</details>
-
-#### 根因与修复总结
-
-签发端轮换新密钥 `kid-2026-11` 后，路径胶囊 **`[📄 src/auth/jwt.ts:48 | 📂]`** 在本地缓存未命中时直接返回 `401`。现已按 [RFC 7517 规范](https://datatracker.ietf.org/doc/html/rfc7517) 补充带单飞锁的强制回源刷新：
-
-| 场景 | 修复前 | 修复后 |
-| --- | --- | --- |
-| 已知 `kid` | 命中内存缓存 | 命中内存缓存 |
-| 轮换新 `kid` | 偶发 `401`（最长持续 15m） | 单飞强制刷新 JWKS 后立即放行 |
-
-<details>
-<summary><b>第 2 轮追问与对话目录预览</b> <sub>（点击展开）</sub></summary>
-
-> **你** `13:28`：高并发下同时遇到新 `kid` 会不会重复打爆上游 JWKS 接口？  
-> **Claude Code** `13:29`：不会。`[📄 src/auth/jwks.ts:19 | 📂]` 内置了 `inflightRefresh` 单飞锁与 5 秒最小冷却间隔，并发请求会共享同一个刷新 Promise。
-
-</details>
-
-</td>
-</tr>
-</table>
 
 ---
 
