@@ -1676,28 +1676,26 @@ describe("SessionManagerPage", () => {
     renderPage("claude");
     await screen.findByRole("heading", { name: "Tool Session" });
 
-    const hideToolsButton = await screen.findByRole("button", {
-      name: "隐藏工具 (1)",
-    });
-    expect(hideToolsButton).toHaveAttribute("aria-pressed", "false");
-    fireEvent.click(hideToolsButton);
+    // 切换「对话」视图可一键屏蔽工具步骤，只保留纯问答内容
+    const dialogueBtn = await screen.findByRole("button", { name: "对话" });
+    expect(dialogueBtn).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(dialogueBtn);
+    expect(dialogueBtn).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByText("tool output")).not.toBeInTheDocument();
+    expect(screen.getByText("all good")).toBeInTheDocument();
 
-    const showToolsButton = screen.getByRole("button", {
-      name: "显示工具 (1)",
+    const darkThemeButton = screen.getByRole("button", {
+      name: "切换到暗色主题",
     });
-    expect(showToolsButton).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(darkThemeButton);
 
-    const systemThemeButton = screen.getByRole("button", {
-      name: "跟随系统外观",
-    });
-    expect(systemThemeButton).toHaveAttribute("aria-pressed", "false");
-    fireEvent.click(systemThemeButton);
-
-    expect(systemThemeButton).toHaveAttribute("aria-pressed", "true");
-    expect(window.localStorage.getItem("test-session-theme")).toBe("system");
+    expect(
+      screen.getByRole("button", { name: "切换到明亮主题" }),
+    ).toBeInTheDocument();
+    expect(window.localStorage.getItem("test-session-theme")).toBe("dark");
   });
 
-  it("keeps thinking messages visible when hiding tools and excludes them from tool count", async () => {
+  it("groups thinking and tool steps into collapsible timeline in all view and hides both in dialogue view", async () => {
     setSessionFixtures(
       [
         {
@@ -1721,23 +1719,16 @@ describe("SessionManagerPage", () => {
     renderPage("claude");
     await screen.findByRole("heading", { name: "Thinking Session" });
 
-    // 工具计数只算真正的 tool 消息，不含 thinking；思考 + 工具按 cc-switch 规则收纳进「执行过程 · 1 步」
-    const hideToolsButton = await screen.findByRole("button", {
-      name: "隐藏工具 (1)",
+    const timelineButton = await screen.findByRole("button", {
+      name: /执行过程 · 1 步/,
     });
-    expect(
-      screen.getByRole("button", { name: /执行过程 · 1 步/ }),
-    ).toHaveAttribute("aria-expanded", "false");
+    expect(timelineButton).toHaveAttribute("aria-expanded", "false");
 
-    fireEvent.click(hideToolsButton);
+    fireEvent.click(screen.getByRole("button", { name: "对话" }));
     expect(
-      screen.getByRole("button", { name: "显示工具 (1)" }),
-    ).toBeInTheDocument();
-    // 隐藏工具后仅剩单条思考过程，直接平铺展示「思考中…」（不再包一层多余时间线）
-    expect(screen.getByRole("button", { name: /思考中/ })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+      screen.queryByRole("button", { name: /执行过程/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("最终答案")).toBeInTheDocument();
   });
 
   it("searches >4096-char server-truncated messages via IPC and advances Enter navigation after >2s pause", async () => {
@@ -2100,9 +2091,7 @@ describe("SessionManagerPage", () => {
     setExportSaveOutcome({ kind: "cancelled" });
     await userEvent.click(exportBtn);
 
-    await waitFor(() =>
-      expect(getExportedMarkdownRecords()).toHaveLength(2),
-    );
+    await waitFor(() => expect(getExportedMarkdownRecords()).toHaveLength(2));
     expect(toastSuccessMock).not.toHaveBeenCalled();
     expect(toastErrorMock).not.toHaveBeenCalled();
 

@@ -25,7 +25,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window-dark.png" />
   <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png" />
-  <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.1 主界面（2880×1800 高清预览）" width="100%" />
+  <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.2 主界面（2880×1800 高清预览）" width="100%" />
 </picture>
 
 *主界面（2880×1800 2x 高清渲染，随 GitHub 亮 / 暗外观自动切换，点击图片可查看原图）：左侧按 Agent / 项目 / 时间分组的会话列表（支持跨会话正文 FTS5 检索与状态快筛），中间轮次缩略导航，右侧两段式思维链、步骤合并、内联行号 Diff 阅读器与操作面板。*
@@ -39,15 +39,15 @@
 - 🔍 **十三种编码 Agent，一站式纳管**：原生解析 **Codex、Claude Code、Gemini CLI、GitHub Copilot、DeepSeek Harness、WorkBuddy、CodeBuddy、Kimi CLI、OpenClaw、OpenCode、ZCode、Pi、Grok Build** 的本地会话记录、父子代理谱系与项目目录绑定。
 - 🧠 **两段式思维链与结构化阅读引擎**：
   - 按各 Agent 原生视觉风格呈现推理块（`✻ 思考中…` / `• 推理` / `✦ 想法` / `Thought` / `Thinking…`），默认单行展示摘要、字数与耗时，点击展开预览并可经 `ContentRef` 按需分页拉取最高 2 MB 完整推理正文；加密推理块静态标识「思考内容不可见」。
-  - 工具栏支持一键 **`✻ 隐藏思考 / 显示思考`** 与 **`🔧 隐藏工具 / 显示工具`**，实时过滤画面并自动同步到复制与 `.md` 导出。
+  - 顶栏 **`全部 | 对话 | 改动`** 三态视图与会话内搜索、Markdown 复制及 `.md` 导出全链路联动（切至 `对话` 一键呈现纯净问答，切至 `改动` 聚焦代码修改清单）。
 - 🛠️ **工具配对、连续步骤合并与内联 Diff 补丁**：
   - 按 `callId` 精确配对工具调用与返回结果，自动将连续读文件/搜索折叠为 `Explored · 查看了 X 个文件、搜索 Y 次`，同服务连续 MCP 调用折叠为 `Called {server} N times`；失败命令在折叠态下自动置顶常显。
-  - 文件编辑/写入内置行号着色的 **`统一 Diff | 原始补丁`** 视图，并支持 **`全部 | 对话 | 改动`** 三态专注筛选与 **`展开过程 / 收起过程`** 全局控制。
+  - 文件编辑/写入内置行号着色的 **`统一 Diff | 原始补丁`** 视图，并支持 **`展开过程 / 收起过程`** 全局控制。
 - ⚡ **跨会话正文全文检索（SQLite FTS5）**：开启搜索框右侧「正文」开关即可在后台增量构建本地 SQLite FTS5（`trigram` + 短词，`INDEX_VERSION = 2` 仅索引非注入正文）索引，展示高亮摘录卡片并一键跳转到目标轮次对应行；关闭开关立即彻底删除索引文件。
 - 📤 **原生「另存为」导出 `.md`、路径胶囊定位与恢复命令**：
   - 点击 **`导出 .md`** 弹出系统原生保存对话框（Windows 端在独立 STA 线程调用 COM `IFileSaveDialog`），由用户自由选择保存目录与文件名。
   - 对话中的本地路径自动渲染为 **`[📄 相对路径 | 📂]`** 胶囊，支持一键复制路径或在系统文件管理器中精准定位（支持 `~` 展开、剥离 `:行号` 后缀及已删子路径回退父目录）；支持一键复制包含工作目录切换的跨平台会话恢复命令。
-- 🧭 **双模会话导航与精致桌面体验**：同时提供左侧轮次缩略导航条（悬停预览问答摘要）与右侧可展开「对话目录」抽屉（按提问/回复/章节跳转），配备无箭头悬浮胶囊滚动条与亮色 / 暗色 / 跟随系统三态主题。
+- 🧭 **双模会话导航与精致桌面体验**：同时提供左侧轮次缩略导航条（悬停预览问答摘要）与右侧可展开「对话目录」抽屉（按提问/回复/章节跳转），配备 0px 占位的悬浮细胶囊滚动条与独立亮色 / 暗色主题切换。
 - 🧹 **深度安全清理**：内置进程运行守卫、NTFS 重解析点 / 符号链接防越界校验、子会话「先子后父」级联清理、50+ 条批量知情核对与崩溃可恢复的待清理日志，绝不触碰用户项目工作目录。详细安全边界见 [SAFETY.md](./SAFETY.md)。
 
 ---
@@ -74,7 +74,7 @@ flowchart LR
   subgraph UI["分栏桌面界面（React + Virtualizer）"]
     C1["左侧导航台<br/>Agent / 目录 / 时间三视图 + 摘录直达"]
     C2["右侧结构化阅读器<br/>两段式思维链 · 步骤合并 · 内联 Diff"]
-    C3["视图控制与导出<br/>全部/对话/改动 · 隐藏工具/思考 · 导出 .md"]
+    C3["视图控制与导出<br/>全部/对话/改动联动搜索与导出 .md"]
   end
 
   Agents --> B1
@@ -199,7 +199,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 ```powershell
 # 仅接受 X.Y.Z 正式版号；同步全部配置文件版本但不自动创建 Git 标签
-pnpm version:set 1.8.1
+pnpm version:set 1.8.2
 pnpm version:check
 pnpm build:installer   # Windows：Tauri Release 构建 + Inno Setup 安装包
 pnpm build:linux       # Linux：输出 .deb 与 .AppImage

@@ -182,7 +182,7 @@ const filterSetToAllowedValues = (
 
 export function SessionManagerPage({ appId }: { appId: string }) {
   const { t } = useTranslation();
-  const { theme, resolvedTheme, setTheme } = useTheme();
+  const { resolvedTheme, setTheme } = useTheme();
   const queryClient = useQueryClient();
   const {
     data,
@@ -1188,7 +1188,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         <section className="asm-workspace" onWheel={(e) => e.stopPropagation()}>
           <AppTitleBar
             availableUpdate={availableUpdate}
-            theme={theme}
             resolvedTheme={resolvedTheme}
             onSetTheme={setTheme}
             onOpenUrl={handleOpenUrl}

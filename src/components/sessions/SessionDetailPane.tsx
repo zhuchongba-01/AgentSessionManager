@@ -30,7 +30,6 @@ import {
   Sparkles,
   Terminal,
   Trash2,
-  Wrench,
   X,
 } from "lucide-react";
 
@@ -63,7 +62,7 @@ import {
   SessionAgentHeader,
 } from "./reader/SessionAgentAvatar";
 import { SessionChapterRow } from "./reader/SessionChapterRow";
-import { SessionEventRow, SessionInjectedRow } from "./reader/SessionEventRow";
+import { SessionEventRow } from "./reader/SessionEventRow";
 import { SessionFinalReply } from "./reader/SessionFinalReply";
 import { SessionOutline } from "./reader/SessionOutline";
 import { SessionQuestion } from "./reader/SessionQuestion";
@@ -135,7 +134,6 @@ const AGENT_ROW_KINDS: ReadonlySet<ReaderRow["kind"]> = new Set([
   "timeline",
   "step",
   "final",
-  "injected",
 ]);
 
 const hasTimelineRow = (turn: SessionTurn) =>
@@ -230,7 +228,6 @@ export function SessionDetailPane({
   isCodexSession,
   selectedSessionChildCount,
   sessionTitles,
-  rawMessages,
   visibleMessages,
   isLoadingMessages,
   isFetchingMessages,
@@ -259,9 +256,6 @@ export function SessionDetailPane({
   const navigatedCursorRef = useRef<number | null>(null);
 
   const [flashRowKey, setFlashRowKey] = useState<string | null>(null);
-  const [hideToolMessages, setHideToolMessages] = useState(false);
-  const [hideThinking, setHideThinking] = useState(false);
-  const [showInjected, setShowInjected] = useState(false);
   const [readerViewMode, setReaderViewMode] =
     useState<SessionReaderViewMode>("all");
   const [timelineExpandMode, setTimelineExpandMode] =
@@ -277,6 +271,7 @@ export function SessionDetailPane({
   const [detailSearchOpen, setDetailSearchOpen] = useState(false);
   const [detailSearchQuery, setDetailSearchQuery] = useState("");
   const [activeMatchCursor, setActiveMatchCursor] = useState(0);
+  const [searchNavNonce, setSearchNavNonce] = useState(0);
   const [outlineOpen, setOutlineOpen] = useState(readInitialOutlineOpen);
   const [atBottom, setAtBottom] = useState(true);
 
@@ -348,11 +343,9 @@ export function SessionDetailPane({
     [onLoadFullContent, sessionScopeKey],
   );
 
-  // 当开启「显示注入」时使用包含 injected 标记的原始消息数组，否则使用常规可见消息
-  const baseMessages = useMemo(() => {
-    const src = showInjected && rawMessages ? rawMessages : visibleMessages;
-    if (expandedContents.size === 0) return src;
-    return src.map((msg) => {
+  const displayedMessages = useMemo(() => {
+    if (expandedContents.size === 0) return visibleMessages;
+    return visibleMessages.map((msg) => {
       const tIdx = msg.transcriptIndex ?? msg.index;
       const full = tIdx !== undefined ? expandedContents.get(tIdx) : undefined;
       if (full === undefined) return msg;
@@ -362,94 +355,9 @@ export function SessionDetailPane({
         truncated: false,
       };
     });
-  }, [expandedContents, rawMessages, showInjected, visibleMessages]);
+  }, [expandedContents, visibleMessages]);
 
-  const hasInjectedMessages = useMemo(
-    () =>
-      (rawMessages ?? visibleMessages).some((message) =>
-        Boolean(message.injected),
-      ),
-    [rawMessages, visibleMessages],
-  );
-
-  const toolMessageCount = useMemo(() => {
-    let count = 0;
-    for (const message of baseMessages) {
-      if (message.blocks && message.blocks.length > 0) {
-        count += message.blocks.filter((b) => b.type === "tool_call").length;
-      } else {
-        const role = message.role.toLowerCase();
-        if (role !== "user" && role !== "assistant" && role !== "thinking") {
-          count += 1;
-        }
-      }
-    }
-    return count;
-  }, [baseMessages]);
-
-  const thinkingBlockCount = useMemo(() => {
-    let count = 0;
-    for (const message of baseMessages) {
-      if (message.injected) continue;
-      if (message.blocks && message.blocks.length > 0) {
-        count += message.blocks.filter(
-          (b) =>
-            b.type === "thinking" && Boolean(b.text || b.summary || b.redacted),
-        ).length;
-      } else if (
-        message.role.toLowerCase() === "thinking" &&
-        message.content.trim().length > 0
-      ) {
-        count += 1;
-      }
-    }
-    return count;
-  }, [baseMessages]);
-
-  const displayedMessages = useMemo(() => {
-    if (!hideToolMessages && !hideThinking) return baseMessages;
-    const filtered: SessionMessage[] = [];
-    for (const message of baseMessages) {
-      const role = message.role.toLowerCase();
-      if (message.blocks && message.blocks.length > 0) {
-        const keptBlocks = message.blocks.filter((b) => {
-          if (
-            hideToolMessages &&
-            (b.type === "tool_call" || b.type === "tool_result")
-          ) {
-            return false;
-          }
-          if (hideThinking && b.type === "thinking") {
-            return false;
-          }
-          return true;
-        });
-        if (keptBlocks.length === 0) continue;
-        if (keptBlocks.length !== message.blocks.length) {
-          filtered.push({
-            ...message,
-            blocks: keptBlocks,
-          });
-          continue;
-        }
-        filtered.push(message);
-        continue;
-      }
-      if (hideThinking && role === "thinking") {
-        continue;
-      }
-      if (
-        hideToolMessages &&
-        role !== "user" &&
-        role !== "assistant" &&
-        role !== "thinking"
-      ) {
-        continue;
-      }
-      filtered.push(message);
-    }
-    return filtered;
-  }, [baseMessages, hideThinking, hideToolMessages]);
+  const baseMessages = displayedMessages;
 
   const style = useMemo(
     () => getAgentReaderStyle(selectedSession?.providerId ?? ""),
@@ -462,15 +370,12 @@ export function SessionDetailPane({
     [selectedSession, t],
   );
 
-  const fullTurns = useMemo(
-    () => buildTurns(baseMessages, { style }),
-    [baseMessages, style],
-  );
-
   const displayedTurns = useMemo(
     () => buildTurns(displayedMessages, { style }),
     [displayedMessages, style],
   );
+
+  const fullTurns = displayedTurns;
 
   const hasAnyChanges = useMemo(
     () =>
@@ -608,14 +513,17 @@ export function SessionDetailPane({
     sourcePath,
   ]);
 
+  const filter = mapViewModeToFilter(readerViewMode);
+
   const search = useMemo(
-    () => findSearchHits(displayedTurns, activeQuery),
-    [activeQuery, displayedTurns],
+    () => findSearchHits(displayedTurns, activeQuery, filter),
+    [activeQuery, displayedTurns, filter],
   );
 
   // 若后端已确认某条未展开的截断消息命中但当前前端尚未拉完其全文，补入占位匹配以保证计数立即响应
   const serverExtraMatches = useMemo(() => {
     if (
+      filter === "changes" ||
       !activeQuery ||
       !serverSearchState ||
       serverSearchState.key !== searchRequestScopeKey
@@ -624,6 +532,14 @@ export function SessionDetailPane({
     }
     const extra: number[] = [];
     displayedMessages.forEach((msg, displayedIdx) => {
+      const role = msg.role.toLowerCase();
+      if (
+        filter === "conversation" &&
+        role !== "user" &&
+        role !== "assistant"
+      ) {
+        return;
+      }
       const tIdx = msg.transcriptIndex ?? msg.index;
       if (
         tIdx !== undefined &&
@@ -640,11 +556,10 @@ export function SessionDetailPane({
   }, [
     activeQuery,
     displayedMessages,
+    filter,
     searchRequestScopeKey,
     serverSearchState,
   ]);
-
-  const filter = mapViewModeToFilter(readerViewMode);
 
   const rows = useMemo(
     () =>
@@ -655,18 +570,22 @@ export function SessionDetailPane({
         turnOverrides,
         stepOverrides,
         search,
-        showInjected,
       }),
     [
       displayedTurns,
       filter,
       search,
-      showInjected,
       stepOverrides,
       timelineExpandMode,
       turnOverrides,
     ],
   );
+
+  const outlineTurns = useMemo(() => {
+    if (filter !== "changes") return displayedTurns;
+    const visibleTurnIndexes = new Set(rows.map((row) => row.turn));
+    return displayedTurns.filter((turn) => visibleTurnIndexes.has(turn.index));
+  }, [displayedTurns, filter, rows]);
 
   const areAllTimelinesExpanded = useMemo(() => {
     const timelineRows = rows.filter(
@@ -959,14 +878,6 @@ export function SessionDetailPane({
       setDetailSearchOpen(true);
       setDetailSearchQuery(pendingJumpTarget.query);
     }
-    if (hideToolMessages) {
-      setHideToolMessages(false);
-      return;
-    }
-    if (hideThinking) {
-      setHideThinking(false);
-      return;
-    }
     if (readerViewMode !== "all") {
       setReaderViewMode("all");
       return;
@@ -993,8 +904,6 @@ export function SessionDetailPane({
   }, [
     displayedMessages,
     displayedTurns,
-    hideThinking,
-    hideToolMessages,
     isFetchingMessages,
     isLoadingMessages,
     onConsumeJumpTarget,
@@ -1008,9 +917,12 @@ export function SessionDetailPane({
   useEffect(() => {
     if (activeMatchRowIndex >= 0 && activeQuery) {
       virtualizer.scrollToIndex(activeMatchRowIndex, { align: "center" });
+      if (searchNavNonce > 0 && rows[activeMatchRowIndex]) {
+        flashRow(rows[activeMatchRowIndex].key);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeMatchRowIndex, activeQuery, safeMatchCursor]);
+  }, [activeMatchRowIndex, activeQuery, safeMatchCursor, searchNavNonce]);
 
   const navigateMatch = useCallback(
     (delta: number) => {
@@ -1019,6 +931,7 @@ export function SessionDetailPane({
         (safeMatchCursor + delta + totalMatchCount) % totalMatchCount;
       navigatedCursorRef.current = nextCursor;
       setActiveMatchCursor(nextCursor);
+      setSearchNavNonce((n) => n + 1);
     },
     [safeMatchCursor, totalMatchCount],
   );
@@ -1028,6 +941,7 @@ export function SessionDetailPane({
     setDetailSearchOpen(false);
     setDetailSearchQuery("");
     setActiveMatchCursor(0);
+    setSearchNavNonce(0);
   }, []);
 
   useEffect(() => {
@@ -1065,10 +979,10 @@ export function SessionDetailPane({
       projectDir: selectedSession?.projectDir ?? undefined,
       t: rt,
       formatCost: moneyCompact,
-      includeThinking: !hideThinking,
+      filter,
     }),
     [
-      hideThinking,
+      filter,
       moneyCompact,
       rt,
       selectedProviderLabel,
@@ -1339,9 +1253,7 @@ export function SessionDetailPane({
       case "event":
         return <SessionEventRow block={row.block} body={row.body} />;
       case "injected":
-        return displayedMessages[row.messageIndex] ? (
-          <SessionInjectedRow message={displayedMessages[row.messageIndex]} />
-        ) : null;
+        return null;
       case "turn_divider":
         return (
           <div aria-hidden className="py-4">
@@ -1410,7 +1322,11 @@ export function SessionDetailPane({
                 type="button"
                 className="asm-list-view-option"
                 aria-pressed={readerViewMode === "all"}
-                onClick={() => setReaderViewMode("all")}
+                onClick={() => {
+                  navigatedCursorRef.current = null;
+                  setActiveMatchCursor(0);
+                  setReaderViewMode("all");
+                }}
               >
                 {t("sessionManager.readerViewAll", { defaultValue: "全部" })}
               </button>
@@ -1418,7 +1334,11 @@ export function SessionDetailPane({
                 type="button"
                 className="asm-list-view-option"
                 aria-pressed={readerViewMode === "dialogue"}
-                onClick={() => setReaderViewMode("dialogue")}
+                onClick={() => {
+                  navigatedCursorRef.current = null;
+                  setActiveMatchCursor(0);
+                  setReaderViewMode("dialogue");
+                }}
               >
                 {t("sessionManager.readerViewDialogue", {
                   defaultValue: "对话",
@@ -1429,7 +1349,11 @@ export function SessionDetailPane({
                   type="button"
                   className="asm-list-view-option"
                   aria-pressed={readerViewMode === "changes"}
-                  onClick={() => setReaderViewMode("changes")}
+                  onClick={() => {
+                    navigatedCursorRef.current = null;
+                    setActiveMatchCursor(0);
+                    setReaderViewMode("changes");
+                  }}
                 >
                   {t("sessionManager.readerViewChanges", {
                     defaultValue: "改动",
@@ -1461,87 +1385,6 @@ export function SessionDetailPane({
                         defaultValue: "展开过程",
                       })}
                 </span>
-              </button>
-            )}
-          {selectedSession &&
-            readerViewMode === "all" &&
-            toolMessageCount > 0 && (
-              <button
-                type="button"
-                className="asm-detail-tool"
-                aria-pressed={hideToolMessages}
-                onClick={() => {
-                  clearHighlightTimer();
-                  navigatedCursorRef.current = null;
-                  setFlashRowKey(null);
-                  setActiveMatchCursor(0);
-                  setHideToolMessages((prev) => !prev);
-                }}
-              >
-                <Wrench className="size-3.5" aria-hidden="true" />
-                <span>
-                  {hideToolMessages
-                    ? t("sessionManager.showTools", {
-                        defaultValue: "显示工具 ({{count}})",
-                        count: toolMessageCount,
-                      })
-                    : t("sessionManager.hideTools", {
-                        defaultValue: "隐藏工具 ({{count}})",
-                        count: toolMessageCount,
-                      })}
-                </span>
-              </button>
-            )}
-          {selectedSession &&
-            readerViewMode === "all" &&
-            thinkingBlockCount > 0 && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className="asm-detail-tool"
-                    aria-pressed={hideThinking}
-                    onClick={() => {
-                      clearHighlightTimer();
-                      navigatedCursorRef.current = null;
-                      setFlashRowKey(null);
-                      setActiveMatchCursor(0);
-                      setHideThinking((prev) => !prev);
-                    }}
-                  >
-                    <span aria-hidden="true" className="text-xs leading-none">
-                      ✻
-                    </span>
-                    <span>
-                      {hideThinking
-                        ? t("sessionManager.showThinking", {
-                            defaultValue: "显示思考 ({{count}})",
-                            count: thinkingBlockCount,
-                          })
-                        : t("sessionManager.hideThinking", {
-                            defaultValue: "隐藏思考 ({{count}})",
-                            count: thinkingBlockCount,
-                          })}
-                    </span>
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {t("sessionManager.toggleThinkingTooltip", {
-                    defaultValue: "在当前视图及复制/导出中显示或隐藏思考过程",
-                  })}
-                </TooltipContent>
-              </Tooltip>
-            )}
-          {selectedSession &&
-            readerViewMode === "all" &&
-            hasInjectedMessages && (
-              <button
-                type="button"
-                className="asm-detail-tool"
-                aria-pressed={showInjected}
-                onClick={() => setShowInjected((prev) => !prev)}
-              >
-                <span>{rt("injectedToggle")}</span>
               </button>
             )}
           {selectedSession && baseMessages.length > 0 && (
@@ -1624,7 +1467,7 @@ export function SessionDetailPane({
               </TooltipContent>
             </Tooltip>
           )}
-          {selectedSession && displayedTurns.length > 0 && (
+          {selectedSession && outlineTurns.length > 0 && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -2196,9 +2039,9 @@ export function SessionDetailPane({
                   </button>
                 )}
               </div>
-              {displayedTurns.length > 0 && outlineOpen && (
+              {outlineTurns.length > 0 && outlineOpen && (
                 <SessionOutline
-                  turns={displayedTurns}
+                  turns={outlineTurns}
                   activeTurn={activeTurn}
                   onJumpQuestion={jumpToQuestion}
                   onJumpReply={jumpToReply}

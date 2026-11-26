@@ -365,20 +365,18 @@ describe("SessionDetailPane & reader components suite", () => {
       ),
     ).toBeInTheDocument();
 
-    // Live toggle: hide thinking removes thinking steps on screen AND excludes them from export
-    const hideThinkingBtn = screen.getByRole("button", {
-      name: "隐藏思考 (2)",
-    });
-    expect(hideThinkingBtn).toHaveAttribute("aria-pressed", "false");
-    fireEvent.click(hideThinkingBtn);
-
-    expect(
-      screen.getByRole("button", { name: "显示思考 (2)" }),
-    ).toHaveAttribute("aria-pressed", "true");
+    // Switching to "对话" hides thinking/steps and syncs clean Q&A with Copy & Export .md
+    fireEvent.click(screen.getByRole("button", { name: "对话" }));
     expect(
       screen.queryByRole("button", { name: /推理.*核对时钟偏移与签名密钥/ }),
     ).not.toBeInTheDocument();
     expect(screen.queryByText("思考内容不可见")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "复制 Markdown" }));
+    expect(onCopy).toHaveBeenCalledWith(
+      expect.stringContaining("加密思考块已安全处理。"),
+      "已复制会话 Markdown",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "导出 .md" }));
     await waitFor(() => expect(getExportedMarkdownRecords()).toHaveLength(1));
@@ -563,7 +561,7 @@ describe("SessionDetailPane & reader components suite", () => {
       },
     ];
 
-    renderDetailPane({ session, messages });
+    const { onCopy } = renderDetailPane({ session, messages });
 
     // Injected message is hidden by default until toggled
     expect(
@@ -604,7 +602,7 @@ describe("SessionDetailPane & reader components suite", () => {
       "true",
     );
 
-    // Filter switching: "改动" shows only file changes and hides tool/injected toggles
+    // Filter switching: "改动" shows only file changes and syncs Copy Markdown to changes only
     fireEvent.click(screen.getByRole("button", { name: "改动" }));
     expect(
       screen.getByRole("button", { name: /Edited.*src\/auth\.ts/ }),
@@ -612,11 +610,14 @@ describe("SessionDetailPane & reader components suite", () => {
     expect(
       screen.queryByRole("button", { name: /Ran.*pnpm test/ }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /隐藏工具/ }),
-    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "复制 Markdown" }));
+    expect(onCopy).toHaveBeenLastCalledWith(
+      expect.stringContaining("src/auth.ts"),
+      "已复制会话 Markdown",
+    );
+    expect(onCopy.mock.lastCall?.[0]).not.toContain("pnpm test");
 
-    // Toggle outline and inline search
+    // Toggle outline and inline search (and verify search respects "对话" filter)
     fireEvent.click(screen.getByRole("button", { name: "全部" }));
     fireEvent.click(screen.getByRole("button", { name: "切换对话目录" }));
     expect(
@@ -627,10 +628,18 @@ describe("SessionDetailPane & reader components suite", () => {
     const findInput = screen.getByRole("searchbox", {
       name: "在当前会话中搜索",
     });
-    await userEvent.type(findInput, "补丁修复");
+    await userEvent.type(findInput, "pnpm test");
     await waitFor(() =>
       expect(screen.getByText(/1 \/ \d+/)).toBeInTheDocument(),
     );
+    // Switching to "对话" excludes hidden tool steps from search hit count
+    fireEvent.click(screen.getByRole("button", { name: "对话" }));
+    await waitFor(() => expect(screen.getByText("0 / 0")).toBeInTheDocument());
+
+    fireEvent.change(findInput, { target: { value: "补丁修复" } });
+    await waitFor(() => expect(screen.getByText("1 / 1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "下一处匹配" }));
+    expect(screen.getByText("1 / 1")).toBeInTheDocument();
   });
 
   it("collapses no-final turns via 收起过程 and omits 改动 button when only non-edit steps fail", () => {

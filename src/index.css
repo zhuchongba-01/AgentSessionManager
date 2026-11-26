@@ -477,8 +477,8 @@ body {
   flex: none;
   flex-wrap: nowrap;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px 6px;
+  gap: 3px;
+  padding: 2px 5px 6px;
 }
 
 .asm-agent-filter-trigger {
@@ -487,8 +487,8 @@ body {
   max-width: 156px;
   flex: 0 1 auto;
   height: 28px !important;
-  gap: 5px !important;
-  padding: 0 8.5px !important;
+  gap: 4px !important;
+  padding: 0 7px !important;
   border: 1px solid hsl(var(--border) / 0.9) !important;
   border-radius: 8px !important;
   background: hsl(var(--card) / 0.9) !important;
@@ -576,9 +576,15 @@ body {
   outline-offset: 1px;
 }
 
+.asm-list-toolbar .asm-list-view-option {
+  min-width: 28px;
+  padding: 0 5.5px;
+}
+
 .asm-list-tool-button {
-  width: 28px !important;
-  height: 28px !important;
+  width: 26px !important;
+  height: 26px !important;
+  flex: none;
   border-radius: 7px !important;
   color: hsl(var(--muted-foreground)) !important;
 }
@@ -795,6 +801,80 @@ body {
   line-height: 1.6;
   text-align: center;
   overflow-wrap: anywhere;
+}
+
+.asm-overlay-scroll-wrap {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.asm-overlay-scroll-viewport {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.asm-shell .asm-overlay-scroll-viewport::-webkit-scrollbar,
+.asm-overlay-scroll-viewport::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.asm-overlay-scroll-content {
+  min-width: 0;
+}
+
+.asm-overlay-scrollbar {
+  position: absolute;
+  top: 4px;
+  right: 2px;
+  bottom: 4px;
+  z-index: 20;
+  width: 10px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.asm-overlay-scrollbar.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.asm-overlay-scrollbar-thumb {
+  position: absolute;
+  top: 0;
+  right: 1px;
+  width: 4px;
+  border-radius: 999px;
+  background-color: hsl(var(--foreground) / 0.22);
+  cursor: pointer;
+  transition:
+    width 120ms ease,
+    background-color 120ms ease;
+}
+
+.dark .asm-overlay-scrollbar-thumb {
+  background-color: hsl(var(--foreground) / 0.26);
+}
+
+.asm-overlay-scrollbar:hover .asm-overlay-scrollbar-thumb,
+.asm-overlay-scrollbar.is-dragging .asm-overlay-scrollbar-thumb {
+  width: 6px;
+  background-color: hsl(var(--foreground) / 0.42);
+}
+
+.dark .asm-overlay-scrollbar:hover .asm-overlay-scrollbar-thumb,
+.dark .asm-overlay-scrollbar.is-dragging .asm-overlay-scrollbar-thumb {
+  background-color: hsl(var(--foreground) / 0.5);
 }
 
 .asm-list-scroll {
@@ -1748,21 +1828,13 @@ html.dark {
   background-color: transparent;
 }
 
-.asm-list-scroll:hover::-webkit-scrollbar-thumb,
-.asm-list-scroll:focus-within::-webkit-scrollbar-thumb,
 .asm-detail-scroll:hover::-webkit-scrollbar-thumb,
-.asm-detail-scroll:focus-within::-webkit-scrollbar-thumb,
-.asm-ccs-outline:hover ol::-webkit-scrollbar-thumb,
-.asm-ccs-outline ol:focus-within::-webkit-scrollbar-thumb {
+.asm-ccs-outline:hover ol::-webkit-scrollbar-thumb {
   background-color: hsl(var(--foreground) / 0.2);
 }
 
-.dark .asm-list-scroll:hover::-webkit-scrollbar-thumb,
-.dark .asm-list-scroll:focus-within::-webkit-scrollbar-thumb,
 .dark .asm-detail-scroll:hover::-webkit-scrollbar-thumb,
-.dark .asm-detail-scroll:focus-within::-webkit-scrollbar-thumb,
-.dark .asm-ccs-outline:hover ol::-webkit-scrollbar-thumb,
-.dark .asm-ccs-outline ol:focus-within::-webkit-scrollbar-thumb {
+.dark .asm-ccs-outline:hover ol::-webkit-scrollbar-thumb {
   background-color: hsl(var(--foreground) / 0.25);
 }
 

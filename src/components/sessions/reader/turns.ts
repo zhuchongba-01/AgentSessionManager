@@ -781,10 +781,11 @@ export const stepSearchText = (step: TimelineStep): string => {
   }
 };
 
-/** 在 turn 结构上查找；空查询返回 null。注入内容不参与（默认不可见） */
+/** 在 turn 结构上查找；空查询返回 null。按当前视图 filter 精确匹配可见内容 */
 export const findSearchHits = (
   turns: SessionTurn[],
   query: string,
+  filter: ReaderFilter = "all",
 ): SearchHits | null => {
   if (!query.trim()) return null;
   const hits: SearchHits = {
@@ -804,30 +805,71 @@ export const findSearchHits = (
     [event.block.text, event.body].filter(Boolean).join("\n");
 
   turns.forEach((turn) => {
-    turn.leadingEvents.forEach((event) => {
-      const count = countMatches(eventText(event), query);
-      if (count) {
-        add({ turn: turn.index, target: "event", targetId: event.id, count });
+    if (filter === "changes") {
+      const changeSteps = turn.steps.filter(
+        (step) =>
+          isChangeStep(step) ||
+          (step.kind === "merged" && step.children.some(isChangeStep)),
+      );
+      if (changeSteps.length === 0) return;
+
+      const questionCount = countMatches(turn.question?.text ?? "", query);
+      if (questionCount) {
+        hits.questionKeys.add(turn.key);
+        add({ turn: turn.index, target: "question", count: questionCount });
       }
-    });
+      const visitChangeStep = (step: TimelineStep, parent?: MergedStep) => {
+        if (step.kind === "merged") {
+          step.children
+            .filter(isChangeStep)
+            .forEach((child) => visitChangeStep(child, step));
+          return;
+        }
+        if (!isChangeStep(step)) return;
+        const count = countMatches(stepSearchText(step), query);
+        if (!count) return;
+        hits.turnKeys.add(turn.key);
+        hits.stepIds.add(step.id);
+        if (parent) hits.stepIds.add(parent.id);
+        add({ turn: turn.index, target: "step", targetId: step.id, count });
+      };
+      changeSteps.forEach((step) => visitChangeStep(step));
+      return;
+    }
+
+    if (filter === "all") {
+      turn.leadingEvents.forEach((event) => {
+        const count = countMatches(eventText(event), query);
+        if (count) {
+          add({
+            turn: turn.index,
+            target: "event",
+            targetId: event.id,
+            count,
+          });
+        }
+      });
+    }
     const questionCount = countMatches(turn.question?.text ?? "", query);
     if (questionCount) {
       hits.questionKeys.add(turn.key);
       add({ turn: turn.index, target: "question", count: questionCount });
     }
-    const visitStep = (step: TimelineStep, parent?: MergedStep) => {
-      if (step.kind === "merged") {
-        step.children.forEach((child) => visitStep(child, step));
-        return;
-      }
-      const count = countMatches(stepSearchText(step), query);
-      if (!count) return;
-      hits.turnKeys.add(turn.key);
-      hits.stepIds.add(step.id);
-      if (parent) hits.stepIds.add(parent.id);
-      add({ turn: turn.index, target: "step", targetId: step.id, count });
-    };
-    turn.steps.forEach((step) => visitStep(step));
+    if (filter === "all") {
+      const visitStep = (step: TimelineStep, parent?: MergedStep) => {
+        if (step.kind === "merged") {
+          step.children.forEach((child) => visitStep(child, step));
+          return;
+        }
+        const count = countMatches(stepSearchText(step), query);
+        if (!count) return;
+        hits.turnKeys.add(turn.key);
+        hits.stepIds.add(step.id);
+        if (parent) hits.stepIds.add(parent.id);
+        add({ turn: turn.index, target: "step", targetId: step.id, count });
+      };
+      turn.steps.forEach((step) => visitStep(step));
+    }
     turn.chapters.forEach((chapter) => {
       const count = countMatches(
         [chapter.title, chapter.summary].filter(Boolean).join("\n"),
@@ -847,12 +889,19 @@ export const findSearchHits = (
       hits.finalKeys.add(turn.key);
       add({ turn: turn.index, target: "final", count: finalCount });
     }
-    turn.trailingEvents.forEach((event) => {
-      const count = countMatches(eventText(event), query);
-      if (count) {
-        add({ turn: turn.index, target: "event", targetId: event.id, count });
-      }
-    });
+    if (filter === "all") {
+      turn.trailingEvents.forEach((event) => {
+        const count = countMatches(eventText(event), query);
+        if (count) {
+          add({
+            turn: turn.index,
+            target: "event",
+            targetId: event.id,
+            count,
+          });
+        }
+      });
+    }
   });
   return hits;
 };

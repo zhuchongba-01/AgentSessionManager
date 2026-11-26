@@ -31,27 +31,31 @@ export function ThemeProvider({
   defaultTheme = "system",
   storageKey = "agent-session-manager-theme",
 }: ThemeProviderProps) {
-  const getInitialTheme = () => {
-    if (typeof window === "undefined") {
-      return defaultTheme;
-    }
-
-    const stored = safeLocalStorageGet(storageKey) as Theme | null;
-    if (stored === "light" || stored === "dark" || stored === "system") {
-      return stored;
-    }
-
-    return defaultTheme;
-  };
-
-  const [theme, setThemeState] = useState<Theme>(getInitialTheme);
-  const [systemTheme, setSystemTheme] = useState<"light" | "dark">(() =>
+  const resolveSystemAppearance = (): "light" | "dark" =>
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia("(prefers-color-scheme: dark)").matches
       ? "dark"
-      : "light",
-  );
+      : "light";
+
+  const getInitialTheme = (): "light" | "dark" => {
+    const fallback =
+      defaultTheme === "light" || defaultTheme === "dark"
+        ? defaultTheme
+        : resolveSystemAppearance();
+    if (typeof window === "undefined") {
+      return fallback;
+    }
+
+    const stored = safeLocalStorageGet(storageKey) as Theme | null;
+    if (stored === "light" || stored === "dark") {
+      return stored;
+    }
+
+    return fallback;
+  };
+
+  const [theme, setThemeState] = useState<"light" | "dark">(getInitialTheme);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -68,44 +72,7 @@ export function ThemeProvider({
 
     const root = window.document.documentElement;
     root.classList.remove("light", "dark");
-
-    if (theme === "system") {
-      const isDark =
-        typeof window.matchMedia === "function" &&
-        window.matchMedia("(prefers-color-scheme: dark)").matches;
-      root.classList.add(isDark ? "dark" : "light");
-      return;
-    }
-
     root.classList.add(theme);
-  }, [theme]);
-
-  useEffect(() => {
-    if (
-      typeof window === "undefined" ||
-      typeof window.matchMedia !== "function"
-    ) {
-      return;
-    }
-
-    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    const handleChange = () => {
-      setSystemTheme(mediaQuery.matches ? "dark" : "light");
-      if (theme !== "system") {
-        return;
-      }
-
-      const root = window.document.documentElement;
-      root.classList.toggle("dark", mediaQuery.matches);
-      root.classList.toggle("light", !mediaQuery.matches);
-    };
-
-    if (theme === "system") {
-      handleChange();
-    }
-
-    mediaQuery.addEventListener("change", handleChange);
-    return () => mediaQuery.removeEventListener("change", handleChange);
   }, [theme]);
 
   // Sync native window theme (Windows/macOS title bar)
@@ -126,14 +93,7 @@ export function ThemeProvider({
       }
     };
 
-    // When "system", pass "system" so Tauri uses None (follows OS theme natively).
-    // This keeps the WebView's prefers-color-scheme in sync with the real OS theme,
-    // allowing effect #3's media query listener to fire on system theme changes.
-    if (theme === "system") {
-      updateNativeTheme("system");
-    } else {
-      updateNativeTheme(theme);
-    }
+    void updateNativeTheme(theme);
 
     return () => {
       isCancelled = true;
@@ -143,13 +103,15 @@ export function ThemeProvider({
   const value = useMemo<ThemeContextValue>(
     () => ({
       theme,
-      resolvedTheme: theme === "system" ? systemTheme : theme,
+      resolvedTheme: theme,
       setTheme: (nextTheme: Theme) => {
-        if (nextTheme === theme) return;
-        setThemeState(nextTheme);
+        const concrete =
+          nextTheme === "system" ? resolveSystemAppearance() : nextTheme;
+        if (concrete === theme) return;
+        setThemeState(concrete);
       },
     }),
-    [systemTheme, theme],
+    [theme],
   );
 
   return (

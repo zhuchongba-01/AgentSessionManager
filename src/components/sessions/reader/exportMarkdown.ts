@@ -12,17 +12,19 @@ import {
   type StepMeta,
   type Translate,
 } from "./toolSummary";
-import type {
-  SessionTurn,
-  TimelineStep,
-  TurnChapter,
-  TurnEvent,
+import {
+  isChangeStep,
+  type ReaderFilter,
+  type SessionTurn,
+  type TimelineStep,
+  type TurnChapter,
+  type TurnEvent,
 } from "./turns";
 
 /**
  * 「复制这一轮 / 复制整段为 Markdown / 导出为 Markdown 文件」：
  * 提问原文、步骤写成 `- ⏺ Bash(cargo build) — 失败 · exit 101 · 12s` 列表、
- * 最终回复原文；思考默认不含（决策 D14）。
+ * 最终回复原文；思考默认不含（决策 D14），并同步遵循当前「全部 / 对话 / 改动」视图筛选。
  */
 
 export interface MarkdownExportOptions {
@@ -34,6 +36,7 @@ export interface MarkdownExportOptions {
   /** 费用格式化函数，和界面上看到的一致 */
   formatCost: (usd: number) => string;
   includeThinking?: boolean;
+  filter?: ReaderFilter;
 }
 
 const metaText = (meta: StepMeta, { t, formatCost }: MarkdownExportOptions) => {
@@ -119,9 +122,47 @@ export const turnToMarkdown = (
   turn: SessionTurn,
   options: MarkdownExportOptions,
 ): string => {
-  const { t } = options;
+  const { t, filter = "all" } = options;
   const sections: string[] = [];
-  turn.leadingEvents.forEach((event) => sections.push(eventLine(event, t)));
+
+  if (filter === "changes") {
+    const changeSteps = turn.steps.filter(
+      (step) =>
+        isChangeStep(step) ||
+        (step.kind === "merged" && step.children.some(isChangeStep)),
+    );
+    if (changeSteps.length === 0) return "";
+    if (turn.question) {
+      const images = turn.question.images.map(
+        (image, index) =>
+          `[${image.alt || t("image.alt", { index: index + 1 })}]`,
+      );
+      sections.push(
+        [
+          heading(options.youLabel, turn.question.ts),
+          turn.question.text,
+          images.join(" "),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+      );
+    }
+    const changeLines = changeSteps.flatMap((step) =>
+      step.kind === "merged"
+        ? step.children
+            .filter(isChangeStep)
+            .flatMap((child) => stepLines(child, options))
+        : stepLines(step, options),
+    );
+    if (changeLines.length > 0) {
+      sections.push(changeLines.join("\n"));
+    }
+    return sections.join("\n\n");
+  }
+
+  if (filter === "all") {
+    turn.leadingEvents.forEach((event) => sections.push(eventLine(event, t)));
+  }
   if (turn.question) {
     const images = turn.question.images.map(
       (image, index) =>
@@ -137,6 +178,16 @@ export const turnToMarkdown = (
         .join("\n\n"),
     );
   }
+  if (filter === "conversation") {
+    turn.chapters.forEach((chapter) => sections.push(chapterSection(chapter)));
+    if (turn.final) {
+      sections.push(
+        `${heading(options.appName, turn.final.ts)}\n\n${turn.final.text}`,
+      );
+    }
+    return sections.join("\n\n");
+  }
+
   let lines: string[] = [];
   const flush = () => {
     if (lines.length) sections.push(lines.join("\n"));

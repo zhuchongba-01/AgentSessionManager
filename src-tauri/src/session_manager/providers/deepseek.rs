@@ -566,11 +566,25 @@ fn is_visible_user_source(event: &Value) -> bool {
     if event.pointer("/data/hidden").and_then(Value::as_bool) == Some(true) {
         return false;
     }
+    if matches!(
+        event.pointer("/data/source/form").and_then(Value::as_str),
+        Some("snapshot" | "catalog" | "notice" | "instructions")
+    ) {
+        return false;
+    }
     match event.pointer("/data/source/kind").and_then(Value::as_str) {
         Some(
-            "plugin" | "agent-instructions" | "tool-skill" | "system" | "hook" | "internal"
-            | "developer",
+            "plugin" | "agent-instructions" | "tool-skill" | "skill-catalog" | "system" | "hook"
+            | "internal" | "developer" | "time-context" | "runtime-context" | "tool-jobs"
+            | "model-selection" | "compact-checkpoint",
         ) => false,
+        Some(kind)
+            if kind.ends_with("-context")
+                || kind.ends_with("-catalog")
+                || kind.ends_with("-checkpoint") =>
+        {
+            false
+        }
         Some(_) => true,
         None => event.pointer("/data/source").is_none_or(Value::is_null),
     }
@@ -3420,10 +3434,14 @@ mod tests {
                 "createdAt": 1_700_000_000_000_i64, "cwd": "C:/work/demo"
             }),
             json!({"type":"turn/start","seq":0,"time":1700000000010_i64,"data":{}}),
-            // Excluded system/skill/instruction injections
+            // Excluded system/skill/instruction/v4-snapshot injections
             json!({"type":"user/message","seq":1,"time":1700000000020_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"agent-instructions"},"content":[{"type":"text","text":"AGENTS.md"}]}}),
             json!({"type":"user/message","seq":2,"time":1700000000030_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"tool-skill"},"content":[{"type":"text","text":"skill body"}]}}),
             json!({"type":"user/message","seq":3,"time":1700000000040_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"system"},"content":[{"type":"text","text":"system prompt"}]}}),
+            json!({"type":"user/message","seq":3,"time":1700000000045_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"time-context","form":"snapshot"},"content":[{"type":"text","text":"Browser time zone for this request: Asia/Shanghai"}]}}),
+            json!({"type":"user/message","seq":3,"time":1700000000046_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"runtime-context","form":"snapshot"},"content":[{"type":"text","text":"runtime snapshot"}]}}),
+            json!({"type":"user/message","seq":3,"time":1700000000047_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"tool-jobs","form":"notice"},"content":[{"type":"text","text":"job notice"}]}}),
+            json!({"type":"user/message","seq":3,"time":1700000000048_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"compact-checkpoint"},"content":[{"type":"text","text":"checkpoint"}]}}),
             // Early conversation that will be replaced by compaction (seq 4..=5)
             json!({"type":"user/message","seq":4,"time":1700000000100_i64,"surfaceOp":"append","data":{"role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"old turn 1"}]}}),
             json!({"type":"assistant/message","seq":5,"time":1700000000200_i64,"surfaceOp":"append","data":{"message":{"role":"assistant","content":[{"type":"text","text":"old reply 1"}]}}}),
@@ -3466,7 +3484,7 @@ mod tests {
                 ("user", "imported question"),
             ]
         );
-        assert!(messages[..3].iter().all(|m| m.injected && m.role == "user"));
+        assert!(messages[..7].iter().all(|m| m.injected && m.role == "user"));
         assert!(messages.iter().any(|m| {
             m.role == "system"
                 && m.injected

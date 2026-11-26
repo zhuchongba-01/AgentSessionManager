@@ -1,15 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  Github,
-  Minus,
-  Monitor,
-  Moon,
-  Sparkles,
-  Square,
-  Sun,
-  X,
-} from "lucide-react";
+import { Github, Minus, Moon, Sparkles, Square, Sun, X } from "lucide-react";
 import appIcon from "@/icons/app-icon.png";
 import {
   APP_VERSION,
@@ -40,7 +31,6 @@ const windowAction = (action: "minimize" | "toggleMaximize" | "close") => {
 
 interface AppTitleBarProps {
   availableUpdate: AvailableUpdate | null;
-  theme: "light" | "dark" | "system";
   resolvedTheme: "light" | "dark";
   onSetTheme: (theme: "light" | "dark" | "system") => void;
   onOpenUrl: (url: string) => void;
@@ -48,7 +38,6 @@ interface AppTitleBarProps {
 
 export function AppTitleBar({
   availableUpdate,
-  theme,
   resolvedTheme,
   onSetTheme,
   onOpenUrl,
@@ -140,35 +129,9 @@ export function AppTitleBar({
               })}
             </TooltipContent>
           </Tooltip>
+        </div>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  "asm-topbar-btn is-icon",
-                  theme === "system" && "is-active",
-                )}
-                aria-label={t("sessionManager.followSystemTheme", {
-                  defaultValue: "跟随系统外观",
-                })}
-                aria-pressed={theme === "system"}
-                onClick={() => onSetTheme("system")}
-              >
-                <Monitor className="size-3.5" aria-hidden="true" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {theme === "system"
-                ? t("sessionManager.followingSystemTheme", {
-                    defaultValue: "当前已跟随系统外观",
-                  })
-                : t("sessionManager.followSystemTheme", {
-                    defaultValue: "跟随系统外观",
-                  })}
-            </TooltipContent>
-          </Tooltip>
-
+        <div className="asm-topbar-capsule">
           <Tooltip>
             <TooltipTrigger asChild>
               <button
