@@ -206,8 +206,6 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                 created_at: (created > 0).then_some(created),
                 last_active_at: (updated > 0).then_some(updated),
                 source_path: Some(source_reference(&path, &session_id)),
-                resume_command: (!residual && is_safe_session_id(&session_id))
-                    .then(|| format!("zcode -s {session_id}")),
             }
         },
     )
@@ -1582,7 +1580,6 @@ mod tests {
         assert!(!root.residual);
         assert!(!root.archived);
         assert!(root.parent_session_id.is_none());
-        assert_eq!(root.resume_command.as_deref(), Some("zcode -s sess_root"));
         assert_eq!(
             root.title.as_ref().unwrap().chars().count(),
             TITLE_MAX_CHARS + 3
@@ -1591,7 +1588,6 @@ mod tests {
 
         let sub = by_id["sess_sub"];
         assert!(sub.residual, "unindexed subagent session must be residual");
-        assert!(sub.resume_command.is_none());
         assert_eq!(sub.parent_session_id.as_deref(), Some("sess_root"));
 
         let linked = by_id["sess_linked"];
@@ -1603,14 +1599,12 @@ mod tests {
             soft_del.residual,
             "tasks.deleted != 0 marks session residual"
         );
-        assert!(soft_del.resume_command.is_none());
 
         let time_del = by_id["sess_time_del"];
         assert!(
             time_del.residual,
             "session.time_deleted > 0 marks session residual"
         );
-        assert!(time_del.resume_command.is_none());
 
         let fork_arch = by_id["sess_fork_arch"];
         assert!(!fork_arch.residual);

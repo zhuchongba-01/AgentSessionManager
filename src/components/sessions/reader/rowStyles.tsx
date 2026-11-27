@@ -1,14 +1,8 @@
 import { memo, type ReactNode } from "react";
 
-import { useMoneyFormat } from "@/hooks/useMoneyFormat";
 import { cn } from "@/lib/utils";
 import { useReaderT } from "./i18n";
-import {
-  formatDuration,
-  formatTokens,
-  type StatusTone,
-  type StepMeta,
-} from "./toolSummary";
+import { formatDuration, type StatusTone, type StepMeta } from "./toolSummary";
 
 /**
  * 阅读页各行共用的样式片段：统一行高 32、glyph 列宽 16、状态色语义。
@@ -64,7 +58,6 @@ export const StepMetaText = memo(function StepMetaText({
   className?: string;
 }) {
   const rt = useReaderT();
-  const { moneyCompact } = useMoneyFormat();
   const parts: ReactNode[] = [];
   if (meta.exitCode !== undefined) {
     parts.push(
@@ -91,16 +84,6 @@ export const StepMetaText = memo(function StepMetaText({
     parts.push(
       <span key="lines">{rt("lines", { count: meta.lineCount })}</span>,
     );
-  }
-  if (meta.tokens !== undefined) {
-    parts.push(
-      <span key="tok">
-        {rt("summaryTokens", { tokens: formatTokens(meta.tokens) })}
-      </span>,
-    );
-  }
-  if (meta.costUsd !== undefined) {
-    parts.push(<span key="cost">{moneyCompact(meta.costUsd)}</span>);
   }
   if (parts.length === 0) return null;
   return (

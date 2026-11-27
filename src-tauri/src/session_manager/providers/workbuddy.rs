@@ -259,7 +259,6 @@ fn scan_sessions_in_home(home: &Path, cache: &FileParseCache<ParsedJsonlMeta>) -
                 created_at,
                 last_active_at,
                 source_path: Some(copy.source_path),
-                resume_command: None,
             });
         }
     }
@@ -309,7 +308,6 @@ fn scan_sessions_in_home(home: &Path, cache: &FileParseCache<ParsedJsonlMeta>) -
             created_at,
             last_active_at,
             source_path: Some(source_reference(&db_path, session_id)),
-            resume_command: None,
         });
     }
 
@@ -376,7 +374,6 @@ fn scan_orphan_workspace_backups(
             created_at: modified_ms,
             last_active_at: modified_ms,
             source_path: Some(source_reference(db_path, &name)),
-            resume_command: None,
         });
     }
 }
@@ -3207,7 +3204,6 @@ mod tests {
             Some("list txt files\n[Image: shot.png]")
         );
         assert_eq!(scanned[0].summary.as_deref(), Some("Found 2 files."));
-        assert!(scanned[0].resume_command.is_none());
 
         let msgs = load_messages(&jsonl).unwrap();
         let pairs: Vec<(&str, &str)> = msgs

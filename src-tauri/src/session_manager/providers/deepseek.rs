@@ -107,9 +107,6 @@ fn scan_sessions_at(home: &Path) -> Vec<SessionMeta> {
     for session in &mut sessions {
         let assignment = catalog.assignments.get(&session.session_id);
         session.archived = catalog.archived.contains(&session.session_id);
-        if session.archived || session.residual {
-            session.resume_command = None;
-        }
         session.project_name = assignment.and_then(|workspace| workspace.project_name.clone());
         session.project_dir = assignment.map(|workspace| workspace.project_dir.clone());
     }
@@ -723,8 +720,6 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
     };
 
     let residual = is_subagent || hidden_dependency;
-    let resume_command =
-        (!residual && !has_parent && is_safe_session_id(&id)).then(|| format!("dsh --resume {id}"));
 
     Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
@@ -743,7 +738,6 @@ fn parse_session_file_only(path: &Path) -> Result<Option<SessionMeta>, String> {
         created_at,
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
-        resume_command,
     }))
 }
 
@@ -3627,10 +3621,6 @@ mod tests {
         let scanned = scan_sessions_at(temp.path());
         assert_eq!(scanned.len(), 1);
         assert_eq!(scanned[0].title.as_deref(), Some("completed frame prompt"));
-        assert_eq!(
-            scanned[0].resume_command.as_deref(),
-            Some("dsh --resume zstd-tail")
-        );
 
         // 2. Partial 2-byte zstd magic prefix at tail also decodes earlier complete frames
         let mut truncated_magic = Vec::new();
@@ -3679,14 +3669,13 @@ mod tests {
             .map(|s| (s.session_id.as_str(), s))
             .collect();
 
-        assert_eq!(
-            by_id["s-root"].resume_command.as_deref(),
-            Some("dsh --resume s-root")
-        );
+        assert!(!by_id["s-root"].residual);
+        assert!(!by_id["s-root"].archived);
         assert!(by_id["s-arch"].archived);
-        assert!(by_id["s-arch"].resume_command.is_none());
-        assert!(by_id["s-branch"].resume_command.is_none());
+        assert_eq!(
+            by_id["s-branch"].parent_session_id.as_deref(),
+            Some("s-root")
+        );
         assert!(by_id["s-sub"].residual);
-        assert!(by_id["s-sub"].resume_command.is_none());
     }
 }

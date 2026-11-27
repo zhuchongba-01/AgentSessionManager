@@ -60,7 +60,6 @@ const defaultSessions = (): SessionMeta[] => [
     title: "Codex Session One",
     projectDir: "/mock/codex",
     sourcePath: "/mock/codex/session-1.jsonl",
-    resumeCommand: "codex resume codex-session-1",
   },
 ];
 
@@ -184,7 +183,8 @@ export const handleExportSaveRequest = (input: {
   const savedPath =
     nextExportSaveOutcome.kind === "cancelled"
       ? null
-      : (nextExportSaveOutcome.path ?? `/mock/exports/${input.defaultFilename}`);
+      : (nextExportSaveOutcome.path ??
+        `/mock/exports/${input.defaultFilename}`);
   exportedMarkdownRecords.push({
     ...input,
     savedPath,

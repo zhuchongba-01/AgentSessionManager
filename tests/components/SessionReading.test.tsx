@@ -132,11 +132,10 @@ describe("session reading integration", () => {
     expect(
       screen.getByText("Codex delayed visible answer"),
     ).toBeInTheDocument();
-    const tick = screen.getByRole("button", { name: "跳转到第 1 个用户问题" });
-    expect(tick).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "跳转到第 2 个用户问题" }),
-    ).not.toBeInTheDocument();
+    const outlineToggle = screen.getByRole("button", { name: "切换对话目录" });
+    fireEvent.click(outlineToggle);
+    const outlineNav = screen.getByRole("navigation", { name: "对话目录" });
+    expect(outlineNav.querySelectorAll("ol > li")).toHaveLength(1);
     expect(
       screen.queryByText(/# AGENTS.md instructions/),
     ).not.toBeInTheDocument();
@@ -145,13 +144,11 @@ describe("session reading integration", () => {
     );
     expect(clients[0].getQueryData(key)).toMatchObject({ messages });
     expect(screen.queryByText("正在读取会话…")).not.toBeInTheDocument();
-    fireEvent.click(tick);
+    fireEvent.click(outlineNav.querySelector("button")!);
     expect(
-      screen.getByText("Codex delayed visible answer"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "跳转到第 1 个用户问题" }),
-    ).toBeInTheDocument();
+      screen.getAllByText("Codex delayed visible answer").length,
+    ).toBeGreaterThan(0);
+    fireEvent.click(outlineToggle);
   });
 
   it("aborts the stream on unmount and ignores later Channel callbacks", async () => {

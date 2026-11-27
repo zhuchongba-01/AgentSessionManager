@@ -40,7 +40,6 @@ describe("standalone Agent session manager", () => {
           sourcePath: "C:\\sessions\\session-1.jsonl",
           createdAt: Date.now() - 60_000,
           lastActiveAt: Date.now() - 30_000,
-          resumeCommand: "codex resume session-1",
         },
       ],
       {

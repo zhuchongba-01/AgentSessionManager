@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
 import {
   Boxes,
   CalendarClock,
-  CheckSquare,
   ChevronDown,
   ChevronRight,
   ChevronsDownUp,
@@ -76,8 +75,6 @@ interface SessionListSidebarProps {
   providerFilterLabel: string;
   providerSessionCounts: Record<string, number>;
   selectionMode: boolean;
-  onEnterSelectionMode: () => void;
-  onExitSelectionMode: () => void;
   listViewMode: SessionListViewMode;
   onListViewModeChange: (mode: SessionListViewMode) => void;
   isLoading: boolean;
@@ -140,8 +137,6 @@ export function SessionListSidebar({
   providerFilterLabel,
   providerSessionCounts,
   selectionMode,
-  onEnterSelectionMode,
-  onExitSelectionMode,
   listViewMode,
   onListViewModeChange,
   isLoading,
@@ -351,25 +346,34 @@ export function SessionListSidebar({
         >
           <SelectTrigger
             className="asm-agent-filter-trigger"
+            title={
+              providerFilter === "all"
+                ? t("sessionManager.providerFilterAll", {
+                    defaultValue: "全部 Agent",
+                  })
+                : providerFilterLabel
+            }
             aria-label={t("sessionManager.providerFilterTooltip", {
               defaultValue: "Agent 筛选",
             })}
           >
-            {providerFilter === "all" ? (
-              <Boxes className="size-3.5 shrink-0" />
-            ) : (
-              <AgentIcon
-                icon={getProviderIconName(providerFilter)}
-                name={providerFilterLabel}
-                size={16}
-              />
-            )}
-            <span className="truncate">
-              {providerFilter === "all"
-                ? t("sessionManager.providerFilterAll", {
-                    defaultValue: "全部 Agent",
-                  })
-                : providerFilterLabel}
+            <span className="flex min-w-0 flex-1 items-center gap-1.5 text-left">
+              {providerFilter === "all" ? (
+                <Boxes className="size-4 shrink-0" />
+              ) : (
+                <AgentIcon
+                  icon={getProviderIconName(providerFilter)}
+                  name={providerFilterLabel}
+                  size={16}
+                />
+              )}
+              <span className="truncate">
+                {providerFilter === "all"
+                  ? t("sessionManager.providerFilterAll", {
+                      defaultValue: "全部 Agent",
+                    })
+                  : providerFilterLabel}
+              </span>
             </span>
           </SelectTrigger>
           <SelectContent className="asm-select-content asm-agent-filter-content">
@@ -408,48 +412,6 @@ export function SessionListSidebar({
           </SelectContent>
         </Select>
         <span className="asm-toolbar-spacer" />
-        {(selectionMode || deletableFilteredSessions.length > 0) && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant={selectionMode ? "secondary" : "ghost"}
-                size="icon"
-                className={
-                  selectionMode
-                    ? "asm-list-tool-button bg-accent text-accent-foreground hover:bg-accent/80"
-                    : "asm-list-tool-button"
-                }
-                aria-label={
-                  selectionMode
-                    ? t("sessionManager.exitBatchModeTooltip", {
-                        defaultValue: "退出批量管理",
-                      })
-                    : t("sessionManager.manageBatchTooltip", {
-                        defaultValue: "进入批量管理",
-                      })
-                }
-                onClick={() => {
-                  if (selectionMode) {
-                    onExitSelectionMode();
-                  } else {
-                    onEnterSelectionMode();
-                  }
-                }}
-              >
-                <CheckSquare className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {selectionMode
-                ? t("sessionManager.exitBatchModeTooltip", {
-                    defaultValue: "退出批量管理",
-                  })
-                : t("sessionManager.manageBatchTooltip", {
-                    defaultValue: "进入批量管理",
-                  })}
-            </TooltipContent>
-          </Tooltip>
-        )}
         <div
           className="asm-list-view-switch"
           role="group"

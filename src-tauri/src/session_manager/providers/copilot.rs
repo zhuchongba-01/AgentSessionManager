@@ -470,9 +470,6 @@ fn build_session_meta(events: ParsedEventsMeta, ws: WorkspaceYaml) -> SessionMet
         .map(|t| truncate_summary(&t, 160))
         .filter(|t| !t.is_empty());
 
-    let resume_command =
-        is_safe_session_id(&session_id).then(|| format!("copilot --resume={session_id}"));
-
     SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id,
@@ -488,7 +485,6 @@ fn build_session_meta(events: ParsedEventsMeta, ws: WorkspaceYaml) -> SessionMet
         created_at,
         last_active_at,
         source_path: Some(events.source_path),
-        resume_command,
     }
 }
 
@@ -1193,10 +1189,6 @@ mod tests {
         assert_eq!(first_scan.len(), 1);
         assert_eq!(first_scan[0].title.as_deref(), Some("Fix the build"));
         assert_eq!(first_scan[0].project_dir.as_deref(), Some("/work/project"));
-        assert_eq!(
-            first_scan[0].resume_command.as_deref(),
-            Some("copilot --resume=0cb916db-0000-4000-8000-000000000001")
-        );
 
         // Adding workspace.yaml updates title/cwd/summary even when events.jsonl hits PARSE_CACHE!
         fs::write(

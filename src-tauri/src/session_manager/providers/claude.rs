@@ -2653,8 +2653,6 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         created_at,
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
-        resume_command: is_safe_session_id(&session_id)
-            .then(|| format!("claude --resume {session_id}")),
     }))
 }
 
@@ -2919,7 +2917,6 @@ fn scan_project_index_ghosts(
             created_at,
             last_active_at,
             source_path: Some(expected_jsonl.to_string_lossy().to_string()),
-            resume_command: None,
         });
     }
 }
@@ -3558,10 +3555,6 @@ mod tests {
 
         let meta = parse_session(&path).expect("parse session with >4MiB line");
         assert_eq!(meta.session_id, fork_id);
-        assert_eq!(
-            meta.resume_command.as_deref(),
-            Some("claude --resume 11111111-2222-3333-4444-555555555555")
-        );
         assert_eq!(meta.project_dir.as_deref(), Some("/workspace/deep-app"));
         assert_eq!(meta.title.as_deref(), Some("Summary fallback title"));
         assert_eq!(meta.summary.as_deref(), Some("Final tail answer"));
@@ -3667,7 +3660,6 @@ mod tests {
             .find(|s| s.session_id == ghost_id)
             .expect("ghost surfaced");
         assert!(ghost.residual);
-        assert!(ghost.resume_command.is_none());
         assert_eq!(ghost.title.as_deref(), Some("Orphaned Resume Entry"));
         assert_eq!(ghost.project_dir.as_deref(), Some("/work/demo"));
 

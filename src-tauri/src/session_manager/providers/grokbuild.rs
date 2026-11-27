@@ -71,7 +71,6 @@ fn parse_discovered_summary(path: &Path) -> Result<Option<SessionMeta>, String> 
         if is_archived_summary(path) {
             session.archived = true;
             session.residual = true;
-            session.resume_command = None;
         }
         session
     }))
@@ -992,8 +991,6 @@ fn parse_summary_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         created_at,
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
-        resume_command: (!is_subagent && is_safe_session_id(&session_id))
-            .then(|| format!("grok --resume {session_id}")),
     }))
 }
 
@@ -1214,11 +1211,6 @@ mod tests {
         assert_eq!(sessions[0].provider_id, "grokbuild");
         assert_eq!(sessions[0].session_id, session_id);
         assert_eq!(sessions[0].title.as_deref(), Some("Grok session"));
-        let expected_resume = format!("grok --resume {session_id}");
-        assert_eq!(
-            sessions[0].resume_command.as_deref(),
-            Some(expected_resume.as_str())
-        );
     }
 
     #[test]
@@ -1244,7 +1236,6 @@ mod tests {
 
         assert!(session.archived);
         assert!(session.residual);
-        assert!(session.resume_command.is_none());
     }
 
     #[test]
@@ -1263,7 +1254,6 @@ mod tests {
             .expect("parse child summary")
             .expect("session meta");
         assert!(session.residual);
-        assert!(session.resume_command.is_none());
         assert_eq!(session.parent_session_id.as_deref(), Some("session-parent"));
     }
 

@@ -138,7 +138,6 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
         // Even when the ID also exists in SQLite, the JSON record is a separate
         // legacy copy that OpenCode no longer uses for its current list.
         session.residual = true;
-        session.resume_command = None;
         merged.push(session);
     }
     merged
@@ -195,14 +194,8 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
         .filter(|path| path.is_file())
     {
         match scan_database(&db_path) {
-            Some(mut rows) => {
+            Some(rows) => {
                 found = true;
-                let primary = database_paths(
-                    &get_opencode_base_dir(),
-                    std::env::var("OPENCODE_DB").ok().as_deref(),
-                    true,
-                );
-                enable_resume_for_database(&mut rows, &db_path, &primary);
                 sessions.extend(rows);
             }
             None => {
@@ -212,14 +205,6 @@ fn try_scan_sessions_sqlite() -> Option<Vec<SessionMeta>> {
     }
     sessions.sort_by_key(|session| std::cmp::Reverse(session.last_active_at));
     found.then_some(sessions)
-}
-
-fn enable_resume_for_database(rows: &mut [SessionMeta], db_path: &Path, primary: &[PathBuf]) {
-    if validate_database_path_from(db_path, primary).is_err() {
-        for session in rows {
-            session.resume_command = None;
-        }
-    }
 }
 
 fn scan_session_table(
@@ -327,8 +312,6 @@ fn scan_session_table(
             created_at: created,
             last_active_at: updated.or(created),
             source_path: Some(format!("sqlite:{db_display}:{session_id}")),
-            resume_command: (!residual && is_safe_session_id(&session_id))
-                .then(|| format!("opencode -s {session_id}")),
         });
     }
     Some(())
@@ -1215,8 +1198,6 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
         created_at,
         last_active_at: updated_at.or(created_at),
         source_path: Some(source_path),
-        resume_command: (parent_id.is_none() && is_safe_session_id(&session_id))
-            .then(|| format!("opencode -s {session_id}")),
     })
 }
 
@@ -1506,16 +1487,9 @@ mod compat_tests {
         for db in [&primary, &channel] {
             Connection::open(db).unwrap().execute_batch("CREATE TABLE session(id TEXT,title TEXT,directory TEXT,time_created INTEGER,time_updated INTEGER); INSERT INTO session VALUES('ses_same','name','',1,1);").unwrap();
         }
-        let mut main = scan_database(&primary).unwrap();
-        let mut dev = scan_database(&channel).unwrap();
-        enable_resume_for_database(&mut main, &primary, std::slice::from_ref(&primary));
-        enable_resume_for_database(&mut dev, &channel, std::slice::from_ref(&primary));
-        assert!(main[0].resume_command.is_some());
-        assert!(dev[0].resume_command.is_none());
+        let main = scan_database(&primary).unwrap();
+        let dev = scan_database(&channel).unwrap();
         assert_ne!(main[0].source_path, dev[0].source_path);
-        let mut explicit = scan_database(&channel).unwrap();
-        enable_resume_for_database(&mut explicit, &channel, std::slice::from_ref(&channel));
-        assert!(explicit[0].resume_command.is_some());
     }
 
     #[test]
@@ -1795,7 +1769,6 @@ mod tests {
 
         let child = parse_session(&storage, &child_path).expect("parse child");
         assert!(child.residual);
-        assert!(child.resume_command.is_none());
         assert_eq!(child.parent_session_id.as_deref(), Some("ses_parent"));
         let error =
             preflight_json_storage(&storage, "ses_parent").expect_err("parent must be protected");
@@ -1924,7 +1897,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "ses_legacy");
         assert!(sessions[0].residual);
-        assert!(sessions[0].resume_command.is_none());
     }
 
     #[test]
@@ -2186,16 +2158,11 @@ mod tests {
             sessions[1].source_path.as_deref(),
             Some(expected_source.as_str())
         );
-        assert_eq!(
-            sessions[1].resume_command.as_deref(),
-            Some("opencode -s ses_1")
-        );
         let child = sessions
             .iter()
             .find(|session| session.session_id == "ses_child")
             .expect("child session");
         assert!(child.residual);
-        assert!(child.resume_command.is_none());
     }
 
     #[test]
@@ -2481,10 +2448,6 @@ mod tests {
         assert_eq!(
             scanned[0].summary.as_ref().unwrap().chars().count(),
             160 + 3
-        );
-        assert_eq!(
-            scanned[0].resume_command.as_deref(),
-            Some("opencode -s 019cc369-bd7c-7891-b371-7b20b4fe0b18")
         );
         assert_eq!(scanned[1].session_id, uuid_child);
         assert!(scanned[1].archived);

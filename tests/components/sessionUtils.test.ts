@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   buildSessionTitleIndex,
-  buildUserMessageToc,
   collectSessionDescendants,
   extractCodexPromptPreview,
   formatSessionMessagePreview,
@@ -14,7 +13,6 @@ import {
   groupSessionsByProviderAndDirectory,
   resolveParentLabel,
   shouldHideCodexMessageFromToc,
-  shouldShowSessionMinimap,
   splitCodexIdeContext,
 } from "@/components/sessions/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
@@ -79,60 +77,6 @@ describe("session utils", () => {
     expect(
       collectSessionDescendants([parent, child, other, unknown], [parent]),
     ).toEqual([child]);
-  });
-  /**
-   * 目录/缩略导航用的下标必须是「可见消息」空间的下标，而不是正文里的绝对下标。
-   *
-   * 虚拟列表的 count 就是 visibleMessages 的长度，scrollToIndex 与 SessionMinimap
-   * 都吃这个空间；一旦这里改用 wire 的 `SessionMessage.index`（那是取全文用的绝对
-   * 下标），点击缩略导航就会跳到错误的条目上——被过滤掉的注入消息越多，偏得越远。
-   */
-  it("derives TOC indexes in the visible-message space, not the transcript space", () => {
-    const messages: SessionMessage[] = [
-      // 被过滤的注入消息位于用户消息之前：绝对下标与可见下标必然错位
-      { role: "developer", content: "developer instructions", index: 0 },
-      { role: "user", content: "第一个问题", index: 1 },
-      { role: "assistant", content: "回答", index: 2 },
-      { role: "system", content: "system note", index: 3 },
-      { role: "user", content: "第二个问题", index: 4 },
-    ];
-
-    const visible = getVisibleSessionMessages(messages, true);
-    expect(visible.map((message) => message.content)).toEqual([
-      "第一个问题",
-      "回答",
-      "第二个问题",
-    ]);
-
-    const toc = buildUserMessageToc(visible, true);
-    expect(toc.map((entry) => entry.index)).toEqual([0, 2]);
-    expect(toc.map((entry) => entry.preview)).toEqual([
-      "第一个问题",
-      "第二个问题",
-    ]);
-
-    // 每个下标都必须能在「可见消息」里定位到同一条用户消息
-    for (const entry of toc) {
-      expect(visible[entry.index].role).toBe("user");
-      expect(visible[entry.index].content).toBe(entry.preview);
-    }
-    // 与正文绝对下标对照：它们确实不同（1/4 vs 0/2），这正是不能混用的原因
-    expect(toc.map((entry) => visible[entry.index].index)).toEqual([1, 4]);
-  });
-
-  it("keeps transcript order and timestamps in the TOC", () => {
-    const visible: SessionMessage[] = [
-      { role: "user", content: "a".repeat(80), ts: 10 },
-      { role: "assistant", content: "reply", ts: 20 },
-      { role: "user", content: "short", ts: 30 },
-    ];
-
-    const toc = buildUserMessageToc(visible, false);
-    expect(toc).toHaveLength(2);
-    expect(toc[0].ts).toBe(10);
-    expect(toc[1].ts).toBe(30);
-    // 预览按既有规则截断
-    expect(toc[0].preview.endsWith("...")).toBe(true);
   });
 
   it("groups native sidebar sections without changing underlying project paths", () => {
@@ -392,22 +336,6 @@ describe("session utils", () => {
     expect(formatSessionMessagePreview("a".repeat(51))).toBe(
       `${"a".repeat(50)}...`,
     );
-  });
-
-  /**
-   * 缩略导航「压根不出来」的回归。
-   *
-   * 判据曾经有两个：先是「正文是否超过两屏」的像素高度（同一个会话随窗口大小
-   * 时有时无），后来换成正文字符数门槛（很短的单轮会话永远不出现）。用户看到的
-   * 都是同一句「不显示」，所以现在只留一个判据：有没有用户提问。
-   */
-  it("shows the session minimap whenever the session has a user question", () => {
-    // 单轮短会话也要出现：用户不知道背后有没有长度门槛，只会认为功能坏了
-    expect(shouldShowSessionMinimap(1)).toBe(true);
-    expect(shouldShowSessionMinimap(2)).toBe(true);
-    expect(shouldShowSessionMinimap(50)).toBe(true);
-    // 没有提问就没有刻度
-    expect(shouldShowSessionMinimap(0)).toBe(false);
   });
 
   it("groups sessions by provider and project directory", () => {

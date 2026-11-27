@@ -1,5 +1,5 @@
 #define MyAppName "Agent会话管理"
-#define MyAppVersion "1.8.2"
+#define MyAppVersion "1.8.3"
 #define MyAppExeName "Agent会话管理.exe"
 
 [Setup]
@@ -13,7 +13,8 @@ UninstallDisplayName={#MyAppName}
 OutputDir=Output
 OutputBaseFilename=AgentSessionManager-Setup-v{#MyAppVersion}
 SetupIconFile=..\src-tauri\icons\icon.ico
-UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayIcon={app}\app-icon.ico
+ChangesAssociations=yes
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -33,11 +34,12 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "..\src-tauri\target\release\agent-session-manager.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+Source: "..\src-tauri\icons\icon.ico"; DestDir: "{app}"; DestName: "app-icon.ico"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent

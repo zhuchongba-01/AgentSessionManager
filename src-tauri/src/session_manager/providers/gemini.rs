@@ -832,8 +832,6 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let project_name = project_dir.as_deref().and_then(path_basename);
-    let resume_command =
-        is_safe_session_id(&session_id).then(|| format!("gemini --resume {session_id}"));
 
     Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
@@ -850,7 +848,6 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
         created_at,
         last_active_at: last_active_at.or(created_at),
         source_path: Some(path.to_string_lossy().to_string()),
-        resume_command,
     }))
 }
 
@@ -1131,13 +1128,11 @@ mod tests {
             Some("E:/workspace/my-gemini-app")
         );
         assert_eq!(sx.project_name.as_deref(), Some("my-gemini-app"));
-        assert_eq!(sx.resume_command.as_deref(), Some("gemini --resume sess-x"));
         assert!(!sx.residual);
         assert!(!sx.archived);
 
         let sy = sessions.iter().find(|s| s.session_id == "sess-y").unwrap();
         assert_eq!(sy.title.as_deref(), Some("Hello legacy"));
-        assert_eq!(sy.resume_command.as_deref(), Some("gemini --resume sess-y"));
     }
 
     #[test]
@@ -1276,7 +1271,6 @@ mod tests {
         )
         .unwrap();
         let meta = parse_session_result(&path).unwrap().unwrap();
-        assert!(meta.resume_command.is_none());
         assert!(preflight_delete(temp.path(), &path, &meta.session_id).is_err());
     }
 

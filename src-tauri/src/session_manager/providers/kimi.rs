@@ -14,7 +14,7 @@ use crate::session_manager::model::{
     SessionBlock, ToolStatus,
 };
 use crate::session_manager::{SessionMessage, SessionMeta};
-use crate::session_paths::{configured_dir, kimi_home};
+use crate::session_paths::kimi_home;
 
 use super::blocks::{
     assign_turn_ids, count_diff_lines, estimate_base64_size, large_text_block, line_change_counts,
@@ -99,27 +99,6 @@ fn select_transcript_file(session_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn build_resume_command(home: &Path, id: &str, archived: bool) -> Option<String> {
-    if archived || !is_safe_session_id(id) {
-        return None;
-    }
-    let custom_env =
-        configured_dir("KIMI_SHARE_DIR").is_some() || configured_dir("KIMI_CODE_HOME").is_some();
-    if custom_env {
-        #[cfg(windows)]
-        return Some(format!(
-            "$env:KIMI_CODE_HOME = '{}'; kimi --session {id}",
-            home.to_string_lossy().replace('\'', "''")
-        ));
-        #[cfg(not(windows))]
-        return Some(format!(
-            "env KIMI_CODE_HOME={} kimi --session {id}",
-            crate::session_manager::terminal::shell_escape(&home.to_string_lossy())
-        ));
-    }
-    Some(format!("kimi --session {id}"))
 }
 
 fn scan_sessions_in_home(
@@ -327,8 +306,6 @@ fn scan_sessions_in_home(
             .or_else(|| fallback.and_then(|f| f.last_active_at))
             .or(created_at);
 
-        let resume_command = build_resume_command(home, &item.id, archived);
-
         sessions.push(SessionMeta {
             provider_id: PROVIDER_ID.to_string(),
             session_id: item.id,
@@ -344,7 +321,6 @@ fn scan_sessions_in_home(
             created_at,
             last_active_at,
             source_path: Some(item.transcript.to_string_lossy().to_string()),
-            resume_command,
         });
     }
 
@@ -1720,10 +1696,6 @@ mod tests {
         assert_eq!(s.summary.as_deref(), Some("Fix auth flow"));
         assert_eq!(s.project_dir.as_deref(), Some("/work/kimi-proj"));
         assert_eq!(s.project_name.as_deref(), Some("kimi-proj"));
-        assert_eq!(
-            s.resume_command.as_deref(),
-            Some("kimi --session session-1")
-        );
 
         match prev_share {
             Some(v) => std::env::set_var("KIMI_SHARE_DIR", v),

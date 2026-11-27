@@ -133,9 +133,6 @@ impl RawCodexSession {
                     .filter(|text| !text.trim().is_empty())
                     .map(|t| truncate_summary(&t, TITLE_MAX_CHARS))
             });
-        let resume_command = is_safe_session_id(&self.session_id)
-            .then(|| format!("codex resume {}", self.session_id));
-
         SessionMeta {
             provider_id: PROVIDER_ID.to_string(),
             session_id: self.session_id,
@@ -151,7 +148,6 @@ impl RawCodexSession {
             created_at: self.created_at,
             last_active_at: self.last_active_at,
             source_path: Some(self.source_path),
-            resume_command,
         }
     }
 }
@@ -226,7 +222,6 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
                     created_at: None,
                     last_active_at: None,
                     source_path: Some(format!("codex-index:{id}")),
-                    resume_command: None,
                 });
             }
         }
@@ -254,7 +249,6 @@ fn reconcile_indexed_rollouts(
             if is_archived_file || native_rollouts.is_some_and(|active| !active.contains_key(&id)) {
                 item.archived = true;
                 item.residual = false;
-                item.resume_command = None;
             }
         } else if rollout_is_missing(Path::new(&source)) {
             // If the rollout was moved into `archived_sessions/` while `threads.rollout_path`
@@ -267,7 +261,6 @@ fn reconcile_indexed_rollouts(
             }) {
                 archived_item.archived = true;
                 archived_item.residual = false;
-                archived_item.resume_command = None;
                 continue;
             }
             sessions.push(SessionMeta {
@@ -295,7 +288,6 @@ fn reconcile_indexed_rollouts(
                 created_at: None,
                 last_active_at: None,
                 source_path: Some(source),
-                resume_command: None,
             });
         }
     }
@@ -1672,7 +1664,6 @@ fn mark_residual_rollouts(
             .is_some_and(is_archived_rollout)
         {
             session.archived = true;
-            session.resume_command = None;
         }
     }
 
@@ -1730,9 +1721,6 @@ fn mark_residual_rollouts(
                                 .is_none_or(|path| rollout_path_key(Path::new(path)) != current_key)
                         });
             }
-            if session.residual || session.archived {
-                session.resume_command = None;
-            }
         }
         return;
     }
@@ -1770,9 +1758,6 @@ fn mark_residual_rollouts(
                 primary_archived_by_id.get(&session.session_id).copied() != Some(index);
         } else {
             session.residual = current_by_id.get(&session.session_id).copied() != Some(index);
-        }
-        if session.residual || session.archived {
-            session.resume_command = None;
         }
     }
 }
@@ -6400,9 +6385,7 @@ mod tests {
             })
             .expect("leftover rollout");
         assert!(!native.residual);
-        assert!(native.resume_command.is_some());
         assert!(leftover.residual);
-        assert!(leftover.resume_command.is_none());
     }
 
     #[test]
@@ -6443,7 +6426,6 @@ mod tests {
             })
             .expect("newer rollout");
         assert!(older.residual);
-        assert!(older.resume_command.is_none());
         assert!(!newer.residual);
         assert_eq!(newer.title.as_deref(), Some("Newer title"));
     }
@@ -6688,7 +6670,6 @@ mod tests {
         let meta = parse_session(&path).unwrap();
         // 带元字符的 ID 可以拼进 shell 命令，必须不能给出 resume 命令
         assert_eq!(meta.session_id, "x; calc");
-        assert!(meta.resume_command.is_none());
     }
 
     #[test]
@@ -7281,7 +7262,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].archived);
         assert!(!sessions[0].residual);
-        assert!(sessions[0].resume_command.is_none());
 
         let indexed = HashMap::from([(
             "arch-1".to_string(),

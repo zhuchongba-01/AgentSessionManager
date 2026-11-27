@@ -7,7 +7,6 @@ import {
   formatMergedTitle,
   formatStepMeta,
   formatStepTitle,
-  formatTokens,
   isFailureStatus,
   type StepMeta,
   type Translate,
@@ -33,13 +32,12 @@ export interface MarkdownExportOptions {
   youLabel: string;
   projectDir?: string;
   t: Translate;
-  /** 费用格式化函数，和界面上看到的一致 */
-  formatCost: (usd: number) => string;
+  formatCost?: (usd: number) => string;
   includeThinking?: boolean;
   filter?: ReaderFilter;
 }
 
-const metaText = (meta: StepMeta, { t, formatCost }: MarkdownExportOptions) => {
+const metaText = (meta: StepMeta, { t }: MarkdownExportOptions) => {
   const parts: string[] = [];
   if (isFailureStatus(meta.status)) parts.push(t(`status.${meta.status}`));
   if (meta.exitCode !== undefined) {
@@ -47,10 +45,6 @@ const metaText = (meta: StepMeta, { t, formatCost }: MarkdownExportOptions) => {
   }
   if (meta.diff) parts.push(`+${meta.diff.added} −${meta.diff.removed}`);
   if (meta.durationMs) parts.push(formatDuration(meta.durationMs));
-  if (meta.tokens !== undefined) {
-    parts.push(t("summaryTokens", { tokens: formatTokens(meta.tokens) }));
-  }
-  if (meta.costUsd !== undefined) parts.push(formatCost(meta.costUsd));
   return parts.length ? ` — ${parts.join(" · ")}` : "";
 };
 

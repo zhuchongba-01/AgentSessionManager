@@ -112,7 +112,7 @@ const switchProviderFilter = async (providerLabel: RegExp) => {
 
 const enterGroupedBatchMode = async () => {
   await switchToGroupedView();
-  fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+  fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
 };
 
 /**
@@ -180,7 +180,6 @@ describe("SessionManagerPage", () => {
         createdAt: 2,
         lastActiveAt: 20,
         sourcePath: "/mock/codex/session-1.jsonl",
-        resumeCommand: "codex resume codex-session-1",
       },
       {
         providerId: "codex",
@@ -191,7 +190,6 @@ describe("SessionManagerPage", () => {
         createdAt: 1,
         lastActiveAt: 10,
         sourcePath: "/mock/codex/session-2.jsonl",
-        resumeCommand: "codex resume codex-session-2",
       },
       {
         providerId: "claude",
@@ -202,7 +200,6 @@ describe("SessionManagerPage", () => {
         createdAt: 3,
         lastActiveAt: 30,
         sourcePath: "/mock/claude/session-1.jsonl",
-        resumeCommand: "claude --resume claude-session-1",
       },
       {
         providerId: "codex",
@@ -213,7 +210,6 @@ describe("SessionManagerPage", () => {
         createdAt: 0,
         lastActiveAt: 5,
         sourcePath: "/mock/codex/session-3.jsonl",
-        resumeCommand: "codex resume codex-session-3",
       },
     ];
     const messages: Record<string, SessionMessage[]> = {
@@ -420,12 +416,12 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     await switchProviderFilter(/ZCode/i);
 
     await waitFor(() => expect(screen.queryByText("Alpha Session")).toBeNull());
 
-    expect(screen.getByRole("button", { name: /退出批量管理/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: "取消多选" })).toBeVisible();
   });
 
   it("drops hidden selections when the provider filter narrows the result set", async () => {
@@ -437,7 +433,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
 
     expect(screen.getByText("已选 3 项")).toBeInTheDocument();
@@ -472,7 +468,7 @@ describe("SessionManagerPage", () => {
     );
 
     await switchToGroupedView();
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     expect(screen.getByText("已选 3 项")).toBeInTheDocument();
 
@@ -582,7 +578,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     openBatchDeleteDialog();
 
@@ -626,7 +622,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     openBatchDeleteDialog();
 
@@ -762,7 +758,7 @@ describe("SessionManagerPage", () => {
     );
 
     await switchToGroupedView();
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     openBatchDeleteDialog();
 
@@ -1078,7 +1074,7 @@ describe("SessionManagerPage", () => {
     );
 
     await switchToGroupedView();
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     openBatchDeleteDialog();
 
@@ -1117,7 +1113,7 @@ describe("SessionManagerPage", () => {
     );
 
     await switchToGroupedView();
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     expect(screen.getByText("已选 120 项")).toBeInTheDocument();
     openBatchDeleteDialog();
@@ -1218,7 +1214,7 @@ describe("SessionManagerPage", () => {
     );
 
     await switchToGroupedView();
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
     openBatchDeleteDialog();
 
@@ -1230,13 +1226,7 @@ describe("SessionManagerPage", () => {
     ).toBeEnabled();
   });
 
-  it("exposes an OS-aware resume command action on active sessions and hides it on residual sessions", async () => {
-    const clipboardSpy = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(window.navigator, "clipboard", {
-      value: { writeText: clipboardSpy },
-      configurable: true,
-    });
-
+  it("keeps the detail pane focused on browsing and deletion without resume command or token/cost clutter", async () => {
     setSessionFixtures(
       [
         {
@@ -1246,39 +1236,41 @@ describe("SessionManagerPage", () => {
           projectDir: "/mock/project",
           sourcePath: "/mock/resume-active.jsonl",
           lastActiveAt: 200,
-          resumeCommand: "codex resume resume-active",
-        },
-        {
-          providerId: "codex",
-          sessionId: "resume-residual",
-          title: "Resume Residual Session",
-          residual: true,
-          sourcePath: "/mock/resume-residual.jsonl",
-          lastActiveAt: 100,
-          resumeCommand: "codex resume resume-residual",
         },
       ],
-      {},
+      {
+        "codex:/mock/resume-active.jsonl": [
+          {
+            role: "user",
+            content: "检查接口",
+            ts: 1000,
+            blocks: [{ type: "text", text: "检查接口" }],
+          },
+          {
+            role: "assistant",
+            content: "已检查",
+            ts: 3300,
+            meta: {
+              model: "gpt-5-codex",
+              inputTokens: 1821,
+              outputTokens: 78,
+              costUsd: 0.0027,
+              durationMs: 2300,
+            },
+            blocks: [{ type: "text", text: "已检查完毕" }],
+          },
+        ],
+      },
     );
     renderPage();
     await screen.findByRole("heading", { name: "Resume Active Session" });
 
-    const resumeBtn = screen.getByRole("button", { name: "复制恢复命令" });
-    fireEvent.click(resumeBtn);
-    await waitFor(() => expect(clipboardSpy).toHaveBeenCalledTimes(1));
-    expect(clipboardSpy.mock.calls[0][0]).toContain(
-      "codex resume resume-active",
-    );
-    expect(clipboardSpy.mock.calls[0][0]).toContain("/mock/project");
-
-    // 残留会话不允许展示恢复命令按钮
-    fireEvent.click(
-      screen.getByRole("button", { name: /Resume Residual Session/ }),
-    );
-    await screen.findByRole("heading", { name: "Resume Residual Session" });
+    expect(await screen.findByText(/gpt-5-codex/)).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "复制恢复命令" }),
     ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Tokens/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\$0\.00/)).not.toBeInTheDocument();
   });
 
   /**
@@ -1289,7 +1281,7 @@ describe("SessionManagerPage", () => {
    * 会话又永远不出现。现在只要求「有用户提问」——这两条用例把两个方向都钉住：单轮
    * 长正文要出现，单轮短正文同样要出现。
    */
-  it("shows the turn navigator for a long single-question session", async () => {
+  it("exposes the conversation outline drawer without rendering a left minimap rail", async () => {
     setSessionFixtures(
       [
         {
@@ -1310,20 +1302,9 @@ describe("SessionManagerPage", () => {
     renderPage();
 
     await screen.findByRole("heading", { name: "Long Answer" });
-    // 导航条依赖正文，等它真正渲染出来再断言
+    expect(document.querySelector(".asm-minimap")).toBeNull();
     expect(
-      await screen.findByRole("button", { name: /跳转到第 1 个用户问题/ }),
-    ).toBeInTheDocument();
-  });
-
-  it("shows the turn navigator for a short single-question session too", async () => {
-    renderPage();
-
-    await screen.findByRole("heading", { name: "Alpha Session" });
-    // 一屏能看完的会话同样要有导航条：用户不知道背后有没有长度门槛，
-    // 看不到就只会认为这个功能坏了
-    expect(
-      await screen.findByRole("button", { name: /跳转到第 1 个用户问题/ }),
+      await screen.findByRole("button", { name: "切换对话目录" }),
     ).toBeInTheDocument();
   });
 
@@ -1336,7 +1317,6 @@ describe("SessionManagerPage", () => {
           title: "Archived Session",
           sourcePath: "/mock/archive.jsonl",
           archived: true,
-          resumeCommand: "codex resume archive-1",
         },
       ],
       {},
@@ -1529,7 +1509,7 @@ describe("SessionManagerPage", () => {
       await renderLineage();
 
       await switchToGroupedView();
-      fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+      fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
 
       // 显式勾选父会话与孙会话两条：子会话 A/B 只作为「父会话的后代」被带上
       const checkRow = (title: string) => {
@@ -1573,7 +1553,7 @@ describe("SessionManagerPage", () => {
       await renderLineage();
 
       await switchToGroupedView();
-      fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+      fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
       fireEvent.click(screen.getByRole("button", { name: /全选筛选结果/i }));
 
       openBatchDeleteDialog(4);
@@ -1818,9 +1798,9 @@ describe("SessionManagerPage", () => {
     ).toBeInTheDocument();
 
     // 同时开启批量管理与会话内搜索：第一次按 Escape 只关搜索，不清空批量模式
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     expect(
-      screen.getByRole("button", { name: /退出批量管理/i }),
+      screen.getByRole("button", { name: "取消多选" }),
     ).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "f", ctrlKey: true });
@@ -1833,7 +1813,7 @@ describe("SessionManagerPage", () => {
       screen.queryByRole("searchbox", { name: "在当前会话中搜索" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /退出批量管理/i }),
+      screen.getByRole("button", { name: "取消多选" }),
     ).toBeInTheDocument();
   });
 
@@ -1872,7 +1852,7 @@ describe("SessionManagerPage", () => {
     // 切回全部并测试批量删除部分失败后保留失败项供直接重试
     fireEvent.click(screen.getByRole("button", { name: "全部 3" }));
     fireEvent.click(dirToggle);
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: "多选删除" }));
     const checkboxes = screen.getAllByRole("checkbox", { name: "选择会话" });
     fireEvent.click(checkboxes[0]);
     fireEvent.click(checkboxes[1]);
@@ -2104,5 +2084,98 @@ describe("SessionManagerPage", () => {
         expect.stringContaining("磁盘空间不足"),
       ),
     );
+  });
+
+  it("renders side-by-side multi-select and single-delete buttons on the right pane and strips Windows verbatim source paths", async () => {
+    const deleteManySpy = vi.spyOn(sessionsApi, "deleteMany");
+    const writeTextSpy = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, "clipboard", {
+      value: { writeText: writeTextSpy },
+      configurable: true,
+    });
+
+    setSessionFixtures(
+      [
+        {
+          providerId: "pi",
+          sessionId: "01a21c2b-c9e9-77a6-8735-ad2845a2b5c8",
+          title: "哈哈",
+          projectDir: "E:\\",
+          createdAt: 100,
+          lastActiveAt: 200,
+          sourcePath:
+            "\\\\?\\C:\\Users\\zcb\\.pi\\agent\\sessions\\--E----\\2026-11-27T08-42-41-515Z_01a21c2b-c9e9-77a6-8735-ad2845a2b5c8.jsonl",
+        },
+        {
+          providerId: "pi",
+          sessionId: "01a21c2b-9b35-71ae-87e7-6bfec3eed2f2",
+          title: "你好",
+          projectDir: "E:\\11",
+          createdAt: 90,
+          lastActiveAt: 150,
+          sourcePath:
+            "\\\\?\\C:\\Users\\zcb\\.pi\\agent\\sessions\\--E--11--\\2026-11-27T08-42-29-559Z_01a21c2b-9b35-71ae-87e7-6bfec3eed2f2.jsonl",
+        },
+      ],
+      {
+        "pi:\\\\?\\C:\\Users\\zcb\\.pi\\agent\\sessions\\--E----\\2026-11-27T08-42-41-515Z_01a21c2b-c9e9-77a6-8735-ad2845a2b5c8.jsonl":
+          [{ role: "user", content: "哈哈", ts: 200 }],
+        "pi:\\\\?\\C:\\Users\\zcb\\.pi\\agent\\sessions\\--E--11--\\2026-11-27T08-42-29-559Z_01a21c2b-9b35-71ae-87e7-6bfec3eed2f2.jsonl":
+          [{ role: "user", content: "你好", ts: 150 }],
+      },
+    );
+
+    renderPage("all");
+    await screen.findByRole("heading", { name: "哈哈" });
+
+    // 复制 Windows verbatim 源路径时自动剥离 \\?\ 前缀
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: /2026-11-27T08-42-41-515Z_01a21c2b/,
+      }),
+    );
+    expect(writeTextSpy).toHaveBeenCalledWith(
+      "C:\\Users\\zcb\\.pi\\agent\\sessions\\--E----\\2026-11-27T08-42-41-515Z_01a21c2b-c9e9-77a6-8735-ad2845a2b5c8.jsonl",
+    );
+
+    // 右方案 1：右侧详情头紧挨并排显示「多选删除」与「仅删除此会话」，左侧工具栏不再有重复批量小图标
+    expect(
+      screen.queryByRole("button", { name: /批量管理/ }),
+    ).not.toBeInTheDocument();
+    const multiSelectBtn = screen.getByRole("button", { name: "多选删除" });
+    expect(
+      screen.getByRole("button", { name: "仅删除此会话" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(multiSelectBtn);
+    expect(batchDeleteButton(0)).toBeDisabled();
+
+    // 右侧直接点击「全选列表」与「取消多选」
+    await userEvent.click(screen.getByRole("button", { name: "全选列表" }));
+    expect(batchDeleteButton(2)).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "全不选" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "取消多选" }));
+    expect(
+      screen.getByRole("button", { name: "仅删除此会话" }),
+    ).toBeInTheDocument();
+
+    // 再次点「多选删除」->「全选列表」->「删除已勾选的 2 条」完成批量清理
+    await userEvent.click(screen.getByRole("button", { name: "多选删除" }));
+    await userEvent.click(screen.getByRole("button", { name: "全选列表" }));
+    await userEvent.click(batchDeleteButton(2));
+
+    const dialog = screen.getByTestId("confirm-dialog");
+    expect(
+      within(dialog).getByText(/已选中的 2 个本地会话记录/),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+    );
+
+    await waitFor(() => expect(deleteManySpy).toHaveBeenCalledTimes(1));
+    expect(deleteManySpy.mock.calls[0][0]).toHaveLength(2);
+
+    deleteManySpy.mockRestore();
   });
 });

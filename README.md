@@ -25,10 +25,10 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window-dark.png" />
   <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png" />
-  <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.2 主界面（2880×1800 高清预览）" width="100%" />
+  <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.3 主界面（2880×1800 高清预览）" width="100%" />
 </picture>
 
-*主界面（2880×1800 2x 高清渲染，随 GitHub 亮 / 暗外观自动切换，点击图片可查看原图）：左侧按 Agent / 项目 / 时间分组的会话列表（支持跨会话正文 FTS5 检索与状态快筛），中间轮次缩略导航，右侧两段式思维链、步骤合并、内联行号 Diff 阅读器与操作面板。*
+*主界面（2880×1800 2x 高清渲染，随 GitHub 亮 / 暗外观自动切换，点击图片可查看原图）：左侧按 Agent / 项目 / 时间分组的会话列表（支持跨会话正文 FTS5 检索与状态快筛），右侧两段式思维链、步骤合并、内联行号 Diff 阅读器、可展开对话目录抽屉与并排快捷清理面板。*
 
 </div>
 
@@ -44,11 +44,11 @@
   - 按 `callId` 精确配对工具调用与返回结果，自动将连续读文件/搜索折叠为 `Explored · 查看了 X 个文件、搜索 Y 次`，同服务连续 MCP 调用折叠为 `Called {server} N times`；失败命令在折叠态下自动置顶常显。
   - 文件编辑/写入内置行号着色的 **`统一 Diff | 原始补丁`** 视图，并支持 **`展开过程 / 收起过程`** 全局控制。
 - ⚡ **跨会话正文全文检索（SQLite FTS5）**：开启搜索框右侧「正文」开关即可在后台增量构建本地 SQLite FTS5（`trigram` + 短词，`INDEX_VERSION = 2` 仅索引非注入正文）索引，展示高亮摘录卡片并一键跳转到目标轮次对应行；关闭开关立即彻底删除索引文件。
-- 📤 **原生「另存为」导出 `.md`、路径胶囊定位与恢复命令**：
+- 📤 **原生「另存为」导出 `.md` 与路径胶囊定位**：
   - 点击 **`导出 .md`** 弹出系统原生保存对话框（Windows 端在独立 STA 线程调用 COM `IFileSaveDialog`），由用户自由选择保存目录与文件名。
-  - 对话中的本地路径自动渲染为 **`[📄 相对路径 | 📂]`** 胶囊，支持一键复制路径或在系统文件管理器中精准定位（支持 `~` 展开、剥离 `:行号` 后缀及已删子路径回退父目录）；支持一键复制包含工作目录切换的跨平台会话恢复命令。
-- 🧭 **双模会话导航与精致桌面体验**：同时提供左侧轮次缩略导航条（悬停预览问答摘要）与右侧可展开「对话目录」抽屉（按提问/回复/章节跳转），配备 0px 占位的悬浮细胶囊滚动条与独立亮色 / 暗色主题切换。
-- 🧹 **深度安全清理**：内置进程运行守卫、NTFS 重解析点 / 符号链接防越界校验、子会话「先子后父」级联清理、50+ 条批量知情核对与崩溃可恢复的待清理日志，绝不触碰用户项目工作目录。详细安全边界见 [SAFETY.md](./SAFETY.md)。
+  - 对话中的本地路径自动渲染为 **`[📄 相对路径 | 📂]`** 胶囊，支持一键复制路径或在系统文件管理器中精准定位（支持 `~` 展开、剥离 `:行号` / `#L行号` 后缀、剥离 Windows `\\?\` 前缀及已删子路径回退父目录）。
+- 🧭 **磨砂琉璃对焦开屏与精致桌面体验**：配备零文字干扰的「磨砂琉璃对焦」启动揭幕过渡与浅色白瓷「铂金刀锋」应用图标；内置可展开「对话目录」抽屉（按提问/回复/章节快速跳转）、右侧并排「多选删除 / 仅删除此会话」快捷操作栏、0px 占位悬浮细胶囊滚动条与独立亮色 / 暗色主题切换。
+- 🧹 **深度安全清理**：内置进程运行守卫、NTFS 重解析点 / 符号链接防越界校验、子会话「先子后父」级联清理、Pi 空会话子目录安全回收、50+ 条批量知情核对与崩溃可恢复的待清理日志，绝不触碰用户项目工作目录。详细安全边界见 [SAFETY.md](./SAFETY.md)。
 
 ---
 
@@ -107,7 +107,7 @@ flowchart LR
 | **OpenClaw** | `~/.openclaw/agents/<agent>/sessions`（含 `sessions.json` 索引），可用 `OPENCLAW_STATE_DIR` 覆盖 |
 | **OpenCode** | `~/.local/share/opencode`（兼容 2.0+ `session_v2`、v1 SQLite 与旧版 JSON；遵循 `XDG_DATA_HOME`、`OPENCODE_DB`） |
 | **ZCode** | `~/.zcode/cli/db/db.sqlite`、`~/.zcode/v2/tasks-index.sqlite`，可用 `ZCODE_DATA_BASE_DIR`、`ZCODE_STORAGE_DIR` 覆盖 |
-| **Pi** | `~/.pi/agent`（`sessions/`），可用 `PI_CODING_AGENT_DIR`、`PI_CODING_AGENT_SESSION_DIR` 覆盖 |
+| **Pi** | `~/.pi/agent`（`sessions/`，兼容 `@mariozechner` 与 `@earendil-works` 分支），可用 `PI_CODING_AGENT_DIR`、`PI_CODING_AGENT_SESSION_DIR` 覆盖 |
 | **Grok Build** | `~/.grok/sessions`、`~/.grok/archived_sessions`，可用 `GROK_HOME`（兼容 `GROK_CONFIG_DIR`）覆盖 |
 
 </details>
@@ -199,7 +199,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 ```powershell
 # 仅接受 X.Y.Z 正式版号；同步全部配置文件版本但不自动创建 Git 标签
-pnpm version:set 1.8.2
+pnpm version:set 1.8.3
 pnpm version:check
 pnpm build:installer   # Windows：Tauri Release 构建 + Inno Setup 安装包
 pnpm build:linux       # Linux：输出 .deb 与 .AppImage

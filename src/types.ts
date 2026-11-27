@@ -16,7 +16,6 @@ export interface SessionMeta {
   createdAt?: number;
   lastActiveAt?: number;
   sourcePath?: string;
-  resumeCommand?: string;
 }
 
 export type ToolKind =

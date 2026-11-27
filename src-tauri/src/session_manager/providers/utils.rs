@@ -252,10 +252,7 @@ pub fn check_sqlite_message_budget(
     Ok(())
 }
 
-/// 会话 ID 会被拼进 `claude --resume {id}` 这类 resume 命令，并在 macOS 上
-/// 经 shell 执行（Windows 上也会被复制进剪贴板供用户粘贴）。因此只接受
-/// 真实 UUID/雪花 ID 会出现的字符，杜绝 `;`、`$` 等元字符借道会话 JSON 或
-/// 文件名注入。校验不过时 resume_command 置空，前端恢复按钮自然禁用。
+/// 仅接受真实 UUID/雪花 ID 会出现的字符，杜绝路径穿越与控制字符借道会话 JSON 或文件名混入删除/SQLite 引用。
 pub fn is_safe_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -725,6 +722,9 @@ pub fn path_basename(value: &str) -> Option<String> {
         return None;
     }
     let normalized = trimmed.trim_end_matches(['/', '\\']);
+    if normalized.is_empty() {
+        return trimmed.starts_with('/').then(|| "/".to_string());
+    }
     let last = normalized
         .split(['/', '\\'])
         .next_back()
@@ -1392,7 +1392,6 @@ mod tests {
             created_at: None,
             last_active_at: None,
             source_path: Some(path.to_string_lossy().to_string()),
-            resume_command: None,
         })
     }
 

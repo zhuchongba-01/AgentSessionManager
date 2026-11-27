@@ -32,6 +32,7 @@ import {
   type AvailableUpdate,
 } from "@/lib/githubRelease";
 import { useTheme } from "@/components/theme-provider";
+import { AppLaunchSplash, useAppLaunchSplash } from "./AppLaunchSplash";
 import { AppTitleBar } from "./AppTitleBar";
 import { SessionListSidebar } from "./SessionListSidebar";
 import {
@@ -1182,10 +1183,24 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     }
   }, [queryClient, refetch, sessions, t]);
 
+  const isInitialScanSettled =
+    !isLoading || sessionsIsSuccess || Boolean(sessionsError);
+  const splashPhase = useAppLaunchSplash({
+    isSettled: isInitialScanSettled,
+  });
+
   return (
     <TooltipProvider>
       <div className="asm-shell">
-        <section className="asm-workspace" onWheel={(e) => e.stopPropagation()}>
+        <AppLaunchSplash phase={splashPhase} />
+        <section
+          className={cn(
+            "asm-workspace",
+            splashPhase === "veiled" && "is-splash-veiled",
+            splashPhase === "revealing" && "is-splash-revealing",
+          )}
+          onWheel={(e) => e.stopPropagation()}
+        >
           <AppTitleBar
             availableUpdate={availableUpdate}
             resolvedTheme={resolvedTheme}
@@ -1248,8 +1263,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 providerFilterLabel={providerFilterLabel}
                 providerSessionCounts={providerSessionCounts}
                 selectionMode={selectionMode}
-                onEnterSelectionMode={() => setSelectionMode(true)}
-                onExitSelectionMode={exitSelectionMode}
                 listViewMode={listViewMode}
                 onListViewModeChange={setListViewMode}
                 isLoading={isLoading}
@@ -1312,7 +1325,6 @@ export function SessionManagerPage({ appId }: { appId: string }) {
               <SessionDetailPane
                 selectedSession={selectedSession}
                 selectedKey={selectedKey}
-                isCodexSession={isCodexSession}
                 selectedSessionChildCount={selectedSessionChildCount}
                 sessionTitles={sessionTitles}
                 rawMessages={messages}
@@ -1324,8 +1336,14 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 onRefetchMessages={() => void refetchMessages()}
                 onLoadFullContent={handleLoadFullContent}
                 hasBatchSelection={hasBatchSelection}
+                selectionMode={selectionMode}
+                deletableFilteredCount={deletableFilteredSessions.length}
+                allFilteredSelected={allFilteredSelected}
                 selectedDeletableCount={selectedDeletableSessions.length}
                 isDeleting={deletion.isDeleting}
+                onEnterSelectionMode={() => setSelectionMode(true)}
+                onExitSelectionMode={exitSelectionMode}
+                onToggleSelectAll={handleToggleSelectAll}
                 onBatchDelete={openBatchDeleteDialog}
                 onSingleDelete={handleSingleDelete}
                 onCopy={(text, message) => void handleCopy(text, message)}

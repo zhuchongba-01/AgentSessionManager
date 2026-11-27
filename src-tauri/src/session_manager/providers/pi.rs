@@ -517,10 +517,32 @@ fn delete_session_with_layout(
     layout: SessionLayout,
 ) -> Result<bool, String> {
     preflight_delete_with_layout(root, path, session_id, layout)?;
-    let (_, source) = validate_source_under_root(root, path, layout)?;
+    let (canonical_root, source) = validate_source_under_root(root, path, layout)?;
     fs::remove_file(&source)
         .map_err(|error| format!("Failed to delete Pi session {}: {error}", source.display()))?;
+    prune_empty_session_ancestors(&canonical_root, &source);
     Ok(true)
+}
+
+/// 删除 `.jsonl` 后顺带摘除变空的父级子目录（如 `forks/`、`<stem>/`、编码项目目录 `--E--11--`），
+/// 严格停在 `canonical_root` 之内，遇到非空目录或符号链接/重解析点立即停止。
+fn prune_empty_session_ancestors(canonical_root: &Path, deleted_file: &Path) {
+    let mut current = deleted_file.parent();
+    while let Some(dir) = current {
+        if dir == canonical_root || !dir.starts_with(canonical_root) {
+            break;
+        }
+        let Ok(meta) = fs::symlink_metadata(dir) else {
+            break;
+        };
+        if super::utils::is_reparse_or_symlink(&meta) || !meta.is_dir() {
+            break;
+        }
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        current = dir.parent();
+    }
 }
 
 fn layout_for_current_root(root: &Path) -> Result<SessionLayout, String> {
@@ -601,13 +623,7 @@ fn parse_session_with_provenance(path: &Path) -> Result<CachedPiSession, String>
             project_name: None,
             created_at: header.timestamp,
             last_active_at: summary.last_active_at.or(header.timestamp),
-            source_path: Some(source_path.clone()),
-            resume_command: (!residual).then(|| {
-                format!(
-                    "pi --session {}",
-                    crate::session_manager::terminal::shell_escape(&source_path)
-                )
-            }),
+            source_path: Some(source_path),
         },
         parent_session,
     })
@@ -1270,7 +1286,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-child");
         assert!(!sessions[0].residual);
-        assert!(sessions[0].resume_command.is_some());
     }
 
     #[test]
@@ -1349,6 +1364,23 @@ mod tests {
         };
         let sessions = scan_sessions_in_root(&root, layout);
         let descriptors = session_descriptors(&root, layout).expect("validate Pi descriptor graph");
+        for session in &sessions {
+            let source = session.source_path.as_deref().expect("source_path");
+            let transcript = crate::session_manager::load_transcript("pi", source)
+                .expect("load real Pi transcript");
+            eprintln!(
+                "  Pi session id={} title={:?} cwd={:?} msgs={}",
+                session.session_id,
+                session.title,
+                session.project_dir,
+                transcript.messages.len(),
+            );
+            for msg in &transcript.messages {
+                if let Some(meta) = &msg.meta {
+                    eprintln!("    assistant meta={meta:?}");
+                }
+            }
+        }
         eprintln!(
             "Pi audit: sessions={}, residuals={}, descriptors={}",
             sessions.len(),
@@ -1397,7 +1429,6 @@ mod tests {
         assert!(child.exists());
         let child = parse_session(&child).unwrap();
         assert!(!child.residual);
-        assert!(child.resume_command.is_some());
     }
 
     #[test]
@@ -1674,11 +1705,6 @@ mod tests {
         // Pi's session picker prefers the message timestamp over the enclosing
         // entry timestamp when both are present.
         assert_eq!(session.last_active_at, Some(1_700_000_001_000));
-        // Pi resumes a session by its exact file path.
-        assert!(session
-            .resume_command
-            .as_deref()
-            .is_some_and(|command| command.starts_with("pi --session ")));
 
         let messages =
             load_messages_with_layout(&root, &path, SessionLayout::Flat).expect("load messages");
@@ -1861,6 +1887,40 @@ mod tests {
             SessionLayout::ProjectDirectories
         )
         .expect("delete project session"));
+        assert!(!project.parent().unwrap().exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn deleting_last_session_prunes_empty_fork_and_project_dirs_preserving_non_empty_siblings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        let project_dir = root.join("--E--11--");
+        let parent = project_dir.join("parent.jsonl");
+        let child = project_dir.join("parent").join("forks").join("child.jsonl");
+        write_session_header(&parent, "session-parent");
+        write_fork_header(&child, "session-child", &parent);
+
+        assert!(delete_session_with_layout(
+            &root,
+            &child,
+            "session-child",
+            SessionLayout::ProjectDirectories
+        )
+        .expect("delete fork child"));
+        assert!(!child.exists());
+        assert!(!project_dir.join("parent").exists());
+        assert!(project_dir.exists());
+
+        assert!(delete_session_with_layout(
+            &root,
+            &parent,
+            "session-parent",
+            SessionLayout::ProjectDirectories
+        )
+        .expect("delete last session in project dir"));
+        assert!(!project_dir.exists());
+        assert!(root.exists());
     }
 
     #[cfg(unix)]

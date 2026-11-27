@@ -12,6 +12,7 @@ import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ArrowDown,
+  CheckSquare,
   ChevronDown,
   ChevronUp,
   ChevronsDownUp,
@@ -27,8 +28,6 @@ import {
   PanelRight,
   RefreshCw,
   Search,
-  Sparkles,
-  Terminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -39,7 +38,6 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useMoneyFormat } from "@/hooks/useMoneyFormat";
 import { sessionsApi } from "@/lib/api/sessions";
 import { isMac } from "@/lib/platform";
 import { clearSessionImageCache } from "@/lib/query/sessions";
@@ -68,7 +66,7 @@ import { SessionOutline } from "./reader/SessionOutline";
 import { SessionQuestion } from "./reader/SessionQuestion";
 import { SessionStep } from "./reader/SessionStep";
 import { SessionTimeline } from "./reader/SessionTimeline";
-import { formatTokens, isFailureStep } from "./reader/toolSummary";
+import { isFailureStep } from "./reader/toolSummary";
 import {
   buildTurns,
   chapterRowKey,
@@ -85,11 +83,9 @@ import {
   type SessionTurn,
   type TurnChapter,
 } from "./reader/turns";
-import { SessionMinimap } from "./SessionMinimap";
 import { SessionStatusBadges } from "./SessionStatusBadges";
 import type { SessionReaderViewMode } from "./types";
 import {
-  buildResumeShellCommand,
   extractRevealableLocalPath,
   formatMessageTimestamp,
   formatSessionTitle,
@@ -97,7 +93,6 @@ import {
   getProviderIconName,
   getProviderLabel,
   resolveParentLabel,
-  shouldShowSessionMinimap,
 } from "./utils";
 
 const OUTLINE_OPEN_STORAGE_KEY = "agent-session-manager.outlineOpen";
@@ -196,7 +191,6 @@ export interface PendingSnippetJump {
 export interface SessionDetailPaneProps {
   selectedSession: SessionMeta | null;
   selectedKey: string | null;
-  isCodexSession: boolean;
   selectedSessionChildCount: number;
   sessionTitles: Map<string, string>;
   rawMessages?: SessionMessage[];
@@ -208,8 +202,14 @@ export interface SessionDetailPaneProps {
   onRefetchMessages: () => void;
   onLoadFullContent: (message: SessionMessage) => Promise<string>;
   hasBatchSelection: boolean;
+  selectionMode?: boolean;
+  deletableFilteredCount?: number;
+  allFilteredSelected?: boolean;
   selectedDeletableCount: number;
   isDeleting: boolean;
+  onEnterSelectionMode?: () => void;
+  onExitSelectionMode?: () => void;
+  onToggleSelectAll?: () => void;
   onBatchDelete: () => void;
   onSingleDelete: (session: SessionMeta) => void;
   onCopy: (text: string, successMessage: string) => void;
@@ -225,7 +225,6 @@ export interface SessionDetailPaneProps {
 export function SessionDetailPane({
   selectedSession,
   selectedKey,
-  isCodexSession,
   selectedSessionChildCount,
   sessionTitles,
   visibleMessages,
@@ -236,8 +235,14 @@ export function SessionDetailPane({
   onRefetchMessages,
   onLoadFullContent,
   hasBatchSelection,
+  selectionMode = false,
+  deletableFilteredCount = 0,
+  allFilteredSelected = false,
   selectedDeletableCount,
   isDeleting,
+  onEnterSelectionMode,
+  onExitSelectionMode,
+  onToggleSelectAll,
   onBatchDelete,
   onSingleDelete,
   onCopy,
@@ -249,7 +254,6 @@ export function SessionDetailPane({
 }: SessionDetailPaneProps) {
   const { t } = useTranslation();
   const rt = useReaderT();
-  const { moneyCompact } = useMoneyFormat();
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const detailSearchInputRef = useRef<HTMLInputElement | null>(null);
@@ -393,61 +397,6 @@ export function SessionDetailPane({
     () => displayedTurns.filter(hasTimelineRow).length,
     [displayedTurns],
   );
-
-  // 统计模型、总 Token 与费用芯片
-  const usageSummary = useMemo(() => {
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let cacheReadTokens = 0;
-    let cacheWriteTokens = 0;
-    let reasoningTokens = 0;
-    let metaCostUsd = 0;
-    let hasMetaCost = false;
-    let latestModel: string | undefined;
-
-    for (const msg of baseMessages) {
-      const meta = msg.meta;
-      if (!meta) continue;
-      if (meta.model) latestModel = meta.model;
-      inputTokens += meta.inputTokens ?? 0;
-      outputTokens += meta.outputTokens ?? 0;
-      cacheReadTokens += meta.cacheReadTokens ?? 0;
-      cacheWriteTokens += meta.cacheWriteTokens ?? 0;
-      reasoningTokens += meta.reasoningTokens ?? 0;
-      if (typeof meta.costUsd === "number" && Number.isFinite(meta.costUsd)) {
-        metaCostUsd += meta.costUsd;
-        hasMetaCost = true;
-      }
-    }
-
-    let stepTokens = 0;
-    let stepCostUsd = 0;
-    let hasStepCost = false;
-    for (const turn of fullTurns) {
-      for (const cost of turn.stepCosts) {
-        stepTokens += cost.tokens ?? 0;
-        if (typeof cost.costUsd === "number" && Number.isFinite(cost.costUsd)) {
-          stepCostUsd += cost.costUsd;
-          hasStepCost = true;
-        }
-      }
-    }
-
-    const metaTotal =
-      inputTokens +
-      outputTokens +
-      cacheReadTokens +
-      cacheWriteTokens +
-      reasoningTokens;
-    const totalTokens = metaTotal > 0 ? metaTotal : stepTokens;
-    const costUsd = hasMetaCost
-      ? metaCostUsd
-      : hasStepCost
-        ? stepCostUsd
-        : null;
-
-    return { latestModel, totalTokens, costUsd };
-  }, [baseMessages, fullTurns]);
 
   const activeQuery = detailSearchOpen ? detailSearchQuery.trim() : "";
   const hasTruncatedLegacyMessages = useMemo(
@@ -679,28 +628,6 @@ export function SessionDetailPane({
 
   const virtualItems = virtualizer.getVirtualItems();
   const viewportStart = virtualizer.scrollOffset ?? 0;
-  const viewportEnd =
-    viewportStart + Math.max(0, virtualizer.scrollRect?.height ?? 600);
-
-  const viewportMessageIndexes = useMemo(() => {
-    const visible: number[] = [];
-    for (const item of virtualItems) {
-      if (
-        !(
-          viewportEnd > viewportStart &&
-          item.end > viewportStart &&
-          item.start < viewportEnd
-        )
-      ) {
-        continue;
-      }
-      const row = rows[item.index];
-      if (!row) continue;
-      const msgIdx = rowPrimaryMessageIndex(row, displayedTurns);
-      if (msgIdx !== null) visible.push(msgIdx);
-    }
-    return visible;
-  }, [displayedTurns, rows, viewportEnd, viewportStart, virtualItems]);
 
   const activeTurn = useMemo(() => {
     if (rows.length === 0) return 0;
@@ -775,25 +702,6 @@ export function SessionDetailPane({
     });
     return () => cancelAnimationFrame(frame);
   }, [detailSearchOpen]);
-
-  const minimapMessageIndexes = useMemo(
-    () =>
-      displayedTurns.flatMap((turn) => {
-        if (!turn.question) return [];
-        if (
-          isCodexSession &&
-          turn.question.text &&
-          turn.question.text.trim().length === 0
-        ) {
-          return [];
-        }
-        return [turn.question.messageIndex];
-      }),
-    [displayedTurns, isCodexSession],
-  );
-  const showSessionMinimap = shouldShowSessionMinimap(
-    minimapMessageIndexes.length,
-  );
 
   const scrollToRowIndex = useCallback(
     (rowIndex: number) => {
@@ -978,18 +886,9 @@ export function SessionDetailPane({
       youLabel: t("sessionManager.you", { defaultValue: "你" }),
       projectDir: selectedSession?.projectDir ?? undefined,
       t: rt,
-      formatCost: moneyCompact,
       filter,
     }),
-    [
-      filter,
-      moneyCompact,
-      rt,
-      selectedProviderLabel,
-      selectedSession?.projectDir,
-      style,
-      t,
-    ],
+    [filter, rt, selectedProviderLabel, selectedSession?.projectDir, style, t],
   );
 
   const handleCopyTurn = useCallback(
@@ -1058,22 +957,6 @@ export function SessionDetailPane({
     selectedSession,
     t,
   ]);
-
-  const canResume = Boolean(
-    selectedSession?.resumeCommand &&
-      !selectedSession.residual &&
-      !selectedSession.cleanupPending,
-  );
-  const fullResumeCommand = useMemo(
-    () =>
-      selectedSession?.resumeCommand
-        ? buildResumeShellCommand(
-            selectedSession.resumeCommand,
-            selectedSession.projectDir,
-          )
-        : "",
-    [selectedSession?.projectDir, selectedSession?.resumeCommand],
-  );
 
   const handleScrollContainerScroll = useCallback(
     (event: UIEvent<HTMLDivElement>) => {
@@ -1270,6 +1153,73 @@ export function SessionDetailPane({
       : content;
   };
 
+  const renderBatchActionControls = () => (
+    <>
+      {onToggleSelectAll && deletableFilteredCount > 0 && (
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="asm-batch-action-secondary h-7 px-2.5 text-xs"
+          disabled={isDeleting}
+          onClick={onToggleSelectAll}
+        >
+          {allFilteredSelected
+            ? t("sessionManager.unselectAllCurrentList", {
+                defaultValue: "全不选",
+              })
+            : t("sessionManager.selectAllCurrentList", {
+                defaultValue: "全选列表",
+              })}
+        </Button>
+      )}
+      {onExitSelectionMode && (
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="asm-batch-action-secondary h-7 px-2.5 text-xs"
+          disabled={isDeleting}
+          onClick={onExitSelectionMode}
+        >
+          {t("sessionManager.cancelMultiSelect", {
+            defaultValue: "取消多选",
+          })}
+        </Button>
+      )}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="asm-delete-btn is-batch-primary h-7 gap-1.5 px-2.5 text-xs"
+            onClick={onBatchDelete}
+            disabled={isDeleting || selectedDeletableCount === 0}
+          >
+            <Trash2 className="size-3.5" />
+            <span>
+              {isDeleting
+                ? t("sessionManager.deleting", {
+                    defaultValue: "删除中...",
+                  })
+                : t("sessionManager.deleteSelectedCount", {
+                    defaultValue: "删除已勾选的 {{count}} 条",
+                    count: selectedDeletableCount,
+                  })}
+            </span>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {t("sessionManager.deleteSelectedTooltip", {
+            defaultValue: "永久删除已勾选的 {{count}} 条本地会话记录",
+            count: selectedDeletableCount,
+          })}
+        </TooltipContent>
+      </Tooltip>
+    </>
+  );
+
   return (
     <ReaderContext.Provider value={readerContext}>
       <div
@@ -1312,6 +1262,30 @@ export function SessionDetailPane({
             </span>
           )}
           <span className="asm-toolbar-spacer" />
+          {!selectedSession && selectionMode && (
+            <div className="asm-detail-actions">
+              {renderBatchActionControls()}
+            </div>
+          )}
+          {!selectedSession &&
+            !selectionMode &&
+            onEnterSelectionMode &&
+            deletableFilteredCount > 0 && (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="asm-batch-enter-btn h-7 gap-1.5 px-2.5 text-xs"
+                onClick={onEnterSelectionMode}
+              >
+                <CheckSquare className="size-3.5" aria-hidden="true" />
+                <span>
+                  {t("sessionManager.multiSelectDelete", {
+                    defaultValue: "多选删除",
+                  })}
+                </span>
+              </Button>
+            )}
           {selectedSession && baseMessages.length > 0 && (
             <div
               className="asm-reader-view-switch"
@@ -1534,108 +1508,95 @@ export function SessionDetailPane({
                   )}
                 />
 
-                {/* 操作按钮组 */}
+                {/* 操作按钮组（右方案 1：紧挨并排双按钮） */}
                 <div className="asm-detail-actions">
-                  {canResume && !hasBatchSelection && (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="asm-resume-btn h-7 gap-1.5 px-2.5 text-xs"
-                          onClick={() =>
-                            onCopy(
-                              fullResumeCommand,
-                              t("sessionManager.resumeCommandCopied", {
-                                defaultValue: "已复制恢复命令",
-                              }),
-                            )
-                          }
-                        >
-                          <Terminal className="size-3.5" />
-                          <span>
-                            {t("sessionManager.copyResumeCommand", {
-                              defaultValue: "复制恢复命令",
+                  {selectionMode || hasBatchSelection ? (
+                    renderBatchActionControls()
+                  ) : (
+                    <>
+                      {onEnterSelectionMode && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              className="asm-batch-enter-btn h-7 gap-1.5 px-2.5 text-xs"
+                              onClick={onEnterSelectionMode}
+                              disabled={
+                                isDeleting || deletableFilteredCount === 0
+                              }
+                            >
+                              <CheckSquare
+                                className="size-3.5"
+                                aria-hidden="true"
+                              />
+                              <span>
+                                {t("sessionManager.multiSelectDelete", {
+                                  defaultValue: "多选删除",
+                                })}
+                              </span>
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {t("sessionManager.multiSelectDeleteTooltip", {
+                              defaultValue: "勾选多条会话进行批量删除",
                             })}
-                          </span>
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="bottom" className="max-w-sm">
-                        <p className="font-mono text-xs break-all">
-                          {fullResumeCommand}
-                        </p>
-                        <p className="text-muted-foreground mt-1">
-                          点击复制命令（已包含工作目录切换）
-                        </p>
-                      </TooltipContent>
-                    </Tooltip>
-                  )}
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="asm-delete-btn h-7 gap-1.5 px-2.5 text-xs"
-                        onClick={() =>
-                          hasBatchSelection
-                            ? onBatchDelete()
-                            : onSingleDelete(selectedSession)
-                        }
-                        disabled={
-                          hasBatchSelection
-                            ? isDeleting || selectedDeletableCount === 0
-                            : !selectedSession.sourcePath || isDeleting
-                        }
-                      >
-                        <Trash2 className="size-3.5" />
-                        <span>
-                          {isDeleting
-                            ? t("sessionManager.deleting", {
-                                defaultValue: "删除中...",
-                              })
-                            : hasBatchSelection
-                              ? t("sessionManager.deleteSelectedCount", {
-                                  defaultValue: "删除已勾选的 {{count}} 条",
-                                  count: selectedDeletableCount,
-                                })
-                              : selectedSession.cleanupPending
-                                ? t("sessionManager.continueCleanup", {
-                                    defaultValue: "继续清理",
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="asm-delete-btn h-7 gap-1.5 px-2.5 text-xs"
+                            onClick={() => onSingleDelete(selectedSession)}
+                            disabled={!selectedSession.sourcePath || isDeleting}
+                          >
+                            <Trash2 className="size-3.5" />
+                            <span>
+                              {isDeleting
+                                ? t("sessionManager.deleting", {
+                                    defaultValue: "删除中...",
                                   })
-                                : selectedSessionChildCount > 0
-                                  ? t("sessionManager.deleteThisWithChildren", {
-                                      defaultValue:
-                                        "删除此会话及其 {{count}} 个子会话",
-                                      count: selectedSessionChildCount,
+                                : selectedSession.cleanupPending
+                                  ? t("sessionManager.continueCleanup", {
+                                      defaultValue: "继续清理",
                                     })
-                                  : t("sessionManager.deleteThisOnly", {
-                                      defaultValue: "仅删除此会话",
-                                    })}
-                        </span>
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      {hasBatchSelection
-                        ? t("sessionManager.deleteSelectedTooltip", {
-                            defaultValue:
-                              "永久删除已勾选的 {{count}} 条本地会话记录",
-                            count: selectedDeletableCount,
-                          })
-                        : selectedSessionChildCount > 0
-                          ? t("sessionManager.deleteWithChildrenTooltip", {
-                              defaultValue:
-                                "永久删除右侧这一条会话及其 {{count}} 个子会话；范围可以在确认框里改",
-                              count: selectedSessionChildCount,
-                            })
-                          : t("sessionManager.deleteTooltip", {
-                              defaultValue: "仅永久删除右侧这一条会话记录",
-                            })}
-                    </TooltipContent>
-                  </Tooltip>
+                                  : selectedSessionChildCount > 0
+                                    ? t(
+                                        "sessionManager.deleteThisWithChildren",
+                                        {
+                                          defaultValue:
+                                            "删除此会话及其 {{count}} 个子会话",
+                                          count: selectedSessionChildCount,
+                                        },
+                                      )
+                                    : t("sessionManager.deleteThisOnly", {
+                                        defaultValue: "仅删除此会话",
+                                      })}
+                            </span>
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {selectedSessionChildCount > 0
+                            ? t("sessionManager.deleteWithChildrenTooltip", {
+                                defaultValue:
+                                  "永久删除右侧这一条会话及其 {{count}} 个子会话；范围可以在确认框里改",
+                                count: selectedSessionChildCount,
+                              })
+                            : t("sessionManager.deleteTooltip", {
+                                defaultValue: "仅永久删除右侧这一条会话记录",
+                              })}
+                        </TooltipContent>
+                      </Tooltip>
+                    </>
+                  )}
                 </div>
               </div>
 
-              {/* 时间、ID、目录、文件与 Token 用量 */}
+              {/* 时间、ID、目录与源文件 */}
               <div className="asm-detail-meta">
                 <span className="asm-chip">
                   <Clock className="size-3" />
@@ -1762,7 +1723,7 @@ export function SessionDetailPane({
                       </TooltipTrigger>
                       <TooltipContent side="bottom" className="max-w-xs">
                         <p className="font-mono text-xs break-all">
-                          {selectedSession.sourcePath}
+                          {revealableSourcePath ?? selectedSession.sourcePath}
                         </p>
                         <p className="text-muted-foreground mt-1">
                           {t("sessionManager.clickToCopyPath")}
@@ -1788,26 +1749,6 @@ export function SessionDetailPane({
                         </TooltipContent>
                       </Tooltip>
                     )}
-                  </span>
-                )}
-                {(usageSummary.latestModel ||
-                  usageSummary.totalTokens > 0 ||
-                  usageSummary.costUsd !== null) && (
-                  <span className="asm-chip asm-chip-mono">
-                    <Sparkles className="size-3 shrink-0" />
-                    <span>
-                      {[
-                        usageSummary.latestModel,
-                        usageSummary.totalTokens > 0
-                          ? `${formatTokens(usageSummary.totalTokens)} Tokens`
-                          : null,
-                        usageSummary.costUsd !== null
-                          ? moneyCompact(usageSummary.costUsd)
-                          : null,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </span>
                   </span>
                 )}
               </div>
@@ -1897,17 +1838,8 @@ export function SessionDetailPane({
               </div>
             )}
 
-            {/* 消息流（cc-switch 结构化阅读引擎）+ 缩略导航 / 对话目录 */}
+            {/* 消息流（结构化阅读引擎）+ 对话目录 */}
             <div className="asm-detail-content">
-              {showSessionMinimap && !outlineOpen && (
-                <SessionMinimap
-                  messages={displayedMessages}
-                  messageIndexes={minimapMessageIndexes}
-                  visibleMessageIndexes={viewportMessageIndexes}
-                  isCodexSession={isCodexSession}
-                  onTickClick={scrollToDisplayedMessage}
-                />
-              )}
               <div className="asm-detail-scroll-stage">
                 <div
                   ref={scrollContainerRef}

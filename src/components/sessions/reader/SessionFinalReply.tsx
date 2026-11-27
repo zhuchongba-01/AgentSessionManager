@@ -3,7 +3,6 @@ import { ClipboardList, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { HoverTip } from "@/components/ui/hover-tip";
-import { useMoneyFormat } from "@/hooks/useMoneyFormat";
 import { cn } from "@/lib/utils";
 import type { SessionTextRange } from "@/types";
 import { findTextMatches, highlightTextRanges } from "../utils";
@@ -21,7 +20,7 @@ import {
   CollapseToggle,
   rowIconButton,
 } from "./SessionQuestion";
-import { formatDuration, formatTokens } from "./toolSummary";
+import { formatDuration } from "./toolSummary";
 import type { TurnFinal } from "./turns";
 
 const SNIPPET_RADIUS = 60;
@@ -107,8 +106,7 @@ export const SessionFinalReply = memo(function SessionFinalReply({
 }: SessionFinalReplyProps) {
   const { t } = useTranslation();
   const rt = useReaderT();
-  const { moneyCompact } = useMoneyFormat();
-  const { style, projectDir, searchQuery, onCopy } = useReaderContext();
+  const { projectDir, searchQuery, onCopy } = useReaderContext();
   const [expanded, setExpanded] = useState(false);
   const text = final.text;
   const long = text.length > COLLAPSE_THRESHOLD;
@@ -142,65 +140,11 @@ export const SessionFinalReply = memo(function SessionFinalReply({
     [],
   );
 
-  // 计算底部元信息：style.showStepCost 的段费用，或无时间线摘要时的回复 meta（耗时 / tokens / costUsd）
-  const footer = useMemo(() => {
-    if (style.showStepCost && final.cost) {
-      const hasAny =
-        final.cost.tokens !== undefined || final.cost.costUsd !== undefined;
-      if (hasAny) {
-        return {
-          durationMs: !hasTimeline ? final.durationMs : undefined,
-          tokens: final.cost.tokens,
-          costUsd: final.cost.costUsd,
-        };
-      }
-    }
-    if (hasTimeline) return null;
-    const meta = final.meta;
-    const metaTokens = meta
-      ? (meta.inputTokens ?? 0) +
-        (meta.outputTokens ?? 0) +
-        (meta.cacheReadTokens ?? 0) +
-        (meta.cacheWriteTokens ?? 0) +
-        (meta.reasoningTokens ?? 0)
-      : 0;
-    const tokens =
-      final.cost?.tokens ?? (metaTokens > 0 ? metaTokens : undefined);
-    const costUsd = final.cost?.costUsd ?? meta?.costUsd;
-    const durationMs =
-      final.durationMs !== undefined && final.durationMs > 0
-        ? final.durationMs
-        : undefined;
-    if (
-      tokens === undefined &&
-      costUsd === undefined &&
-      durationMs === undefined
-    ) {
-      return null;
-    }
-    return { durationMs, tokens, costUsd };
-  }, [
-    final.cost,
-    final.durationMs,
-    final.meta,
-    hasTimeline,
-    style.showStepCost,
-  ]);
-
-  const footerParts: string[] = [];
-  if (footer?.durationMs !== undefined && footer.durationMs > 0) {
-    footerParts.push(
-      rt("summaryDuration", { duration: formatDuration(footer.durationMs) }),
-    );
-  }
-  if (footer?.tokens !== undefined && footer.tokens > 0) {
-    footerParts.push(
-      rt("summaryTokens", { tokens: formatTokens(footer.tokens) }),
-    );
-  }
-  if (footer?.costUsd !== undefined && footer.costUsd > 0) {
-    footerParts.push(moneyCompact(footer.costUsd));
-  }
+  // 无时间线摘要时仅展示本轮耗时，不展示容易误导的估算 Token 与费用
+  const footerText =
+    !hasTimeline && final.durationMs !== undefined && final.durationMs > 0
+      ? rt("summaryDuration", { duration: formatDuration(final.durationMs) })
+      : null;
 
   return (
     <div className="group/final relative min-w-0 px-1.5 py-1">
@@ -268,9 +212,9 @@ export const SessionFinalReply = memo(function SessionFinalReply({
           variant="result"
           className="mt-2"
         />
-        {footerParts.length > 0 && (
+        {footerText && (
           <div className="mt-1.5 text-caption tabular-nums text-fg-3">
-            {footerParts.join(" · ")}
+            {footerText}
           </div>
         )}
         {hiddenMatches.length > 0 && searchQuery && (

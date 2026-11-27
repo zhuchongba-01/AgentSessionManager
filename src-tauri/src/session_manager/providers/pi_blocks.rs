@@ -582,35 +582,61 @@ fn summary_event(
     })
 }
 
-/// `model / usage{input, output, cacheRead, cacheWrite, cost.total} / stopReason` → [`MessageMeta`]（0 视为缺省）。
+/// `model / usage{input, output, cacheRead, cacheWrite, reasoning, totalTokens, cost.total} / durationMs / stopReason` → [`MessageMeta`]（0 视为缺省）。
 fn assistant_meta(msg: &Value) -> Option<MessageMeta> {
     let usage = msg.get("usage");
-    let count = |key: &str| {
-        usage
-            .and_then(|u| u.get(key))
-            .and_then(Value::as_u64)
-            .filter(|n| *n > 0)
+    let raw_u64 = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let non_zero = |n: Option<u64>| n.filter(|v| *v > 0);
+
+    let raw_input = raw_u64("input");
+    let raw_output = raw_u64("output");
+    let raw_cache_read = raw_u64("cacheRead");
+    let raw_cache_write = raw_u64("cacheWrite");
+    let raw_reasoning = raw_u64("reasoning");
+    let total_tokens = raw_u64("totalTokens");
+
+    // Pi (`@earendil-works/pi-coding-agent` v1.6+) 的 `usage.output` 已包含 `usage.reasoning`
+    // （即 `input + output + cacheRead + cacheWrite == totalTokens`）。拆出纯文本输出，避免前端累加时重复计算思考 Token。
+    let adjusted_output = match (raw_output, raw_reasoning, total_tokens) {
+        (Some(out), Some(reas), Some(total))
+            if reas > 0
+                && out >= reas
+                && raw_input
+                    .unwrap_or(0)
+                    .saturating_add(out)
+                    .saturating_add(raw_cache_read.unwrap_or(0))
+                    .saturating_add(raw_cache_write.unwrap_or(0))
+                    == total =>
+        {
+            out.checked_sub(reas)
+        }
+        _ => raw_output,
     };
+
     MessageMeta {
         model: msg
             .get("model")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        input_tokens: count("input"),
-        output_tokens: count("output"),
-        cache_read_tokens: count("cacheRead"),
-        cache_write_tokens: count("cacheWrite"),
+        input_tokens: non_zero(raw_input),
+        output_tokens: non_zero(adjusted_output),
+        cache_read_tokens: non_zero(raw_cache_read),
+        cache_write_tokens: non_zero(raw_cache_write),
+        reasoning_tokens: non_zero(raw_reasoning),
         cost_usd: usage
             .and_then(|u| u.pointer("/cost/total"))
             .and_then(Value::as_f64)
             .filter(|c| *c > 0.0),
+        duration_ms: msg
+            .get("durationMs")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0),
         stop_reason: msg
             .get("stopReason")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        ..MessageMeta::default()
     }
     .into_option()
 }
@@ -954,5 +980,51 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn extracts_v1_6_reasoning_tokens_without_double_counting_and_duration_ms() {
+        let mut t = PiTranscript::new();
+        push(
+            &mut t,
+            json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "model": "deepseek-v4-pro",
+                    "durationMs": 2269,
+                    "stopReason": "stop",
+                    "usage": {
+                        "input": 1821,
+                        "output": 78,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                        "reasoning": 40,
+                        "totalTokens": 1899,
+                        "cost": { "total": 0.0027126 }
+                    },
+                    "content": [
+                        { "type": "thinking", "thinking": "用户发了你好，简洁回复即可。" },
+                        { "type": "text", "text": "你好！有什么我可以帮你的？" }
+                    ]
+                }
+            }),
+            0,
+            "m1",
+        );
+        let messages = t.finish();
+        let meta = messages[0].meta.as_ref().expect("meta");
+        assert_eq!(meta.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(meta.input_tokens, Some(1821));
+        assert_eq!(meta.output_tokens, Some(38));
+        assert_eq!(meta.reasoning_tokens, Some(40));
+        assert_eq!(
+            meta.input_tokens.unwrap_or(0)
+                + meta.output_tokens.unwrap_or(0)
+                + meta.reasoning_tokens.unwrap_or(0),
+            1899
+        );
+        assert_eq!(meta.duration_ms, Some(2269));
+        assert_eq!(meta.cost_usd, Some(0.0027126));
     }
 }

@@ -1619,7 +1619,6 @@ mod tests {
             created_at: None,
             last_active_at: None,
             source_path: source_path.map(str::to_string),
-            resume_command: None,
         }
     }
 

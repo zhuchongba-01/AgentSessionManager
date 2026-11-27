@@ -228,7 +228,6 @@ fn pending_sessions_detailed_in(
         // belong to its persisted plan, not to independently retryable tasks.
         for mut target in operation.targets.into_iter().take(1) {
             target.cleanup_pending = true;
-            target.resume_command = None;
             if let Some(error) = &operation.last_error {
                 target.summary = Some(format!("待清理：{error}"));
             }
@@ -1163,7 +1162,10 @@ fn scoped_package_matches(scope: &str, pkg: &str, provider: &str) -> bool {
         }
         "claude" => scope == "@anthropic-ai" && matches!(pkg, "claude-code" | "claude"),
         "codex" => scope == "@openai" && (pkg == "codex" || pkg.starts_with("codex-")),
-        "pi" => scope == "@mariozechner" && matches!(pkg, "pi-coding-agent" | "pi"),
+        "pi" => {
+            matches!(scope, "@mariozechner" | "@earendil-works")
+                && matches!(pkg, "pi-coding-agent" | "pi")
+        }
         "opencode" => {
             matches!(scope, "@opencode-ai" | "@sst")
                 && (pkg == "opencode" || pkg.starts_with("opencode-"))
@@ -1910,7 +1912,6 @@ mod tests {
             created_at: None,
             last_active_at: None,
             source_path: Some("missing.jsonl".into()),
-            resume_command: None,
         };
         let mut residual = target.clone();
         residual.residual = true;
@@ -2092,6 +2093,18 @@ mod tests {
             "node.exe",
             Some(r"node C:\tools\codex.cjs --help"),
             "codex"
+        ));
+        assert!(script_process_matches(
+            "node.exe",
+            Some(
+                r"node C:\Users\zcb\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js"
+            ),
+            "pi"
+        ));
+        assert!(script_process_matches(
+            "/usr/bin/node",
+            Some("node /usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"),
+            "pi"
         ));
 
         // Ordinary user home/project directory named `claude` must NOT block claude

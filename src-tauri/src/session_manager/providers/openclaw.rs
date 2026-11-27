@@ -194,7 +194,6 @@ fn scan_sessions_in_root(
                 created_at: item.created_at,
                 last_active_at: item.last_active_at.or(item.created_at),
                 source_path: Some(item.source_path),
-                resume_command: None, // OpenClaw sessions are gateway-managed, no CLI resume
             }
         })
         .collect()
@@ -790,7 +789,6 @@ mod tests {
         assert_eq!(first[0].summary.as_deref(), Some("Here is how..."));
         assert_eq!(first[0].project_dir.as_deref(), Some("/tmp/my-app"));
         assert_eq!(first[0].project_name.as_deref(), Some("my-app"));
-        assert!(first[0].resume_command.is_none());
 
         // Adding displayName in sessions.json overrides title even when .jsonl hits PARSE_CACHE
         fs::write(

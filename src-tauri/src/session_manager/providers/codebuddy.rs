@@ -312,29 +312,6 @@ fn session_meta_title(record: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn resume_command(id: &str) -> Option<String> {
-    if !is_valid_codebuddy_session_id(id) {
-        return None;
-    }
-    let mut prefix = String::new();
-    if let Ok(value) = std::env::var("CODEBUDDY_CONFIG_DIR") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            #[cfg(windows)]
-            prefix.push_str(&format!(
-                "$env:CODEBUDDY_CONFIG_DIR = '{}'; ",
-                trimmed.replace('\'', "''")
-            ));
-            #[cfg(not(windows))]
-            prefix.push_str(&format!(
-                "env CODEBUDDY_CONFIG_DIR={} ",
-                crate::session_manager::terminal::shell_escape(trimmed)
-            ));
-        }
-    }
-    Some(format!("{prefix}codebuddy --resume {id}"))
-}
-
 fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
     let Some(stem) = path
         .file_stem()
@@ -404,7 +381,6 @@ fn parse_session_result(path: &Path) -> Result<Option<SessionMeta>, String> {
 
     Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
-        resume_command: resume_command(&session_id),
         session_id,
         residual: false,
         parent_session_id: None,
@@ -1652,10 +1628,6 @@ mod tests {
         assert_eq!(main.summary.as_deref(), Some("list the txt files"));
         assert_eq!(main.project_dir.as_deref(), Some("/work/proj"));
         assert_eq!(main.project_name.as_deref(), Some("proj"));
-        assert_eq!(
-            main.resume_command.as_deref(),
-            Some("codebuddy --resume 0f3c-41aa")
-        );
         assert_eq!(main.created_at, Some(1791900000000));
         assert_eq!(main.last_active_at, Some(1791900000700));
 
@@ -1664,12 +1636,6 @@ mod tests {
             .find(|s| s.session_id == "teammate-1")
             .unwrap();
         assert_eq!(mate.title.as_deref(), Some("Reporting in."));
-
-        // Custom CODEBUDDY_CONFIG_DIR prefixes resume command
-        std::env::set_var("CODEBUDDY_CONFIG_DIR", temp.path());
-        let cmd = resume_command("0f3c-41aa").unwrap();
-        assert!(cmd.contains("CODEBUDDY_CONFIG_DIR"));
-        assert!(cmd.ends_with("codebuddy --resume 0f3c-41aa"));
 
         match prev {
             Some(v) => std::env::set_var("CODEBUDDY_CONFIG_DIR", v),

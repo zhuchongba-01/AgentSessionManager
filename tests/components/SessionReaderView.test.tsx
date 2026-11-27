@@ -90,7 +90,6 @@ function renderDetailPane({
         <SessionDetailPane
           selectedSession={session}
           selectedKey={`${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`}
-          isCodexSession={isCodexSession}
           selectedSessionChildCount={0}
           sessionTitles={new Map()}
           rawMessages={messages}
@@ -294,7 +293,6 @@ describe("SessionDetailPane & reader components suite", () => {
       title: "JWT 校验排查",
       projectDir: "/repo/app",
       sourcePath: "sqlite:/repo/app/opencode.db:codex-session-1",
-      resumeCommand: "codex resume codex-session-1",
     };
 
     const messages: SessionMessage[] = [
@@ -428,7 +426,6 @@ describe("SessionDetailPane & reader components suite", () => {
       title: "单测与补丁修复",
       projectDir: "/repo/app",
       sourcePath: "/mock/codex/session-2.jsonl",
-      resumeCommand: "codex resume codex-session-2",
     };
 
     const messages: SessionMessage[] = [

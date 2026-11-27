@@ -1,5 +1,4 @@
 import { createElement, type ReactNode } from "react";
-import { isWindows } from "@/lib/platform";
 import type { SessionMessage, SessionMeta, SessionTextRange } from "@/types";
 
 const CODEX_IDE_CONTEXT_PREFIX = "# Context from my IDE setup:";
@@ -467,50 +466,6 @@ export const extractCodexPromptPreview = (content: string) => {
   return extractCodexPromptFromIdeContext(content) ?? content;
 };
 
-export interface UserMessageTocEntry {
-  index: number;
-  preview: string;
-  ts?: number;
-}
-
-/**
- * 消息目录 / 缩略导航的条目。
- *
- * **`index` 是「可见消息」数组里的下标，不是正文里的绝对下标。**
- * 传给虚拟列表、`scrollToIndex` 与 `SessionMinimap` 的都必须是同一个空间：
- * 虚拟列表的 count 就是 `getVisibleSessionMessages` 的结果长度。这一点容易被
- * 误解成 wire 里的 `SessionMessage.index`（那是取全文用的绝对下标，只在
- * `get_message_content` 中使用）；两者混用会让点击缩略导航跳到错误的消息上。
- */
-export const buildUserMessageToc = (
-  visibleMessages: SessionMessage[],
-  isCodexSession: boolean,
-): UserMessageTocEntry[] => {
-  const entries: UserMessageTocEntry[] = [];
-  visibleMessages.forEach((message, index) => {
-    if (message.role.toLowerCase() !== "user" || message.injected) return;
-    if (message.blocks && message.blocks.length > 0) {
-      const hasQuestionBlock = message.blocks.some(
-        (block) =>
-          (block.type === "text" && block.text.trim().length > 0) ||
-          block.type === "image",
-      );
-      if (!hasQuestionBlock) return;
-    }
-    const rawText = extractMessagePlainText(message);
-    if (isCodexSession && shouldHideCodexMessageFromToc(rawText)) return;
-    const previewContent = isCodexSession
-      ? extractCodexPromptPreview(rawText)
-      : rawText;
-    entries.push({
-      index,
-      preview: formatSessionMessagePreview(previewContent),
-      ts: message.ts,
-    });
-  });
-  return entries;
-};
-
 export const formatSessionMessagePreview = (
   content: string,
   maxLength = 50,
@@ -519,23 +474,6 @@ export const formatSessionMessagePreview = (
     content.slice(0, maxLength) + (content.length > maxLength ? "..." : "")
   );
 };
-
-/**
- * 缩略导航的显示条件：**只要有用户提问就显示**。
- *
- * 这条规则被改过两次，都是因为「什么才算值得导航」一旦交给别的判据，用户看到的就是
- * 「有时候有、有时候没有」：
- *
- * 1. 最早按「正文是否超过两屏」的像素高度判断。那个数字来自一次布局测量，窗口高度、
- *    分栏宽度、滚动条、测量时机都会影响它，同一个会话时而出现、时而消失。
- * 2. 改成按正文字符数（单轮 ≥ 3000 字）判断，确定性有了，但很短的单轮会话仍然永远
- *    不出现——用户看到的就是「压根不出来」，而他自己并不知道背后有个长度门槛。
- *
- * 现在只剩「有没有提问」这一个判据：没有提问就没有刻度，有提问就一定给导航。少一条
- * 判据，就少一种「该出现却没出现」。
- */
-export const shouldShowSessionMinimap = (userTurnCount: number) =>
-  userTurnCount > 0;
 
 export interface SessionTimeGroup {
   key: "today" | "yesterday" | "thisWeek" | "older";
@@ -629,31 +567,11 @@ export const extractRevealableLocalPath = (
     trimmed.startsWith("\\\\") ||
     /^[a-z]:[/\\]/i.test(trimmed)
   ) {
-    return trimmed;
+    return trimmed.replace(/^\\\\\?\\([a-z]:\\)/i, "$1");
   }
 
   return null;
 };
-
-export const buildResumeShellCommand = (
-  resumeCommand: string,
-  projectDir?: string | null,
-  windows?: boolean,
-): string => {
-  const cmd = resumeCommand.trim();
-  const dir = projectDir?.trim();
-  if (!dir) return cmd;
-
-  const isWin =
-    windows ??
-    (typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent));
-  if (isWin) {
-    return `Set-Location -LiteralPath '${dir.replace(/'/g, "''")}'; ${cmd}`;
-  }
-  return `cd '${dir.replace(/'/g, "'\\''")}' && ${cmd}`;
-};
-
-// ── cc-switch 会话列表与阅读器共用辅助函数 ───────────────────────────────
 
 export const SESSION_APP_IDS = [
   "claude",
@@ -676,52 +594,6 @@ export type SessionAppId = (typeof SESSION_APP_IDS)[number];
 export const isSessionAppId = (value: string): value is SessionAppId =>
   (SESSION_APP_IDS as readonly string[]).includes(value);
 
-export const SESSION_SOURCE_PATHS: Record<SessionAppId, string[]> = {
-  claude: ["~/.claude/projects"],
-  codex: ["~/.codex/sessions", "~/.codex/archived_sessions"],
-  gemini: ["~/.gemini/tmp/<project>/chats"],
-  copilot: ["~/.copilot/session-state"],
-  opencode: ["~/.local/share/opencode"],
-  zcode: ["~/.zcode"],
-  pi: ["~/.pi/agent/sessions"],
-  openclaw: ["~/.openclaw/agents/<agent>/sessions"],
-  deepseek: ["~/.deepseek/sessions", "~/.dsh/sessions"],
-  workbuddy: ["~/.workbuddy/projects"],
-  codebuddy: ["~/.codebuddy/projects"],
-  kimi: ["~/.kimi/sessions", "~/.kimi-code/sessions"],
-  grokbuild: ["~/.grok/sessions", "~/.grok/archived_sessions"],
-};
-
-export interface SessionProjectGroup {
-  key: string;
-  projectDir: string | null;
-  label: string;
-  sessions: SessionMeta[];
-  latest: number;
-}
-
-export const getSessionTime = (session: SessionMeta) =>
-  session.lastActiveAt ?? session.createdAt ?? 0;
-
-export const sortSessionsByTime = (sessions: SessionMeta[]) =>
-  [...sessions].sort((a, b) => getSessionTime(b) - getSessionTime(a));
-
-export const shortenHomePath = (value: string) =>
-  value
-    .replace(/^\/Users\/[^/]+(?=\/|$)/, "~")
-    .replace(/^\/home\/[^/]+(?=\/|$)/, "~")
-    .replace(/^[A-Za-z]:\\Users\\[^\\]+(?=\\|$)/, "~");
-
-export const formatShortDateTime = (value?: number) => {
-  if (!value) return "";
-  return new Date(value).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-};
-
 export const formatMessageTime = (value?: number) => {
   if (!value) return "";
   const date = new Date(value);
@@ -735,77 +607,6 @@ export const formatMessageTime = (value?: number) => {
     minute: "2-digit",
   });
 };
-
-export const formatClock = (value?: number) => {
-  if (!value) return "";
-  return new Date(value).toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-};
-
-export const getSessionLastText = (session: SessionMeta) => {
-  const summary = session.summary?.trim();
-  if (!summary) return "";
-  if (summary === formatSessionTitle(session).trim()) return "";
-  return summary;
-};
-
-const CODEX_CHAT_DIR_RE =
-  /^(.*[\\/]Documents[\\/]Codex)[\\/]\d{4}-\d{2}-\d{2}[\\/][^\\/]+[\\/]*$/i;
-const CODEX_CHATS_KEY_PREFIX = "__codex_chats__:";
-
-export const groupSessionsByProject = (
-  sessions: SessionMeta[],
-  unknownDirectoryLabel: string,
-  codexChatsLabel: string,
-): SessionProjectGroup[] => {
-  const groups = new Map<string, SessionProjectGroup>();
-
-  sessions.forEach((session) => {
-    const rawDir = session.projectDir?.trim() || null;
-    const codexChatsRoot = rawDir?.match(CODEX_CHAT_DIR_RE)?.[1] ?? null;
-    const projectDir = codexChatsRoot ?? rawDir;
-    const key = session.sidebarSection
-      ? `${session.providerId}:section:${session.sidebarSection.id}`
-      : codexChatsRoot
-        ? CODEX_CHATS_KEY_PREFIX + normalizeDirectoryIdentity(codexChatsRoot)
-        : projectDir
-          ? normalizeDirectoryIdentity(projectDir)
-          : UNKNOWN_PROJECT_DIR_KEY;
-    let group = groups.get(key);
-    if (!group) {
-      group = {
-        key,
-        projectDir,
-        label: session.sidebarSection?.name
-          ? session.sidebarSection.name
-          : codexChatsRoot
-            ? codexChatsLabel
-            : session.projectName?.trim() ||
-              (projectDir
-                ? getBaseName(projectDir) || projectDir
-                : unknownDirectoryLabel),
-        sessions: [],
-        latest: 0,
-      };
-      groups.set(key, group);
-    }
-    group.sessions.push(session);
-    group.latest = Math.max(group.latest, getSessionTime(session));
-  });
-
-  return Array.from(groups.values()).sort((a, b) => {
-    if (a.projectDir === null && b.projectDir !== null) return 1;
-    if (a.projectDir !== null && b.projectDir === null) return -1;
-    return b.latest - a.latest;
-  });
-};
-
-export const buildCdResumeCommand = (projectDir: string, command: string) =>
-  isWindows()
-    ? `Set-Location -LiteralPath '${projectDir.replace(/'/g, "''")}'; ${command}`
-    : `cd '${projectDir.replace(/'/g, `'\\''`)}' && ${command}`;
 
 export function* findTextMatches(text: string, query: string) {
   const needle = query.trim().toLowerCase();

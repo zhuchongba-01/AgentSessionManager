@@ -5,7 +5,6 @@ pub mod export;
 pub mod model;
 pub mod providers;
 pub mod search_index;
-pub mod terminal;
 pub mod wire;
 
 pub use model::SessionMessage;
@@ -52,8 +51,6 @@ pub struct SessionMeta {
     pub last_active_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +156,6 @@ fn scan_report() -> SessionScanReport {
                 && s.source_path == item.source_path
         }) {
             existing.cleanup_pending = true;
-            existing.resume_command = None;
             existing.residual = item.residual;
             existing.archived = item.archived;
             // The native title may have disappeared with the index during
@@ -1429,7 +1425,6 @@ mod tests {
             created_at: None,
             last_active_at: None,
             source_path: Some(source_path.to_string()),
-            resume_command: None,
         }
     }
 
