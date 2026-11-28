@@ -849,14 +849,14 @@ footer {
     "  float mag = length(c);",
     "  vec3 hue = mag > 0.0001 ? (c / mag) : vec3(0.0);",
     "  if (uIsDark > 0.5) {",
-    "    vec3 mapped = c / (vec3(1.0) + c * 1.5);",
-    "    vec3 col = uBgColor + mapped * (0.54 + 0.08 * spec);",
+    "    vec3 mapped = c / (vec3(1.0) + c * 1.15);",
+    "    vec3 col = uBgColor + mapped * (0.78 + 0.18 * spec);",
     "    gl_FragColor = vec4(col, 1.0);",
     "  } else {",
-    "    // Clear, airy watercolor wash: never muddy dark, never glaring white at center",
-    "    float ink = clamp(mag / (1.0 + mag * 0.95), 0.0, 0.62);",
-    "    vec3 clearWash = mix(vec3(0.56, 0.68, 0.84), hue * 0.88 + 0.10, 0.78);",
-    "    vec3 col = mix(uBgColor, clearWash, ink * 0.68);",
+    "    // Silky colorful marbled oil-ink on warm paper: vivid, glossy, never glaring white",
+    "    float ink = clamp(mag / (1.0 + mag * 0.72), 0.0, 0.86);",
+    "    vec3 glossyHue = hue * (0.88 + 0.18 * spec);",
+    "    vec3 col = mix(uBgColor, glossyHue, ink * 0.78);",
     "    gl_FragColor = vec4(col, 1.0);",
     "  }",
     "}"
@@ -952,62 +952,58 @@ footer {
     }, 150);
   });
 
-  // Low-glare, serene Song-dynasty mineral pigments
-  var lightPigments = [
-    [0.18, 0.42, 0.68], // 石青
-    [0.14, 0.56, 0.54], // 碧玉青
-    [0.34, 0.36, 0.66], // 远山靛
-    [0.62, 0.38, 0.50], // 暮霞藕
-    [0.24, 0.50, 0.64]  // 苍翠蓝
-  ];
-  var darkPigments = [
-    [0.16, 0.44, 0.88],
-    [0.10, 0.68, 0.72],
-    [0.42, 0.34, 0.90],
-    [0.64, 0.28, 0.72],
-    [0.18, 0.58, 0.92]
-  ];
-  var colorCursor = 0;
+  // Continuous colorful marbled oil-ink spectrum (smooth HSL cycling as you drag)
+  var huePhase = Math.random();
+  function hsvToRgb(h, s, v) {
+    var i = Math.floor(h * 6);
+    var f = h * 6 - i;
+    var p = v * (1 - s);
+    var q = v * (1 - f * s);
+    var t = v * (1 - (1 - f) * s);
+    switch (i % 6) {
+      case 0: return [v, t, p];
+      case 1: return [q, v, p];
+      case 2: return [p, v, t];
+      case 3: return [p, q, v];
+      case 4: return [t, p, v];
+      default: return [v, p, q];
+    }
+  }
 
   function pickColor() {
-    var pal = isDark ? darkPigments : lightPigments;
-    var base = pal[Math.floor(colorCursor) % pal.length];
-    var next = pal[(Math.floor(colorCursor) + 1) % pal.length];
-    var t = colorCursor % 1;
-    colorCursor += 0.08;
-    return [
-      base[0] + (next[0] - base[0]) * t,
-      base[1] + (next[1] - base[1]) * t,
-      base[2] + (next[2] - base[2]) * t
-    ];
+    huePhase = (huePhase + 0.022) % 1.0;
+    return isDark
+      ? hsvToRgb(huePhase, 0.82, 0.92)
+      : hsvToRgb(huePhase, 0.78, 0.88);
   }
 
   function splat(x, y, dx, dy, color, radius) {
+    var r = radius || 0.0054;
     gl.useProgram(splatShader.program);
     gl.uniform1i(splatShader.uniforms.uTarget, velocity.read.attach(0));
     gl.uniform1f(splatShader.uniforms.aspectRatio, canvas.width / canvas.height);
     gl.uniform2f(splatShader.uniforms.point, x, y);
     gl.uniform3f(splatShader.uniforms.color, dx, dy, 0);
-    gl.uniform1f(splatShader.uniforms.radius, radius || 0.0026);
+    gl.uniform1f(splatShader.uniforms.radius, r * 1.28);
     blit(velocity.write);
     velocity.swap();
 
     gl.uniform1i(splatShader.uniforms.uTarget, dye.read.attach(0));
     gl.uniform3f(splatShader.uniforms.color, color[0], color[1], color[2]);
-    gl.uniform1f(splatShader.uniforms.radius, (radius || 0.0026) * 1.15);
+    gl.uniform1f(splatShader.uniforms.radius, r);
     blit(dye.write);
     dye.swap();
   }
 
   function openingFlourish() {
     var strokes = [
-      { x: 0.18, y: 0.65, dx: 220, dy: 80 },
-      { x: 0.82, y: 0.58, dx: -220, dy: 96 },
-      { x: 0.48, y: 0.34, dx: 150, dy: -110 }
+      { x: 0.16, y: 0.66, dx: 360, dy: 120 },
+      { x: 0.84, y: 0.56, dx: -360, dy: 140 },
+      { x: 0.50, y: 0.30, dx: 240, dy: -160 }
     ];
     strokes.forEach(function (s, idx) {
       setTimeout(function () {
-        splat(s.x, s.y, s.dx, s.dy, pickColor(), 0.0048);
+        splat(s.x, s.y, s.dx, s.dy, pickColor(), 0.0082);
       }, idx * 140);
     });
   }
@@ -1017,7 +1013,7 @@ footer {
   var pendingSplats = [];
 
   function clampVel(v) {
-    return Math.max(-420, Math.min(420, v));
+    return Math.max(-680, Math.min(680, v));
   }
 
   window.addEventListener("pointermove", function (e) {
@@ -1031,14 +1027,14 @@ footer {
     var rawDx = x - lastX;
     var rawDy = y - lastY;
     var dist = Math.hypot(rawDx, rawDy);
-    if (dist < 0.0008) return;
+    if (dist < 0.0006) return;
 
-    // Continuous sub-step interpolation so ink stays glued 1:1 to cursor even on fast drags
-    var steps = Math.min(8, Math.max(1, Math.ceil(dist / 0.014)));
-    var vx = clampVel(rawDx * 1850);
-    var vy = clampVel(rawDy * 1850);
+    // Lush continuous sub-step interpolation for silky oil-ink marbling
+    var steps = Math.min(8, Math.max(1, Math.ceil(dist / 0.016)));
+    var vx = clampVel(rawDx * 2600);
+    var vy = clampVel(rawDy * 2600);
     var col = pickColor();
-    var stepWeight = 1.0 / Math.sqrt(steps);
+    var stepWeight = 0.85 / Math.sqrt(steps);
     var weightedCol = [col[0] * stepWeight, col[1] * stepWeight, col[2] * stepWeight];
 
     for (var s = 1; s <= steps; s++) {
@@ -1049,7 +1045,7 @@ footer {
         dx: vx,
         dy: vy,
         color: weightedCol,
-        radius: 0.0022
+        radius: 0.0054
       });
     }
     if (pendingSplats.length > 24) pendingSplats.splice(0, pendingSplats.length - 24);
@@ -1065,15 +1061,15 @@ footer {
     var y = 1.0 - e.clientY / window.innerHeight;
     lastX = x;
     lastY = y;
-    for (var i = 0; i < 4; i++) {
-      var a = (Math.PI * 2 * i) / 4 + Math.random() * 0.5;
+    for (var i = 0; i < 5; i++) {
+      var a = (Math.PI * 2 * i) / 5 + Math.random() * 0.4;
       pendingSplats.push({
         x: x,
         y: y,
-        dx: Math.cos(a) * 260,
-        dy: Math.sin(a) * 260,
+        dx: Math.cos(a) * 380,
+        dy: Math.sin(a) * 380,
         color: pickColor(),
-        radius: 0.0034
+        radius: 0.0068
       });
     }
   }, { passive: true });
@@ -1102,7 +1098,7 @@ footer {
     gl.uniform2f(vorticityShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(vorticityShader.uniforms.uVelocity, velocity.read.attach(0));
     gl.uniform1i(vorticityShader.uniforms.uCurl, curl.attach(1));
-    gl.uniform1f(vorticityShader.uniforms.curl, 26.0);
+    gl.uniform1f(vorticityShader.uniforms.curl, 36.0);
     gl.uniform1f(vorticityShader.uniforms.dt, dt);
     blit(velocity.write);
     velocity.swap();
@@ -1121,7 +1117,7 @@ footer {
     gl.useProgram(pressureShader.program);
     gl.uniform2f(pressureShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(pressureShader.uniforms.uDivergence, divergence.attach(0));
-    for (var i = 0; i < 14; i++) {
+    for (var i = 0; i < 16; i++) {
       gl.uniform1i(pressureShader.uniforms.uPressure, pressure.read.attach(1));
       blit(pressure.write);
       pressure.swap();
@@ -1140,14 +1136,14 @@ footer {
     gl.uniform1i(advectionShader.uniforms.uVelocity, velId);
     gl.uniform1i(advectionShader.uniforms.uSource, velId);
     gl.uniform1f(advectionShader.uniforms.dt, dt);
-    gl.uniform1f(advectionShader.uniforms.dissipation, 0.92);
+    gl.uniform1f(advectionShader.uniforms.dissipation, 0.35);
     blit(velocity.write);
     velocity.swap();
 
     gl.uniform2f(advectionShader.uniforms.texelSize, dye.texelSizeX, dye.texelSizeY);
     gl.uniform1i(advectionShader.uniforms.uVelocity, velocity.read.attach(0));
     gl.uniform1i(advectionShader.uniforms.uSource, dye.read.attach(1));
-    gl.uniform1f(advectionShader.uniforms.dissipation, 0.74);
+    gl.uniform1f(advectionShader.uniforms.dissipation, 0.42);
     blit(dye.write);
     dye.swap();
 
