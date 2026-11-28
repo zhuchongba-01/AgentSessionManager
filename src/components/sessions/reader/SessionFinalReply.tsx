@@ -1,8 +1,9 @@
 import { memo, useCallback, useMemo, useState } from "react";
-import { ClipboardList, Copy } from "lucide-react";
+import { Check, ClipboardList, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { HoverTip } from "@/components/ui/hover-tip";
+import { useCopiedFeedback } from "@/hooks/useCopiedFeedback";
 import { cn } from "@/lib/utils";
 import type { SessionTextRange } from "@/types";
 import { findTextMatches, highlightTextRanges } from "../utils";
@@ -107,6 +108,8 @@ export const SessionFinalReply = memo(function SessionFinalReply({
   const { t } = useTranslation();
   const rt = useReaderT();
   const { projectDir, searchQuery, onCopy } = useReaderContext();
+  const replyCopied = useCopiedFeedback();
+  const turnCopied = useCopiedFeedback();
   const [expanded, setExpanded] = useState(false);
   const text = final.text;
   const long = text.length > COLLAPSE_THRESHOLD;
@@ -151,42 +154,72 @@ export const SessionFinalReply = memo(function SessionFinalReply({
       <div className="absolute end-0 top-0 flex items-center gap-0.5">
         {text && (
           <HoverTip
-            content={t("sessionManager.copyReply", {
-              defaultValue: "复制回复",
-            })}
+            content={
+              replyCopied.copied
+                ? t("sessionManager.copiedShort", { defaultValue: "已复制" })
+                : t("sessionManager.copyReply", {
+                    defaultValue: "复制回复",
+                  })
+            }
           >
             <button
               type="button"
               aria-label={t("sessionManager.copyReply", {
                 defaultValue: "复制这条回复",
               })}
-              onClick={() =>
+              onClick={() => {
+                replyCopied.triggerCopied();
                 onCopy(
                   text,
                   t("sessionManager.messageCopied", {
                     defaultValue: "已复制这条消息",
                   }),
-                )
-              }
-              className={cn(rowIconButton, "group-hover/final:opacity-100")}
+                );
+              }}
+              className={cn(
+                rowIconButton,
+                "group-hover/final:opacity-100",
+                replyCopied.copied && "opacity-100 text-success-text",
+              )}
             >
-              <Copy aria-hidden className="h-3.5 w-3.5" strokeWidth={1.5} />
+              {replyCopied.copied ? (
+                <Check aria-hidden className="h-3.5 w-3.5" strokeWidth={1.8} />
+              ) : (
+                <Copy aria-hidden className="h-3.5 w-3.5" strokeWidth={1.5} />
+              )}
             </button>
           </HoverTip>
         )}
         {turnKey && onCopyTurn && (
-          <HoverTip content={rt("copyTurn")}>
+          <HoverTip
+            content={
+              turnCopied.copied
+                ? t("sessionManager.copiedShort", { defaultValue: "已复制" })
+                : rt("copyTurn")
+            }
+          >
             <button
               type="button"
               aria-label={rt("copyTurn")}
-              onClick={() => onCopyTurn(turnKey)}
-              className={cn(rowIconButton, "group-hover/final:opacity-100")}
+              onClick={() => {
+                turnCopied.triggerCopied();
+                onCopyTurn(turnKey);
+              }}
+              className={cn(
+                rowIconButton,
+                "group-hover/final:opacity-100",
+                turnCopied.copied && "opacity-100 text-success-text",
+              )}
             >
-              <ClipboardList
-                aria-hidden
-                className="h-3.5 w-3.5"
-                strokeWidth={1.5}
-              />
+              {turnCopied.copied ? (
+                <Check aria-hidden className="h-3.5 w-3.5" strokeWidth={1.8} />
+              ) : (
+                <ClipboardList
+                  aria-hidden
+                  className="h-3.5 w-3.5"
+                  strokeWidth={1.5}
+                />
+              )}
             </button>
           </HoverTip>
         )}

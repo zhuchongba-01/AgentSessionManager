@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { Copy, Maximize2, Minimize2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -98,6 +98,12 @@ export const SessionImageLightbox = memo(function SessionImageLightbox({
   const { t } = useTranslation();
   const rt = useReaderT();
   const [actualSize, setActualSize] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setActualSize(false);
+    }
+  }, [open, url]);
 
   const handleCopy = async () => {
     try {

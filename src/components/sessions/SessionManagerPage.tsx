@@ -1068,6 +1068,36 @@ export function SessionManagerPage({ appId }: { appId: string }) {
     setExpandedDirectoryGroups(nextDirectories);
   }, [allGroupsExpanded, groupedSessions]);
 
+  const handleLocateSelectedSession = useCallback(() => {
+    if (!selectedSession) return;
+    if (listViewMode === "grouped") {
+      const directoryKey = getSessionDirectoryGroupKey(
+        selectedSession.providerId,
+        selectedSession.projectDir,
+        selectedSession.projectName,
+        selectedSession.sidebarSection,
+      );
+      setExpandedProviderGroups((current) => {
+        if (current.has(selectedSession.providerId)) return current;
+        const next = new Set(current);
+        next.add(selectedSession.providerId);
+        return next;
+      });
+      setExpandedDirectoryGroups((current) => {
+        if (current.has(directoryKey)) return current;
+        const next = new Set(current);
+        next.add(directoryKey);
+        return next;
+      });
+    }
+    requestAnimationFrame(() => {
+      const selectedEl = document.querySelector<HTMLElement>(
+        ".asm-list .asm-session-item.is-selected",
+      );
+      selectedEl?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    });
+  }, [listViewMode, selectedSession]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -1302,6 +1332,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                 onSelectSnippet={handleSelectSnippet}
                 onToggleSessionChecked={toggleSessionChecked}
                 onToggleSessionGroupChecked={toggleSessionGroupChecked}
+                onLocateSelectedSession={handleLocateSelectedSession}
                 updatedAtLabel={updatedAtLabel}
                 providerCount={providerCount}
               />

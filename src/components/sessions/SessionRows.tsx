@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import type { SessionMeta } from "@/types";
-import { Button } from "@/components/ui/button";
 import { getSessionKey } from "./utils";
 
 const PAGE_SIZE = 100;
@@ -47,6 +47,8 @@ export function SessionRows({
 
   const lastPage = Math.max(0, Math.ceil(sessions.length / PAGE_SIZE) - 1);
   const visiblePage = Math.min(page, lastPage);
+  const prevLabel = t("sessionManager.prevPage", { defaultValue: "上一页" });
+  const nextLabel = t("sessionManager.nextPage", { defaultValue: "下一页" });
 
   return (
     <>
@@ -58,17 +60,19 @@ export function SessionRows({
           aria-label={t("sessionManager.paginationNav", {
             defaultValue: "会话分页",
           })}
-          className="flex items-center justify-between gap-2 p-2 text-xs"
+          className="asm-pagination-bar"
         >
-          <Button
-            size="sm"
-            variant="outline"
+          <button
+            type="button"
+            className="asm-pagination-btn"
+            aria-label={prevLabel}
             disabled={visiblePage === 0}
             onClick={() => setPage(visiblePage - 1)}
           >
-            {t("sessionManager.prevPage", { defaultValue: "上一页" })}
-          </Button>
-          <span>
+            <ChevronLeft className="size-3.5" aria-hidden="true" />
+            <span>{prevLabel}</span>
+          </button>
+          <span className="asm-pagination-meta">
             {t("sessionManager.paginationStatus", {
               defaultValue: "{{current}} / {{total}} 页 · {{count}} 条",
               current: visiblePage + 1,
@@ -76,14 +80,16 @@ export function SessionRows({
               count: sessions.length,
             })}
           </span>
-          <Button
-            size="sm"
-            variant="outline"
+          <button
+            type="button"
+            className="asm-pagination-btn"
+            aria-label={nextLabel}
             disabled={visiblePage === lastPage}
             onClick={() => setPage(visiblePage + 1)}
           >
-            {t("sessionManager.nextPage", { defaultValue: "下一页" })}
-          </Button>
+            <span>{nextLabel}</span>
+            <ChevronRight className="size-3.5" aria-hidden="true" />
+          </button>
         </nav>
       )}
     </>

@@ -1,8 +1,9 @@
-import { FileText, FolderOpen } from "lucide-react";
+import { Check, FileText, FolderOpen } from "lucide-react";
 import { memo, useCallback, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { HoverTip } from "@/components/ui/hover-tip";
+import { useCopiedFeedback } from "@/hooks/useCopiedFeedback";
 import { sessionsApi } from "@/lib/api/sessions";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
@@ -118,6 +119,7 @@ export const PathChip = memo(function PathChip({
   className,
 }: PathChipProps) {
   const { t } = useTranslation();
+  const { copied, triggerCopied } = useCopiedFeedback();
   const ctx = useReaderContext();
   const effectiveProjectDir = projectDir ?? ctx.projectDir;
   const effectiveSearchQuery = searchQuery ?? ctx.searchQuery;
@@ -129,6 +131,7 @@ export const PathChip = memo(function PathChip({
   const handleCopy = useCallback(async () => {
     const ok = await copyText(localPath);
     if (ok) {
+      triggerCopied();
       toast.success(
         t("sessionManager.pathCopied", {
           defaultValue: "已复制路径 {{path}}",
@@ -138,7 +141,7 @@ export const PathChip = memo(function PathChip({
     } else {
       toast.error(t("sessionManager.copyFailed", { defaultValue: "复制失败" }));
     }
-  }, [localPath, t]);
+  }, [localPath, t, triggerCopied]);
 
   const handleReveal = useCallback(async () => {
     if (effectiveReveal) {
@@ -179,7 +182,11 @@ export const PathChip = memo(function PathChip({
         onClick={() => void handleCopy()}
         className="inline-flex min-w-0 items-center gap-1 rounded-s-control py-px pe-1 ps-1.5 font-mono transition-colors hover:bg-selected focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <FileText aria-hidden className="size-3 shrink-0 text-fg-3" />
+        {copied ? (
+          <Check aria-hidden className="size-3 shrink-0 text-success-text" />
+        ) : (
+          <FileText aria-hidden className="size-3 shrink-0 text-fg-3" />
+        )}
         <span className="truncate">
           {label ??
             (effectiveSearchQuery

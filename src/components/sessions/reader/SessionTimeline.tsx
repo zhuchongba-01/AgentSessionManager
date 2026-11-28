@@ -1,7 +1,8 @@
 import { memo } from "react";
-import { ChevronRight, Copy } from "lucide-react";
+import { Check, ChevronRight, Copy } from "lucide-react";
 
 import { HoverTip } from "@/components/ui/hover-tip";
+import { useCopiedFeedback } from "@/hooks/useCopiedFeedback";
 import { cn } from "@/lib/utils";
 import { useReaderT } from "./i18n";
 import { formatDuration, type TurnSummary } from "./toolSummary";
@@ -36,6 +37,7 @@ export const SessionTimeline = memo(function SessionTimeline({
   onCopyTurn,
 }: SessionTimelineProps) {
   const rt = useReaderT();
+  const { copied, triggerCopied } = useCopiedFeedback();
   const parts: { key: string; text: string; danger?: boolean }[] = [];
   if (summary.commandCount > 0) {
     parts.push({
@@ -107,14 +109,24 @@ export const SessionTimeline = memo(function SessionTimeline({
           )}
         </span>
       </button>
-      <HoverTip content={rt("copyTurn")}>
+      <HoverTip content={copied ? "已复制" : rt("copyTurn")}>
         <button
           type="button"
           aria-label={rt("copyTurn")}
-          onClick={() => onCopyTurn(turnKey)}
-          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-control text-fg-3 opacity-0 transition-[opacity,color] hover:bg-subtle hover:text-fg-1 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/timeline:opacity-100"
+          onClick={() => {
+            triggerCopied();
+            onCopyTurn(turnKey);
+          }}
+          className={cn(
+            "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-control text-fg-3 opacity-0 transition-[opacity,color] hover:bg-subtle hover:text-fg-1 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/timeline:opacity-100",
+            copied && "opacity-100 text-success-text",
+          )}
         >
-          <Copy aria-hidden className="h-3.5 w-3.5" strokeWidth={1.5} />
+          {copied ? (
+            <Check aria-hidden className="h-3.5 w-3.5" strokeWidth={1.8} />
+          ) : (
+            <Copy aria-hidden className="h-3.5 w-3.5" strokeWidth={1.5} />
+          )}
         </button>
       </HoverTip>
     </div>

@@ -1063,8 +1063,8 @@ export const isChangeStep = (step: TimelineStep): step is ToolStep =>
     Boolean(step.call?.diff));
 
 /**
- * 轮的执行过程是否展开（规则 3、4）：手动切换优先；查找命中在步骤内时始终展开；
- * 显式「收起全部」时收起其余轮次；否则按「展开全部」、中断、无最终回复自动展开。
+ * 轮的执行过程是否展开：手动切换优先；查找命中在步骤内时自动展开；
+ * 默认一律收起（包括无最终回复或中断轮次），仅在用户开启「展开过程」时展开。
  */
 export const isTimelineExpanded = (
   turn: SessionTurn,
@@ -1072,9 +1072,7 @@ export const isTimelineExpanded = (
 ): boolean =>
   options.turnOverrides?.get(turn.key) ??
   (Boolean(options.search?.turnKeys.has(turn.key)) ||
-    (options.forceCollapseAll
-      ? false
-      : Boolean(options.expandAll) || turn.aborted || !turn.final));
+    (options.forceCollapseAll ? false : Boolean(options.expandAll)));
 
 /** 工具输出预览在前 `visible` 行之后还有没有命中（大小写不敏感，和查找一致） */
 const previewTailHasQuery = (

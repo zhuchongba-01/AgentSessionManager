@@ -1,7 +1,8 @@
 import { memo, useEffect, useMemo, useRef } from "react";
-import { Bookmark } from "lucide-react";
+import { Bookmark, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { OverlayScrollArea } from "@/components/ui/overlay-scroll-area";
 import { cn } from "@/lib/utils";
 import { formatMessageTime } from "../utils";
 import { useReaderT } from "./i18n";
@@ -39,12 +40,13 @@ export interface SessionOutlineProps {
   onJumpQuestion: (turn: SessionTurn) => void;
   onJumpReply: (turn: SessionTurn) => void;
   onJumpChapter: (turn: SessionTurn, chapter: TurnChapter) => void;
+  onClose?: () => void;
 }
 
 /**
- * 右侧对话目录（260px，默认展开）：每轮拆成「你」和 Agent 两条，和正文一样人靠右、Agent 靠左，
+ * 右侧对话目录：每轮拆成「你」和 Agent 两条，和正文一样人靠右、Agent 靠左，
  * 一眼分清谁说了什么；点哪条跳到正文对应位置，滚动正文时跟着高亮当前轮。
- * 有章节标记的轮，章节标题列在这一轮最前面，点了跳到正文里的章节行。
+ * 窄窗口下自动转为右侧浮层抽屉，并提供右上角关闭按钮。
  */
 export const SessionOutline = memo(function SessionOutline({
   turns,
@@ -52,6 +54,7 @@ export const SessionOutline = memo(function SessionOutline({
   onJumpQuestion,
   onJumpReply,
   onJumpChapter,
+  onClose,
 }: SessionOutlineProps) {
   const { t } = useTranslation();
   const rt = useReaderT();
@@ -78,136 +81,150 @@ export const SessionOutline = memo(function SessionOutline({
     [turns],
   );
 
-  // 正文滚到别的轮时，把目录里对应的条目滚进视野；只滚目录自己，不带动外层容器
+  // 正文滚到别的轮时，把目录里对应的条目滚进视野；只滚目录滚动视口自己，不带动外层容器
   useEffect(() => {
     const list = listRef.current;
     const item = list?.querySelector<HTMLElement>(
       `[data-outline-turn="${activeTurn}"]`,
     );
-    if (!list || !item) return;
-    const top = item.offsetTop - list.offsetTop;
-    const bottom = top + item.offsetHeight;
-    if (top < list.scrollTop) {
-      list.scrollTop = top;
-    } else if (bottom > list.scrollTop + list.clientHeight) {
-      list.scrollTop = bottom - list.clientHeight;
+    const viewport = list?.closest<HTMLElement>(".asm-overlay-scroll-viewport");
+    if (!viewport || !item) return;
+    const viewportRect = viewport.getBoundingClientRect();
+    const itemRect = item.getBoundingClientRect();
+    if (itemRect.top < viewportRect.top + 6) {
+      viewport.scrollTop -= viewportRect.top + 6 - itemRect.top;
+    } else if (itemRect.bottom > viewportRect.bottom - 6) {
+      viewport.scrollTop += itemRect.bottom - (viewportRect.bottom - 6);
     }
   }, [activeTurn]);
 
   return (
-    <nav
-      aria-label={rt("outlineTitle")}
-      className="asm-ccs-outline flex min-h-0 w-[260px] shrink-0 flex-col border-s border-border max-md:hidden"
-    >
-      <div className="flex h-9 shrink-0 items-center px-4 text-caption font-semibold text-fg-2">
-        {rt("outlineTitle")}
-        <span className="ms-1.5 font-normal tabular-nums text-fg-3">
-          {entries.length}
+    <nav aria-label={rt("outlineTitle")} className="asm-ccs-outline">
+      <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/60 pe-2 ps-3.5 text-caption font-semibold text-fg-2">
+        <span className="flex items-center">
+          {rt("outlineTitle")}
+          <span className="ms-1.5 rounded-full bg-subtle px-1.5 py-px text-[11px] font-medium tabular-nums text-fg-3">
+            {entries.length}
+          </span>
         </span>
+        {onClose && (
+          <button
+            type="button"
+            aria-label={t("sessionManager.closeOutline", {
+              defaultValue: "关闭对话目录",
+            })}
+            onClick={onClose}
+            className="inline-flex h-6 w-6 items-center justify-center rounded-control text-fg-3 transition-colors hover:bg-subtle hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        )}
       </div>
-      <ol
-        ref={listRef}
-        className="m-0 min-h-0 flex-1 list-none overflow-y-auto overscroll-contain px-2 pb-4"
+      <OverlayScrollArea
+        wrapperClassName="min-h-0 flex-1"
+        className="px-2 py-2 pb-4"
       >
-        {entries.map((entry) => {
-          const active = entry.turn.index === activeTurn;
-          return (
-            <li
-              key={entry.turn.key}
-              data-outline-turn={entry.turn.index}
-              className={cn(
-                "relative mb-1 flex flex-col gap-1 rounded-panel px-1.5 py-1.5 transition-colors",
-                active && "bg-subtle",
-              )}
-            >
-              {active && (
-                <span
-                  aria-hidden
-                  className="absolute inset-y-2 start-0 w-[2px] rounded-full bg-[var(--reader-accent)]"
-                />
-              )}
-
-              {entry.turn.chapters.map((chapter) => (
-                <button
-                  key={chapter.id}
-                  type="button"
-                  onClick={() => onJumpChapter(entry.turn, chapter)}
-                  title={chapter.summary}
-                  className="group/outline flex min-w-0 items-center gap-1.5 rounded-control py-0.5 text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <Bookmark
-                    aria-hidden
-                    className="h-3 w-3 shrink-0 text-[var(--reader-accent)]"
-                    strokeWidth={2}
-                  />
-                  <span className="sr-only">{rt("chapter")}：</span>
-                  <span className="min-w-0 truncate text-caption font-semibold text-fg-1 group-hover/outline:underline">
-                    {chapter.title}
-                  </span>
-                </button>
-              ))}
-
-              {entry.question !== undefined && (
-                <button
-                  type="button"
-                  onClick={() => onJumpQuestion(entry.turn)}
-                  aria-current={active ? "true" : undefined}
-                  className="group/outline flex min-w-0 flex-col items-end gap-0.5 self-end rounded-control text-end focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <span className="text-[11px] tabular-nums text-fg-3">
-                    {t("sessionManager.you", { defaultValue: "你" })}
-                    {entry.turn.question?.ts
-                      ? ` · ${formatMessageTime(entry.turn.question.ts)}`
-                      : ""}
-                  </span>
-                  <span
-                    className="line-clamp-2 max-w-[200px] break-words rounded-[10px] rounded-se-[3px] px-2 py-1 text-start text-caption text-fg-1 transition-[filter] group-hover/outline:brightness-110"
-                    style={{
-                      background:
-                        "color-mix(in srgb, var(--reader-accent) 14%, var(--bg-subtle))",
-                    }}
-                  >
-                    {entry.question || rt("outlineEmptyQuestion")}
-                  </span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => onJumpReply(entry.turn)}
-                className="group/outline flex min-w-0 items-start gap-1.5 rounded-control text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        <ol ref={listRef} className="m-0 list-none p-0">
+          {entries.map((entry) => {
+            const active = entry.turn.index === activeTurn;
+            return (
+              <li
+                key={entry.turn.key}
+                data-outline-turn={entry.turn.index}
+                className={cn(
+                  "relative mb-1 flex flex-col gap-1 rounded-panel px-1.5 py-1.5 transition-colors",
+                  active && "bg-subtle",
+                )}
               >
-                <span className="mt-0.5 origin-top-left scale-[0.72]">
-                  <SessionAgentAvatar />
-                </span>
-                <span className="-ms-1.5 flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="flex items-center gap-1 text-[11px] tabular-nums text-fg-3">
-                    {entry.steps > 0 &&
-                      rt("outlineSteps", { count: entry.steps })}
-                    {entry.failed && (
-                      <span
-                        aria-label={rt("outlineFailed")}
-                        className="h-1.5 w-1.5 rounded-full bg-danger"
-                      />
-                    )}
-                  </span>
+                {active && (
                   <span
-                    className={cn(
-                      "line-clamp-2 break-words text-caption transition-colors group-hover/outline:text-fg-1",
-                      entry.reply ? "text-fg-2" : "italic text-fg-3",
-                    )}
+                    aria-hidden
+                    className="absolute inset-y-2 start-0 w-[2px] rounded-full bg-[var(--reader-accent)]"
+                  />
+                )}
+
+                {entry.turn.chapters.map((chapter) => (
+                  <button
+                    key={chapter.id}
+                    type="button"
+                    onClick={() => onJumpChapter(entry.turn, chapter)}
+                    title={chapter.summary}
+                    className="group/outline flex min-w-0 items-center gap-1.5 rounded-control py-0.5 text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    {entry.reply ||
-                      (entry.turn.aborted
-                        ? rt("outlineAborted")
-                        : rt("outlineNoReply"))}
+                    <Bookmark
+                      aria-hidden
+                      className="h-3 w-3 shrink-0 text-[var(--reader-accent)]"
+                      strokeWidth={2}
+                    />
+                    <span className="sr-only">{rt("chapter")}：</span>
+                    <span className="min-w-0 truncate text-caption font-semibold text-fg-1 group-hover/outline:underline">
+                      {chapter.title}
+                    </span>
+                  </button>
+                ))}
+
+                {entry.question !== undefined && (
+                  <button
+                    type="button"
+                    onClick={() => onJumpQuestion(entry.turn)}
+                    aria-current={active ? "true" : undefined}
+                    className="group/outline flex min-w-0 flex-col items-end gap-0.5 self-end rounded-control text-end focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <span className="text-[11px] tabular-nums text-fg-3">
+                      {t("sessionManager.you", { defaultValue: "你" })}
+                      {entry.turn.question?.ts
+                        ? ` · ${formatMessageTime(entry.turn.question.ts)}`
+                        : ""}
+                    </span>
+                    <span
+                      className="line-clamp-2 max-w-[200px] break-words rounded-[10px] rounded-se-[3px] px-2 py-1 text-start text-caption text-fg-1 transition-[filter] group-hover/outline:brightness-110"
+                      style={{
+                        background:
+                          "color-mix(in srgb, var(--reader-accent) 14%, var(--bg-subtle))",
+                      }}
+                    >
+                      {entry.question || rt("outlineEmptyQuestion")}
+                    </span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => onJumpReply(entry.turn)}
+                  className="group/outline flex min-w-0 items-start gap-1.5 rounded-control text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <span className="mt-0.5 origin-top-left scale-[0.72]">
+                    <SessionAgentAvatar />
                   </span>
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ol>
+                  <span className="-ms-1.5 flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span className="flex items-center gap-1 text-[11px] tabular-nums text-fg-3">
+                      {entry.steps > 0 &&
+                        rt("outlineSteps", { count: entry.steps })}
+                      {entry.failed && (
+                        <span
+                          aria-label={rt("outlineFailed")}
+                          className="h-1.5 w-1.5 rounded-full bg-danger"
+                        />
+                      )}
+                    </span>
+                    <span
+                      className={cn(
+                        "line-clamp-2 break-words text-caption transition-colors group-hover/outline:text-fg-1",
+                        entry.reply ? "text-fg-2" : "italic text-fg-3",
+                      )}
+                    >
+                      {entry.reply ||
+                        (entry.turn.aborted
+                          ? rt("outlineAborted")
+                          : rt("outlineNoReply"))}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ol>
+      </OverlayScrollArea>
     </nav>
   );
 });

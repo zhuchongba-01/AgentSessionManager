@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type UIEvent,
 } from "react";
@@ -12,24 +13,16 @@ import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ArrowDown,
+  Check,
   CheckSquare,
-  ChevronDown,
-  ChevronUp,
-  ChevronsDownUp,
-  ChevronsUpDown,
   Clock,
-  Copy,
-  Download,
   ExternalLink,
   FileText,
   FolderOpen,
   Hash,
   MessageSquare,
-  PanelRight,
   RefreshCw,
-  Search,
   Trash2,
-  X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -38,6 +31,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useCopiedFeedback } from "@/hooks/useCopiedFeedback";
 import { sessionsApi } from "@/lib/api/sessions";
 import { isMac } from "@/lib/platform";
 import { clearSessionImageCache } from "@/lib/query/sessions";
@@ -45,7 +39,6 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import type { SessionMessage, SessionMeta } from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { AgentIcon } from "./AgentIcon";
 import { getAgentReaderStyle } from "./reader/agentStyles";
 import { ReaderContext, type ReaderContextValue } from "./reader/context";
 import {
@@ -83,6 +76,8 @@ import {
   type SessionTurn,
   type TurnChapter,
 } from "./reader/turns";
+import { SessionDetailFindBar } from "./SessionDetailFindBar";
+import { SessionDetailToolbar } from "./SessionDetailToolbar";
 import { SessionStatusBadges } from "./SessionStatusBadges";
 import type { SessionReaderViewMode } from "./types";
 import {
@@ -90,27 +85,17 @@ import {
   formatMessageTimestamp,
   formatSessionTitle,
   getBaseName,
-  getProviderIconName,
   getProviderLabel,
   resolveParentLabel,
 } from "./utils";
 
 const OUTLINE_OPEN_STORAGE_KEY = "agent-session-manager.outlineOpen";
-const EXPAND_ALL_STORAGE_KEY = "cc-switch.sessionReader.expandTimelines";
-
-type TimelineExpandMode = "auto" | "expanded" | "collapsed";
+const LEGACY_EXPAND_ALL_STORAGE_KEY = "cc-switch.sessionReader.expandTimelines";
+const SCROLL_MEMORY_LIMIT = 24;
 
 function readInitialOutlineOpen(): boolean {
   try {
     return window.localStorage.getItem(OUTLINE_OPEN_STORAGE_KEY) === "true";
-  } catch {
-    return false;
-  }
-}
-
-function readInitialExpandAll(): boolean {
-  try {
-    return window.localStorage.getItem(EXPAND_ALL_STORAGE_KEY) === "1";
   } catch {
     return false;
   }
@@ -254,18 +239,20 @@ export function SessionDetailPane({
 }: SessionDetailPaneProps) {
   const { t } = useTranslation();
   const rt = useReaderT();
+  const idCopied = useCopiedFeedback();
+  const dirCopied = useCopiedFeedback();
+  const srcCopied = useCopiedFeedback();
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const scrollMemoryRef = useRef<Map<string, number>>(new Map());
+  const pendingScrollRestoreKeyRef = useRef<string | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const detailSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const detailSearchInputRef = useRef<HTMLInputElement>(null);
   const navigatedCursorRef = useRef<number | null>(null);
 
   const [flashRowKey, setFlashRowKey] = useState<string | null>(null);
   const [readerViewMode, setReaderViewMode] =
     useState<SessionReaderViewMode>("all");
-  const [timelineExpandMode, setTimelineExpandMode] =
-    useState<TimelineExpandMode>(() =>
-      readInitialExpandAll() ? "expanded" : "auto",
-    );
+  const [expandAllTimelines, setExpandAllTimelines] = useState(false);
   const [turnOverrides, setTurnOverrides] = useState<Map<string, boolean>>(
     () => new Map(),
   );
@@ -279,7 +266,14 @@ export function SessionDetailPane({
   const [outlineOpen, setOutlineOpen] = useState(readInitialOutlineOpen);
   const [atBottom, setAtBottom] = useState(true);
 
-  useEffect(() => () => clearSessionImageCache(), []);
+  useEffect(() => {
+    try {
+      window.localStorage.removeItem(LEGACY_EXPAND_ALL_STORAGE_KEY);
+    } catch {
+      // ignore storage access errors
+    }
+    return () => clearSessionImageCache();
+  }, []);
 
   const handleToggleOutline = useCallback(() => {
     setOutlineOpen((prev) => {
@@ -514,18 +508,18 @@ export function SessionDetailPane({
     () =>
       flattenRows(displayedTurns, {
         filter,
-        expandAll: timelineExpandMode === "expanded",
-        forceCollapseAll: timelineExpandMode === "collapsed",
+        expandAll: expandAllTimelines,
+        forceCollapseAll: !expandAllTimelines,
         turnOverrides,
         stepOverrides,
         search,
       }),
     [
       displayedTurns,
+      expandAllTimelines,
       filter,
       search,
       stepOverrides,
-      timelineExpandMode,
       turnOverrides,
     ],
   );
@@ -548,15 +542,7 @@ export function SessionDetailPane({
     const nextExpanded = !areAllTimelinesExpanded;
     setTurnOverrides(new Map());
     setStepOverrides(new Map());
-    setTimelineExpandMode(nextExpanded ? "expanded" : "collapsed");
-    try {
-      window.localStorage.setItem(
-        EXPAND_ALL_STORAGE_KEY,
-        nextExpanded ? "1" : "0",
-      );
-    } catch {
-      // ignore
-    }
+    setExpandAllTimelines(nextExpanded);
   }, [areAllTimelinesExpanded]);
 
   const agentStartKeys = useMemo(() => {
@@ -662,16 +648,44 @@ export function SessionDetailPane({
     setFlashRowKey(null);
     setTurnOverrides(new Map());
     setStepOverrides(new Map());
-    setTimelineExpandMode(readInitialExpandAll() ? "expanded" : "auto");
+    setExpandAllTimelines(false);
     setReaderViewMode("all");
     setDetailSearchOpen(false);
     setDetailSearchQuery("");
     setActiveMatchCursor(0);
-    setAtBottom(true);
+
+    const rememberedTop = selectedKey
+      ? (scrollMemoryRef.current.get(selectedKey) ?? 0)
+      : 0;
+    pendingScrollRestoreKeyRef.current =
+      selectedKey && rememberedTop > 0 ? selectedKey : null;
+    setAtBottom(rememberedTop <= 0);
     if (scrollContainerRef.current) {
-      scrollContainerRef.current.scrollTop = 0;
+      scrollContainerRef.current.scrollTop = rememberedTop;
     }
   }, [selectedKey, clearHighlightTimer]);
+
+  useEffect(() => {
+    if (
+      !selectedKey ||
+      pendingScrollRestoreKeyRef.current !== selectedKey ||
+      isLoadingMessages ||
+      isFetchingMessages ||
+      rows.length === 0
+    ) {
+      return;
+    }
+    const rememberedTop = scrollMemoryRef.current.get(selectedKey) ?? 0;
+    pendingScrollRestoreKeyRef.current = null;
+    const el = scrollContainerRef.current;
+    if (el && rememberedTop > 0) {
+      el.scrollTop = rememberedTop;
+      const nextAtBottom =
+        el.scrollHeight <= el.clientHeight + 32 ||
+        el.scrollTop + el.clientHeight >= el.scrollHeight - 32;
+      setAtBottom(nextAtBottom);
+    }
+  }, [isFetchingMessages, isLoadingMessages, rows.length, selectedKey]);
 
   useEffect(() => clearHighlightTimer, [clearHighlightTimer]);
 
@@ -782,6 +796,7 @@ export function SessionDetailPane({
     if (!pendingJumpTarget || pendingJumpTarget.sessionKey !== selectedKey) {
       return;
     }
+    pendingScrollRestoreKeyRef.current = null;
     if (pendingJumpTarget.query) {
       setDetailSearchOpen(true);
       setDetailSearchQuery(pendingJumpTarget.query);
@@ -851,6 +866,61 @@ export function SessionDetailPane({
     setActiveMatchCursor(0);
     setSearchNavNonce(0);
   }, []);
+
+  const handleSelectReaderViewMode = useCallback(
+    (mode: SessionReaderViewMode) => {
+      navigatedCursorRef.current = null;
+      setActiveMatchCursor(0);
+      setReaderViewMode(mode);
+    },
+    [],
+  );
+
+  const handleToggleDetailSearch = useCallback(() => {
+    if (detailSearchOpen) {
+      closeDetailSearch();
+    } else {
+      setDetailSearchOpen(true);
+    }
+  }, [closeDetailSearch, detailSearchOpen]);
+
+  const handleFindQueryChange = useCallback((nextQuery: string) => {
+    navigatedCursorRef.current = null;
+    setDetailSearchQuery(nextQuery);
+    setActiveMatchCursor(0);
+  }, []);
+
+  const handleFindInputKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLInputElement>) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeDetailSearch();
+        return;
+      }
+      if (event.key === "Enter" && totalMatchCount > 0) {
+        event.preventDefault();
+        if (event.shiftKey) {
+          navigateMatch(-1);
+        } else if (navigatedCursorRef.current === safeMatchCursor) {
+          navigateMatch(1);
+        } else {
+          navigatedCursorRef.current = safeMatchCursor;
+          if (activeMatchRowIndex >= 0) {
+            scrollToRowIndex(activeMatchRowIndex);
+          }
+        }
+      }
+    },
+    [
+      activeMatchRowIndex,
+      closeDetailSearch,
+      navigateMatch,
+      safeMatchCursor,
+      scrollToRowIndex,
+      totalMatchCount,
+    ],
+  );
 
   useEffect(() => {
     if (!detailSearchOpen) return;
@@ -961,6 +1031,16 @@ export function SessionDetailPane({
   const handleScrollContainerScroll = useCallback(
     (event: UIEvent<HTMLDivElement>) => {
       const el = event.currentTarget;
+      if (selectedKey) {
+        const memory = scrollMemoryRef.current;
+        memory.delete(selectedKey);
+        memory.set(selectedKey, el.scrollTop);
+        while (memory.size > SCROLL_MEMORY_LIMIT) {
+          const oldest = memory.keys().next().value;
+          if (oldest === undefined) break;
+          memory.delete(oldest);
+        }
+      }
       if (el.scrollHeight <= el.clientHeight + 32) {
         setAtBottom(true);
         return;
@@ -969,7 +1049,7 @@ export function SessionDetailPane({
         el.scrollTop + el.clientHeight >= el.scrollHeight - 32;
       setAtBottom((prev) => (prev === nextAtBottom ? prev : nextAtBottom));
     },
-    [],
+    [selectedKey],
   );
 
   const handleJumpToLatest = useCallback(() => {
@@ -1231,240 +1311,31 @@ export function SessionDetailPane({
           } as CSSProperties
         }
       >
-        <div className="asm-detail-toolbar">
-          {selectedSession ? (
-            <div className="asm-detail-breadcrumb">
-              <AgentIcon
-                icon={getProviderIconName(selectedSession.providerId)}
-                name={getProviderLabel(selectedSession.providerId, t)}
-                size={16}
-              />
-              <span className="asm-detail-provider">
-                {getProviderLabel(selectedSession.providerId, t)}
-              </span>
-              {(selectedSession.projectName || selectedSession.projectDir) && (
-                <>
-                  <span className="asm-detail-crumb-sep" aria-hidden="true">
-                    /
-                  </span>
-                  <span className="asm-detail-crumb-dir">
-                    {selectedSession.projectName ||
-                      getBaseName(selectedSession.projectDir)}
-                  </span>
-                </>
-              )}
-            </div>
-          ) : (
-            <span className="asm-detail-provider">
-              {t("sessionManager.sessionDetail", {
-                defaultValue: "会话详情",
-              })}
-            </span>
-          )}
-          <span className="asm-toolbar-spacer" />
-          {!selectedSession && selectionMode && (
-            <div className="asm-detail-actions">
-              {renderBatchActionControls()}
-            </div>
-          )}
-          {!selectedSession &&
-            !selectionMode &&
-            onEnterSelectionMode &&
-            deletableFilteredCount > 0 && (
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                className="asm-batch-enter-btn h-7 gap-1.5 px-2.5 text-xs"
-                onClick={onEnterSelectionMode}
-              >
-                <CheckSquare className="size-3.5" aria-hidden="true" />
-                <span>
-                  {t("sessionManager.multiSelectDelete", {
-                    defaultValue: "多选删除",
-                  })}
-                </span>
-              </Button>
-            )}
-          {selectedSession && baseMessages.length > 0 && (
-            <div
-              className="asm-reader-view-switch"
-              role="group"
-              aria-label="阅读视图筛选"
-            >
-              <button
-                type="button"
-                className="asm-list-view-option"
-                aria-pressed={readerViewMode === "all"}
-                onClick={() => {
-                  navigatedCursorRef.current = null;
-                  setActiveMatchCursor(0);
-                  setReaderViewMode("all");
-                }}
-              >
-                {t("sessionManager.readerViewAll", { defaultValue: "全部" })}
-              </button>
-              <button
-                type="button"
-                className="asm-list-view-option"
-                aria-pressed={readerViewMode === "dialogue"}
-                onClick={() => {
-                  navigatedCursorRef.current = null;
-                  setActiveMatchCursor(0);
-                  setReaderViewMode("dialogue");
-                }}
-              >
-                {t("sessionManager.readerViewDialogue", {
-                  defaultValue: "对话",
-                })}
-              </button>
-              {hasAnyChanges && (
-                <button
-                  type="button"
-                  className="asm-list-view-option"
-                  aria-pressed={readerViewMode === "changes"}
-                  onClick={() => {
-                    navigatedCursorRef.current = null;
-                    setActiveMatchCursor(0);
-                    setReaderViewMode("changes");
-                  }}
-                >
-                  {t("sessionManager.readerViewChanges", {
-                    defaultValue: "改动",
-                  })}
-                </button>
-              )}
-            </div>
-          )}
-          {selectedSession &&
-            readerViewMode === "all" &&
-            collapsibleTurnCount > 0 && (
-              <button
-                type="button"
-                className="asm-detail-tool"
-                aria-pressed={areAllTimelinesExpanded}
-                onClick={handleToggleExpandAllTimelines}
-              >
-                {areAllTimelinesExpanded ? (
-                  <ChevronsDownUp className="size-3.5" aria-hidden="true" />
-                ) : (
-                  <ChevronsUpDown className="size-3.5" aria-hidden="true" />
-                )}
-                <span>
-                  {areAllTimelinesExpanded
-                    ? t("sessionManager.collapseAllSteps", {
-                        defaultValue: "收起过程",
-                      })
-                    : t("sessionManager.expandAllSteps", {
-                        defaultValue: "展开过程",
-                      })}
-                </span>
-              </button>
-            )}
-          {selectedSession && baseMessages.length > 0 && (
-            <>
-              <span className="asm-toolbar-divider" aria-hidden="true" />
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className="asm-detail-icon-tool"
-                    aria-label={t("sessionManager.copyMarkdown", {
-                      defaultValue: "复制 Markdown",
-                    })}
-                    onClick={handleCopyMarkdown}
-                  >
-                    <Copy className="size-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {t("sessionManager.copyMarkdown", {
-                    defaultValue: "复制 Markdown",
-                  })}
-                </TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className="asm-detail-tool asm-detail-export-btn"
-                    aria-label={t("sessionManager.exportMarkdown", {
-                      defaultValue: "导出 .md",
-                    })}
-                    onClick={() => void handleExportMarkdown()}
-                  >
-                    <Download className="size-3.5" aria-hidden="true" />
-                    <span>
-                      {t("sessionManager.exportMarkdown", {
-                        defaultValue: "导出 .md",
-                      })}
-                    </span>
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {t("sessionManager.exportMarkdownSaveAs", {
-                    defaultValue: "选择位置导出为 Markdown (.md)",
-                  })}
-                </TooltipContent>
-              </Tooltip>
-            </>
-          )}
-          {selectedSession && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className={cn(
-                    "asm-detail-icon-tool",
-                    detailSearchOpen && "is-active",
-                  )}
-                  aria-label={t("sessionManager.searchInSession", {
-                    defaultValue: "在当前会话中搜索",
-                  })}
-                  aria-pressed={detailSearchOpen}
-                  onClick={() => {
-                    if (detailSearchOpen) {
-                      closeDetailSearch();
-                    } else {
-                      setDetailSearchOpen(true);
-                    }
-                  }}
-                >
-                  <Search className="size-3.5" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {t("sessionManager.searchInSession", {
-                  defaultValue: "在当前会话中搜索",
-                })}{" "}
-                ({isMac() ? "⌘F" : "Ctrl F"})
-              </TooltipContent>
-            </Tooltip>
-          )}
-          {selectedSession && outlineTurns.length > 0 && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className={cn(
-                    "asm-detail-icon-tool",
-                    outlineOpen && "is-active",
-                  )}
-                  aria-label={t("sessionManager.toggleOutline", {
-                    defaultValue: "切换对话目录",
-                  })}
-                  aria-pressed={outlineOpen}
-                  onClick={handleToggleOutline}
-                >
-                  <PanelRight className="size-3.5" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {t("sessionManager.tocTitle", { defaultValue: "对话目录" })}
-              </TooltipContent>
-            </Tooltip>
-          )}
-        </div>
+        <SessionDetailToolbar
+          selectedSession={selectedSession}
+          selectionMode={selectionMode}
+          deletableFilteredCount={deletableFilteredCount}
+          hasMessages={baseMessages.length > 0}
+          hasAnyChanges={hasAnyChanges}
+          collapsibleTurnCount={collapsibleTurnCount}
+          areAllTimelinesExpanded={areAllTimelinesExpanded}
+          readerViewMode={readerViewMode}
+          detailSearchOpen={detailSearchOpen}
+          hasOutlineTurns={outlineTurns.length > 0}
+          outlineOpen={outlineOpen}
+          batchActionControls={
+            !selectedSession && selectionMode
+              ? renderBatchActionControls()
+              : null
+          }
+          onEnterSelectionMode={onEnterSelectionMode}
+          onSelectReaderViewMode={handleSelectReaderViewMode}
+          onToggleExpandAllTimelines={handleToggleExpandAllTimelines}
+          onCopyMarkdown={handleCopyMarkdown}
+          onExportMarkdown={() => void handleExportMarkdown()}
+          onToggleDetailSearch={handleToggleDetailSearch}
+          onToggleOutline={handleToggleOutline}
+        />
 
         {!selectedSession ? (
           <div className="asm-empty-studio">
@@ -1608,17 +1479,22 @@ export function SessionDetailPane({
                   <TooltipTrigger asChild>
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        idCopied.triggerCopied();
                         onCopy(
                           selectedSession.sessionId,
                           t("sessionManager.sessionIdCopied", {
                             defaultValue: "已复制会话 ID",
                           }),
-                        )
-                      }
+                        );
+                      }}
                       className="asm-chip asm-chip-mono"
                     >
-                      <Hash className="size-3 shrink-0" />
+                      {idCopied.copied ? (
+                        <Check className="size-3 shrink-0 text-success-text" />
+                      ) : (
+                        <Hash className="size-3 shrink-0" />
+                      )}
                       <span className="asm-chip-truncate asm-chip-id">
                         {selectedSession.sessionId}
                       </span>
@@ -1641,14 +1517,15 @@ export function SessionDetailPane({
                       <TooltipTrigger asChild>
                         <button
                           type="button"
-                          onClick={() =>
+                          onClick={() => {
+                            dirCopied.triggerCopied();
                             onCopy(
                               selectedSession.projectDir!,
                               t("sessionManager.projectDirCopied", {
                                 defaultValue: "目录已复制",
                               }),
-                            )
-                          }
+                            );
+                          }}
                           className={cn(
                             "asm-chip asm-chip-mono",
                             revealableProjectDir &&
@@ -1656,7 +1533,11 @@ export function SessionDetailPane({
                               "has-reveal-sibling",
                           )}
                         >
-                          <FolderOpen className="size-3" />
+                          {dirCopied.copied ? (
+                            <Check className="size-3 shrink-0 text-success-text" />
+                          ) : (
+                            <FolderOpen className="size-3" />
+                          )}
                           <span className="asm-chip-truncate">
                             {selectedSession.projectName ||
                               getBaseName(selectedSession.projectDir)}
@@ -1699,15 +1580,16 @@ export function SessionDetailPane({
                       <TooltipTrigger asChild>
                         <button
                           type="button"
-                          onClick={() =>
+                          onClick={() => {
+                            srcCopied.triggerCopied();
                             onCopy(
                               revealableSourcePath ??
                                 selectedSession.sourcePath!,
                               t("sessionManager.sourcePathCopied", {
                                 defaultValue: "原始文件已复制",
                               }),
-                            )
-                          }
+                            );
+                          }}
                           className={cn(
                             "asm-chip asm-chip-mono asm-chip-source",
                             revealableSourcePath &&
@@ -1715,7 +1597,11 @@ export function SessionDetailPane({
                               "has-reveal-sibling",
                           )}
                         >
-                          <FileText className="size-3 shrink-0" />
+                          {srcCopied.copied ? (
+                            <Check className="size-3 shrink-0 text-success-text" />
+                          ) : (
+                            <FileText className="size-3 shrink-0" />
+                          )}
                           <span className="asm-chip-truncate">
                             {getBaseName(selectedSession.sourcePath)}
                           </span>
@@ -1755,87 +1641,17 @@ export function SessionDetailPane({
             </div>
 
             {detailSearchOpen && (
-              <div className="asm-detail-search-bar">
-                <Search
-                  className="size-3.5 shrink-0 text-muted-foreground"
-                  aria-hidden="true"
-                />
-                <input
-                  ref={detailSearchInputRef}
-                  type="search"
-                  aria-label={t("sessionManager.searchInSession", {
-                    defaultValue: "在当前会话中搜索",
-                  })}
-                  placeholder={t("sessionManager.searchInSessionPlaceholder", {
-                    defaultValue: "在当前会话中搜索...",
-                  })}
-                  value={detailSearchQuery}
-                  onChange={(event) => {
-                    navigatedCursorRef.current = null;
-                    setDetailSearchQuery(event.target.value);
-                    setActiveMatchCursor(0);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape") {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      closeDetailSearch();
-                      return;
-                    }
-                    if (event.key === "Enter" && totalMatchCount > 0) {
-                      event.preventDefault();
-                      if (event.shiftKey) {
-                        navigateMatch(-1);
-                      } else if (
-                        navigatedCursorRef.current === safeMatchCursor
-                      ) {
-                        navigateMatch(1);
-                      } else {
-                        navigatedCursorRef.current = safeMatchCursor;
-                        if (activeMatchRowIndex >= 0) {
-                          scrollToRowIndex(activeMatchRowIndex);
-                        }
-                      }
-                    }
-                  }}
-                />
-                {activeQuery.length > 0 && (
-                  <span className="asm-detail-search-count">
-                    {totalMatchCount > 0
-                      ? `${safeMatchCursor + 1} / ${totalMatchCount}`
-                      : "0 / 0"}
-                  </span>
-                )}
-                <button
-                  type="button"
-                  aria-label={t("sessionManager.prevMatch", {
-                    defaultValue: "上一处匹配",
-                  })}
-                  disabled={totalMatchCount === 0}
-                  onClick={() => navigateMatch(-1)}
-                >
-                  <ChevronUp className="size-3.5" aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  aria-label={t("sessionManager.nextMatch", {
-                    defaultValue: "下一处匹配",
-                  })}
-                  disabled={totalMatchCount === 0}
-                  onClick={() => navigateMatch(1)}
-                >
-                  <ChevronDown className="size-3.5" aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  aria-label={t("sessionManager.closeSessionSearch", {
-                    defaultValue: "关闭会话内搜索",
-                  })}
-                  onClick={closeDetailSearch}
-                >
-                  <X className="size-3.5" aria-hidden="true" />
-                </button>
-              </div>
+              <SessionDetailFindBar
+                inputRef={detailSearchInputRef}
+                query={detailSearchQuery}
+                activeQuery={activeQuery}
+                totalMatchCount={totalMatchCount}
+                safeMatchCursor={safeMatchCursor}
+                onQueryChange={handleFindQueryChange}
+                onInputKeyDown={handleFindInputKeyDown}
+                onNavigateMatch={navigateMatch}
+                onClose={closeDetailSearch}
+              />
             )}
 
             {/* 消息流（结构化阅读引擎）+ 对话目录 */}
@@ -1978,6 +1794,7 @@ export function SessionDetailPane({
                   onJumpQuestion={jumpToQuestion}
                   onJumpReply={jumpToReply}
                   onJumpChapter={jumpToChapter}
+                  onClose={handleToggleOutline}
                 />
               )}
             </div>

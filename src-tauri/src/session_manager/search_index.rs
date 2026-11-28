@@ -130,6 +130,21 @@ pub enum SessionIndexAction {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SourceBatchItem<'a> {
+    pub provider_id: &'a str,
+    pub source_path: &'a str,
+    pub revision: &'a str,
+    pub rows: &'a [(usize, String)],
+}
+
+struct PendingSourceWrite {
+    provider_id: String,
+    source_path: String,
+    revision: String,
+    rows: Vec<(usize, String)>,
+}
+
 fn lock_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -631,50 +646,66 @@ impl SessionIndex {
         revision: &str,
         rows: &[(usize, String)],
     ) -> rusqlite::Result<()> {
-        let tx = self.conn.transaction()?;
-        let existing_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM sources WHERE provider_id = ?1 AND source_path = ?2",
-                params![provider_id, source_path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let source_id = match existing_id {
-            Some(id) => {
-                delete_source_rows(&tx, id)?;
-                tx.execute(
-                    "UPDATE sources SET revision = ?1 WHERE id = ?2",
-                    params![revision, id],
-                )?;
-                id
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO sources (provider_id, source_path, revision) VALUES (?1, ?2, ?3)",
-                    params![provider_id, source_path, revision],
-                )?;
-                tx.last_insert_rowid()
-            }
-        };
+        self.replace_sources_batch(&[SourceBatchItem {
+            provider_id,
+            source_path,
+            revision,
+            rows,
+        }])
+    }
 
+    pub fn replace_sources_batch(&mut self, batch: &[SourceBatchItem<'_>]) -> rusqlite::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
         {
+            let mut lookup =
+                tx.prepare("SELECT id FROM sources WHERE provider_id = ?1 AND source_path = ?2")?;
+            let mut update_rev = tx.prepare("UPDATE sources SET revision = ?1 WHERE id = ?2")?;
+            let mut insert_src = tx.prepare(
+                "INSERT INTO sources (provider_id, source_path, revision) VALUES (?1, ?2, ?3)",
+            )?;
             let mut insert_fts = tx.prepare(
                 "INSERT INTO messages_fts (rowid, raw_content, content) VALUES (?1, ?2, ?3)",
             )?;
             let mut insert_short =
                 tx.prepare("INSERT INTO short_terms (rowid, tokens) VALUES (?1, ?2)")?;
-            for (index, raw_text) in rows {
-                if *index >= MAX_MESSAGES_PER_SOURCE {
-                    break;
+
+            for item in batch {
+                let existing_id: Option<i64> = lookup
+                    .query_row(params![item.provider_id, item.source_path], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let source_id = match existing_id {
+                    Some(id) => {
+                        delete_source_rows(&tx, id)?;
+                        update_rev.execute(params![item.revision, id])?;
+                        id
+                    }
+                    None => {
+                        insert_src.execute(params![
+                            item.provider_id,
+                            item.source_path,
+                            item.revision
+                        ])?;
+                        tx.last_insert_rowid()
+                    }
+                };
+
+                for (index, raw_text) in item.rows {
+                    if *index >= MAX_MESSAGES_PER_SOURCE {
+                        break;
+                    }
+                    let rowid = (source_id << ROW_SHIFT) | (*index as i64);
+                    let normalized = raw_text.to_lowercase();
+                    let grams = encode_short_grams(&normalized);
+                    insert_fts.execute(params![rowid, raw_text, normalized])?;
+                    insert_short.execute(params![rowid, grams])?;
                 }
-                let rowid = (source_id << ROW_SHIFT) | (*index as i64);
-                let normalized = raw_text.to_lowercase();
-                let grams = encode_short_grams(&normalized);
-                insert_fts.execute(params![rowid, raw_text, normalized])?;
-                insert_short.execute(params![rowid, grams])?;
             }
         }
-
         tx.commit()
     }
 
@@ -1445,6 +1476,67 @@ impl IndexRuntime {
         let initially_empty = stored_revisions.is_empty() && removed == 0;
 
         let mut changed = 0usize;
+        let mut pending_batch: Vec<PendingSourceWrite> = Vec::with_capacity(PROGRESS_EVERY);
+
+        let flush_batch = |batch: &mut Vec<PendingSourceWrite>,
+                           stored: &mut HashMap<(String, String), String>,
+                           changed_count: &mut usize|
+         -> Result<(), String> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let batch_res = self.with_index(path, Some(sync_gen), |index| {
+                let refs: Vec<SourceBatchItem<'_>> = batch
+                    .iter()
+                    .map(|entry| SourceBatchItem {
+                        provider_id: &entry.provider_id,
+                        source_path: &entry.source_path,
+                        revision: &entry.revision,
+                        rows: &entry.rows,
+                    })
+                    .collect();
+                index.replace_sources_batch(&refs)
+            });
+            match batch_res {
+                Ok(()) => {
+                    *changed_count += batch.len();
+                    for entry in batch.drain(..) {
+                        stored.insert((entry.provider_id, entry.source_path), entry.revision);
+                    }
+                    Ok(())
+                }
+                Err(err) if err == SYNC_ABORTED_BY_CLEAR => Err(err),
+                Err(_) => {
+                    // 整批提交偶发失败时逐条回退写入，避免单条异常拖累同批其他会话
+                    for entry in batch.drain(..) {
+                        match self.with_index(path, Some(sync_gen), |index| {
+                            index.replace_source(
+                                &entry.provider_id,
+                                &entry.source_path,
+                                &entry.revision,
+                                &entry.rows,
+                            )
+                        }) {
+                            Ok(()) => {
+                                *changed_count += 1;
+                                stored
+                                    .insert((entry.provider_id, entry.source_path), entry.revision);
+                            }
+                            Err(err) if err == SYNC_ABORTED_BY_CLEAR => return Err(err),
+                            Err(err) => {
+                                log::warn!(
+                                    "写入会话正文索引失败 ({}:{}): {err}",
+                                    entry.provider_id,
+                                    entry.source_path
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        };
+
         for (provider_id, source_path) in &sources {
             if self.clear_generation.load(Ordering::SeqCst) != sync_gen {
                 return Ok(self.current_status());
@@ -1457,20 +1549,17 @@ impl IndexRuntime {
                 Ok(SessionIndexAction::Unchanged) => {}
                 Ok(SessionIndexAction::Updated { revision, messages }) => {
                     let rows = message_rows(&messages.messages);
-                    match self.with_index(path, Some(sync_gen), |index| {
-                        index.replace_source(provider_id, source_path, &revision, &rows)
-                    }) {
-                        Ok(()) => {
-                            changed += 1;
-                            stored_revisions
-                                .insert((provider_id.clone(), source_path.clone()), revision);
-                        }
-                        Err(err) if err == SYNC_ABORTED_BY_CLEAR => {
-                            return Ok(self.current_status());
-                        }
-                        Err(err) => {
-                            log::warn!("写入会话正文索引失败 ({provider_id}:{source_path}): {err}");
-                        }
+                    pending_batch.push(PendingSourceWrite {
+                        provider_id: provider_id.clone(),
+                        source_path: source_path.clone(),
+                        revision,
+                        rows,
+                    });
+                    if pending_batch.len() >= PROGRESS_EVERY
+                        && flush_batch(&mut pending_batch, &mut stored_revisions, &mut changed)
+                            .is_err()
+                    {
+                        return Ok(self.current_status());
                     }
                 }
                 Err(err) => {
@@ -1479,12 +1568,18 @@ impl IndexRuntime {
             }
 
             status.processed += 1;
-            if status.processed % PROGRESS_EVERY == 0
-                && status.processed < total
-                && !self.update_status_if_current(sync_gen, status, &mut emit_status)
-            {
-                return Ok(self.current_status());
+            if status.processed % PROGRESS_EVERY == 0 && status.processed < total {
+                if flush_batch(&mut pending_batch, &mut stored_revisions, &mut changed).is_err() {
+                    return Ok(self.current_status());
+                }
+                if !self.update_status_if_current(sync_gen, status, &mut emit_status) {
+                    return Ok(self.current_status());
+                }
             }
+        }
+
+        if flush_batch(&mut pending_batch, &mut stored_revisions, &mut changed).is_err() {
+            return Ok(self.current_status());
         }
 
         if self.clear_generation.load(Ordering::SeqCst) != sync_gen {
@@ -1544,11 +1639,11 @@ where
                 if stored_revision.is_some_and(|stored| revision_matches(stored, &revision)) {
                     return Ok(SessionIndexAction::Unchanged);
                 }
-                let messages = super::load_transcript(provider_id, source_path)?;
+                let messages = super::load_transcript_for_index(provider_id, source_path)?;
                 return Ok(SessionIndexAction::Updated { revision, messages });
             }
 
-            let messages = super::load_transcript(provider_id, source_path)?;
+            let messages = super::load_transcript_for_index(provider_id, source_path)?;
             let revision = revision_from_messages(&messages.messages);
             if stored_revision == Some(revision.as_str()) {
                 return Ok(SessionIndexAction::Unchanged);
@@ -2232,5 +2327,70 @@ mod tests {
         }
         let reopened = SessionIndex::open(&db_path).unwrap();
         assert!(reopened.search("synced", None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn batched_sync_writes_across_progress_boundaries_and_peek_preserves_lru() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(INDEX_FILE_NAME);
+        let runtime = IndexRuntime::new();
+
+        let total = PROGRESS_EVERY * 2 + 7;
+        let scanned: Vec<SessionMeta> = (0..total)
+            .map(|idx| {
+                meta(
+                    "claude",
+                    &format!("s-{idx}"),
+                    Some(&format!("/batch-{idx}.jsonl")),
+                    false,
+                )
+            })
+            .collect();
+
+        let mut progress_events = Vec::new();
+        let status = runtime
+            .sync_with(
+                &db_path,
+                || scanned,
+                |_provider, source_path, _| {
+                    Ok(SessionIndexAction::Updated {
+                        revision: format!("rev:{source_path}"),
+                        messages: Arc::new(Transcript::new(vec![msg(
+                            "assistant",
+                            &format!("batched token for {source_path}"),
+                        )])),
+                    })
+                },
+                |st| progress_events.push(st),
+            )
+            .unwrap();
+
+        assert!(!status.running);
+        assert_eq!(status.processed, total);
+        assert_eq!(status.total, total);
+        assert!(progress_events.len() >= 3);
+
+        let last_hit = runtime
+            .search(&db_path, &format!("batch-{}", total - 1), None, None, None)
+            .unwrap();
+        assert_eq!(last_hit.hits.len(), 1);
+
+        // 验证 get_if_cached 未命中时不污染 LRU，命中时直接返回
+        let sample_file = temp.path().join("sample.jsonl");
+        fs::write(&sample_file, "{}\n").unwrap();
+        let srcs = vec![(sample_file.clone(), None)];
+        let fp = cache::transcript_fingerprint(&srcs).unwrap();
+        let lru = cache::TranscriptCache::new(1, 1024 * 1024);
+        assert!(lru.get_if_cached("missing-key", &fp).is_none());
+        let (inserted, _) = lru
+            .get_or_load("hot-key".to_string(), fp.clone(), || {
+                Ok(Transcript::new(vec![msg("user", "keep me cached")]))
+            })
+            .unwrap();
+        assert!(lru.get_if_cached("other-miss", &fp).is_none());
+        let hit = lru
+            .get_if_cached("hot-key", &fp)
+            .expect("hot entry stays cached");
+        assert!(Arc::ptr_eq(&inserted, &hit));
     }
 }

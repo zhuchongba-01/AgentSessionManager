@@ -7,6 +7,7 @@ import {
   ChevronRight,
   ChevronsDownUp,
   ChevronsUpDown,
+  Crosshair,
   FileSearch,
   FolderOpen,
   MessageSquare,
@@ -123,6 +124,7 @@ interface SessionListSidebarProps {
     groupSessions: SessionMeta[],
     checked: boolean,
   ) => void;
+  onLocateSelectedSession?: () => void;
   updatedAtLabel: string;
   providerCount: number;
 }
@@ -176,6 +178,7 @@ export function SessionListSidebar({
   onSelectSnippet,
   onToggleSessionChecked,
   onToggleSessionGroupChecked,
+  onLocateSelectedSession,
   updatedAtLabel,
   providerCount,
 }: SessionListSidebarProps) {
@@ -197,6 +200,15 @@ export function SessionListSidebar({
   const getGroupSelectionState = (
     groupSessions: SessionMeta[],
   ): GroupSelectionState => {
+    if (!selectionMode) {
+      return {
+        checked: false,
+        isSelected: false,
+        selectedCount: 0,
+        selectableCount: 0,
+      };
+    }
+
     const selectableSessions = groupSessions.filter((session) =>
       Boolean(session.sourcePath),
     );
@@ -531,46 +543,6 @@ export function SessionListSidebar({
           </TooltipContent>
         </Tooltip>
       </div>
-      {selectionMode && (
-        <div className="asm-batch-bar">
-          <span className="asm-batch-dot" aria-hidden="true" />
-          <span>
-            {t("sessionManager.selectedCount", {
-              defaultValue: "已选 {{count}} 项",
-              count: selectedDeletableSessions.length,
-            })}
-          </span>
-          <span className="asm-toolbar-spacer" />
-          {deletableFilteredSessions.length > 0 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 rounded-md px-2 text-xs whitespace-nowrap"
-              onClick={onToggleSelectAll}
-            >
-              {allFilteredSelected
-                ? t("sessionManager.clearFilteredSelection", {
-                    defaultValue: "取消全选",
-                  })
-                : t("sessionManager.selectAllFiltered", {
-                    defaultValue: "全选筛选结果（含其他分页）",
-                  })}
-            </Button>
-          )}
-          {selectedDeletableSessions.length > 0 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 rounded-md px-2 text-xs whitespace-nowrap"
-              onClick={onClearSelection}
-            >
-              {t("sessionManager.clearSelection", {
-                defaultValue: "清空已选",
-              })}
-            </Button>
-          )}
-        </div>
-      )}
       <div className="asm-search" role="search">
         <Search className="size-4 shrink-0" aria-hidden="true" />
         <input
@@ -1046,9 +1018,9 @@ export function SessionListSidebar({
         )}
       </OverlayScrollArea>
       <div
-        className="asm-list-status"
+        className={cn("asm-list-status", selectionMode && "is-selecting")}
         title={
-          updatedAtLabel
+          !selectionMode && updatedAtLabel
             ? t("sessionManager.statusbarUpdated", {
                 defaultValue: "更新于 {{time}}",
                 time: updatedAtLabel,
@@ -1056,20 +1028,96 @@ export function SessionListSidebar({
             : undefined
         }
       >
-        <span className="asm-status-live-dot" aria-hidden="true" />
-        <span>
-          {t("sessionManager.statusbarSessions", {
-            defaultValue: "{{count}} 个会话",
-            count: sessions.length,
-          })}
-        </span>
-        <span className="asm-toolbar-spacer" />
-        <span>
-          {t("sessionManager.statusbarAgents", {
-            defaultValue: "{{count}} 个 Agent",
-            count: providerCount,
-          })}
-        </span>
+        {selectionMode ? (
+          <>
+            <span className="asm-batch-dot" aria-hidden="true" />
+            <span className="font-medium text-foreground">
+              {t("sessionManager.selectedCount", {
+                defaultValue: "已选 {{count}} 项",
+                count: selectedDeletableSessions.length,
+              })}
+            </span>
+            <span className="asm-toolbar-spacer" />
+            {deletableFilteredSessions.length > 0 && (
+              <button
+                type="button"
+                className="asm-status-action"
+                aria-label={
+                  allFilteredSelected
+                    ? t("sessionManager.clearFilteredSelection", {
+                        defaultValue: "取消全选",
+                      })
+                    : t("sessionManager.selectAllFiltered", {
+                        defaultValue: "全选筛选结果（含其他分页）",
+                      })
+                }
+                onClick={onToggleSelectAll}
+              >
+                {allFilteredSelected
+                  ? t("sessionManager.clearFilteredSelection", {
+                      defaultValue: "取消全选",
+                    })
+                  : t("sessionManager.selectAllShort", {
+                      defaultValue: "全选结果",
+                    })}
+              </button>
+            )}
+            {selectedDeletableSessions.length > 0 && (
+              <button
+                type="button"
+                className="asm-status-action"
+                onClick={onClearSelection}
+              >
+                {t("sessionManager.clearSelection", {
+                  defaultValue: "清空已选",
+                })}
+              </button>
+            )}
+          </>
+        ) : (
+          <>
+            <span className="asm-status-live-dot" aria-hidden="true" />
+            <span>
+              {t("sessionManager.statusbarSessions", {
+                defaultValue: "{{count}} 个会话",
+                count: sessions.length,
+              })}
+            </span>
+            <span className="asm-toolbar-spacer" />
+            {selectedKey && onLocateSelectedSession && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className="asm-status-locate-btn"
+                    aria-label={t("sessionManager.locateCurrentSession", {
+                      defaultValue: "定位到当前选中的会话",
+                    })}
+                    onClick={onLocateSelectedSession}
+                  >
+                    <Crosshair className="size-3" aria-hidden="true" />
+                    <span>
+                      {t("sessionManager.locateShort", {
+                        defaultValue: "定位",
+                      })}
+                    </span>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {t("sessionManager.locateCurrentSession", {
+                    defaultValue: "定位到当前选中的会话",
+                  })}
+                </TooltipContent>
+              </Tooltip>
+            )}
+            <span>
+              {t("sessionManager.statusbarAgents", {
+                defaultValue: "{{count}} 个 Agent",
+                count: providerCount,
+              })}
+            </span>
+          </>
+        )}
       </div>
     </div>
   );

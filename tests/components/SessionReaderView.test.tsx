@@ -639,7 +639,9 @@ describe("SessionDetailPane & reader components suite", () => {
     expect(screen.getByText("1 / 1")).toBeInTheDocument();
   });
 
-  it("collapses no-final turns via 收起过程 and omits 改动 button when only non-edit steps fail", () => {
+  it("defaults no-final turns to collapsed even with legacy storage key, toggles via 展开过程 / 收起过程, and omits 改动 button when only non-edit steps fail", () => {
+    window.localStorage.setItem("cc-switch.sessionReader.expandTimelines", "1");
+
     const session: SessionMeta = {
       providerId: "claude",
       sessionId: "claude-no-final",
@@ -692,14 +694,26 @@ describe("SessionDetailPane & reader components suite", () => {
       screen.queryByRole("button", { name: "改动" }),
     ).not.toBeInTheDocument();
 
-    // No final reply -> timeline auto-expands initially, so toolbar button says "收起过程"
+    // Even with no final reply and legacy localStorage="1", entry defaults to collapsed ("展开过程")
+    const expandBtn = screen.getByRole("button", { name: "展开过程" });
+    expect(expandBtn).toHaveAttribute("aria-pressed", "false");
+    expect(
+      screen.queryByRole("button", { name: /思考中… · 8 字/ }),
+    ).not.toBeInTheDocument();
+    // Pinned failure step still stays visible underneath the collapsed timeline
+    expect(
+      screen.getByRole("button", { name: /Bash.*cargo check/ }),
+    ).toBeInTheDocument();
+
+    // Clicking "展开过程" expands all steps including thinking
+    fireEvent.click(expandBtn);
     const collapseBtn = screen.getByRole("button", { name: "收起过程" });
     expect(collapseBtn).toHaveAttribute("aria-pressed", "true");
     expect(
       screen.getByRole("button", { name: /思考中… · 8 字/ }),
     ).toBeInTheDocument();
 
-    // Clicking "收起过程" genuinely collapses the timeline even though !turn.final
+    // Clicking "收起过程" collapses back cleanly
     fireEvent.click(collapseBtn);
     expect(screen.getByRole("button", { name: "展开过程" })).toHaveAttribute(
       "aria-pressed",
@@ -740,5 +754,169 @@ describe("SessionDetailPane & reader components suite", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(writeMock).toHaveBeenCalledTimes(1);
     fetchSpy.mockRestore();
+  });
+
+  it("remembers and restores per-session reading scrollTop when switching back and forth", () => {
+    const sessionA: SessionMeta = {
+      providerId: "claude",
+      sessionId: "scroll-a",
+      title: "会话 A",
+      sourcePath: "/mock/claude/a.jsonl",
+    };
+    const sessionB: SessionMeta = {
+      providerId: "claude",
+      sessionId: "scroll-b",
+      title: "会话 B",
+      sourcePath: "/mock/claude/b.jsonl",
+    };
+    const msgs: SessionMessage[] = [
+      {
+        role: "user",
+        content: "提问",
+        blocks: [{ type: "text", text: "提问" }],
+      },
+      {
+        role: "assistant",
+        content: "回答",
+        blocks: [{ type: "text", text: "回答" }],
+      },
+    ];
+
+    const { container, rerender } = render(
+      <TooltipProvider>
+        <SessionDetailPane
+          selectedSession={sessionA}
+          selectedKey="claude:/mock/claude/a.jsonl"
+          selectedSessionChildCount={0}
+          sessionTitles={new Map()}
+          visibleMessages={msgs}
+          isLoadingMessages={false}
+          isFetchingMessages={false}
+          messageRevision={1}
+          messagesError={null}
+          onRefetchMessages={vi.fn()}
+          onLoadFullContent={vi.fn()}
+          hasBatchSelection={false}
+          selectedDeletableCount={0}
+          isDeleting={false}
+          onBatchDelete={vi.fn()}
+          onSingleDelete={vi.fn()}
+          onCopy={vi.fn()}
+          onCopyMessage={vi.fn()}
+          onCopyCode={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    const scrollEl = container.querySelector(
+      ".asm-detail-scroll",
+    ) as HTMLDivElement;
+    expect(scrollEl).toBeTruthy();
+    scrollEl.scrollTop = 340;
+    fireEvent.scroll(scrollEl);
+
+    rerender(
+      <TooltipProvider>
+        <SessionDetailPane
+          selectedSession={sessionB}
+          selectedKey="claude:/mock/claude/b.jsonl"
+          selectedSessionChildCount={0}
+          sessionTitles={new Map()}
+          visibleMessages={msgs}
+          isLoadingMessages={false}
+          isFetchingMessages={false}
+          messageRevision={2}
+          messagesError={null}
+          onRefetchMessages={vi.fn()}
+          onLoadFullContent={vi.fn()}
+          hasBatchSelection={false}
+          selectedDeletableCount={0}
+          isDeleting={false}
+          onBatchDelete={vi.fn()}
+          onSingleDelete={vi.fn()}
+          onCopy={vi.fn()}
+          onCopyMessage={vi.fn()}
+          onCopyCode={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    expect(scrollEl.scrollTop).toBe(0);
+
+    rerender(
+      <TooltipProvider>
+        <SessionDetailPane
+          selectedSession={sessionA}
+          selectedKey="claude:/mock/claude/a.jsonl"
+          selectedSessionChildCount={0}
+          sessionTitles={new Map()}
+          visibleMessages={msgs}
+          isLoadingMessages={false}
+          isFetchingMessages={false}
+          messageRevision={1}
+          messagesError={null}
+          onRefetchMessages={vi.fn()}
+          onLoadFullContent={vi.fn()}
+          hasBatchSelection={false}
+          selectedDeletableCount={0}
+          isDeleting={false}
+          onBatchDelete={vi.fn()}
+          onSingleDelete={vi.fn()}
+          onCopy={vi.fn()}
+          onCopyMessage={vi.fn()}
+          onCopyCode={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    expect(scrollEl.scrollTop).toBe(340);
+  });
+
+  it("collapses >28 line code blocks with expand/collapse toggle, shows 已复制 feedback, and closes outline via drawer X button", () => {
+    const session: SessionMeta = {
+      providerId: "claude",
+      sessionId: "long-code",
+      title: "长代码块与目录关闭测试",
+      sourcePath: "/mock/claude/long-code.jsonl",
+    };
+    const longCode = Array.from(
+      { length: 34 },
+      (_, idx) => `const line_${idx + 1} = ${idx + 1};`,
+    ).join("\n");
+    const messages: SessionMessage[] = [
+      {
+        role: "user",
+        content: "",
+        blocks: [{ type: "text", text: "给我完整代码" }],
+      },
+      {
+        role: "assistant",
+        content: "",
+        blocks: [{ type: "text", text: `\`\`\`ts\n${longCode}\n\`\`\`` }],
+      },
+    ];
+
+    renderDetailPane({ session, messages });
+
+    // 34 lines > 28 threshold -> collapsed to 18 lines initially
+    expect(screen.getByText(/line_18/)).toBeInTheDocument();
+    expect(screen.queryByText(/line_34/)).not.toBeInTheDocument();
+
+    const expandCodeBtn = screen.getByRole("button", {
+      name: /展开全部 34 行代码/,
+    });
+    fireEvent.click(expandCodeBtn);
+    expect(screen.getByText(/line_34/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /收起代码/ }));
+    expect(screen.queryByText(/line_34/)).not.toBeInTheDocument();
+
+    // Open outline and close via the internal × button inside SessionOutline
+    fireEvent.click(screen.getByRole("button", { name: "切换对话目录" }));
+    expect(
+      screen.getByRole("navigation", { name: "对话目录" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭对话目录" }));
+    expect(
+      screen.queryByRole("navigation", { name: "对话目录" }),
+    ).not.toBeInTheDocument();
   });
 });

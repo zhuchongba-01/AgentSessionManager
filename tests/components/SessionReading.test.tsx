@@ -48,6 +48,7 @@ const clients: QueryClient[] = [];
 afterEach(() => {
   clients.forEach((client) => client.clear());
   clients.length = 0;
+  window.localStorage.removeItem("agent-session-manager.outlineOpen");
   vi.restoreAllMocks();
 });
 
@@ -144,7 +145,7 @@ describe("session reading integration", () => {
     );
     expect(clients[0].getQueryData(key)).toMatchObject({ messages });
     expect(screen.queryByText("正在读取会话…")).not.toBeInTheDocument();
-    fireEvent.click(outlineNav.querySelector("button")!);
+    fireEvent.click(outlineNav.querySelector("ol button")!);
     expect(
       screen.getAllByText("Codex delayed visible answer").length,
     ).toBeGreaterThan(0);

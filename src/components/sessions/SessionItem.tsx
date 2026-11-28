@@ -1,11 +1,6 @@
 import { memo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { ContentHighlight, SessionContentHit, SessionMeta } from "@/types";
 import { AgentIcon } from "./AgentIcon";
@@ -118,20 +113,13 @@ export const SessionItem = memo(function SessionItem({
           className="flex min-w-0 flex-1 cursor-pointer flex-col gap-1 text-left"
         >
           <span className="flex w-full min-w-0 items-center gap-2">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="asm-provider-icon">
-                  <AgentIcon
-                    icon={getProviderIconName(session.providerId)}
-                    name={providerLabel}
-                    size={16}
-                  />
-                </span>
-              </TooltipTrigger>
-              <TooltipContent>
-                {getProviderLabel(session.providerId, t)}
-              </TooltipContent>
-            </Tooltip>
+            <span className="asm-provider-icon" title={providerLabel}>
+              <AgentIcon
+                icon={getProviderIconName(session.providerId)}
+                name={providerLabel}
+                size={16}
+              />
+            </span>
             <span className="asm-session-title">
               {highlightText(title, highlightTerms)}
             </span>

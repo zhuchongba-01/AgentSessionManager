@@ -1,6 +1,8 @@
-import { memo, useCallback, useMemo, type ReactNode } from "react";
+import { memo, useCallback, useMemo, useState, type ReactNode } from "react";
+import { Check, ChevronDown, ChevronUp, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { useCopiedFeedback } from "@/hooks/useCopiedFeedback";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -338,9 +340,12 @@ export interface SessionCodeBlockProps {
   className?: string;
 }
 
+const CODE_COLLAPSE_LINE_THRESHOLD = 28;
+const CODE_PREVIEW_LINES = 18;
+
 /**
- * 会话阅读页的代码块：30px 顶栏显示语言标签与复制按钮，正文横向滚动。
- * 搜索词非空时优先 `<mark>` 高亮，否则使用轻量纯 TS 语法着色。
+ * 会话阅读页的代码块：30px 顶栏显示语言标签、行数与带状态反馈的复制按钮；
+ * 超长代码块（> 28 行）默认展示前 18 行并提供展开/收起控制，搜索命中时自动展开。
  */
 export const SessionCodeBlock = memo(function SessionCodeBlock({
   code,
@@ -350,28 +355,42 @@ export const SessionCodeBlock = memo(function SessionCodeBlock({
   className,
 }: SessionCodeBlockProps) {
   const { t } = useTranslation();
+  const { copied, triggerCopied } = useCopiedFeedback();
+  const [expanded, setExpanded] = useState(false);
   const label = language?.trim() || "text";
   const trimmedQuery = searchQuery?.trim() ?? "";
+
+  const codeLines = useMemo(() => code.split("\n"), [code]);
+  const totalLines = codeLines.length;
+  const isCollapsible = totalLines > CODE_COLLAPSE_LINE_THRESHOLD;
+  const isExpanded = !isCollapsible || expanded || Boolean(trimmedQuery);
+  const visibleCode = useMemo(
+    () =>
+      isExpanded ? code : codeLines.slice(0, CODE_PREVIEW_LINES).join("\n"),
+    [code, codeLines, isExpanded],
+  );
 
   const handleCopy = useCallback(async () => {
     if (onCopy) {
       onCopy(code);
+      triggerCopied();
       return;
     }
     const ok = await copyText(code);
     if (ok) {
+      triggerCopied();
       toast.success(
         t("sessionManager.codeCopied", { defaultValue: "已复制代码" }),
       );
     } else {
       toast.error(t("sessionManager.copyFailed", { defaultValue: "复制失败" }));
     }
-  }, [code, onCopy, t]);
+  }, [code, onCopy, t, triggerCopied]);
 
   const body = useMemo<ReactNode>(() => {
-    if (trimmedQuery) return highlightText(code, trimmedQuery);
-    return highlightCodeSyntax(code, label);
-  }, [code, label, trimmedQuery]);
+    if (trimmedQuery) return highlightText(visibleCode, trimmedQuery);
+    return highlightCodeSyntax(visibleCode, label);
+  }, [label, trimmedQuery, visibleCode]);
 
   return (
     <div
@@ -381,9 +400,15 @@ export const SessionCodeBlock = memo(function SessionCodeBlock({
         className,
       )}
     >
-      <div className="flex h-[30px] items-center justify-between border-b border-border pe-1 ps-3">
-        <span className="truncate font-mono text-caption text-fg-2">
-          {label}
+      <div className="flex h-[30px] items-center justify-between border-b border-border bg-subtle/60 pe-1.5 ps-3">
+        <span className="flex min-w-0 items-center gap-2 truncate font-mono text-caption text-fg-2">
+          <span className="truncate">{label}</span>
+          {totalLines >= 6 && (
+            <span className="shrink-0 text-[11px] tabular-nums text-fg-3">
+              {totalLines}{" "}
+              {t("sessionManager.linesUnit", { defaultValue: "行" })}
+            </span>
+          )}
         </span>
         <button
           type="button"
@@ -391,24 +416,80 @@ export const SessionCodeBlock = memo(function SessionCodeBlock({
             defaultValue: "复制代码",
           })}
           onClick={() => void handleCopy()}
-          className="h-6 shrink-0 rounded-control px-2 text-caption text-fg-2 transition-colors hover:bg-selected hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "inline-flex h-6 shrink-0 items-center gap-1 rounded-control px-2 text-caption transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            copied
+              ? "text-success-text"
+              : "text-fg-2 hover:bg-selected hover:text-fg-1",
+          )}
         >
-          {t("sessionManager.copyShort", { defaultValue: "复制" })}
+          {copied ? (
+            <>
+              <Check aria-hidden className="size-3" />
+              <span>
+                {t("sessionManager.copiedShort", { defaultValue: "已复制" })}
+              </span>
+            </>
+          ) : (
+            <>
+              <Copy aria-hidden className="size-3" />
+              <span>
+                {t("sessionManager.copyShort", { defaultValue: "复制" })}
+              </span>
+            </>
+          )}
         </button>
       </div>
-      <div
-        tabIndex={0}
-        role="region"
-        aria-label={t("sessionManager.codeRegion", {
-          defaultValue: "{{lang}} 代码",
-          lang: label,
-        })}
-        className="overflow-x-auto px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-      >
-        <pre className="m-0 whitespace-pre font-mono text-caption text-fg-1">
-          <code data-language={language || undefined}>{body}</code>
-        </pre>
+      <div className="relative">
+        <div
+          tabIndex={0}
+          role="region"
+          aria-label={t("sessionManager.codeRegion", {
+            defaultValue: "{{lang}} 代码",
+            lang: label,
+          })}
+          className="overflow-x-auto px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          <pre className="m-0 whitespace-pre font-mono text-caption text-fg-1">
+            <code data-language={language || undefined}>{body}</code>
+          </pre>
+        </div>
+        {!isExpanded && (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-9 bg-gradient-to-t from-[hsl(var(--card))] to-transparent opacity-85"
+          />
+        )}
       </div>
+      {isCollapsible && !trimmedQuery && (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((prev) => !prev)}
+          className="flex h-7 w-full items-center justify-center gap-1 border-t border-border bg-subtle/40 text-caption text-fg-2 transition-colors hover:bg-selected hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          {expanded ? (
+            <>
+              <ChevronUp aria-hidden className="size-3.5" />
+              <span>
+                {t("sessionManager.collapseCodeLines", {
+                  defaultValue: "收起代码",
+                })}
+              </span>
+            </>
+          ) : (
+            <>
+              <ChevronDown aria-hidden className="size-3.5" />
+              <span className="tabular-nums">
+                {t("sessionManager.expandCodeLines", {
+                  defaultValue: "展开全部 {{count}} 行代码",
+                  count: totalLines,
+                })}
+              </span>
+            </>
+          )}
+        </button>
+      )}
     </div>
   );
 });

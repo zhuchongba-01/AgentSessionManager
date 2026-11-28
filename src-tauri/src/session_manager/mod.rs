@@ -503,6 +503,51 @@ where
     }
 }
 
+/// 供后台正文索引使用的读取路径：若前台阅读缓存已命中则零成本复用，未命中时直接解析但不写入 LRU，防止全盘建索引冲掉当前正在阅读的会话缓存。
+pub(crate) fn load_transcript_for_index(
+    provider_id: &str,
+    source_path: &str,
+) -> Result<Arc<cache::Transcript>, String> {
+    let peek_or_direct = |sources: Option<cache::TranscriptSources>,
+                          load: &dyn Fn() -> Result<Vec<SessionMessage>, String>|
+     -> Result<Arc<cache::Transcript>, String> {
+        if let Some(srcs) = sources {
+            if let Ok(fingerprint) = cache::transcript_fingerprint(&srcs) {
+                let key = cache::cache_key(provider_id, source_path, &srcs);
+                if let Some(hit) = cache::global().get_if_cached(&key, &fingerprint) {
+                    return Ok(hit);
+                }
+            }
+        }
+        Ok(Arc::new(cache::Transcript::new(load()?)))
+    };
+
+    if let Some(kind) = checked_sqlite_source(provider_id, source_path)? {
+        return match kind {
+            SqliteSourceKind::OpenCode => {
+                peek_or_direct(opencode::sqlite_transcript_sources(source_path), &|| {
+                    opencode::load_messages_sqlite(source_path)
+                })
+            }
+            SqliteSourceKind::ZCode => {
+                peek_or_direct(zcode::transcript_sources(source_path), &|| {
+                    zcode::load_messages(source_path)
+                })
+            }
+            SqliteSourceKind::WorkBuddy => {
+                peek_or_direct(workbuddy::sqlite_transcript_sources(source_path), &|| {
+                    workbuddy::load_messages_sqlite(source_path)
+                })
+            }
+        };
+    }
+
+    let path = validated_file_source(provider_id, source_path)?;
+    peek_or_direct(transcript_cache_sources(provider_id, &path), &|| {
+        dispatch_messages(provider_id, &path)
+    })
+}
+
 pub fn checked_list_sessions() -> Result<SessionScanReport, String> {
     // 浏览不因单份清理记录损坏而整体失败：扫描报告会携带警告；删除路径仍
     // 单独走 pending_sessions()? 严格校验，继续拒绝操作。

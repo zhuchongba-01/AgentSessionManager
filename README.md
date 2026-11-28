@@ -9,15 +9,15 @@
 <sub>Standalone desktop session manager for local coding agents — browse, full-text search, inspect chain-of-thought & diffs, export Markdown, and safely clean up Codex, Claude Code, Gemini CLI, GitHub Copilot, DeepSeek Harness, WorkBuddy, CodeBuddy, Kimi CLI, OpenClaw, OpenCode, ZCode, Pi and Grok Build sessions on Windows and Linux.</sub>
 
 [![Release](https://img.shields.io/github/v/release/zhuchongba-01/AgentSessionManager?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
-[![Website](https://img.shields.io/badge/%E9%A1%B9%E7%9B%AE%E5%AE%98%E7%BD%91-zgrnf.dpdns.org-8b5bff?style=flat-square)](http://www.zgrnf.dpdns.org/)
-[![Live Demo](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E4%BD%93%E9%AA%8C-1%3A1%20%E4%BA%A4%E4%BA%92%E6%A1%8C%E9%9D%A2-5b8cff?style=flat-square)](http://www.zgrnf.dpdns.org/demo/)
+[![Website](https://img.shields.io/badge/%E9%A1%B9%E7%9B%AE%E5%AE%98%E7%BD%91-wallpaper26.top-8b5bff?style=flat-square)](https://www.wallpaper26.top/)
+[![Live Demo](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E4%BD%93%E9%AA%8C-1%3A1%20%E4%BA%A4%E4%BA%92%E6%A1%8C%E9%9D%A2-5b8cff?style=flat-square)](https://www.wallpaper26.top/demo/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20amd64-blue?style=flat-square)](https://github.com/zhuchongba-01/AgentSessionManager/releases)
 
 <p>
-  🌐 <a href="http://www.zgrnf.dpdns.org/"><b>项目官网</b></a>
+  🌐 <a href="https://www.wallpaper26.top/"><b>项目官网</b></a>
   &nbsp;·&nbsp;
-  🖥️ <a href="http://www.zgrnf.dpdns.org/demo/"><b>1:1 在线交互体验</b></a>
+  🖥️ <a href="https://www.wallpaper26.top/demo/"><b>1:1 在线交互体验</b></a>
   &nbsp;·&nbsp;
   📦 <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases"><b>下载安装包</b></a>
 </p>
@@ -25,7 +25,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window-dark.png" />
   <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png" />
-  <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.3 主界面（2880×1800 高清预览）" width="100%" />
+  <img src="docs/images/main-window-dark.png" alt="Agent会话管理 v1.8.4 主界面（2880×1800 高清预览）" width="100%" />
 </picture>
 
 *主界面（2880×1800 2x 高清渲染，随 GitHub 亮 / 暗外观自动切换，点击图片可查看原图）：左侧按 Agent / 项目 / 时间分组的会话列表（支持跨会话正文 FTS5 检索与状态快筛），右侧两段式思维链、步骤合并、内联行号 Diff 阅读器、可展开对话目录抽屉与并排快捷清理面板。*
@@ -199,7 +199,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 ```powershell
 # 仅接受 X.Y.Z 正式版号；同步全部配置文件版本但不自动创建 Git 标签
-pnpm version:set 1.8.3
+pnpm version:set 1.8.4
 pnpm version:check
 pnpm build:installer   # Windows：Tauri Release 构建 + Inno Setup 安装包
 pnpm build:linux       # Linux：输出 .deb 与 .AppImage

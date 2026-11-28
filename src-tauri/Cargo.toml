@@ -1,6 +1,6 @@
 [package]
 name = "agent-session-manager"
-version = "1.8.3"
+version = "1.8.4"
 description = "Standalone local session manager for coding agents"
 license = "MIT"
 edition = "2021"
@@ -27,7 +27,7 @@ log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 # protocol-asset 未使用：应用不通过 asset 协议读取文件（tauri.conf.json 里的
 # assetProtocol 开关与空 scope 已一并移除）
-tauri = { version = "2.8.2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.10", features = ["tray-icon", "image-png"] }
 tauri-plugin-window-state = "2"
 dirs = "5.0"
 toml_edit = "0.22"

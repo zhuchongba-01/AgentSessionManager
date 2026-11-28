@@ -79,21 +79,56 @@ export const useSessionMessagesQuery = (
         revision,
         messages: [],
       });
-      const messages = await sessionsApi.streamMessages(
-        providerId!,
-        sourcePath!,
-        (partial) => {
-          if (signal.aborted || activeRequest.current !== revision) return;
-          setStreamed({
-            providerId: providerId!,
-            sourcePath: sourcePath!,
-            revision,
-            messages: partial,
-          });
-        },
-        signal,
-      );
-      return { messages, revision };
+      let rafId: number | null = null;
+      let latestPartial: SessionMessage[] | null = null;
+      const cancelPendingProgress = () => {
+        if (rafId !== null && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        latestPartial = null;
+      };
+
+      try {
+        const messages = await sessionsApi.streamMessages(
+          providerId!,
+          sourcePath!,
+          (partial) => {
+            if (signal.aborted || activeRequest.current !== revision) return;
+            latestPartial = partial;
+            if (typeof requestAnimationFrame !== "function") {
+              setStreamed({
+                providerId: providerId!,
+                sourcePath: sourcePath!,
+                revision,
+                messages: partial,
+              });
+              return;
+            }
+            if (rafId !== null) return;
+            rafId = requestAnimationFrame(() => {
+              rafId = null;
+              if (
+                signal.aborted ||
+                activeRequest.current !== revision ||
+                latestPartial === null
+              ) {
+                return;
+              }
+              setStreamed({
+                providerId: providerId!,
+                sourcePath: sourcePath!,
+                revision,
+                messages: latestPartial,
+              });
+            });
+          },
+          signal,
+        );
+        return { messages, revision };
+      } finally {
+        cancelPendingProgress();
+      }
     },
     enabled: Boolean(providerId && sourcePath),
     staleTime: 30_000,

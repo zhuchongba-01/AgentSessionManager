@@ -536,6 +536,16 @@ impl TranscriptCache {
         Ok((transcript, false))
     }
 
+    /// 仅当目标已在缓存且指纹匹配时直接返回，不改变 LRU 淘汰队列，未命中时也不写入缓存（供后台索引使用，避免挤占前台阅读缓存）。
+    pub fn get_if_cached(&self, key: &str, fingerprint: &Fingerprint) -> Option<Arc<Transcript>> {
+        let state = self.lock();
+        let entry = state.entries.iter().find(|entry| entry.key == key)?;
+        entry
+            .fingerprint
+            .matches(fingerprint)
+            .then(|| Arc::clone(&entry.transcript))
+    }
+
     /// 删除会话后整体作废。删除会级联清理同 ID 的历史副本与索引，逐个推导受影响
     /// 的缓存键容易漏；删除是低频操作，整体清空最安全。
     pub fn clear(&self) {

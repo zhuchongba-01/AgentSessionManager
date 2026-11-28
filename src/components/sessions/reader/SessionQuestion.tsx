@@ -1,8 +1,9 @@
 import { memo, useState } from "react";
-import { Copy } from "lucide-react";
+import { Check, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { HoverTip } from "@/components/ui/hover-tip";
+import { useCopiedFeedback } from "@/hooks/useCopiedFeedback";
 import { cn } from "@/lib/utils";
 import { formatMessageTime } from "../utils";
 import { useReaderContext } from "./context";
@@ -72,6 +73,7 @@ export const SessionQuestion = memo(function SessionQuestion({
 }: SessionQuestionProps) {
   const { t } = useTranslation();
   const { searchQuery, onCopy } = useReaderContext();
+  const { copied, triggerCopied } = useCopiedFeedback();
   const [expanded, setExpanded] = useState(false);
   const text = question.text;
   const long = text.length > COLLAPSE_THRESHOLD;
@@ -89,27 +91,37 @@ export const SessionQuestion = memo(function SessionQuestion({
         </span>
         {text && (
           <HoverTip
-            content={t("sessionManager.copyShort", { defaultValue: "复制" })}
+            content={
+              copied
+                ? t("sessionManager.copiedShort", { defaultValue: "已复制" })
+                : t("sessionManager.copyShort", { defaultValue: "复制" })
+            }
           >
             <button
               type="button"
               aria-label={t("sessionManager.copyQuestion", {
                 defaultValue: "复制这条提问",
               })}
-              onClick={() =>
+              onClick={() => {
+                triggerCopied();
                 onCopy(
                   text,
                   t("sessionManager.messageCopied", {
                     defaultValue: "已复制这条消息",
                   }),
-                )
-              }
+                );
+              }}
               className={cn(
                 rowIconButton,
                 "h-5 w-5 group-hover/question:opacity-100",
+                copied && "opacity-100 text-success-text",
               )}
             >
-              <Copy aria-hidden className="h-3.5 w-3.5" strokeWidth={1.5} />
+              {copied ? (
+                <Check aria-hidden className="h-3.5 w-3.5" strokeWidth={1.8} />
+              ) : (
+                <Copy aria-hidden className="h-3.5 w-3.5" strokeWidth={1.5} />
+              )}
             </button>
           </HoverTip>
         )}
