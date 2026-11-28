@@ -21,8 +21,8 @@
 :root {
   /* 温润素绢灰白：比纯白更柔和护眼，不刺眼 */
   --bg: #f6f4ef;
-  --surface: rgba(255, 253, 249, 0.68);
-  --surface-strong: rgba(255, 253, 249, 0.88);
+  --surface: rgba(255, 253, 249, 0.84);
+  --surface-strong: rgba(255, 253, 249, 0.94);
   --border: rgba(24, 24, 27, 0.085);
   --border-strong: rgba(24, 24, 27, 0.15);
   --text: #1c1d21;
@@ -37,8 +37,8 @@
 [data-mode="ink"] {
   /* 低饱和克制玄墨夜 */
   --bg: #080a0f;
-  --surface: rgba(14, 17, 24, 0.56);
-  --surface-strong: rgba(18, 22, 31, 0.78);
+  --surface: rgba(14, 17, 24, 0.78);
+  --surface-strong: rgba(18, 22, 31, 0.90);
   --border: rgba(255, 255, 255, 0.085);
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #e6e7eb;
@@ -165,7 +165,6 @@ header {
   border-radius: 999px;
   border: 1px solid var(--border-strong);
   background: var(--surface);
-  backdrop-filter: blur(12px);
   color: var(--text);
   font-size: 13px;
   font-weight: 520;
@@ -204,7 +203,6 @@ header {
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface);
-  backdrop-filter: blur(14px);
   font-size: 12.5px;
   letter-spacing: 0.04em;
   color: var(--text-2);
@@ -267,7 +265,6 @@ header {
   background: var(--surface-strong);
   color: var(--text);
   border: 1px solid var(--border-strong);
-  backdrop-filter: blur(18px);
 }
 
 .hero-meta {
@@ -291,7 +288,6 @@ header {
   padding: 10px;
   background: var(--surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(22px);
   box-shadow: var(--shadow);
 }
 
@@ -377,7 +373,6 @@ header {
   border-radius: 18px;
   background: var(--surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(18px);
   text-align: center;
 }
 
@@ -438,7 +433,6 @@ header {
   border-radius: 20px;
   background: var(--surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(20px);
   transition: transform 0.26s ease, background-color 0.26s ease;
 }
 
@@ -459,7 +453,6 @@ header {
   border-radius: 14px;
   background: var(--surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(16px);
   transition: background-color 0.2s ease, transform 0.2s ease;
 }
 
@@ -473,7 +466,6 @@ header {
   border-radius: 26px;
   background: var(--surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(22px);
   text-align: center;
   box-shadow: var(--shadow);
   margin-bottom: 72px;
@@ -934,7 +926,7 @@ footer {
 
   var lastWindowWidth = window.innerWidth;
   function resizeCanvas() {
-    var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    var dpr = 1;
     var rect = canvas.getBoundingClientRect();
     var w = Math.max(window.innerWidth, Math.round(rect.width || 0));
     var h = Math.max(window.innerHeight, Math.round(rect.height || 0));
@@ -1037,7 +1029,7 @@ footer {
     if (dist < 0.0006) return;
 
     // Lush continuous sub-step interpolation for silky oil-ink marbling
-    var steps = Math.min(8, Math.max(1, Math.ceil(dist / 0.016)));
+    var steps = Math.min(4, Math.max(1, Math.ceil(dist / 0.022)));
     var vx = clampVel(rawDx * 2600);
     var vy = clampVel(rawDy * 2600);
     var col = pickColor();
@@ -1055,7 +1047,7 @@ footer {
         radius: 0.0054
       });
     }
-    if (pendingSplats.length > 24) pendingSplats.splice(0, pendingSplats.length - 24);
+    if (pendingSplats.length > 10) pendingSplats.splice(0, pendingSplats.length - 10);
     lastX = x;
     lastY = y;
   }, { passive: true });
@@ -1088,7 +1080,7 @@ footer {
   var lastTime = performance.now();
   function step() {
     var now = performance.now();
-    var dt = Math.min((now - lastTime) / 1000, 0.0166);
+    var dt = Math.min((now - lastTime) / 1000, 0.033);
     lastTime = now;
 
     // Apply all queued interpolated cursor strokes right inside the frame loop
@@ -1128,7 +1120,7 @@ footer {
     gl.useProgram(pressureShader.program);
     gl.uniform2f(pressureShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(pressureShader.uniforms.uDivergence, divergence.attach(0));
-    for (var i = 0; i < 16; i++) {
+    for (var i = 0; i < 10; i++) {
       gl.uniform1i(pressureShader.uniforms.uPressure, pressure.read.attach(1));
       blit(pressure.write);
       pressure.swap();
