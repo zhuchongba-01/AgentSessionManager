@@ -577,10 +577,70 @@ footer {
   .footer-row { flex-direction: column; text-align: center; }
   .footer-links { justify-content: center; gap: 14px; }
 }
+
+/* Custom Minimalist Floating Pill Scrollbar */
+html { scrollbar-width: none; -ms-overflow-style: none; }
+html::-webkit-scrollbar { display: none; width: 0; height: 0; }
+
+.custom-scrollbar {
+  position: fixed;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 40;
+  width: 18px;
+  height: min(38vh, 260px);
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  touch-action: none;
+}
+
+.custom-scrollbar-track {
+  position: relative;
+  width: 4px;
+  height: 100%;
+  border-radius: 999px;
+  background: rgba(24, 24, 27, 0.16);
+  overflow: hidden;
+  transition: width 0.18s ease, background-color 0.25s ease;
+}
+
+[data-mode="ink"] .custom-scrollbar-track {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.custom-scrollbar:hover .custom-scrollbar-track,
+.custom-scrollbar.dragging .custom-scrollbar-track {
+  width: 5px;
+}
+
+.custom-scrollbar-thumb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 28%;
+  border-radius: 999px;
+  background: #0b0d12;
+  will-change: transform;
+  transition: background-color 0.25s ease;
+}
+
+[data-mode="ink"] .custom-scrollbar-thumb {
+  background: #f1f5f9;
+}
+
+@media (max-width: 640px) {
+  .custom-scrollbar { display: none; }
+}
 </style>
 </head>
 <body>
 <canvas id="fluidCanvas" aria-hidden="true"></canvas>
+<div class="custom-scrollbar" id="customScrollbar" aria-hidden="true"><div class="custom-scrollbar-track" id="customScrollTrack"><div class="custom-scrollbar-thumb" id="customScrollThumb"></div></div></div>
 
 <div class="page">
   <header>
@@ -1227,6 +1287,96 @@ footer {
       wakeFluid();
     });
   }
+})();
+</script>
+
+<script>
+(function () {
+  var bar = document.getElementById("customScrollbar");
+  var track = document.getElementById("customScrollTrack");
+  var thumb = document.getElementById("customScrollThumb");
+  if (!bar || !track || !thumb) return;
+
+  var dragging = false;
+  var dragStartY = 0;
+  var dragStartScroll = 0;
+  var rafId = 0;
+
+  function update() {
+    rafId = 0;
+    var docH = document.documentElement.scrollHeight;
+    var winH = window.innerHeight;
+    var maxScroll = Math.max(0, docH - winH);
+    if (maxScroll <= 1) {
+      bar.style.opacity = "0";
+      bar.style.pointerEvents = "none";
+      return;
+    }
+    bar.style.opacity = "1";
+    bar.style.pointerEvents = "auto";
+
+    var trackH = track.clientHeight || 200;
+    var ratio = winH / docH;
+    var thumbH = Math.max(28, Math.min(trackH * 0.65, Math.round(trackH * ratio)));
+    var maxThumbY = Math.max(1, trackH - thumbH);
+    var progress = Math.max(0, Math.min(1, window.scrollY / maxScroll));
+    thumb.style.height = thumbH + "px";
+    thumb.style.transform = "translate3d(0," + (progress * maxThumbY).toFixed(1) + "px,0)";
+  }
+
+  function scheduleUpdate() {
+    if (!rafId) rafId = requestAnimationFrame(update);
+  }
+
+  window.addEventListener("scroll", scheduleUpdate, { passive: true });
+  window.addEventListener("resize", scheduleUpdate, { passive: true });
+  window.addEventListener("load", scheduleUpdate);
+
+  bar.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    var rect = track.getBoundingClientRect();
+    var docH = document.documentElement.scrollHeight;
+    var winH = window.innerHeight;
+    var maxScroll = Math.max(1, docH - winH);
+    var thumbH = thumb.offsetHeight || 40;
+    var maxThumbY = Math.max(1, rect.height - thumbH);
+
+    // If clicked outside the thumb, jump directly to that position first
+    var thumbRect = thumb.getBoundingClientRect();
+    if (e.clientY < thumbRect.top || e.clientY > thumbRect.bottom) {
+      var clickRatio = Math.max(0, Math.min(1, (e.clientY - rect.top - thumbH / 2) / maxThumbY));
+      window.scrollTo({ top: clickRatio * maxScroll, behavior: "auto" });
+    }
+
+    dragging = true;
+    bar.classList.add("dragging");
+    dragStartY = e.clientY;
+    dragStartScroll = window.scrollY;
+    if (bar.setPointerCapture) bar.setPointerCapture(e.pointerId);
+  });
+
+  window.addEventListener("pointermove", function (e) {
+    if (!dragging) return;
+    var rect = track.getBoundingClientRect();
+    var docH = document.documentElement.scrollHeight;
+    var winH = window.innerHeight;
+    var maxScroll = Math.max(1, docH - winH);
+    var thumbH = thumb.offsetHeight || 40;
+    var maxThumbY = Math.max(1, rect.height - thumbH);
+    var dy = e.clientY - dragStartY;
+    var nextScroll = Math.max(0, Math.min(maxScroll, dragStartScroll + (dy / maxThumbY) * maxScroll));
+    window.scrollTo(0, nextScroll);
+  });
+
+  function stopDrag() {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList.remove("dragging");
+  }
+  window.addEventListener("pointerup", stopDrag);
+  window.addEventListener("pointercancel", stopDrag);
+
+  update();
 })();
 </script>
 </body>
