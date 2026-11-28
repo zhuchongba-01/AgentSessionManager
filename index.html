@@ -589,7 +589,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
   transform: translateY(-50%);
   z-index: 40;
   width: 16px;
-  height: min(22vh, 148px);
+  height: min(14vh, 96px);
   display: flex;
   align-items: stretch;
   justify-content: center;
@@ -606,7 +606,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
 
 .custom-scrollbar-track {
   position: relative;
-  width: 3px;
+  width: 2px;
   height: 100%;
   border-radius: 999px;
   background: rgba(24, 24, 27, 0.16);
@@ -620,7 +620,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
 
 .custom-scrollbar:hover .custom-scrollbar-track,
 .custom-scrollbar.dragging .custom-scrollbar-track {
-  width: 4px;
+  width: 3px;
 }
 
 .custom-scrollbar-thumb {
@@ -1334,7 +1334,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
 
     var trackH = track.clientHeight || 140;
     var ratio = winH / docH;
-    var thumbH = Math.max(20, Math.min(trackH * 0.58, Math.round(trackH * ratio)));
+    var thumbH = Math.max(14, Math.min(trackH * 0.52, Math.round(trackH * ratio)));
     var maxThumbY = Math.max(1, trackH - thumbH);
     var progress = Math.max(0, Math.min(1, window.scrollY / maxScroll));
     thumb.style.height = thumbH + "px";
