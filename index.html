@@ -1417,7 +1417,7 @@ footer {
 
     var isMobile = W < 720;
     // Larger, chunky non-overlapping shapes: 36px ~ 64px on desktop, 26px ~ 44px on mobile
-    var count = isMobile ? 48 : Math.min(135, Math.max(88, Math.floor(W / 11)));
+    var count = isMobile ? 74 : Math.min(205, Math.max(138, Math.floor(W / 7.4)));
     shapes = [];
     for (var i = 0; i < count; i++) {
       var size = (isMobile ? 26 : 36) + Math.random() * (isMobile ? 18 : 28);
@@ -1428,7 +1428,7 @@ footer {
       var pr = r * nestFactor;
       var p = pickColor(0.2);
       var colFrac = (i + 0.5 + (Math.random() - 0.5) * 0.6) / count;
-      var row = Math.floor(Math.random() * 4);
+      var row = Math.floor(Math.random() * 6);
       shapes.push({
         type: type,
         color: p.color,
