@@ -924,22 +924,26 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
     "uniform vec3 uBgColor;",
     "uniform float uIsDark;",
     "void main () {",
-    "  vec3 c0 = texture2D(uTexture, vUv).rgb;",
+    "  vec3 c = texture2D(uTexture, vUv).rgb;",
     "  vec3 lc = texture2D(uTexture, vL).rgb;",
     "  vec3 rc = texture2D(uTexture, vR).rgb;",
     "  vec3 tc = texture2D(uTexture, vT).rgb;",
     "  vec3 bc = texture2D(uTexture, vB).rgb;",
-    "  // 5-tap Gaussian smoothing eliminates jagged texel aliasing and spiky edges",
-    "  vec3 c = c0 * 0.44 + (lc + rc + tc + bc) * 0.14;",
+    "  float dx = length(rc) - length(lc);",
+    "  float dy = length(tc) - length(bc);",
+    "  vec3 n = normalize(vec3(dx, dy, 0.14));",
+    "  float spec = clamp(dot(n, normalize(vec3(0.2, 0.35, 1.0))), 0.75, 1.0);",
     "  float mag = length(c);",
     "  vec3 hue = mag > 0.0001 ? (c / mag) : vec3(0.0);",
     "  if (uIsDark > 0.5) {",
-    "    vec3 mapped = c / (vec3(1.0) + c * 1.18);",
-    "    vec3 col = uBgColor + mapped * 0.86;",
+    "    vec3 mapped = c / (vec3(1.0) + c * 1.15);",
+    "    vec3 col = uBgColor + mapped * (0.78 + 0.18 * spec);",
     "    gl_FragColor = vec4(col, 1.0);",
     "  } else {",
-    "    float ink = smoothstep(0.008, 0.95, mag / (1.0 + mag * 0.72));",
-    "    vec3 col = mix(uBgColor, hue * 0.96, ink * 0.78);",
+    "    // Silky colorful marbled oil-ink on warm paper: vivid, glossy, never glaring white",
+    "    float ink = clamp(mag / (1.0 + mag * 0.72), 0.0, 0.86);",
+    "    vec3 glossyHue = hue * (0.88 + 0.18 * spec);",
+    "    vec3 col = mix(uBgColor, glossyHue, ink * 0.78);",
     "    gl_FragColor = vec4(col, 1.0);",
     "  }",
     "}"
@@ -1005,7 +1009,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
   function initFBOs() {
     var isMobile = window.innerWidth < 720;
     var baseSim = isMobile ? 64 : 128;
-    var baseDye = isMobile ? 256 : 768;
+    var baseDye = isMobile ? 224 : 512;
     var aspect = window.innerWidth / Math.max(1, window.innerHeight);
     var simW = aspect >= 1 ? Math.round(baseSim * aspect) : baseSim;
     var simH = aspect >= 1 ? baseSim : Math.round(baseSim / aspect);
@@ -1208,7 +1212,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
     gl.uniform2f(vorticityShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(vorticityShader.uniforms.uVelocity, velocity.read.attach(0));
     gl.uniform1i(vorticityShader.uniforms.uCurl, curl.attach(1));
-    gl.uniform1f(vorticityShader.uniforms.curl, 22.0);
+    gl.uniform1f(vorticityShader.uniforms.curl, 36.0);
     gl.uniform1f(vorticityShader.uniforms.dt, dt);
     blit(velocity.write);
     velocity.swap();
@@ -1259,7 +1263,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
     dye.swap();
 
     gl.useProgram(displayShader.program);
-    gl.uniform2f(displayShader.uniforms.texelSize, dye.texelSizeX * 1.25, dye.texelSizeY * 1.25);
+    gl.uniform2f(displayShader.uniforms.texelSize, 1.0 / canvas.width, 1.0 / canvas.height);
     gl.uniform1i(displayShader.uniforms.uTexture, dye.read.attach(0));
     if (isDark) {
       // #090b10
