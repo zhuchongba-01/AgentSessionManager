@@ -20,9 +20,9 @@
 <style>
 :root {
   /* 温润素绢灰白：比纯白更柔和护眼，不刺眼 */
-  --bg: #eae7e0;
-  --surface: rgba(246, 244, 239, 0.72);
-  --surface-strong: rgba(250, 248, 244, 0.88);
+  --bg: #f6f4ef;
+  --surface: rgba(255, 253, 249, 0.68);
+  --surface-strong: rgba(255, 253, 249, 0.88);
   --border: rgba(24, 24, 27, 0.085);
   --border-strong: rgba(24, 24, 27, 0.15);
   --text: #1c1d21;
@@ -36,9 +36,9 @@
 
 [data-mode="ink"] {
   /* 低饱和克制玄墨夜 */
-  --bg: #090b10;
-  --surface: rgba(15, 18, 25, 0.62);
-  --surface-strong: rgba(20, 24, 33, 0.82);
+  --bg: #080a0f;
+  --surface: rgba(14, 17, 24, 0.56);
+  --surface-strong: rgba(18, 22, 31, 0.78);
   --border: rgba(255, 255, 255, 0.085);
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #e6e7eb;
@@ -627,7 +627,7 @@ footer {
       </div>
       <div class="frame-note">
         <span>2880×1800 2x 高清桌面端主界面 · 轻划屏幕可触发实时流体水彩晕染</span>
-        <span>支持自由切换「素绢白 / 玄墨夜」双外观</span>
+        <span>支持自由切换「宣纸白 / 玄墨夜」双外观</span>
       </div>
     </section>
 
@@ -732,7 +732,7 @@ footer {
 
   function syncModeUI() {
     root.setAttribute("data-mode", isDark ? "ink" : "paper");
-    if (modeBtn) modeBtn.textContent = isDark ? "素绢白" : "玄墨夜";
+    if (modeBtn) modeBtn.textContent = isDark ? "宣纸白" : "玄墨夜";
     syncShotButtons(isDark);
   }
   syncModeUI();
@@ -843,15 +843,15 @@ footer {
     "  vec3 bc = texture2D(uTexture, vB).rgb;",
     "  float dx = length(rc) - length(lc);",
     "  float dy = length(tc) - length(bc);",
-    "  vec3 n = normalize(vec3(dx, dy, 0.1));",
-    "  float spec = clamp(dot(n, normalize(vec3(0.22, 0.35, 1.0))), 0.72, 1.0);",
-    "  float density = clamp(length(c) * 0.85, 0.0, 0.82);",
-    "  vec3 shaded = c * (0.86 + 0.22 * spec);",
+    "  vec3 n = normalize(vec3(dx, dy, 0.08));",
+    "  float spec = clamp(dot(n, normalize(vec3(0.25, 0.4, 1.0))), 0.65, 1.0);",
+    "  float density = clamp(length(c) * 0.92, 0.0, 0.88);",
+    "  vec3 shaded = c * (0.85 + 0.3 * spec);",
     "  if (uIsDark > 0.5) {",
-    "    vec3 col = uBgColor + shaded * 0.46;",
+    "    vec3 col = uBgColor + shaded * 0.72;",
     "    gl_FragColor = vec4(col, 1.0);",
     "  } else {",
-    "    vec3 pigment = mix(uBgColor, uBgColor * (1.0 - clamp(shaded * 0.54, 0.0, 0.5)) + shaded * 0.16, density);",
+    "    vec3 pigment = mix(uBgColor, uBgColor * (1.0 - clamp(shaded * 0.68, 0.0, 0.62)) + shaded * 0.28, density);",
     "    gl_FragColor = vec4(pigment, 1.0);",
     "  }",
     "}"
@@ -949,18 +949,18 @@ footer {
 
   // Low-glare, serene Song-dynasty mineral pigments
   var lightPigments = [
-    [0.16, 0.34, 0.56], // 沉石青
-    [0.14, 0.44, 0.44], // 苍竹青
-    [0.28, 0.30, 0.54], // 黛远山
-    [0.48, 0.32, 0.42], // 烟霞藕
-    [0.20, 0.40, 0.52]  // 暮云蓝
+    [0.18, 0.42, 0.68], // 石青
+    [0.14, 0.56, 0.54], // 碧玉青
+    [0.34, 0.36, 0.66], // 远山靛
+    [0.62, 0.38, 0.50], // 暮霞藕
+    [0.24, 0.50, 0.64]  // 苍翠蓝
   ];
   var darkPigments = [
-    [0.13, 0.34, 0.68],
-    [0.10, 0.50, 0.54],
-    [0.32, 0.26, 0.68],
-    [0.46, 0.22, 0.54],
-    [0.15, 0.44, 0.70]
+    [0.16, 0.44, 0.88],
+    [0.10, 0.68, 0.72],
+    [0.42, 0.34, 0.90],
+    [0.64, 0.28, 0.72],
+    [0.18, 0.58, 0.92]
   ];
   var colorCursor = 0;
 
@@ -1102,11 +1102,11 @@ footer {
     gl.uniform1i(displayShader.uniforms.uTexture, dye.read.attach(0));
     if (isDark) {
       // #090b10
-      gl.uniform3f(displayShader.uniforms.uBgColor, 0.035, 0.043, 0.063);
+      gl.uniform3f(displayShader.uniforms.uBgColor, 0.031, 0.039, 0.059);
       gl.uniform1f(displayShader.uniforms.uIsDark, 1.0);
     } else {
       // #eae7e0 soft warm silk paper
-      gl.uniform3f(displayShader.uniforms.uBgColor, 0.918, 0.906, 0.878);
+      gl.uniform3f(displayShader.uniforms.uBgColor, 0.965, 0.957, 0.937);
       gl.uniform1f(displayShader.uniforms.uIsDark, 0.0);
     }
     blit(null);
