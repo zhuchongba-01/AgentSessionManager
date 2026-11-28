@@ -4,77 +4,89 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agent会话管理 v1.8.4 — 本地编码 Agent 会话阅读与治理工作台</title>
-<meta name="description" content="面向 13 种本地编码 Agent 的一站式桌面会话管理、两段式思维链与 Diff 阅读、SQLite FTS5 全文检索与安全清理工具。100% 本地离线运行。">
+<meta name="description" content="面向 13 种本地编码 Agent 的旗舰级桌面会话阅读、SQLite FTS5 全文检索、内联 Diff 与安全治理工具。Rust + Tauri v2 驱动，100% 本地离线。">
 <link rel="icon" type="image/png" href="./app-icon.png">
 <script>
 (function () {
   try {
-    var saved = localStorage.getItem("asm-site-theme");
-    var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-    var theme = saved === "dark" || saved === "light" ? saved : (prefersDark ? "dark" : "light");
+    var saved = localStorage.getItem("asm-site-theme-v2");
+    var theme = saved === "light" || saved === "dark" ? saved : "dark";
     document.documentElement.setAttribute("data-theme", theme);
   } catch (e) {
-    document.documentElement.setAttribute("data-theme", "light");
+    document.documentElement.setAttribute("data-theme", "dark");
   }
 })();
 </script>
 <style>
 :root {
-  --bg: #f8f9fb;
-  --bg-subtle: #f1f3f7;
-  --surface: #ffffff;
-  --surface-glass: rgba(255, 255, 255, 0.78);
-  --surface-hover: #f9fafc;
+  --bg: #05060a;
+  --bg-elevated: #0b0d14;
+  --surface: rgba(16, 19, 28, 0.72);
+  --surface-solid: #0f121b;
+  --surface-2: rgba(24, 29, 42, 0.65);
+  --nav-bg: rgba(5, 6, 10, 0.72);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --specular: rgba(255, 255, 255, 0.22);
+  --text: #f5f7fb;
+  --text-secondary: #98a2b8;
+  --text-muted: #667085;
+  --heading-grad: linear-gradient(180deg, #ffffff 30%, rgba(226, 232, 240, 0.68) 100%);
+  --heading-sub-grad: linear-gradient(180deg, rgba(203, 213, 225, 0.85) 0%, rgba(148, 163, 184, 0.45) 100%);
+  --accent: #7aa2ff;
+  --accent-glow: rgba(122, 162, 255, 0.18);
+  --emerald: #34d399;
+  --emerald-soft: rgba(52, 211, 153, 0.12);
+  --rose: #fb7185;
+  --rose-soft: rgba(251, 113, 133, 0.12);
+  --btn-primary-bg: linear-gradient(180deg, #ffffff 0%, #e4e9f2 100%);
+  --btn-primary-text: #07090f;
+  --btn-primary-shadow: 0 1px 0 rgba(255,255,255,0.9) inset, 0 12px 30px -10px rgba(255,255,255,0.35);
+  --btn-sec-bg: rgba(255, 255, 255, 0.05);
+  --btn-sec-hover: rgba(255, 255, 255, 0.1);
+  --stage-bezel: linear-gradient(180deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0.03) 100%);
+  --stage-shadow: 0 40px 120px -24px rgba(0, 0, 0, 0.88), 0 0 0 1px rgba(255, 255, 255, 0.09);
+  --beam-top: radial-gradient(ellipse 68% 36% at 50% -8%, rgba(122, 162, 255, 0.18), transparent 72%);
+  --beam-stage: radial-gradient(ellipse 60% 45% at 50% 45%, rgba(122, 162, 255, 0.13), transparent 70%);
+  --mini-bg: rgba(7, 9, 15, 0.82);
+  --mini-row: rgba(255, 255, 255, 0.035);
+}
+
+[data-theme="light"] {
+  --bg: #f6f7fa;
+  --bg-elevated: #ffffff;
+  --surface: rgba(255, 255, 255, 0.86);
+  --surface-solid: #ffffff;
+  --surface-2: rgba(241, 244, 249, 0.85);
+  --nav-bg: rgba(246, 247, 250, 0.78);
   --border: rgba(15, 23, 42, 0.08);
-  --border-strong: rgba(15, 23, 42, 0.14);
-  --text: #0f172a;
+  --border-strong: rgba(15, 23, 42, 0.15);
+  --specular: rgba(255, 255, 255, 0.95);
+  --text: #0b0f19;
   --text-secondary: #475569;
   --text-muted: #64748b;
+  --heading-grad: linear-gradient(180deg, #0b0f19 35%, #334155 100%);
+  --heading-sub-grad: linear-gradient(180deg, #475569 0%, #94a3b8 100%);
   --accent: #2563eb;
-  --accent-soft: rgba(37, 99, 235, 0.08);
-  --accent-border: rgba(37, 99, 235, 0.22);
-  --btn-primary-bg: #0f172a;
+  --accent-glow: rgba(37, 99, 235, 0.12);
+  --emerald: #059669;
+  --emerald-soft: rgba(5, 150, 105, 0.1);
+  --rose: #e11d48;
+  --rose-soft: rgba(225, 29, 72, 0.08);
+  --btn-primary-bg: linear-gradient(180deg, #1e293b 0%, #0b0f19 100%);
   --btn-primary-text: #ffffff;
-  --btn-primary-hover: #1e293b;
-  --green: #10b981;
-  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
-  --shadow-md: 0 12px 32px -12px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.03);
-  --shadow-stage: 0 28px 70px -24px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.07);
-  --radius-sm: 8px;
-  --radius-md: 14px;
-  --radius-lg: 20px;
-  --grid-line: rgba(15, 23, 42, 0.035);
+  --btn-primary-shadow: 0 1px 0 rgba(255,255,255,0.22) inset, 0 14px 28px -10px rgba(15,23,42,0.45);
+  --btn-sec-bg: rgba(255, 255, 255, 0.88);
+  --btn-sec-hover: #ffffff;
+  --stage-bezel: linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(226,232,240,0.65) 100%);
+  --stage-shadow: 0 38px 96px -28px rgba(15, 23, 42, 0.2), 0 0 0 1px rgba(15, 23, 42, 0.08);
+  --beam-top: radial-gradient(ellipse 68% 36% at 50% -8%, rgba(59, 130, 246, 0.13), transparent 72%);
+  --beam-stage: radial-gradient(ellipse 60% 45% at 50% 45%, rgba(59, 130, 246, 0.09), transparent 70%);
+  --mini-bg: rgba(248, 250, 252, 0.96);
+  --mini-row: rgba(15, 23, 42, 0.035);
 }
 
-[data-theme="dark"] {
-  --bg: #090b10;
-  --bg-subtle: #0f131b;
-  --surface: #11151e;
-  --surface-glass: rgba(9, 11, 16, 0.78);
-  --surface-hover: #161b26;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.15);
-  --text: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-  --accent: #60a5fa;
-  --accent-soft: rgba(96, 165, 250, 0.11);
-  --accent-border: rgba(96, 165, 250, 0.28);
-  --btn-primary-bg: #f8fafc;
-  --btn-primary-text: #090b10;
-  --btn-primary-hover: #e2e8f0;
-  --green: #34d399;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 16px 36px -14px rgba(0, 0, 0, 0.45);
-  --shadow-stage: 0 36px 90px -24px rgba(0, 0, 0, 0.72), 0 0 0 1px rgba(255, 255, 255, 0.08);
-  --grid-line: rgba(255, 255, 255, 0.03);
-}
-
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
 html {
   scroll-behavior: smooth;
@@ -84,26 +96,38 @@ html {
 }
 
 body {
-  background-color: var(--bg);
+  background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   line-height: 1.6;
   overflow-x: hidden;
-  transition: background-color 0.25s ease, color 0.25s ease;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Subtle architectural top hairline grid */
-.page-backdrop {
+a { color: inherit; text-decoration: none; }
+button { font: inherit; color: inherit; }
+
+/* Atmospheric Studio Lighting & Subtle Grain */
+.studio-light {
   position: fixed;
   inset: 0;
-  pointer-events: none;
   z-index: 0;
+  pointer-events: none;
+  background: var(--beam-top);
+}
+
+.studio-grid {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
   background-image:
-    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-  background-size: 56px 56px;
-  mask-image: radial-gradient(ellipse 80% 45% at 50% 0%, #000 10%, transparent 80%);
-  -webkit-mask-image: radial-gradient(ellipse 80% 45% at 50% 0%, #000 10%, transparent 80%);
+    linear-gradient(to right, var(--border) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--border) 1px, transparent 1px);
+  background-size: 72px 72px;
+  opacity: 0.45;
+  mask-image: radial-gradient(ellipse 75% 42% at 50% 0%, #000 0%, transparent 78%);
+  -webkit-mask-image: radial-gradient(ellipse 75% 42% at 50% 0%, #000 0%, transparent 78%);
 }
 
 ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -112,42 +136,26 @@ body {
   border: 2px solid transparent;
   border-radius: 999px;
   background-clip: content-box;
-  background-color: rgba(100, 116, 139, 0.28);
+  background-color: rgba(148, 163, 184, 0.28);
 }
-::-webkit-scrollbar-thumb:hover { background-color: rgba(100, 116, 139, 0.48); }
+::-webkit-scrollbar-thumb:hover { background-color: rgba(148, 163, 184, 0.5); }
 
-a { color: inherit; text-decoration: none; }
-button { font: inherit; color: inherit; }
+.wrap { max-width: 1140px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+.stage-wrap { max-width: 1320px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
 
-.container {
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 0 24px;
-  position: relative;
-  z-index: 1;
-}
-
-.stage-container {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 0 24px;
-  position: relative;
-  z-index: 1;
-}
-
-/* Navbar */
+/* Floating Precision Navbar */
 .site-header {
   position: sticky;
   top: 0;
-  z-index: 50;
-  background: var(--surface-glass);
-  backdrop-filter: blur(18px) saturate(160%);
-  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  z-index: 60;
+  background: var(--nav-bg);
+  backdrop-filter: blur(22px) saturate(180%);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
   border-bottom: 1px solid var(--border);
 }
 
-.nav-inner {
-  height: 62px;
+.nav-bar {
+  height: 60px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -158,51 +166,50 @@ button { font: inherit; color: inherit; }
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  font-size: 15px;
   font-weight: 650;
-  font-size: 15.5px;
   letter-spacing: -0.02em;
 }
 
-.brand-icon {
-  width: 30px;
-  height: 30px;
+.brand img {
+  width: 28px;
+  height: 28px;
   border-radius: 8px;
-  box-shadow: var(--shadow-sm), 0 0 0 1px var(--border);
-  object-fit: cover;
+  box-shadow: 0 0 0 1px var(--border-strong), 0 4px 12px rgba(0,0,0,0.22);
 }
 
-.version-pill {
-  font-size: 11.5px;
+.nav-ver {
+  font-size: 11px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   padding: 2px 7px;
   border-radius: 999px;
-  background: var(--bg-subtle);
   border: 1px solid var(--border);
+  background: var(--btn-sec-bg);
   color: var(--text-secondary);
 }
 
 .nav-links {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
 }
 
 .nav-links a {
-  padding: 6px 12px;
-  border-radius: 8px;
+  padding: 6px 13px;
+  border-radius: 999px;
   font-size: 13.5px;
   font-weight: 500;
   color: var(--text-secondary);
-  transition: color 0.15s ease, background-color 0.15s ease;
+  transition: color 0.18s ease, background-color 0.18s ease;
 }
 
 .nav-links a:hover {
   color: var(--text);
-  background: var(--bg-subtle);
+  background: var(--btn-sec-bg);
 }
 
-.nav-actions {
+.nav-right {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -211,99 +218,124 @@ button { font: inherit; color: inherit; }
 .icon-btn {
   width: 34px;
   height: 34px;
-  border-radius: 9px;
+  border-radius: 999px;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--btn-sec-bg);
   color: var(--text-secondary);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+  transition: color 0.18s ease, border-color 0.18s ease, background-color 0.18s ease;
 }
 
 .icon-btn:hover {
   color: var(--text);
   border-color: var(--border-strong);
-  background: var(--surface-hover);
+  background: var(--btn-sec-hover);
 }
 
-.nav-cta {
+.nav-dl {
+  height: 34px;
+  padding: 0 15px;
+  border-radius: 999px;
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-text);
+  box-shadow: var(--btn-primary-shadow);
+  font-size: 13px;
+  font-weight: 650;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 34px;
-  padding: 0 14px;
-  border-radius: 9px;
-  background: var(--btn-primary-bg);
-  color: var(--btn-primary-text);
-  font-size: 13px;
-  font-weight: 600;
-  transition: background-color 0.15s ease, transform 0.15s ease;
+  transition: transform 0.18s ease, opacity 0.18s ease;
 }
 
-.nav-cta:hover {
-  background: var(--btn-primary-hover);
-}
+.nav-dl:hover { transform: translateY(-1px); opacity: 0.94; }
 
-/* Hero */
+/* Sculpted Hero */
 .hero {
-  padding: 72px 0 44px;
+  padding: 84px 0 48px;
   text-align: center;
 }
 
-.hero-badge {
+.emblem-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px;
+  border-radius: 24px;
+  background: var(--stage-bezel);
+  box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-strong), 0 0 40px var(--accent-glow);
+  margin-bottom: 28px;
+}
+
+.emblem-wrap img {
+  width: 68px;
+  height: 68px;
+  border-radius: 18px;
+  display: block;
+}
+
+.hero-pill {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 13px 5px 10px;
+  padding: 5px 14px 5px 10px;
   border-radius: 999px;
+  border: 1px solid var(--border-strong);
   background: var(--surface);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(12px);
   font-size: 12.5px;
-  font-weight: 500;
+  font-weight: 550;
   color: var(--text-secondary);
   margin-bottom: 24px;
-  transition: border-color 0.2s ease;
+  box-shadow: 0 1px 0 var(--specular) inset;
+  transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
-.hero-badge:hover {
-  border-color: var(--border-strong);
+.hero-pill:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
 }
 
-.hero-badge-dot {
-  width: 7px;
-  height: 7px;
+.pill-dot {
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.16);
+  background: var(--emerald);
+  box-shadow: 0 0 10px var(--emerald);
 }
 
 .hero h1 {
-  font-size: clamp(34px, 5vw, 56px);
-  font-weight: 750;
-  line-height: 1.12;
-  letter-spacing: -0.035em;
-  max-width: 820px;
-  margin: 0 auto 18px;
-  color: var(--text);
+  font-size: clamp(38px, 5.8vw, 66px);
+  font-weight: 760;
+  line-height: 1.07;
+  letter-spacing: -0.04em;
+  max-width: 900px;
+  margin: 0 auto 20px;
+  background: var(--heading-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
-.hero h1 .muted-line {
+.hero h1 span {
+  background: var(--heading-sub-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero-sub {
+  max-width: 620px;
+  margin: 0 auto 34px;
+  font-size: 17px;
+  line-height: 1.72;
   color: var(--text-secondary);
-  font-weight: 650;
+  font-weight: 420;
 }
 
-.hero-desc {
-  max-width: 650px;
-  margin: 0 auto 30px;
-  font-size: 16.5px;
-  line-height: 1.7;
-  color: var(--text-secondary);
-}
-
-.hero-actions {
+.hero-cta {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -312,164 +344,137 @@ button { font: inherit; color: inherit; }
 }
 
 .btn {
+  height: 46px;
+  padding: 0 24px;
+  border-radius: 999px;
+  font-size: 14.5px;
+  font-weight: 650;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 8px;
-  height: 44px;
-  padding: 0 22px;
-  border-radius: 11px;
-  font-size: 14.5px;
-  font-weight: 600;
   cursor: pointer;
-  transition: background-color 0.16s ease, border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
 }
 
+.btn:hover { transform: translateY(-1.5px); }
 .btn:active { transform: translateY(0); }
 
 .btn-primary {
   background: var(--btn-primary-bg);
   color: var(--btn-primary-text);
-  box-shadow: var(--shadow-md);
-}
-
-.btn-primary:hover {
-  background: var(--btn-primary-hover);
-  transform: translateY(-1px);
+  box-shadow: var(--btn-primary-shadow);
 }
 
 .btn-secondary {
-  background: var(--surface);
+  background: var(--btn-sec-bg);
   color: var(--text);
   border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(12px);
 }
 
 .btn-secondary:hover {
-  background: var(--surface-hover);
+  background: var(--btn-sec-hover);
   border-color: var(--text-muted);
-  transform: translateY(-1px);
 }
 
-.hero-meta {
+.hero-footnote {
+  margin-top: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 18px;
+  gap: 16px;
   flex-wrap: wrap;
-  margin-top: 22px;
   font-size: 12.5px;
   color: var(--text-muted);
 }
 
-.hero-meta span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-/* Spec Strip */
-.spec-strip {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  margin: 42px auto 0;
-  max-width: 920px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-sm);
-  overflow: hidden;
-}
-
-.spec-item {
-  padding: 18px 16px;
-  text-align: center;
-  border-right: 1px solid var(--border);
-}
-
-.spec-item:last-child { border-right: none; }
-
-.spec-val {
-  font-size: 22px;
-  font-weight: 700;
-  letter-spacing: -0.025em;
-  font-variant-numeric: tabular-nums;
-  color: var(--text);
-}
-
-.spec-lbl {
-  font-size: 12.5px;
-  color: var(--text-muted);
-  margin-top: 2px;
-}
-
-/* Product Interactive Stage */
+/* Cinema Product Stage */
 .stage-section {
-  padding: 20px 0 84px;
+  padding: 18px 0 96px;
+  position: relative;
 }
 
-.window-frame {
+.stage-glow {
+  position: absolute;
+  inset: -40px 0 0;
+  background: var(--beam-stage);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.chassis-outer {
+  position: relative;
+  z-index: 1;
+  padding: 7px;
+  border-radius: 22px;
+  background: var(--stage-bezel);
+  box-shadow: var(--stage-shadow);
+}
+
+.chassis-outer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 12%;
+  right: 12%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--specular), transparent);
+  pointer-events: none;
+}
+
+.chassis-inner {
   border-radius: 16px;
-  background: var(--surface);
-  box-shadow: var(--shadow-stage);
   overflow: hidden;
+  background: var(--bg-elevated);
   border: 1px solid var(--border);
 }
 
-.window-chrome {
+.win-bar {
   height: 46px;
   padding: 0 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  background: var(--bg-subtle);
+  background: var(--surface-solid);
   border-bottom: 1px solid var(--border);
 }
 
-.chrome-left {
+.win-left {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-width: 0;
 }
 
-.traffic-dots {
+.win-dots {
   display: flex;
-  align-items: center;
   gap: 7px;
 }
 
-.traffic-dots i {
+.win-dots i {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  display: block;
   background: var(--border-strong);
+  display: block;
 }
 
-.chrome-title {
+.win-title {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text-secondary);
-  white-space: nowrap;
 }
 
-.chrome-title img {
-  width: 16px;
-  height: 16px;
-  border-radius: 4px;
-}
+.win-title img { width: 16px; height: 16px; border-radius: 4px; }
 
-.segmented {
+.seg-control {
   display: inline-flex;
-  align-items: center;
   padding: 3px;
-  border-radius: 9px;
-  background: var(--bg);
+  border-radius: 999px;
+  background: var(--btn-sec-bg);
   border: 1px solid var(--border);
   gap: 2px;
 }
@@ -477,391 +482,642 @@ button { font: inherit; color: inherit; }
 .seg-btn {
   border: 0;
   background: transparent;
-  padding: 4px 11px;
-  border-radius: 6px;
+  padding: 4px 13px;
+  border-radius: 999px;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
   cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  transition: all 0.18s ease;
 }
 
 .seg-btn.active {
-  background: var(--surface);
+  background: var(--surface-solid);
   color: var(--text);
-  box-shadow: var(--shadow-sm);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24), 0 0 0 1px var(--border);
 }
 
-.chrome-actions {
+.win-actions {
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
-.chrome-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
+.win-btn {
   height: 28px;
-  padding: 0 10px;
-  border-radius: 7px;
+  padding: 0 11px;
+  border-radius: 999px;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--btn-sec-bg);
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 550;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+  transition: all 0.16s ease;
 }
 
-.chrome-btn:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-}
-
-.stage-body {
-  position: relative;
-  background: var(--bg);
-}
+.win-btn:hover { color: var(--text); border-color: var(--border-strong); background: var(--btn-sec-hover); }
 
 .demo-iframe {
   width: 100%;
   height: 760px;
   border: 0;
   display: block;
-  background: var(--bg);
+  background: var(--bg-elevated);
 }
 
-.preview-pane {
-  display: none;
-  background: var(--bg);
-}
+.shot-pane { display: none; }
+.shot-pane.active { display: block; }
+.shot-pane img { width: 100%; height: auto; display: block; }
 
-.preview-pane.active {
-  display: block;
-}
-
-.preview-pane img {
-  width: 100%;
-  height: auto;
-  display: block;
-}
-
-.stage-caption {
+.stage-note {
+  margin-top: 16px;
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  align-items: center;
   flex-wrap: wrap;
-  margin-top: 14px;
-  padding: 0 4px;
+  gap: 10px;
+  padding: 0 6px;
   font-size: 12.5px;
   color: var(--text-muted);
 }
 
-/* Section Headers */
-.section {
-  padding: 76px 0;
+/* Metrics Ribbon */
+.metrics-band {
   border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  backdrop-filter: blur(16px);
 }
 
-.section-head {
-  max-width: 640px;
-  margin-bottom: 40px;
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
 }
 
-.section-eyebrow {
-  display: inline-block;
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-bottom: 10px;
+.metric-cell {
+  padding: 32px 20px;
+  text-align: center;
+  border-right: 1px solid var(--border);
 }
 
-.section-head h2 {
-  font-size: clamp(24px, 3vw, 34px);
-  font-weight: 750;
-  letter-spacing: -0.03em;
-  line-height: 1.2;
-  margin-bottom: 10px;
+.metric-cell:last-child { border-right: none; }
+
+.metric-num {
+  font-size: 32px;
+  font-weight: 760;
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+  background: var(--heading-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
-.section-head p {
-  font-size: 15.5px;
+.metric-label {
+  margin-top: 4px;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 
-/* Bento Grid */
-.bento-grid {
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 16px;
+/* Section Layout */
+.section {
+  padding: 96px 0;
+  position: relative;
+  z-index: 1;
 }
 
-.bento-card {
-  grid-column: span 2;
+.section-header {
+  max-width: 660px;
+  margin-bottom: 48px;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+
+.section-header h2 {
+  font-size: clamp(28px, 3.6vw, 42px);
+  font-weight: 750;
+  line-height: 1.14;
+  letter-spacing: -0.035em;
+  margin-bottom: 14px;
+  background: var(--heading-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.section-header p {
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+/* Flagship Interactive Bento Grid */
+.bento {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 18px;
+}
+
+.card {
+  position: relative;
+  grid-column: span 4;
+  border-radius: 20px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 26px;
+  padding: 28px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  gap: 18px;
-  box-shadow: var(--shadow-sm);
-  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+  gap: 22px;
+  overflow: hidden;
+  backdrop-filter: blur(16px);
+  transition: border-color 0.25s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.bento-card.wide {
-  grid-column: span 3;
+.card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 16px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--specular), transparent);
+  opacity: 0.55;
+  pointer-events: none;
 }
 
-.bento-card:hover {
+.card:hover {
   border-color: var(--border-strong);
   transform: translateY(-2px);
-  box-shadow: var(--shadow-md);
 }
 
-.bento-icon {
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
-  background: var(--bg-subtle);
-  border: 1px solid var(--border);
-  color: var(--text);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 16px;
-}
+.card.span-7 { grid-column: span 7; }
+.card.span-5 { grid-column: span 5; }
+.card.span-6 { grid-column: span 6; }
 
-.bento-card h3 {
-  font-size: 16.5px;
-  font-weight: 680;
-  letter-spacing: -0.015em;
+.card-kicker {
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
   margin-bottom: 8px;
 }
 
-.bento-card p {
+.card h3 {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+
+.card p {
   font-size: 14px;
   line-height: 1.65;
   color: var(--text-secondary);
 }
 
-.bento-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+/* Sculpted Mini UI Previews inside Bento Cards */
+.mini-ui {
+  border-radius: 13px;
+  background: var(--mini-bg);
+  border: 1px solid var(--border);
+  padding: 14px;
+  font-size: 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
 }
 
-.bento-tag {
-  font-size: 11.5px;
-  font-weight: 550;
-  padding: 3px 9px;
+.mini-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.mini-tabs {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--mini-row);
+  border: 1px solid var(--border);
+}
+
+.mini-tab {
+  border: 0;
+  background: transparent;
+  padding: 4px 10px;
   border-radius: 6px;
-  background: var(--bg-subtle);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.mini-tab.active {
+  background: var(--surface-solid);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.25), 0 0 0 1px var(--border);
+}
+
+.mini-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--emerald-soft);
+  color: var(--emerald);
+  font-variant-numeric: tabular-nums;
+}
+
+.mini-thought {
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: var(--mini-row);
   border: 1px solid var(--border);
   color: var(--text-secondary);
-}
-
-/* Agents Matrix */
-.agents-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 12px;
-}
-
-.agent-tile {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 15px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  transition: border-color 0.16s ease, background-color 0.16s ease;
-}
-
-.agent-tile:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-hover);
-}
-
-.agent-name {
-  font-size: 14.5px;
-  font-weight: 650;
-  color: var(--text);
+  margin-bottom: 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 
-.agent-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--green);
-  opacity: 0.8;
+.mini-diff {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.65;
+  border-radius: 9px;
+  overflow: hidden;
+  border: 1px solid var(--border);
 }
 
-.agent-meta {
-  font-size: 12px;
-  color: var(--text-muted);
+.diff-del { background: var(--rose-soft); color: var(--rose); padding: 2px 10px; }
+.diff-add { background: var(--emerald-soft); color: var(--emerald); padding: 2px 10px; }
+.diff-ctx { padding: 2px 10px; color: var(--text-secondary); }
+
+.mini-search-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 11px;
+  border-radius: 9px;
+  background: var(--mini-row);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-/* Security Band */
-.security-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
-}
-
-.security-card {
-  background: var(--surface);
+.mini-hit {
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: var(--mini-row);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 24px;
+  margin-bottom: 7px;
 }
 
-.security-card h3 {
-  font-size: 15.5px;
+.mini-hit:last-child { margin-bottom: 0; }
+
+.mini-hit-title {
+  font-size: 11.5px;
   font-weight: 650;
-  margin-bottom: 8px;
+  color: var(--text);
+  margin-bottom: 3px;
+  display: flex;
+  justify-content: space-between;
+}
+
+.mini-hit-body {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.hl {
+  background: var(--accent-glow);
+  color: var(--accent);
+  padding: 0 4px;
+  border-radius: 4px;
+  font-weight: 650;
+}
+
+.mini-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+  position: relative;
+}
+
+.mini-code-fade {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
   display: flex;
   align-items: center;
+  justify-content: space-between;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
-.security-card p {
-  font-size: 13.8px;
-  line-height: 1.65;
-  color: var(--text-secondary);
-}
-
-.security-link {
+.path-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-top: 22px;
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--accent);
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--mini-row);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
 }
 
-.security-link:hover { text-decoration: underline; }
+.shield-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
 
-/* Download CTA */
-.cta-panel {
+.shield-box {
+  padding: 10px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--mini-row);
+}
+
+.shield-box strong {
+  display: block;
+  font-size: 11.5px;
+  margin-bottom: 2px;
+}
+
+.shield-box span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* 13 Agents Infinite Dual-Track Marquee */
+.marquee-section {
+  padding: 84px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.marquee-shell {
+  margin-top: 36px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
+}
+
+.marquee-track {
+  display: flex;
+  gap: 14px;
+  width: max-content;
+  animation: scroll-left 34s linear infinite;
+}
+
+.marquee-track.reverse {
+  animation: scroll-right 38s linear infinite;
+}
+
+.marquee-shell:hover .marquee-track {
+  animation-play-state: paused;
+}
+
+@keyframes scroll-left {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+@keyframes scroll-right {
+  from { transform: translateX(-50%); }
+  to { transform: translateX(0); }
+}
+
+.agent-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 20px;
+  border-radius: 14px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 48px 36px;
-  text-align: center;
-  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(10px);
+  transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
-.cta-panel h2 {
-  font-size: clamp(24px, 3vw, 32px);
-  font-weight: 750;
-  letter-spacing: -0.03em;
-  margin-bottom: 10px;
+.agent-chip:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-2px);
 }
 
-.cta-panel p {
-  max-width: 540px;
-  margin: 0 auto 26px;
-  font-size: 15px;
+.agent-chip strong {
+  font-size: 14.5px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.agent-chip span {
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text-muted);
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--mini-row);
+  border: 1px solid var(--border);
+}
+
+/* Security Architecture Band */
+.sec-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+
+.sec-item {
+  padding: 28px;
+  border-radius: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  position: relative;
+}
+
+.sec-num {
+  font-size: 12px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--accent);
+  margin-bottom: 14px;
+}
+
+.sec-item h3 {
+  font-size: 17px;
+  font-weight: 680;
+  margin-bottom: 8px;
+}
+
+.sec-item p {
+  font-size: 14px;
+  line-height: 1.68;
   color: var(--text-secondary);
 }
 
-.cta-sub {
-  margin-top: 16px;
-  font-size: 12.5px;
-  color: var(--text-muted);
+/* Monumental Final CTA */
+.final-cta {
+  padding: 96px 0 84px;
+  text-align: center;
+  position: relative;
+}
+
+.cta-card {
+  position: relative;
+  border-radius: 28px;
+  padding: 68px 32px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  overflow: hidden;
+  box-shadow: var(--stage-shadow);
+}
+
+.cta-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--beam-top);
+  pointer-events: none;
+}
+
+.cta-card > * { position: relative; z-index: 1; }
+
+.cta-card h2 {
+  font-size: clamp(28px, 4vw, 44px);
+  font-weight: 760;
+  letter-spacing: -0.035em;
+  margin: 18px 0 12px;
+  background: var(--heading-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.cta-card p {
+  max-width: 520px;
+  margin: 0 auto 30px;
+  font-size: 15.5px;
+  color: var(--text-secondary);
 }
 
 /* Footer */
 .site-footer {
   border-top: 1px solid var(--border);
-  padding: 32px 0 44px;
+  padding: 32px 0 48px;
   font-size: 13px;
   color: var(--text-muted);
 }
 
-.footer-inner {
+.footer-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
   flex-wrap: wrap;
+  gap: 16px;
 }
 
 .footer-links {
   display: flex;
-  align-items: center;
-  gap: 18px;
+  gap: 20px;
 }
 
-.footer-links a:hover {
-  color: var(--text);
+.footer-links a:hover { color: var(--text); }
+
+/* Scroll Reveal */
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-/* Theme Icon Visibility */
-.icon-sun { display: none; }
-.icon-moon { display: block; }
-[data-theme="dark"] .icon-sun { display: block; }
-[data-theme="dark"] .icon-moon { display: none; }
+.reveal.in {
+  opacity: 1;
+  transform: translateY(0);
+}
 
-@media (max-width: 960px) {
-  .bento-card, .bento-card.wide { grid-column: span 3; }
-  .security-grid { grid-template-columns: 1fr; }
-  .spec-strip { grid-template-columns: repeat(2, 1fr); }
-  .spec-item:nth-child(2) { border-right: none; }
-  .spec-item:nth-child(1), .spec-item:nth-child(2) { border-bottom: 1px solid var(--border); }
+/* Theme icons */
+.icon-sun { display: block; }
+.icon-moon { display: none; }
+[data-theme="light"] .icon-sun { display: none; }
+[data-theme="light"] .icon-moon { display: block; }
+
+@media (max-width: 980px) {
+  .card, .card.span-7, .card.span-5, .card.span-6 { grid-column: span 12; }
+  .sec-grid { grid-template-columns: 1fr; }
+  .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+  .metric-cell:nth-child(2) { border-right: none; }
+  .metric-cell:nth-child(1), .metric-cell:nth-child(2) { border-bottom: 1px solid var(--border); }
 }
 
 @media (max-width: 720px) {
   .nav-links { display: none; }
-  .hero { padding: 48px 0 32px; }
-  .bento-card, .bento-card.wide { grid-column: span 6; }
-  .window-chrome { height: auto; padding: 10px 12px; flex-wrap: wrap; }
-  .demo-iframe { height: 620px; }
-  .cta-panel { padding: 34px 20px; }
+  .hero { padding: 56px 0 36px; }
+  .win-bar { height: auto; padding: 10px 12px; flex-wrap: wrap; }
+  .demo-iframe { height: 600px; }
+  .cta-card { padding: 48px 20px; }
 }
 </style>
 </head>
 <body>
-<div class="page-backdrop" aria-hidden="true"></div>
+<div class="studio-light" aria-hidden="true"></div>
+<div class="studio-grid" aria-hidden="true"></div>
 
 <header class="site-header">
-  <div class="container nav-inner">
+  <div class="wrap nav-bar">
     <a class="brand" href="#">
-      <img class="brand-icon" src="./app-icon.png" alt="Agent会话管理图标">
+      <img src="./app-icon.png" alt="Agent会话管理">
       <span>Agent会话管理</span>
-      <span class="version-pill">v1.8.4</span>
+      <span class="nav-ver">v1.8.4</span>
     </a>
 
     <nav class="nav-links" aria-label="主导航">
-      <a href="#demo">在线体验</a>
-      <a href="#features">核心特性</a>
-      <a href="#agents">支持工具</a>
-      <a href="#security">安全机制</a>
+      <a href="#stage">在线体验</a>
+      <a href="#engine">核心引擎</a>
+      <a href="#agents">13 种 Agent</a>
+      <a href="#security">安全架构</a>
     </nav>
 
-    <div class="nav-actions">
-      <button class="icon-btn" id="themeToggle" type="button" title="切换亮色 / 暗色外观" aria-label="切换亮色 / 暗色外观">
-        <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+    <div class="nav-right">
+      <button class="icon-btn" id="themeToggle" type="button" title="切换暗色 / 亮色外观" aria-label="切换暗色 / 亮色外观">
         <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+        <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
       </button>
       <a class="icon-btn" href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer" title="GitHub 仓库" aria-label="GitHub 仓库">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2Z"/></svg>
       </a>
-      <a class="nav-cta" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-        <span>下载</span>
+      <a class="nav-dl" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
+        <span>下载桌面端</span>
       </a>
     </div>
   </div>
@@ -870,294 +1126,361 @@ button { font: inherit; color: inherit; }
 <main>
   <!-- Hero -->
   <section class="hero">
-    <div class="container">
-      <a class="hero-badge" href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">
-        <span class="hero-badge-dot"></span>
-        <span>v1.8.4 · 长代码块折叠 · 零抖动多选底栏 · FTS5 批量索引</span>
+    <div class="wrap">
+      <div>
+        <div class="emblem-wrap">
+          <img src="./app-icon.png" alt="Agent会话管理 铂金刀锋图标">
+        </div>
+      </div>
+
+      <a class="hero-pill" href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">
+        <span class="pill-dot"></span>
+        <span>v1.8.4 · 长代码智能折叠 · 零抖动多选底栏 · FTS5 批量索引</span>
       </a>
 
       <h1>
-        本地编码 Agent 会话，<br>
-        <span class="muted-line">一站式阅读与治理。</span>
+        本地 AI 编码会话，<br>
+        <span>终有一座精密工作台。</span>
       </h1>
 
-      <p class="hero-desc">
-        原生只读解析 13 种本地 AI 编程工具的历史记录。将散落的 JSONL 与 SQLite 还原为结构化思维链、内联行号 Diff 与可检索知识库，全程 100% 本地离线运行。
+      <p class="hero-sub">
+        原生只读解析 13 种主流本地编码 Agent 的历史记录。将散落的 JSONL、SQLite 与思考流，雕琢为结构化思维链、内联行号 Diff 与毫秒级全文知识库。
       </p>
 
-      <div class="hero-actions">
+      <div class="hero-cta">
         <a class="btn btn-primary" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-          <span>下载桌面端安装包</span>
+          <span>下载 Windows / Linux 版</span>
         </a>
         <a class="btn btn-secondary" href="./demo/" target="_blank" rel="noopener noreferrer">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
-          <span>全屏在线体验</span>
+          <span>全屏 1:1 在线体验</span>
         </a>
       </div>
 
-      <div class="hero-meta">
-        <span>Windows x64 &amp; Linux amd64</span>
+      <div class="hero-footnote">
+        <span>Rust + Tauri v2 原生架构</span>
         <span>·</span>
-        <span>Rust + Tauri v2 原生驱动</span>
+        <span>~5.1 MB 轻量安装包</span>
         <span>·</span>
-        <span>零云端上传</span>
+        <span>100% 本地离线零上传</span>
         <span>·</span>
         <span>MIT 开源</span>
       </div>
-
-      <div class="spec-strip">
-        <div class="spec-item">
-          <div class="spec-val">13</div>
-          <div class="spec-lbl">原生支持本地 Agent</div>
-        </div>
-        <div class="spec-item">
-          <div class="spec-val">FTS5</div>
-          <div class="spec-lbl">本地 SQLite 全文索引</div>
-        </div>
-        <div class="spec-item">
-          <div class="spec-val">~5.1 MB</div>
-          <div class="spec-lbl">轻量原生安装包体积</div>
-        </div>
-        <div class="spec-item">
-          <div class="spec-val">100%</div>
-          <div class="spec-lbl">本地离线零数据外发</div>
-        </div>
-      </div>
     </div>
   </section>
 
-  <!-- Live 1:1 Interactive Stage -->
-  <section class="stage-section" id="demo">
-    <div class="stage-container">
-      <div class="window-frame">
-        <div class="window-chrome">
-          <div class="chrome-left">
-            <div class="traffic-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-            <div class="chrome-title">
-              <img src="./app-icon.png" alt="">
-              <span>Agent会话管理 v1.8.4</span>
+  <!-- Cinema Stage -->
+  <section class="stage-section" id="stage">
+    <div class="stage-glow" aria-hidden="true"></div>
+    <div class="stage-wrap">
+      <div class="chassis-outer">
+        <div class="chassis-inner">
+          <div class="win-bar">
+            <div class="win-left">
+              <div class="win-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+              <div class="win-title">
+                <img src="./app-icon.png" alt="">
+                <span>Agent会话管理 v1.8.4</span>
+              </div>
+            </div>
+
+            <div class="seg-control" role="tablist" aria-label="演示视图">
+              <button class="seg-btn active" id="modeInteractive" type="button" role="tab" aria-selected="true">1:1 实时交互</button>
+              <button class="seg-btn" id="modeScreenshot" type="button" role="tab" aria-selected="false">2880×1800 静态图</button>
+            </div>
+
+            <div class="win-actions">
+              <button class="win-btn" id="resetDemoBtn" type="button">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                <span>重置数据</span>
+              </button>
+              <a class="win-btn" href="./demo/" target="_blank" rel="noopener noreferrer">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+                <span>全屏</span>
+              </a>
             </div>
           </div>
 
-          <div class="segmented" role="tablist" aria-label="预览模式">
-            <button class="seg-btn active" id="modeInteractive" type="button" role="tab" aria-selected="true">1:1 实时交互</button>
-            <button class="seg-btn" id="modeScreenshot" type="button" role="tab" aria-selected="false">2880×1800 高清图</button>
-          </div>
-
-          <div class="chrome-actions">
-            <button class="chrome-btn" id="resetDemoBtn" type="button" title="重置模拟会话数据">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-              <span>重置数据</span>
-            </button>
-            <a class="chrome-btn" href="./demo/" target="_blank" rel="noopener noreferrer">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
-              <span>全屏打开</span>
-            </a>
-          </div>
-        </div>
-
-        <div class="stage-body">
           <iframe
             id="demoFrame"
             class="demo-iframe"
-            src="./demo/"
-            title="Agent会话管理 v1.8.4 1:1 在线交互体验"
-            loading="eager"
+            src="./demo/?theme=dark"
+            title="Agent会话管理 v1.8.4 1:1 实时交互体验"
           ></iframe>
-          <div id="screenshotPane" class="preview-pane">
-            <img id="screenshotImg" src="./main-window-light.png" alt="Agent会话管理 2880×1800 高清主界面预览">
+
+          <div id="shotPane" class="shot-pane">
+            <img id="shotImg" src="./main-window-dark.png" alt="Agent会话管理 2880×1800 高清界面预览">
           </div>
         </div>
       </div>
 
-      <div class="stage-caption">
-        <span>上方舞台运行真实的 v1.8.4 前端应用，内置 13 种 Agent 模拟会话，可直接体验思维链、长代码折叠、目录抽屉、FTS5 搜索与批量清理。</span>
-        <span>模拟数据仅驻留于浏览器内存，刷新即可复原</span>
+      <div class="stage-note">
+        <span>上方即真实运行的 v1.8.4 前端应用，内置 13 种 Agent 演示会话，可直接操作思维链、长代码折叠、目录抽屉与批量清理。</span>
+        <span>模拟数据仅驻留内存 · 刷新即复原</span>
       </div>
     </div>
   </section>
 
-  <!-- Core Features Bento -->
-  <section class="section" id="features">
-    <div class="container">
-      <div class="section-head">
-        <span class="section-eyebrow">Core Capabilities</span>
-        <h2>专为长上下文与工程代码设计的阅读引擎</h2>
-        <p>不止是日志查看器，而是把混乱的原始工具调用与思考流，整理成清晰、可查、可导出的工程文档。</p>
+  <!-- Metrics Ribbon -->
+  <section class="metrics-band">
+    <div class="wrap metrics-grid">
+      <div class="metric-cell">
+        <div class="metric-num">13</div>
+        <div class="metric-label">原生适配本地编码 Agent</div>
+      </div>
+      <div class="metric-cell">
+        <div class="metric-num">2 MB</div>
+        <div class="metric-label">单块推理链按需流式分页</div>
+      </div>
+      <div class="metric-cell">
+        <div class="metric-num">FTS5</div>
+        <div class="metric-label">SQLite 纯正文增量全文检索</div>
+      </div>
+      <div class="metric-cell">
+        <div class="metric-num">0 B</div>
+        <div class="metric-label">云端上传与遥测数据量</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Flagship Interactive Bento -->
+  <section class="section" id="engine">
+    <div class="wrap">
+      <div class="section-header reveal">
+        <div class="eyebrow">Reading &amp; Indexing Engine</div>
+        <h2>每一处细节，都为长上下文工程而生。</h2>
+        <p>不是把原始 JSONL 粗暴铺在屏幕上，而是用结构化阅读引擎把每一次推理、工具调用与代码修改还原成清晰可查的工程资产。</p>
       </div>
 
-      <div class="bento-grid">
-        <article class="bento-card wide">
+      <div class="bento">
+        <!-- Card 1: Interactive Tri-Mode Reader -->
+        <article class="card span-7 reveal">
           <div>
-            <div class="bento-icon">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg>
-            </div>
-            <h3>两段式思维链 &amp; 三态视图联动</h3>
-            <p>按各 Agent 原生风格呈现推理块，默认单行展示摘要与耗时，点击按需分页拉取最高 2 MB 完整正文；顶栏「全部 / 对话 / 改动」三态切换实时同步会话内搜索、Markdown 复制与文件导出。</p>
+            <div class="card-kicker">Structured Reader</div>
+            <h3>两段式思维链 &amp; 三态视图全链路联动</h3>
+            <p>按各 Agent 原生风格呈现思考过程，默认单行摘要按需拉取全文；顶栏「全部 / 对话 / 改动」三态视图与搜索、复制、导出实时联动。</p>
           </div>
-          <div class="bento-tags">
-            <span class="bento-tag">全部 | 对话 | 改动</span>
-            <span class="bento-tag">ContentRef 按需分页</span>
-            <span class="bento-tag">可关闭目录抽屉</span>
+          <div class="mini-ui" id="miniReader">
+            <div class="mini-toolbar">
+              <div class="mini-tabs" role="tablist">
+                <button class="mini-tab active" data-view="all" type="button">全部</button>
+                <button class="mini-tab" data-view="dialog" type="button">对话</button>
+                <button class="mini-tab" data-view="changes" type="button">改动</button>
+              </div>
+              <span class="mini-badge" id="miniReaderStat">3 步过程 · 1 处改动</span>
+            </div>
+            <div class="mini-thought" id="miniThoughtRow">
+              <span>✻ 思考中 · 定位 JWKS 未知 kid 轮换未触发回源刷新…</span>
+              <span style="opacity:.7">1.4s</span>
+            </div>
+            <div class="mini-diff" id="miniDiffRow">
+              <div class="diff-del">- if (!key) throw new UnauthorizedError('unknown kid');</div>
+              <div class="diff-add">+ if (!key) { await refreshJwks({ force: true }); key = jwksCache.get(kid); }</div>
+            </div>
+            <div class="mini-thought" id="miniDialogRow" style="display:none;margin-bottom:0">
+              <span>已为未知 kid 补充单飞强制回源刷新，消除 15 分钟轮换窗口期的偶发 401。</span>
+            </div>
           </div>
         </article>
 
-        <article class="bento-card wide">
+        <!-- Card 2: FTS5 Full-Text Search -->
+        <article class="card span-5 reveal">
           <div>
-            <div class="bento-icon">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-            </div>
-            <h3>SQLite FTS5 跨会话正文全文检索</h3>
-            <p>开启「正文」开关后在后台批量增量构建纯正文 FTS5（trigram + 短词）索引，自动跳过系统注入块且不挤占前台阅读缓存；点击高亮摘录直达目标轮次，关闭即彻底清理索引文件。</p>
+            <div class="card-kicker">SQLite FTS5</div>
+            <h3>跨会话正文毫秒级检索</h3>
+            <p>后台批量事务增量索引纯正文，跳过系统注入块且不挤占阅读缓存；高亮摘录一键跳至对应轮次，关闭即彻底清理索引库。</p>
           </div>
-          <div class="bento-tags">
-            <span class="bento-tag">批量事务写入</span>
-            <span class="bento-tag">摘录直达轮次</span>
-            <span class="bento-tag">即关即清</span>
+          <div class="mini-ui">
+            <div class="mini-search-bar">
+              <span>kid-2026-11</span>
+              <span class="mini-badge">0.4 ms · 3 命中</span>
+            </div>
+            <div class="mini-hit">
+              <div class="mini-hit-title"><span>Claude Code · edge-gateway</span><span style="color:var(--text-muted)">第 2 轮</span></div>
+              <div class="mini-hit-body">当签发端轮换到新密钥 <span class="hl">kid-2026-11</span> 时触发单飞回源…</div>
+            </div>
+            <div class="mini-hit">
+              <div class="mini-hit-title"><span>DeepSeek · 子代理核验</span><span style="color:var(--text-muted)">第 1 轮</span></div>
+              <div class="mini-hit-body">并发请求未知 <span class="hl">kid-2026-11</span> 共享同一个刷新 Promise…</div>
+            </div>
           </div>
         </article>
 
-        <article class="bento-card">
+        <!-- Card 3: Long Code Collapse -->
+        <article class="card span-4 reveal">
           <div>
-            <div class="bento-icon">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-            </div>
-            <h3>步骤合并、内联 Diff 与长代码折叠</h3>
-            <p>按调用 ID 精确配对工具入参输出，连续读/搜自动归并、失败命令置顶；文件编辑支持行号着色 Diff，超过 28 行的长代码块默认折叠预览并显示行数。</p>
+            <div class="card-kicker">Code Ergonomics</div>
+            <h3>超长代码块智能折叠</h3>
+            <p>超过 28 行的代码块自动折叠预览前 18 行并展示行数角标，搜词时自动展开；全局复制统一提供 1.5s 绿色对勾微反馈。</p>
           </div>
-          <div class="bento-tags">
-            <span class="bento-tag">统一 Diff / 补丁</span>
-            <span class="bento-tag">长代码智能折叠</span>
+          <div class="mini-ui">
+            <div class="mini-code">
+              <div>export async function refreshJwks(opts) {</div>
+              <div>&nbsp;&nbsp;if (!inflightRefresh) {</div>
+              <div>&nbsp;&nbsp;&nbsp;&nbsp;inflightRefresh = fetchOrigin();</div>
+              <div>&nbsp;&nbsp;}</div>
+              <div class="mini-code-fade">
+                <span style="color:var(--accent);font-weight:600">展开全部 38 行代码</span>
+                <span class="mini-badge">✓ 已复制</span>
+              </div>
+            </div>
           </div>
         </article>
 
-        <article class="bento-card">
+        <!-- Card 4: Native Export & Path Chips -->
+        <article class="card span-4 reveal">
           <div>
-            <div class="bento-icon">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>
-            </div>
-            <h3>原生另存为 `.md` &amp; 路径胶囊定位</h3>
-            <p>Windows 独立 STA 线程弹出系统「另存为」窗口导出 Markdown；对话路径自动渲染为可一键复制或直达资源管理器的胶囊，全局复制配备 1.5s 绿色对勾反馈。</p>
+            <div class="card-kicker">Native Bridge</div>
+            <h3>原生另存为 &amp; 路径直达</h3>
+            <p>Windows 独立 STA 线程拉起原生「另存为」导出 `.md`；正文路径自动识别为胶囊，一键复制或在资源管理器中精准定位。</p>
           </div>
-          <div class="bento-tags">
-            <span class="bento-tag">系统保存对话框</span>
-            <span class="bento-tag">资源管理器直达</span>
+          <div class="mini-ui">
+            <div class="chip-row">
+              <span class="path-pill">src/auth/jwt.ts:48</span>
+              <span class="path-pill">search_index.rs</span>
+              <span class="path-pill" style="color:var(--emerald)">导出 .md</span>
+            </div>
           </div>
         </article>
 
-        <article class="bento-card">
+        <!-- Card 5: Zero-Jump Multi-Select & Safety -->
+        <article class="card span-4 reveal">
           <div>
-            <div class="bento-icon">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
-            </div>
-            <h3>零抖动多选底栏 &amp; 一键定位会话</h3>
-            <p>进入多选模式时左侧底栏原地切换，列表零跳动；支持跨分页全选、子代理「先子后父」级联清理，以及常规态下随时一键定位当前阅读会话。</p>
+            <div class="card-kicker">Safe Governance</div>
+            <h3>零抖动多选 &amp; 边界隔离</h3>
+            <p>底栏原地切换多选状态零跳动，支持一键定位当前会话、跨分页全选与父子代理级联清理，绝不触碰项目工作区。</p>
           </div>
-          <div class="bento-tags">
-            <span class="bento-tag">0px 布局跳动</span>
-            <span class="bento-tag">24 条滚动记忆</span>
+          <div class="mini-ui">
+            <div class="shield-split">
+              <div class="shield-box">
+                <strong style="color:var(--emerald)">受控会话目录 ✓</strong>
+                <span>仅清理会话与边车记录</span>
+              </div>
+              <div class="shield-box">
+                <strong style="color:var(--text)">代码工作区 🔒</strong>
+                <span>只读隔离 · 永不修改</span>
+              </div>
+            </div>
           </div>
         </article>
       </div>
     </div>
   </section>
 
-  <!-- 13 Supported Agents -->
-  <section class="section" id="agents">
-    <div class="container">
-      <div class="section-head">
-        <span class="section-eyebrow">13 Native Adapters</span>
-        <h2>覆盖主流本地编码 Agent 生态</h2>
-        <p>针对每种工具的原生存储结构定制只读解析器与安全删除策略，无需配置导出插件或修改原始格式。</p>
+  <!-- 13 Agents Infinite Dual-Row Marquee -->
+  <section class="marquee-section" id="agents">
+    <div class="wrap">
+      <div class="section-header reveal" style="margin-bottom:0">
+        <div class="eyebrow">13 Native Adapters</div>
+        <h2>开箱纳管十三种本地编码 Agent</h2>
+        <p>针对每种工具的原生存储结构定制解析器与清理策略，零侵入、零配置插件。</p>
+      </div>
+    </div>
+
+    <div class="marquee-shell" aria-label="支持的 13 种本地编码 Agent">
+      <div class="marquee-track">
+        <div class="agent-chip"><strong>Claude Code</strong><span>Projects JSONL</span></div>
+        <div class="agent-chip"><strong>Codex</strong><span>Rollout JSONL</span></div>
+        <div class="agent-chip"><strong>Gemini CLI</strong><span>Chats &amp; Thought</span></div>
+        <div class="agent-chip"><strong>GitHub Copilot</strong><span>Session Events</span></div>
+        <div class="agent-chip"><strong>DeepSeek Harness</strong><span>Session v3 / v4</span></div>
+        <div class="agent-chip"><strong>WorkBuddy</strong><span>JSONL + Sidecar</span></div>
+        <div class="agent-chip"><strong>CodeBuddy</strong><span>DAG + Rollback</span></div>
+        <!-- Duplicate for seamless loop -->
+        <div class="agent-chip"><strong>Claude Code</strong><span>Projects JSONL</span></div>
+        <div class="agent-chip"><strong>Codex</strong><span>Rollout JSONL</span></div>
+        <div class="agent-chip"><strong>Gemini CLI</strong><span>Chats &amp; Thought</span></div>
+        <div class="agent-chip"><strong>GitHub Copilot</strong><span>Session Events</span></div>
+        <div class="agent-chip"><strong>DeepSeek Harness</strong><span>Session v3 / v4</span></div>
+        <div class="agent-chip"><strong>WorkBuddy</strong><span>JSONL + Sidecar</span></div>
+        <div class="agent-chip"><strong>CodeBuddy</strong><span>DAG + Rollback</span></div>
       </div>
 
-      <div class="agents-grid">
-        <div class="agent-tile"><div class="agent-name">Claude Code <span class="agent-dot"></span></div><div class="agent-meta">Projects JSONL · Subagent</div></div>
-        <div class="agent-tile"><div class="agent-name">Codex <span class="agent-dot"></span></div><div class="agent-meta">Rollout JSONL · Archived</div></div>
-        <div class="agent-tile"><div class="agent-name">Gemini CLI <span class="agent-dot"></span></div><div class="agent-meta">Chats JSONL · Thought</div></div>
-        <div class="agent-tile"><div class="agent-name">GitHub Copilot <span class="agent-dot"></span></div><div class="agent-meta">Session Events JSONL</div></div>
-        <div class="agent-tile"><div class="agent-name">DeepSeek Harness <span class="agent-dot"></span></div><div class="agent-meta">Session v3 / v4 JSONL</div></div>
-        <div class="agent-tile"><div class="agent-name">WorkBuddy <span class="agent-dot"></span></div><div class="agent-meta">Projects JSONL · Sidecar</div></div>
-        <div class="agent-tile"><div class="agent-name">CodeBuddy <span class="agent-dot"></span></div><div class="agent-meta">DAG Chain · Rollback</div></div>
-        <div class="agent-tile"><div class="agent-name">Kimi CLI <span class="agent-dot"></span></div><div class="agent-meta">Context &amp; Wire JSONL</div></div>
-        <div class="agent-tile"><div class="agent-name">OpenCode <span class="agent-dot"></span></div><div class="agent-meta">SQLite WAL · Storage</div></div>
-        <div class="agent-tile"><div class="agent-name">ZCode <span class="agent-dot"></span></div><div class="agent-meta">Dual SQLite · Lineage</div></div>
-        <div class="agent-tile"><div class="agent-name">OpenClaw <span class="agent-dot"></span></div><div class="agent-meta">Multi-Agent Sessions</div></div>
-        <div class="agent-tile"><div class="agent-name">Pi <span class="agent-dot"></span></div><div class="agent-meta">Branch Tree JSONL</div></div>
-        <div class="agent-tile"><div class="agent-name">Grok Build <span class="agent-dot"></span></div><div class="agent-meta">JSONL · Zstd Archive</div></div>
+      <div class="marquee-track reverse">
+        <div class="agent-chip"><strong>Kimi CLI</strong><span>Context &amp; Wire</span></div>
+        <div class="agent-chip"><strong>OpenCode</strong><span>SQLite WAL</span></div>
+        <div class="agent-chip"><strong>ZCode</strong><span>Dual SQLite Lineage</span></div>
+        <div class="agent-chip"><strong>OpenClaw</strong><span>Multi-Agent JSONL</span></div>
+        <div class="agent-chip"><strong>Pi</strong><span>Branch Tree JSONL</span></div>
+        <div class="agent-chip"><strong>Grok Build</strong><span>JSONL + Zstd Archive</span></div>
+        <!-- Duplicate for seamless loop -->
+        <div class="agent-chip"><strong>Kimi CLI</strong><span>Context &amp; Wire</span></div>
+        <div class="agent-chip"><strong>OpenCode</strong><span>SQLite WAL</span></div>
+        <div class="agent-chip"><strong>ZCode</strong><span>Dual SQLite Lineage</span></div>
+        <div class="agent-chip"><strong>OpenClaw</strong><span>Multi-Agent JSONL</span></div>
+        <div class="agent-chip"><strong>Pi</strong><span>Branch Tree JSONL</span></div>
+        <div class="agent-chip"><strong>Grok Build</strong><span>JSONL + Zstd Archive</span></div>
       </div>
     </div>
   </section>
 
-  <!-- Security -->
+  <!-- Security Architecture -->
   <section class="section" id="security">
-    <div class="container">
-      <div class="section-head">
-        <span class="section-eyebrow">Safety &amp; Privacy</span>
-        <h2>本地优先，严守文件安全边界</h2>
-        <p>面向开发者的历史对话往往包含代码片段与配置路径，我们将数据隐私与防误删视为核心底线。</p>
+    <div class="wrap">
+      <div class="section-header reveal">
+        <div class="eyebrow">Safety Architecture</div>
+        <h2>把防误删与隐私边界，写进 Rust 底层。</h2>
+        <p>所有文件操作与解析都在本机 Rust 核心内严格校验，完整安全承诺公开可审计。</p>
       </div>
 
-      <div class="security-grid">
-        <div class="security-card">
-          <h3>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/></svg>
-            只读解析，绝不触碰项目目录
-          </h3>
-          <p>仅扫描各 Agent 的受控会话数据根路径；清理操作严格限定在会话记录与边车元数据内，永不修改或删除您的源代码工作区。</p>
+      <div class="sec-grid">
+        <div class="sec-item reveal">
+          <div class="sec-num">01 / PATH BOUNDARY</div>
+          <h3>受控根路径与防符号链接越界</h3>
+          <p>删除前逐层校验规范路径、NTFS 重解析点与符号链接边界，任何指向项目仓库或系统目录的链接都会被直接拦截拒绝。</p>
         </div>
-        <div class="security-card">
-          <h3>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-            进程守卫与防符号链接越界
-          </h3>
-          <p>执行删除前校验 NTFS 重解析点、符号链接边界与活跃锁文件，支持 50+ 条大批量知情核对与崩溃可恢复待清理日志。</p>
+        <div class="sec-item reveal">
+          <div class="sec-num">02 / PROCESS GUARD</div>
+          <h3>进程守卫与先子后父级联清理</h3>
+          <p>检测正在写入会话的活跃 Agent 进程与锁文件，按「先子代理后父会话」顺序安全回收，50+ 条批量操作强制知情核对。</p>
         </div>
-        <div class="security-card">
-          <h3>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
-            纯离线单机，零云端遥测
-          </h3>
-          <p>无账号体系、无埋点上报、无对话上传；除用户手动点击或检查 GitHub 新版本外不产生任何外部网络请求。</p>
+        <div class="sec-item reveal">
+          <div class="sec-num">03 / LOCAL FIRST</div>
+          <h3>100% 离线单机，零云端遥测</h3>
+          <p>无账号、无统计埋点、不上传任何对话或路径信息。所有索引、缓存与导出均在您的本机磁盘闭环完成。</p>
         </div>
       </div>
 
-      <a class="security-link" href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">
-        <span>阅读完整安全边界文档 (SAFETY.md)</span>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
-      </a>
+      <div style="margin-top:26px">
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px">
+          <span>审阅完整安全边界说明 (SAFETY.md)</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+        </a>
+      </div>
     </div>
   </section>
 
-  <!-- Final Download CTA -->
-  <section class="section">
-    <div class="container">
-      <div class="cta-panel">
-        <h2>立即整理你的本地 Agent 会话库</h2>
-        <p>免费开源，安装即用。支持 Windows x64 一键安装程序与 Linux amd64 AppImage / deb 发行包。</p>
-        <div class="hero-actions">
+  <!-- Monumental CTA -->
+  <section class="final-cta">
+    <div class="wrap">
+      <div class="cta-card reveal">
+        <div class="emblem-wrap" style="margin-bottom:8px">
+          <img src="./app-icon.png" alt="" style="width:52px;height:52px;border-radius:14px">
+        </div>
+        <h2>让每一次 AI 协作，都有迹可循。</h2>
+        <p>下载 Agent会话管理 v1.8.4，支持 Windows x64 安装程序与 Linux amd64 AppImage / deb 发行包。</p>
+        <div class="hero-cta">
           <a class="btn btn-primary" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-            <span>前往 Releases 下载</span>
+            <span>前往 GitHub Releases 下载</span>
           </a>
           <a class="btn btn-secondary" href="./demo/" target="_blank" rel="noopener noreferrer">
-            <span>独立全屏体验 Demo</span>
+            <span>独立全屏打开在线体验</span>
           </a>
         </div>
-        <div class="cta-sub">当前最新构建版本 v1.8.4 · MIT License</div>
       </div>
     </div>
   </section>
 </main>
 
 <footer class="site-footer">
-  <div class="container footer-inner">
-    <div>© 2026 Agent会话管理 · 开源桌面工具</div>
+  <div class="wrap footer-row">
+    <div>© 2026 Agent会话管理 · MIT Open Source</div>
     <div class="footer-links">
       <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
       <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">历史版本</a>
+      <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">全部版本</a>
       <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
     </div>
   </div>
@@ -1168,19 +1491,19 @@ button { font: inherit; color: inherit; }
   var root = document.documentElement;
   var themeToggle = document.getElementById("themeToggle");
   var demoFrame = document.getElementById("demoFrame");
-  var screenshotPane = document.getElementById("screenshotPane");
-  var screenshotImg = document.getElementById("screenshotImg");
+  var shotPane = document.getElementById("shotPane");
+  var shotImg = document.getElementById("shotImg");
   var modeInteractive = document.getElementById("modeInteractive");
   var modeScreenshot = document.getElementById("modeScreenshot");
   var resetDemoBtn = document.getElementById("resetDemoBtn");
 
   function getTheme() {
-    return root.getAttribute("data-theme") === "dark" ? "dark" : "light";
+    return root.getAttribute("data-theme") === "light" ? "light" : "dark";
   }
 
-  function syncVisualTheme(theme) {
-    if (screenshotImg) {
-      screenshotImg.src = theme === "dark" ? "./main-window-dark.png" : "./main-window-light.png";
+  function syncTheme(theme) {
+    if (shotImg) {
+      shotImg.src = theme === "light" ? "./main-window-light.png" : "./main-window-dark.png";
     }
     if (demoFrame && demoFrame.contentWindow) {
       try {
@@ -1192,54 +1515,83 @@ button { font: inherit; color: inherit; }
     }
   }
 
-  function setTheme(theme) {
-    root.setAttribute("data-theme", theme);
-    try {
-      localStorage.setItem("asm-site-theme", theme);
-    } catch (e) {}
-    syncVisualTheme(theme);
-  }
-
-  // Initialize demo iframe URL with matching theme so initial paint has zero flash
-  var initialTheme = getTheme();
+  var initTheme = getTheme();
   if (demoFrame) {
-    demoFrame.src = "./demo/?theme=" + initialTheme;
+    demoFrame.src = "./demo/?theme=" + initTheme;
     demoFrame.addEventListener("load", function () {
-      syncVisualTheme(getTheme());
+      syncTheme(getTheme());
     });
   }
-  syncVisualTheme(initialTheme);
+  syncTheme(initTheme);
 
   if (themeToggle) {
     themeToggle.addEventListener("click", function () {
-      setTheme(getTheme() === "dark" ? "light" : "dark");
+      var next = getTheme() === "dark" ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem("asm-site-theme-v2", next); } catch (e) {}
+      syncTheme(next);
     });
   }
 
-  function setStageMode(mode) {
-    var isInteractive = mode === "interactive";
-    modeInteractive.classList.toggle("active", isInteractive);
-    modeInteractive.setAttribute("aria-selected", String(isInteractive));
-    modeScreenshot.classList.toggle("active", !isInteractive);
-    modeScreenshot.setAttribute("aria-selected", String(!isInteractive));
-    demoFrame.style.display = isInteractive ? "block" : "none";
-    screenshotPane.classList.toggle("active", !isInteractive);
-    resetDemoBtn.style.display = isInteractive ? "inline-flex" : "none";
+  function setMode(mode) {
+    var live = mode === "live";
+    modeInteractive.classList.toggle("active", live);
+    modeInteractive.setAttribute("aria-selected", String(live));
+    modeScreenshot.classList.toggle("active", !live);
+    modeScreenshot.setAttribute("aria-selected", String(!live));
+    demoFrame.style.display = live ? "block" : "none";
+    shotPane.classList.toggle("active", !live);
+    resetDemoBtn.style.display = live ? "inline-flex" : "none";
   }
 
-  if (modeInteractive && modeScreenshot) {
-    modeInteractive.addEventListener("click", function () {
-      setStageMode("interactive");
-    });
-    modeScreenshot.addEventListener("click", function () {
-      setStageMode("screenshot");
-    });
-  }
+  modeInteractive.addEventListener("click", function () { setMode("live"); });
+  modeScreenshot.addEventListener("click", function () { setMode("shot"); });
+  resetDemoBtn.addEventListener("click", function () {
+    demoFrame.src = "./demo/?theme=" + getTheme() + "&reset=" + Date.now();
+  });
 
-  if (resetDemoBtn && demoFrame) {
-    resetDemoBtn.addEventListener("click", function () {
-      demoFrame.src = "./demo/?theme=" + getTheme() + "&reset=" + Date.now();
+  // Interactive Bento Card 1: All / Dialog / Changes switcher
+  var miniTabs = document.querySelectorAll("#miniReader .mini-tab");
+  var thoughtRow = document.getElementById("miniThoughtRow");
+  var diffRow = document.getElementById("miniDiffRow");
+  var dialogRow = document.getElementById("miniDialogRow");
+  var readerStat = document.getElementById("miniReaderStat");
+  miniTabs.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var v = btn.getAttribute("data-view");
+      miniTabs.forEach(function (b) { b.classList.toggle("active", b === btn); });
+      if (v === "all") {
+        thoughtRow.style.display = "flex";
+        diffRow.style.display = "block";
+        dialogRow.style.display = "none";
+        readerStat.textContent = "3 步过程 · 1 处改动";
+      } else if (v === "dialog") {
+        thoughtRow.style.display = "none";
+        diffRow.style.display = "none";
+        dialogRow.style.display = "flex";
+        readerStat.textContent = "纯净问答视图";
+      } else {
+        thoughtRow.style.display = "none";
+        diffRow.style.display = "block";
+        dialogRow.style.display = "none";
+        readerStat.textContent = "仅展示代码补丁 (+1 / -1)";
+      }
     });
+  });
+
+  // Smooth Scroll Reveal
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("in");
+          io.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12 });
+    document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
+  } else {
+    document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
   }
 })();
 </script>
