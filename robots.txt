@@ -10,4 +10,4 @@ Allow: /
 User-agent: Bingbot
 Allow: /
 
-Sitemap: https://www.zgrnf.dpdns.org/sitemap.xml
+Sitemap: https://www.wallpaper26.top/sitemap.xml
