@@ -123,6 +123,19 @@ button { font: inherit; color: inherit; }
   display: block;
 }
 
+#shapesCanvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100lvh;
+  z-index: 1;
+  pointer-events: none;
+  display: block;
+  transition: opacity 0.25s ease;
+}
+
 .page { position: relative; z-index: 2; }
 .wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px; }
 
@@ -581,6 +594,7 @@ footer {
 </head>
 <body>
 <canvas id="fluidCanvas" aria-hidden="true"></canvas>
+<canvas id="shapesCanvas" aria-hidden="true"></canvas>
 
 <div class="page">
   <header>
@@ -1227,6 +1241,325 @@ footer {
       wakeFluid();
     });
   }
+})();
+</script>
+
+<script>
+(function () {
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var canvas = document.getElementById("shapesCanvas");
+  if (!canvas || reduced) return;
+  var ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  var W = 0, H = 0, dpr = 1;
+  var shapes = [];
+  var running = false;
+  var activeUntil = 0;
+
+  var TYPES = ["circle", "ring", "triangle", "bowtie", "star", "cross", "pill", "pentagon"];
+  var LIGHT_NEUTRALS = ["#cbd5e1", "#b6c2d1", "#94a3b8", "#64748b", "#dce3ec", "#18181b", "#27272a"];
+  var LIGHT_ACCENTS  = ["#ef4444", "#22c55e", "#2563eb", "#a855f7", "#c6f135", "#f97316"];
+  var DARK_NEUTRALS  = ["#475569", "#64748b", "#94a3b8", "#cbd5e1", "#334155", "#e2e8f0"];
+  var DARK_ACCENTS   = ["#fb7185", "#34d399", "#60a5fa", "#c084fc", "#bef264", "#fb923c"];
+
+  function isInkMode() {
+    return document.documentElement.getAttribute("data-mode") === "ink";
+  }
+
+  function pickPaletteColor(accentChance) {
+    var dark = isInkMode();
+    if (Math.random() < accentChance) {
+      var acc = dark ? DARK_ACCENTS : LIGHT_ACCENTS;
+      return { color: acc[Math.floor(Math.random() * acc.length)], isAccent: true };
+    }
+    var neu = dark ? DARK_NEUTRALS : LIGHT_NEUTRALS;
+    return { color: neu[Math.floor(Math.random() * neu.length)], isAccent: false };
+  }
+
+  function createShape(i, total) {
+    var isMobile = W < 720;
+    var size = (isMobile ? 9 : 11) + Math.random() * (isMobile ? 12 : 16);
+    var p = pickPaletteColor(0.22);
+    var spread = (i + Math.random()) / total;
+    var x = spread * W;
+    var edgeFactor = Math.abs(spread - 0.5) * 2;
+    var floorOffset = 10 + Math.random() * (isMobile ? 48 : 88) + edgeFactor * (isMobile ? 16 : 36);
+    var restY = H - floorOffset;
+    return {
+      type: TYPES[Math.floor(Math.random() * TYPES.length)],
+      color: p.color,
+      isAccent: p.isAccent,
+      size: size,
+      x: x,
+      y: restY - Math.random() * 24,
+      restY: restY,
+      vx: (Math.random() - 0.5) * 0.4,
+      vy: 0,
+      angle: Math.random() * Math.PI * 2,
+      va: (Math.random() - 0.5) * 0.02,
+      mass: 0.7 + (size / 26) * 0.7,
+      settled: false
+    };
+  }
+
+  function initShapes() {
+    dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var count = W < 720 ? 46 : Math.min(135, Math.max(90, Math.floor(W / 11)));
+    shapes = [];
+    for (var i = 0; i < count; i++) {
+      shapes.push(createShape(i, count));
+    }
+    drawAll();
+    wake(1800);
+  }
+
+  function recolorShapes() {
+    for (var i = 0; i < shapes.length; i++) {
+      var p = pickPaletteColor(shapes[i].isAccent ? 1 : 0);
+      shapes[i].color = p.color;
+    }
+    drawAll();
+  }
+
+  function wake(ms) {
+    var target = performance.now() + (ms || 3600);
+    if (target > activeUntil) activeUntil = target;
+    if (!running) {
+      running = true;
+      requestAnimationFrame(tick);
+    }
+  }
+
+  function applyInkForce(cx, cy, dx, dy, isBurst) {
+    var radius = isBurst ? (W < 720 ? 150 : 220) : (W < 720 ? 120 : 185);
+    var r2 = radius * radius;
+    var speed = Math.min(48, Math.hypot(dx, dy));
+    var hitAny = false;
+
+    for (var i = 0; i < shapes.length; i++) {
+      var s = shapes[i];
+      var rx = s.x - cx;
+      var ry = s.y - cy;
+      var d2 = rx * rx + ry * ry;
+      if (d2 > r2) continue;
+
+      var d = Math.sqrt(d2) || 1;
+      var falloff = 1 - d / radius;
+      var f = (falloff * falloff) / s.mass;
+
+      if (isBurst) {
+        var burstMag = (W < 720 ? 7.5 : 11.5) * f;
+        s.vx += (rx / d) * burstMag + (Math.random() - 0.5) * 2.5;
+        s.vy += (ry / d) * burstMag - (W < 720 ? 5.5 : 8.5) * f;
+        s.va += (Math.random() - 0.5) * 0.28 * f;
+      } else {
+        s.vx += (dx * 0.36 + (rx / d) * speed * 0.14) * f;
+        s.vy += (dy * 0.28 - (2.8 + speed * 0.26)) * f;
+        s.va += ((dx * 0.012) + (rx > 0 ? 0.04 : -0.04)) * f;
+      }
+
+      s.vx = Math.max(-18, Math.min(18, s.vx));
+      s.vy = Math.max(-20, Math.min(14, s.vy));
+      s.settled = false;
+      hitAny = true;
+    }
+    if (hitAny) wake(4200);
+  }
+
+  var lastPx = null, lastPy = null;
+  window.addEventListener("pointermove", function (e) {
+    if (window.scrollY > H * 0.9) return;
+    var x = e.clientX;
+    var y = e.clientY;
+    if (lastPx === null) { lastPx = x; lastPy = y; return; }
+    var dx = x - lastPx;
+    var dy = y - lastPy;
+    if (Math.hypot(dx, dy) > 2) {
+      applyInkForce(x, y, dx, dy, false);
+      lastPx = x;
+      lastPy = y;
+    }
+  }, { passive: true });
+
+  window.addEventListener("pointerdown", function (e) {
+    if (window.scrollY > H * 0.9) return;
+    lastPx = e.clientX;
+    lastPy = e.clientY;
+    applyInkForce(e.clientX, e.clientY, 0, 0, true);
+  }, { passive: true });
+
+  window.addEventListener("pointerleave", function () { lastPx = null; lastPy = null; });
+  window.addEventListener("pointercancel", function () { lastPx = null; lastPy = null; });
+
+  function syncScrollFade() {
+    var ratio = Math.max(0, Math.min(1, 1 - window.scrollY / Math.max(1, H * 0.72)));
+    canvas.style.opacity = ratio.toFixed(3);
+  }
+  window.addEventListener("scroll", syncScrollFade, { passive: true });
+
+  var lastW = window.innerWidth;
+  var rTimer;
+  window.addEventListener("resize", function () {
+    if (Math.abs(window.innerWidth - lastW) <= 2) return;
+    lastW = window.innerWidth;
+    clearTimeout(rTimer);
+    rTimer = setTimeout(initShapes, 180);
+  });
+
+  var mo = new MutationObserver(recolorShapes);
+  mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-mode"] });
+
+  function drawShape(s) {
+    var r = s.size * 0.5;
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.angle);
+    ctx.fillStyle = s.color;
+    ctx.strokeStyle = s.color;
+
+    switch (s.type) {
+      case "circle":
+        ctx.beginPath();
+        ctx.arc(0, 0, r * 0.85, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+      case "ring":
+        ctx.lineWidth = Math.max(2.6, r * 0.36);
+        ctx.beginPath();
+        ctx.arc(0, 0, r * 0.72, 0, Math.PI * 2);
+        ctx.stroke();
+        break;
+      case "triangle":
+        ctx.beginPath();
+        ctx.moveTo(0, -r);
+        ctx.lineTo(r * 0.92, r * 0.8);
+        ctx.lineTo(-r * 0.92, r * 0.8);
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case "bowtie":
+        ctx.beginPath();
+        ctx.moveTo(-r, -r * 0.75);
+        ctx.lineTo(0, 0);
+        ctx.lineTo(-r, r * 0.75);
+        ctx.closePath();
+        ctx.moveTo(r, -r * 0.75);
+        ctx.lineTo(0, 0);
+        ctx.lineTo(r, r * 0.75);
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case "star":
+        ctx.beginPath();
+        for (var k = 0; k < 10; k++) {
+          var rad = k % 2 === 0 ? r : r * 0.44;
+          var a = (k * Math.PI) / 5 - Math.PI / 2;
+          if (k === 0) ctx.moveTo(Math.cos(a) * rad, Math.sin(a) * rad);
+          else ctx.lineTo(Math.cos(a) * rad, Math.sin(a) * rad);
+        }
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case "cross":
+        var w = r * 0.44;
+        ctx.beginPath();
+        if (ctx.roundRect) {
+          ctx.roundRect(-r, -w, r * 2, w * 2, 2);
+          ctx.roundRect(-w, -r, w * 2, r * 2, 2);
+        } else {
+          ctx.rect(-r, -w, r * 2, w * 2);
+          ctx.rect(-w, -r, w * 2, r * 2);
+        }
+        ctx.fill();
+        break;
+      case "pill":
+        var pw = r * 1.15, ph = r * 0.52;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(-pw, -ph, pw * 2, ph * 2, ph);
+        else ctx.rect(-pw, -ph, pw * 2, ph * 2);
+        ctx.fill();
+        break;
+      case "pentagon":
+        ctx.beginPath();
+        for (var m = 0; m < 5; m++) {
+          var ang = (m * Math.PI * 2) / 5 - Math.PI / 2;
+          if (m === 0) ctx.moveTo(Math.cos(ang) * r, Math.sin(ang) * r);
+          else ctx.lineTo(Math.cos(ang) * r, Math.sin(ang) * r);
+        }
+        ctx.closePath();
+        ctx.fill();
+        break;
+    }
+    ctx.restore();
+  }
+
+  function drawAll() {
+    ctx.clearRect(0, 0, W, H);
+    for (var i = 0; i < shapes.length; i++) {
+      drawShape(shapes[i]);
+    }
+  }
+
+  function tick() {
+    var now = performance.now();
+    var anyMoving = false;
+
+    for (var i = 0; i < shapes.length; i++) {
+      var s = shapes[i];
+      if (s.settled) continue;
+
+      s.vy += 0.24 * s.mass;
+      s.vx *= 0.986;
+      s.vy *= 0.992;
+      s.va *= 0.975;
+
+      s.x += s.vx;
+      s.y += s.vy;
+      s.angle += s.va;
+
+      var pad = s.size * 0.5;
+      if (s.x < pad) { s.x = pad; s.vx = Math.abs(s.vx) * 0.5; }
+      else if (s.x > W - pad) { s.x = W - pad; s.vx = -Math.abs(s.vx) * 0.5; }
+      if (s.y < pad) { s.y = pad; s.vy = Math.abs(s.vy) * 0.4; }
+
+      if (s.y >= s.restY) {
+        s.y = s.restY;
+        if (Math.abs(s.vy) > 1.1) {
+          s.vy = -s.vy * 0.34;
+          s.vx *= 0.82;
+          s.va *= 0.78;
+        } else {
+          s.vy = 0;
+          s.vx *= 0.78;
+          s.va *= 0.75;
+          if (Math.abs(s.vx) < 0.06 && Math.abs(s.va) < 0.004) {
+            s.vx = 0;
+            s.va = 0;
+            s.settled = true;
+          }
+        }
+      }
+      if (!s.settled) anyMoving = true;
+    }
+
+    drawAll();
+
+    if (!anyMoving && now > activeUntil) {
+      running = false;
+      return;
+    }
+    requestAnimationFrame(tick);
+  }
+
+  initShapes();
+  syncScrollFade();
 })();
 </script>
 </body>
