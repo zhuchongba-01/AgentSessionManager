@@ -81,9 +81,11 @@ button { font: inherit; color: inherit; }
 /* Fullscreen GPU WebGL Navier-Stokes Fluid Watercolor Canvas */
 #fluidCanvas {
   position: fixed;
-  inset: 0;
+  top: 0;
+  left: 0;
   width: 100vw;
   height: 100vh;
+  height: 100lvh;
   z-index: 0;
   pointer-events: none;
   display: block;
@@ -930,21 +932,29 @@ footer {
     pressure = createDoubleFBO(simW, simH, formatR.internalFormat, formatR.format, halfFloatTexType, gl.NEAREST);
   }
 
+  var lastWindowWidth = window.innerWidth;
   function resizeCanvas() {
     var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    canvas.width = Math.floor(window.innerWidth * dpr);
-    canvas.height = Math.floor(window.innerHeight * dpr);
+    var rect = canvas.getBoundingClientRect();
+    var w = Math.max(window.innerWidth, Math.round(rect.width || 0));
+    var h = Math.max(window.innerHeight, Math.round(rect.height || 0));
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
   }
 
   resizeCanvas();
   initFBOs();
   var resizeTimer;
   window.addEventListener("resize", function () {
+    // Ignore mobile browser URL-bar height-only resize so scrolling NEVER wipes the fluid canvas!
+    var widthChanged = Math.abs(window.innerWidth - lastWindowWidth) > 2;
+    if (!widthChanged) return;
+    lastWindowWidth = window.innerWidth;
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(function () {
       resizeCanvas();
       initFBOs();
-    }, 150);
+    }, 180);
   });
 
   // Continuous colorful marbled oil-ink spectrum (smooth HSL cycling as you drag)
@@ -973,10 +983,12 @@ footer {
   }
 
   function splat(x, y, dx, dy, color, radius) {
-    var r = radius || 0.0054;
+    var aspect = canvas.width / Math.max(1, canvas.height);
+    var portraitBoost = aspect < 1 ? (1.0 / Math.max(0.55, aspect)) * 0.85 : 1.0;
+    var r = (radius || 0.0054) * portraitBoost;
     gl.useProgram(splatShader.program);
     gl.uniform1i(splatShader.uniforms.uTarget, velocity.read.attach(0));
-    gl.uniform1f(splatShader.uniforms.aspectRatio, canvas.width / canvas.height);
+    gl.uniform1f(splatShader.uniforms.aspectRatio, aspect);
     gl.uniform2f(splatShader.uniforms.point, x, y);
     gl.uniform3f(splatShader.uniforms.color, dx, dy, 0);
     gl.uniform1f(splatShader.uniforms.radius, r * 1.28);
@@ -1049,6 +1061,7 @@ footer {
   }, { passive: true });
 
   window.addEventListener("pointerleave", function () { lastX = null; lastY = null; });
+  window.addEventListener("pointercancel", function () { lastX = null; lastY = null; });
   window.addEventListener("blur", function () { lastX = null; lastY = null; });
 
   window.addEventListener("pointerdown", function (e) {
@@ -1056,15 +1069,18 @@ footer {
     var y = 1.0 - e.clientY / window.innerHeight;
     lastX = x;
     lastY = y;
+    var isTouch = e.pointerType === "touch";
+    var burstSpeed = isTouch ? 165 : 340;
+    var burstRadius = isTouch ? 0.0078 : 0.0068;
     for (var i = 0; i < 5; i++) {
       var a = (Math.PI * 2 * i) / 5 + Math.random() * 0.4;
       pendingSplats.push({
         x: x,
         y: y,
-        dx: Math.cos(a) * 380,
-        dy: Math.sin(a) * 380,
+        dx: Math.cos(a) * burstSpeed,
+        dy: Math.sin(a) * burstSpeed,
         color: pickColor(),
-        radius: 0.0068
+        radius: burstRadius
       });
     }
   }, { passive: true });
