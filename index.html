@@ -799,15 +799,19 @@ footer {
         <a class="cta cta-glass" href="./demo/" target="_blank" rel="noopener noreferrer">前往 1:1 在线体验 ↗</a>
       </div>
     </div>
-    <footer class="finale-footer-pill">
-      <span>© 2026 Agent会话管理 · MIT</span>
-      <span class="sep">·</span>
-      <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">历史版本</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
-    </footer>
   </section>
+
+  <footer>
+    <div class="wrap footer-row">
+      <div>© 2026 Agent会话管理 · MIT Open Source</div>
+      <div class="footer-links">
+        <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">历史版本</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
+      </div>
+    </div>
+  </footer>
 </div>
 
 <script>
@@ -1322,7 +1326,7 @@ footer {
   var running = false;
   var activeUntil = 0;
 
-  var TYPES = ["circle", "ring", "triangle", "bowtie", "star", "cross", "pill", "pentagon"];
+  var TYPES = ["circle", "ring", "triangle", "bowtie", "star", "cross", "pill", "pentagon", "gear"];
   var LIGHT_NEUTRALS = ["#cbd5e1", "#b6c2d1", "#94a3b8", "#64748b", "#dce3ec", "#18181b", "#27272a"];
   var LIGHT_ACCENTS  = ["#ef4444", "#22c55e", "#2563eb", "#a855f7", "#c6f135", "#f97316"];
   var DARK_NEUTRALS  = ["#475569", "#64748b", "#94a3b8", "#cbd5e1", "#334155", "#e2e8f0"];
@@ -1352,7 +1356,7 @@ footer {
           var b = shapes[j];
           var dx = b.x - a.x;
           var dy = b.y - a.y;
-          var minDist = a.r + b.r + 1.5;
+          var minDist = a.pr + b.pr;
           var d2 = dx * dx + dy * dy;
           if (d2 >= minDist * minDist) continue;
 
@@ -1391,8 +1395,8 @@ footer {
         if (s.x < s.r) { s.x = s.r; if (s.vx < 0) s.vx *= -0.25; }
         else if (s.x > W - s.r) { s.x = W - s.r; if (s.vx > 0) s.vx *= -0.25; }
         if (s.y < s.r) { s.y = s.r; if (s.vy < 0) s.vy *= -0.2; }
-        if (s.y > H - s.r) {
-          s.y = H - s.r;
+        if (s.y > H - s.pr) {
+          s.y = H - s.pr;
           if (s.vy > 0.6) s.vy *= -0.26;
           else s.vy = 0;
           s.vx *= 0.86;
@@ -1417,16 +1421,21 @@ footer {
     shapes = [];
     for (var i = 0; i < count; i++) {
       var size = (isMobile ? 26 : 36) + Math.random() * (isMobile ? 18 : 28);
+      var type = TYPES[Math.floor(Math.random() * TYPES.length)];
       var r = size * 0.48;
+      // Concave / angled shapes (star, cross, bowtie, triangle, gear, pill) use tighter packing radius so teeth & corners nestle together naturally
+      var nestFactor = (type === "circle" || type === "ring") ? 0.88 : (type === "pentagon" ? 0.82 : 0.72);
+      var pr = r * nestFactor;
       var p = pickColor(0.2);
       var colFrac = (i + 0.5 + (Math.random() - 0.5) * 0.6) / count;
       var row = Math.floor(Math.random() * 4);
       shapes.push({
-        type: TYPES[Math.floor(Math.random() * TYPES.length)],
+        type: type,
         color: p.color,
         isAccent: p.isAccent,
         size: size,
         r: r,
+        pr: pr,
         x: r + colFrac * Math.max(40, W - r * 2),
         y: H - r - row * (size * 0.92) - Math.random() * 20,
         vx: 0,
@@ -1614,6 +1623,23 @@ footer {
         }
         ctx.closePath();
         ctx.fill();
+        break;
+      case "gear":
+        var teeth = 8;
+        ctx.beginPath();
+        for (var g = 0; g < teeth * 2; g++) {
+          var gr = g % 2 === 0 ? r * 0.98 : r * 0.68;
+          var ga = (g * Math.PI) / teeth;
+          if (g === 0) ctx.moveTo(Math.cos(ga) * gr, Math.sin(ga) * gr);
+          else ctx.lineTo(Math.cos(ga) * gr, Math.sin(ga) * gr);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalCompositeOperation = "destination-out";
+        ctx.beginPath();
+        ctx.arc(0, 0, r * 0.34, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalCompositeOperation = "source-over";
         break;
     }
     ctx.restore();
