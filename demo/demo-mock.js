@@ -11,9 +11,24 @@
       document.documentElement.classList.toggle("dark", isDark);
       document.documentElement.classList.toggle("light", !isDark);
     } else if (!window.localStorage.getItem("agent-session-manager-theme")) {
-      window.localStorage.setItem("agent-session-manager-theme", "dark");
-      document.documentElement.classList.add("dark");
+      window.localStorage.setItem("agent-session-manager-theme", "light");
+      document.documentElement.classList.remove("dark");
+      document.documentElement.classList.add("light");
     }
+    window.addEventListener("message", (event) => {
+      if (event.origin !== window.location.origin) return;
+      const payload = event.data;
+      if (!payload || payload.type !== "asm-demo-theme") return;
+      if (payload.theme !== "light" && payload.theme !== "dark") return;
+      try {
+        window.localStorage.setItem("agent-session-manager-theme", payload.theme);
+      } catch {
+        // ignore
+      }
+      const isDark = payload.theme === "dark";
+      document.documentElement.classList.toggle("dark", isDark);
+      document.documentElement.classList.toggle("light", !isDark);
+    });
     if (!window.localStorage.getItem("agent-session-manager.sidebarWidth")) {
       window.localStorage.setItem("agent-session-manager.sidebarWidth", "348");
     }
@@ -395,7 +410,7 @@
           },
           {
             type: "text",
-            text: "### 根因与修复总结\n\n当签发端轮换到新密钥 `kid-2026-11` 时，`src/auth/jwt.ts:48` 在本地缓存未命中时直接抛出了 `401`，未触发回源刷新。现已参照 [RFC 7517 规范](https://datatracker.ietf.org/doc/html/rfc7517) 补充单飞强制刷新逻辑：\n\n| 场景 | 修复前 | 修复后 |\n| --- | --- | --- |\n| 已知 `kid` | 命中内存缓存 | 命中内存缓存 |\n| 轮换新 `kid` | 偶发 401（最长持续 15m） | 单飞强制刷新 JWKS 后立即放行 |\n\n```ts\nlet key = jwksCache.get(header.kid);\nif (!key) {\n  await refreshJwks({ force: true });\n  key = jwksCache.get(header.kid);\n}\n```",
+            text: "### 根因与修复总结\n\n当签发端轮换到新密钥 `kid-2026-11` 时，`src/auth/jwt.ts:48` 在本地缓存未命中时直接抛出了 `401`，未触发回源刷新。现已参照 [RFC 7517 规范](https://datatracker.ietf.org/doc/html/rfc7517) 补充单飞强制刷新逻辑：\n\n| 场景 | 修复前 | 修复后 |\n| --- | --- | --- |\n| 已知 `kid` | 命中内存缓存 | 命中内存缓存 |\n| 轮换新 `kid` | 偶发 401（最长持续 15m） | 单飞强制刷新 JWKS 后立即放行 |\n\n```ts\nconst MIN_FORCE_REFRESH_COOLDOWN_MS = 5_000;\nlet inflightRefresh: Promise<void> | null = null;\nlet lastForceRefreshAt = 0;\n\nexport async function refreshJwks(opts?: { force?: boolean }): Promise<void> {\n  const now = Date.now();\n  if (opts?.force && now - lastForceRefreshAt < MIN_FORCE_REFRESH_COOLDOWN_MS) {\n    if (inflightRefresh) {\n      return inflightRefresh;\n    }\n    return;\n  }\n  if (!inflightRefresh) {\n    if (opts?.force) {\n      lastForceRefreshAt = now;\n    }\n    inflightRefresh = fetchJwksFromOrigin()\n      .then((keys) => {\n        jwksCache.replaceAll(keys);\n      })\n      .finally(() => {\n        inflightRefresh = null;\n      });\n  }\n  return inflightRefresh;\n}\n\nexport async function resolveSigningKey(kid: string) {\n  let key = jwksCache.get(kid);\n  if (!key) {\n    await refreshJwks({ force: true });\n    key = jwksCache.get(kid);\n  }\n  if (!key) throw new UnauthorizedError(`unknown kid: ${kid}`);\n  return key;\n}\n```",
           },
         ],
       },
