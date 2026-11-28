@@ -584,23 +584,29 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
 
 .custom-scrollbar {
   position: fixed;
-  right: 12px;
+  right: 10px;
   top: 50%;
   transform: translateY(-50%);
   z-index: 40;
-  width: 18px;
-  height: min(38vh, 260px);
+  width: 16px;
+  height: min(22vh, 148px);
   display: flex;
   align-items: stretch;
   justify-content: center;
   cursor: pointer;
   user-select: none;
   touch-action: none;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+.custom-scrollbar.visible {
+  opacity: 1;
 }
 
 .custom-scrollbar-track {
   position: relative;
-  width: 4px;
+  width: 3px;
   height: 100%;
   border-radius: 999px;
   background: rgba(24, 24, 27, 0.16);
@@ -614,7 +620,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
 
 .custom-scrollbar:hover .custom-scrollbar-track,
 .custom-scrollbar.dragging .custom-scrollbar-track {
-  width: 5px;
+  width: 4px;
 }
 
 .custom-scrollbar-thumb {
@@ -1298,9 +1304,21 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
   if (!bar || !track || !thumb) return;
 
   var dragging = false;
+  var hovering = false;
   var dragStartY = 0;
   var dragStartScroll = 0;
   var rafId = 0;
+  var hideTimer = 0;
+
+  function revealTemporarily() {
+    bar.classList.add("visible");
+    clearTimeout(hideTimer);
+    if (!dragging && !hovering) {
+      hideTimer = setTimeout(function () {
+        if (!dragging && !hovering) bar.classList.remove("visible");
+      }, 1000);
+    }
+  }
 
   function update() {
     rafId = 0;
@@ -1308,16 +1326,15 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
     var winH = window.innerHeight;
     var maxScroll = Math.max(0, docH - winH);
     if (maxScroll <= 1) {
-      bar.style.opacity = "0";
+      bar.classList.remove("visible");
       bar.style.pointerEvents = "none";
       return;
     }
-    bar.style.opacity = "1";
     bar.style.pointerEvents = "auto";
 
-    var trackH = track.clientHeight || 200;
+    var trackH = track.clientHeight || 140;
     var ratio = winH / docH;
-    var thumbH = Math.max(28, Math.min(trackH * 0.65, Math.round(trackH * ratio)));
+    var thumbH = Math.max(20, Math.min(trackH * 0.58, Math.round(trackH * ratio)));
     var maxThumbY = Math.max(1, trackH - thumbH);
     var progress = Math.max(0, Math.min(1, window.scrollY / maxScroll));
     thumb.style.height = thumbH + "px";
@@ -1328,9 +1345,22 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
     if (!rafId) rafId = requestAnimationFrame(update);
   }
 
-  window.addEventListener("scroll", scheduleUpdate, { passive: true });
+  window.addEventListener("scroll", function () {
+    scheduleUpdate();
+    revealTemporarily();
+  }, { passive: true });
   window.addEventListener("resize", scheduleUpdate, { passive: true });
   window.addEventListener("load", scheduleUpdate);
+
+  bar.addEventListener("pointerenter", function () {
+    hovering = true;
+    clearTimeout(hideTimer);
+    bar.classList.add("visible");
+  });
+  bar.addEventListener("pointerleave", function () {
+    hovering = false;
+    revealTemporarily();
+  });
 
   bar.addEventListener("pointerdown", function (e) {
     e.preventDefault();
@@ -1372,6 +1402,7 @@ html::-webkit-scrollbar { display: none; width: 0; height: 0; }
     if (!dragging) return;
     dragging = false;
     bar.classList.remove("dragging");
+    revealTemporarily();
   }
   window.addEventListener("pointerup", stopDrag);
   window.addEventListener("pointercancel", stopDrag);
