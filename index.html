@@ -3,85 +3,51 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Agent会话管理 v1.8.4 — 本地编码 Agent 会话阅读与治理工作台</title>
-<meta name="description" content="面向 13 种本地编码 Agent 的旗舰级桌面会话阅读、SQLite FTS5 全文检索、内联 Diff 与安全治理工具。Rust + Tauri v2 驱动，100% 本地离线。">
+<title>Agent会话管理 v1.8.4 — 面向 13 种本地编码 Agent 的桌面会话工作台</title>
+<meta name="description" content="面向 13 种本地编码 Agent 的一站式桌面会话浏览、两段式思维链阅读、SQLite FTS5 全文检索、内联 Diff 与安全清理工具。Rust + Tauri v2 驱动，100% 本地离线。">
 <link rel="icon" type="image/png" href="./app-icon.png">
 <script>
 (function () {
   try {
-    var saved = localStorage.getItem("asm-site-theme-v2");
-    var theme = saved === "light" || saved === "dark" ? saved : "dark";
-    document.documentElement.setAttribute("data-theme", theme);
+    var saved = localStorage.getItem("asm-fluid-mode");
+    var mode = saved === "ink" || saved === "paper" ? saved : "paper";
+    document.documentElement.setAttribute("data-mode", mode);
   } catch (e) {
-    document.documentElement.setAttribute("data-theme", "dark");
+    document.documentElement.setAttribute("data-mode", "paper");
   }
 })();
 </script>
 <style>
 :root {
-  --bg: #05060a;
-  --bg-elevated: #0b0d14;
-  --surface: rgba(16, 19, 28, 0.76);
-  --surface-solid: #0f121b;
-  --nav-bg: rgba(5, 6, 10, 0.76);
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --specular: rgba(255, 255, 255, 0.22);
-  --text: #f5f7fb;
-  --text-secondary: #98a2b8;
-  --text-muted: #667085;
-  --heading-grad: linear-gradient(180deg, #ffffff 30%, rgba(226, 232, 240, 0.68) 100%);
-  --heading-sub-grad: linear-gradient(180deg, rgba(203, 213, 225, 0.85) 0%, rgba(148, 163, 184, 0.45) 100%);
-  --accent: #7aa2ff;
-  --accent-glow: rgba(122, 162, 255, 0.18);
-  --emerald: #34d399;
-  --emerald-soft: rgba(52, 211, 153, 0.12);
-  --rose: #fb7185;
-  --rose-soft: rgba(251, 113, 133, 0.12);
-  --btn-primary-bg: linear-gradient(180deg, #ffffff 0%, #e4e9f2 100%);
-  --btn-primary-text: #07090f;
-  --btn-primary-shadow: 0 1px 0 rgba(255,255,255,0.9) inset, 0 12px 30px -10px rgba(255,255,255,0.35);
-  --btn-sec-bg: rgba(255, 255, 255, 0.055);
-  --btn-sec-hover: rgba(255, 255, 255, 0.11);
-  --stage-bezel: linear-gradient(180deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0.03) 100%);
-  --stage-shadow: 0 40px 120px -24px rgba(0, 0, 0, 0.88), 0 0 0 1px rgba(255, 255, 255, 0.09);
-  --beam-top: radial-gradient(ellipse 68% 36% at 50% -8%, rgba(122, 162, 255, 0.18), transparent 72%);
-  --beam-stage: radial-gradient(ellipse 60% 45% at 50% 45%, rgba(122, 162, 255, 0.13), transparent 70%);
-  --mini-bg: rgba(7, 9, 15, 0.82);
-  --mini-row: rgba(255, 255, 255, 0.035);
+  /* 温润素绢灰白：比纯白更柔和护眼，不刺眼 */
+  --bg: #eae7e0;
+  --surface: rgba(246, 244, 239, 0.72);
+  --surface-strong: rgba(250, 248, 244, 0.88);
+  --border: rgba(24, 24, 27, 0.085);
+  --border-strong: rgba(24, 24, 27, 0.15);
+  --text: #1c1d21;
+  --text-2: #50535d;
+  --text-3: #7d808c;
+  --btn-bg: #1c1d21;
+  --btn-text: #f3f1ec;
+  --accent: #315a8a;
+  --shadow: 0 28px 84px -26px rgba(20, 22, 28, 0.16), 0 0 0 1px rgba(24, 24, 27, 0.07);
 }
 
-[data-theme="light"] {
-  --bg: #f6f7fa;
-  --bg-elevated: #ffffff;
-  --surface: rgba(255, 255, 255, 0.88);
-  --surface-solid: #ffffff;
-  --nav-bg: rgba(246, 247, 250, 0.82);
-  --border: rgba(15, 23, 42, 0.08);
-  --border-strong: rgba(15, 23, 42, 0.15);
-  --specular: rgba(255, 255, 255, 0.95);
-  --text: #0b0f19;
-  --text-secondary: #475569;
-  --text-muted: #64748b;
-  --heading-grad: linear-gradient(180deg, #0b0f19 35%, #334155 100%);
-  --heading-sub-grad: linear-gradient(180deg, #475569 0%, #94a3b8 100%);
-  --accent: #2563eb;
-  --accent-glow: rgba(37, 99, 235, 0.12);
-  --emerald: #059669;
-  --emerald-soft: rgba(5, 150, 105, 0.1);
-  --rose: #e11d48;
-  --rose-soft: rgba(225, 29, 72, 0.08);
-  --btn-primary-bg: linear-gradient(180deg, #1e293b 0%, #0b0f19 100%);
-  --btn-primary-text: #ffffff;
-  --btn-primary-shadow: 0 1px 0 rgba(255,255,255,0.22) inset, 0 14px 28px -10px rgba(15,23,42,0.45);
-  --btn-sec-bg: rgba(255, 255, 255, 0.9);
-  --btn-sec-hover: #ffffff;
-  --stage-bezel: linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(226,232,240,0.65) 100%);
-  --stage-shadow: 0 38px 96px -28px rgba(15, 23, 42, 0.2), 0 0 0 1px rgba(15, 23, 42, 0.08);
-  --beam-top: radial-gradient(ellipse 68% 36% at 50% -8%, rgba(59, 130, 246, 0.13), transparent 72%);
-  --beam-stage: radial-gradient(ellipse 60% 45% at 50% 45%, rgba(59, 130, 246, 0.09), transparent 70%);
-  --mini-bg: rgba(248, 250, 252, 0.96);
-  --mini-row: rgba(15, 23, 42, 0.035);
+[data-mode="ink"] {
+  /* 低饱和克制玄墨夜 */
+  --bg: #090b10;
+  --surface: rgba(15, 18, 25, 0.62);
+  --surface-strong: rgba(20, 24, 33, 0.82);
+  --border: rgba(255, 255, 255, 0.085);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #e6e7eb;
+  --text-2: #969ba6;
+  --text-3: #686d78;
+  --btn-bg: #e6e7eb;
+  --btn-text: #090b10;
+  --accent: #7ea8e6;
+  --shadow: 0 36px 104px -24px rgba(0, 0, 0, 0.78), 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 * {
@@ -102,64 +68,42 @@ html {
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  line-height: 1.6;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  line-height: 1.65;
   overflow-x: clip;
   padding-bottom: env(safe-area-inset-bottom, 0px);
-  transition: background-color 0.3s ease, color 0.3s ease;
+  transition: background-color 0.45s ease, color 0.45s ease;
 }
 
 a { color: inherit; text-decoration: none; }
 button { font: inherit; color: inherit; }
 
-/* Atmospheric Studio Lighting */
-.studio-light {
+/* Fullscreen GPU WebGL Navier-Stokes Fluid Watercolor Canvas */
+#fluidCanvas {
   position: fixed;
   inset: 0;
+  width: 100vw;
+  height: 100vh;
   z-index: 0;
   pointer-events: none;
-  background: var(--beam-top);
+  display: block;
 }
 
-.studio-grid {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(to right, var(--border) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--border) 1px, transparent 1px);
-  background-size: 72px 72px;
-  opacity: 0.45;
-  mask-image: radial-gradient(ellipse 75% 42% at 50% 0%, #000 0%, transparent 78%);
-  -webkit-mask-image: radial-gradient(ellipse 75% 42% at 50% 0%, #000 0%, transparent 78%);
-}
+.page { position: relative; z-index: 2; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px; }
 
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  border: 2px solid transparent;
-  border-radius: 999px;
-  background-clip: content-box;
-  background-color: rgba(148, 163, 184, 0.28);
-}
-::-webkit-scrollbar-thumb:hover { background-color: rgba(148, 163, 184, 0.5); }
-
-.wrap { max-width: 1140px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
-.stage-wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
-
-/* Floating Precision Navbar */
-.site-header {
+/* Sticky Translucent Header */
+header {
   position: sticky;
   top: 0;
-  z-index: 60;
-  background: var(--nav-bg);
-  backdrop-filter: blur(22px) saturate(180%);
-  -webkit-backdrop-filter: blur(22px) saturate(180%);
+  z-index: 30;
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
   border-bottom: 1px solid var(--border);
 }
 
-.nav-bar {
+.nav {
   height: 60px;
   display: flex;
   align-items: center;
@@ -171,9 +115,9 @@ button { font: inherit; color: inherit; }
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  font-weight: 620;
   font-size: 15px;
-  font-weight: 650;
-  letter-spacing: -0.02em;
+  letter-spacing: 0.015em;
   min-width: 0;
 }
 
@@ -182,45 +126,32 @@ button { font: inherit; color: inherit; }
   height: 28px;
   border-radius: 8px;
   flex: none;
-  box-shadow: 0 0 0 1px var(--border-strong), 0 4px 12px rgba(0,0,0,0.22);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
 }
 
-.brand-name {
+.brand-text {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.nav-ver {
-  font-size: 11px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  padding: 2px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--btn-sec-bg);
-  color: var(--text-secondary);
-  flex: none;
-}
-
 .nav-links {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
 }
 
 .nav-links a {
-  padding: 6px 13px;
+  padding: 6px 12px;
   border-radius: 999px;
   font-size: 13.5px;
-  font-weight: 500;
-  color: var(--text-secondary);
+  color: var(--text-2);
   transition: color 0.18s ease, background-color 0.18s ease;
 }
 
 .nav-links a:hover {
   color: var(--text);
-  background: var(--btn-sec-bg);
+  background: var(--surface);
 }
 
 .nav-right {
@@ -230,860 +161,345 @@ button { font: inherit; color: inherit; }
   flex: none;
 }
 
-.icon-btn {
-  width: 34px;
-  height: 34px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--btn-sec-bg);
-  color: var(--text-secondary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: color 0.18s ease, border-color 0.18s ease, background-color 0.18s ease;
-}
-
-.icon-btn:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: var(--btn-sec-hover);
-}
-
-.nav-demo {
+.pill-btn {
   height: 34px;
   padding: 0 13px;
   border-radius: 999px;
   border: 1px solid var(--border-strong);
-  background: var(--btn-sec-bg);
+  background: var(--surface);
+  backdrop-filter: blur(12px);
   color: var(--text);
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 520;
+  cursor: pointer;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  transition: background-color 0.18s ease, border-color 0.18s ease;
+  white-space: nowrap;
+  transition: background-color 0.2s ease, transform 0.2s ease, border-color 0.2s ease;
 }
 
-.nav-demo:hover {
-  background: var(--btn-sec-hover);
-  border-color: var(--text-muted);
+.pill-btn:hover { background: var(--surface-strong); transform: translateY(-1px); }
+
+.pill-btn.solid {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  border-color: transparent;
 }
 
-.nav-dl {
-  height: 34px;
-  padding: 0 15px;
-  border-radius: 999px;
-  background: var(--btn-primary-bg);
-  color: var(--btn-primary-text);
-  box-shadow: var(--btn-primary-shadow);
-  font-size: 13px;
-  font-weight: 650;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  transition: transform 0.18s ease, opacity 0.18s ease;
-}
-
-.nav-dl:hover { transform: translateY(-1px); opacity: 0.94; }
-
-/* Sculpted Hero */
+/* Poetic Hero */
 .hero {
-  padding: 80px 0 46px;
-  text-align: center;
-}
-
-.emblem-wrap {
-  display: inline-flex;
+  min-height: 76vh;
+  display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 7px;
-  border-radius: 24px;
-  background: var(--stage-bezel);
-  box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-strong), 0 0 40px var(--accent-glow);
-  margin-bottom: 26px;
+  text-align: center;
+  padding: 88px 0 56px;
 }
 
-.emblem-wrap img {
-  width: 68px;
-  height: 68px;
-  border-radius: 18px;
-  display: block;
-}
-
-.hero-pill {
+.seal-tag {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 14px 5px 10px;
+  padding: 6px 16px;
   border-radius: 999px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   background: var(--surface);
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(14px);
   font-size: 12.5px;
-  font-weight: 550;
-  color: var(--text-secondary);
-  margin-bottom: 22px;
-  max-width: 100%;
-  box-shadow: 0 1px 0 var(--specular) inset;
-  transition: border-color 0.2s ease, transform 0.2s ease;
-}
-
-.hero-pill:hover {
-  border-color: var(--accent);
-  transform: translateY(-1px);
-}
-
-.pill-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--emerald);
-  box-shadow: 0 0 10px var(--emerald);
+  letter-spacing: 0.04em;
+  color: var(--text-2);
+  margin-bottom: 28px;
 }
 
 .hero h1 {
-  font-size: clamp(32px, 5.8vw, 66px);
-  font-weight: 760;
-  line-height: 1.08;
-  letter-spacing: -0.04em;
-  max-width: 900px;
-  margin: 0 auto 18px;
-  background: var(--heading-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  font-family: "Songti SC", "Noto Serif SC", "STSong", "PingFang SC", Georgia, serif;
+  font-size: clamp(34px, 6vw, 68px);
+  font-weight: 600;
+  line-height: 1.16;
+  letter-spacing: 0.02em;
+  margin-bottom: 20px;
 }
 
-.hero h1 span {
-  background: var(--heading-sub-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+.hero h1 em {
+  font-style: normal;
+  opacity: 0.56;
+  font-weight: 400;
 }
 
-.hero-sub {
-  max-width: 620px;
-  margin: 0 auto 32px;
-  font-size: clamp(15px, 2vw, 17px);
-  line-height: 1.72;
-  color: var(--text-secondary);
-  font-weight: 420;
+.hero-desc {
+  max-width: 570px;
+  font-size: clamp(15px, 2vw, 16.5px);
+  line-height: 1.85;
+  color: var(--text-2);
+  margin-bottom: 34px;
 }
 
-.hero-cta {
+.cta-group {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 14px;
   flex-wrap: wrap;
 }
 
-.btn {
-  height: 46px;
-  padding: 0 24px;
+.cta {
+  height: 48px;
+  padding: 0 28px;
   border-radius: 999px;
-  font-size: 14.5px;
-  font-weight: 650;
+  font-size: 15px;
+  font-weight: 560;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  cursor: pointer;
-  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
+  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.24s ease, background-color 0.2s ease;
 }
 
-.btn:hover { transform: translateY(-1.5px); }
-.btn:active { transform: translateY(0); }
+.cta:hover { transform: translateY(-2px); }
 
-.btn-primary {
-  background: var(--btn-primary-bg);
-  color: var(--btn-primary-text);
-  box-shadow: var(--btn-primary-shadow);
+.cta-dark {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  box-shadow: 0 14px 34px -14px rgba(0, 0, 0, 0.32);
 }
 
-.btn-secondary {
-  background: var(--btn-sec-bg);
+.cta-glass {
+  background: var(--surface-strong);
   color: var(--text);
   border: 1px solid var(--border-strong);
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(18px);
 }
 
-.btn-secondary:hover {
-  background: var(--btn-sec-hover);
-  border-color: var(--text-muted);
-}
-
-.hero-footnote {
-  margin-top: 22px;
+.hero-meta {
+  margin-top: 26px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 10px 14px;
   flex-wrap: wrap;
   font-size: 12.5px;
-  color: var(--text-muted);
+  color: var(--text-3);
 }
 
-/* Cinema Product Showcase (Retina Static Preview + Direct Demo Jump) */
-.stage-section {
-  padding: 16px 0 92px;
-  position: relative;
+/* Showcase Frame */
+.showcase {
+  padding: 6px 0 84px;
 }
 
-.stage-glow {
-  position: absolute;
-  inset: -40px 0 0;
-  background: var(--beam-stage);
-  pointer-events: none;
-  z-index: 0;
-}
-
-.chassis-outer {
-  position: relative;
-  z-index: 1;
-  padding: 7px;
+.frame {
   border-radius: 22px;
-  background: var(--stage-bezel);
-  box-shadow: var(--stage-shadow);
-}
-
-.chassis-outer::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 12%;
-  right: 12%;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--specular), transparent);
-  pointer-events: none;
-}
-
-.chassis-inner {
-  border-radius: 16px;
-  overflow: hidden;
-  background: var(--bg-elevated);
+  padding: 10px;
+  background: var(--surface);
   border: 1px solid var(--border);
+  backdrop-filter: blur(22px);
+  box-shadow: var(--shadow);
 }
 
-.win-bar {
-  height: 46px;
-  padding: 0 14px;
+.frame-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  background: var(--surface-solid);
-  border-bottom: 1px solid var(--border);
+  padding: 2px 6px 10px;
 }
 
-.win-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.win-dots {
-  display: flex;
-  gap: 7px;
-  flex: none;
-}
-
-.win-dots i {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--border-strong);
-  display: block;
-}
-
-.win-title {
+.frame-title {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  white-space: nowrap;
+  font-weight: 550;
+  color: var(--text-2);
 }
 
-.win-title img { width: 16px; height: 16px; border-radius: 4px; }
+.frame-title img { width: 16px; height: 16px; border-radius: 4px; }
 
-.seg-control {
-  display: inline-flex;
-  padding: 3px;
-  border-radius: 999px;
-  background: var(--btn-sec-bg);
-  border: 1px solid var(--border);
-  gap: 2px;
-}
-
-.seg-btn {
-  border: 0;
-  background: transparent;
-  padding: 4px 12px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  cursor: pointer;
-  white-space: nowrap;
-  transition: all 0.18s ease;
-}
-
-.seg-btn.active {
-  background: var(--surface-solid);
-  color: var(--text);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24), 0 0 0 1px var(--border);
-}
-
-.win-demo-btn {
-  height: 30px;
-  padding: 0 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border-strong);
-  background: var(--btn-sec-bg);
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  white-space: nowrap;
-  transition: all 0.16s ease;
-}
-
-.win-demo-btn:hover {
-  border-color: var(--accent);
-  background: var(--btn-sec-hover);
-}
-
-.shot-frame {
-  position: relative;
-  background: var(--bg-elevated);
-}
-
-.shot-frame img {
-  width: 100%;
-  height: auto;
-  display: block;
-}
-
-.stage-note {
-  margin-top: 16px;
+.frame-actions {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  padding: 0 6px;
-  font-size: 12.5px;
-  color: var(--text-muted);
-}
-
-/* Metrics Ribbon */
-.metrics-band {
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  backdrop-filter: blur(16px);
-}
-
-.metrics-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-}
-
-.metric-cell {
-  padding: 32px 16px;
-  text-align: center;
-  border-right: 1px solid var(--border);
-}
-
-.metric-cell:last-child { border-right: none; }
-
-.metric-num {
-  font-size: clamp(24px, 3vw, 32px);
-  font-weight: 760;
-  letter-spacing: -0.035em;
-  font-variant-numeric: tabular-nums;
-  background: var(--heading-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.metric-label {
-  margin-top: 4px;
-  font-size: 12.5px;
-  color: var(--text-secondary);
-}
-
-/* Section Layout */
-.section {
-  padding: 92px 0;
-  position: relative;
-  z-index: 1;
-}
-
-.section-header {
-  max-width: 660px;
-  margin-bottom: 44px;
-}
-
-.eyebrow {
-  display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-bottom: 10px;
 }
 
-.section-header h2 {
-  font-size: clamp(24px, 3.6vw, 42px);
-  font-weight: 750;
-  line-height: 1.15;
-  letter-spacing: -0.035em;
-  margin-bottom: 12px;
-  background: var(--heading-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.section-header p {
-  font-size: clamp(14.5px, 1.8vw, 16px);
-  line-height: 1.7;
-  color: var(--text-secondary);
-}
-
-/* Flagship Interactive Bento Grid */
-.bento {
-  display: grid;
-  grid-template-columns: repeat(12, 1fr);
-  gap: 18px;
-}
-
-.card {
-  position: relative;
-  grid-column: span 4;
-  border-radius: 20px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  padding: 26px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  gap: 20px;
-  overflow: hidden;
-  min-width: 0;
-  backdrop-filter: blur(16px);
-  transition: border-color 0.25s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.card::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 16px;
-  right: 16px;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--specular), transparent);
-  opacity: 0.55;
-  pointer-events: none;
-}
-
-.card:hover {
-  border-color: var(--border-strong);
-  transform: translateY(-2px);
-}
-
-.card.span-7 { grid-column: span 7; }
-.card.span-5 { grid-column: span 5; }
-
-.card-kicker {
-  font-size: 11.5px;
-  font-weight: 650;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-bottom: 8px;
-}
-
-.card h3 {
-  font-size: 18.5px;
-  font-weight: 700;
-  letter-spacing: -0.025em;
-  margin-bottom: 8px;
-  color: var(--text);
-}
-
-.card p {
-  font-size: 14px;
-  line-height: 1.65;
-  color: var(--text-secondary);
-}
-
-/* Sculpted Mini UI Previews */
-.mini-ui {
-  border-radius: 13px;
-  background: var(--mini-bg);
-  border: 1px solid var(--border);
-  padding: 14px;
-  font-size: 12px;
-  min-width: 0;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
-}
-
-.mini-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.mini-tabs {
+.seg {
   display: inline-flex;
   padding: 2px;
-  border-radius: 8px;
-  background: var(--mini-row);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
   border: 1px solid var(--border);
 }
 
-.mini-tab {
+.seg button {
   border: 0;
   background: transparent;
-  padding: 4px 10px;
-  border-radius: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
   font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text-secondary);
+  font-weight: 550;
+  color: var(--text-2);
   cursor: pointer;
   transition: all 0.16s ease;
 }
 
-.mini-tab.active {
-  background: var(--surface-solid);
+.seg button.active {
+  background: var(--surface-strong);
   color: var(--text);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.25), 0 0 0 1px var(--border);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
-.mini-badge {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--emerald-soft);
-  color: var(--emerald);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+.frame-img {
+  width: 100%;
+  border-radius: 14px;
+  display: block;
 }
 
-.mini-thought {
-  padding: 9px 11px;
-  border-radius: 9px;
-  background: var(--mini-row);
-  border: 1px solid var(--border);
-  color: var(--text-secondary);
-  margin-bottom: 8px;
+.frame-note {
+  margin-top: 14px;
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.mini-diff {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11.5px;
-  line-height: 1.65;
-  border-radius: 9px;
-  overflow-x: auto;
-  border: 1px solid var(--border);
-}
-
-.diff-del, .diff-add { white-space: nowrap; padding: 3px 10px; }
-.diff-del { background: var(--rose-soft); color: var(--rose); }
-.diff-add { background: var(--emerald-soft); color: var(--emerald); }
-
-.mini-search-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 11px;
-  border-radius: 9px;
-  background: var(--mini-row);
-  border: 1px solid var(--border);
-  margin-bottom: 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.mini-hit {
-  padding: 9px 11px;
-  border-radius: 9px;
-  background: var(--mini-row);
-  border: 1px solid var(--border);
-  margin-bottom: 7px;
-}
-
-.mini-hit:last-child { margin-bottom: 0; }
-
-.mini-hit-title {
-  font-size: 11.5px;
-  font-weight: 650;
-  color: var(--text);
-  margin-bottom: 3px;
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.mini-hit-body {
-  font-size: 11.5px;
-  color: var(--text-secondary);
-}
-
-.hl {
-  background: var(--accent-glow);
-  color: var(--accent);
-  padding: 0 4px;
-  border-radius: 4px;
-  font-weight: 650;
-}
-
-.mini-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  line-height: 1.65;
-  color: var(--text-secondary);
-  overflow-x: auto;
-}
-
-.mini-code > div { white-space: nowrap; }
-
-.mini-code-fade {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.chip-row {
-  display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  padding: 0 6px;
+  font-size: 12.5px;
+  color: var(--text-3);
 }
 
-.path-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 8px;
-  background: var(--mini-row);
-  border: 1px solid var(--border);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11.5px;
-  color: var(--text);
-}
-
-.shield-split {
+/* Metrics */
+.metrics {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 84px;
 }
 
-.shield-box {
-  padding: 10px 11px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background: var(--mini-row);
-}
-
-.shield-box strong {
-  display: block;
-  font-size: 11.5px;
-  margin-bottom: 2px;
-}
-
-.shield-box span {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-/* 13 Agents Infinite Dual-Track Marquee */
-.marquee-section {
-  padding: 80px 0;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  overflow: hidden;
-}
-
-.marquee-shell {
-  margin-top: 32px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
-}
-
-.marquee-track {
-  display: flex;
-  gap: 12px;
-  width: max-content;
-  animation: scroll-left 34s linear infinite;
-}
-
-.marquee-track.reverse {
-  animation: scroll-right 38s linear infinite;
-}
-
-.marquee-shell:hover .marquee-track {
-  animation-play-state: paused;
-}
-
-@keyframes scroll-left {
-  from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
-}
-
-@keyframes scroll-right {
-  from { transform: translateX(-50%); }
-  to { transform: translateX(0); }
-}
-
-.agent-chip {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 18px;
-  border-radius: 14px;
+.metric {
+  padding: 24px 16px;
+  border-radius: 18px;
   background: var(--surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(10px);
-  transition: border-color 0.2s ease, transform 0.2s ease;
+  backdrop-filter: blur(18px);
+  text-align: center;
 }
 
-.agent-chip:hover {
-  border-color: var(--border-strong);
-  transform: translateY(-2px);
+.metric-v {
+  font-family: Georgia, "Songti SC", serif;
+  font-size: clamp(24px, 3vw, 32px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
-.agent-chip strong {
-  font-size: 14px;
-  font-weight: 650;
-  color: var(--text);
+.metric-l {
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--text-2);
 }
 
-.agent-chip span {
-  font-size: 11.5px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--text-muted);
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: var(--mini-row);
-  border: 1px solid var(--border);
+/* Section Heading */
+.sec {
+  padding: 16px 0 84px;
 }
 
-/* Security Architecture Band */
-.sec-grid {
+.sec-head {
+  margin-bottom: 32px;
+  max-width: 600px;
+}
+
+.sec-kicker {
+  font-family: Georgia, serif;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--text-3);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+.sec-head h2 {
+  font-family: "Songti SC", "Noto Serif SC", "STSong", "PingFang SC", Georgia, serif;
+  font-size: clamp(24px, 3.6vw, 38px);
+  font-weight: 600;
+  line-height: 1.2;
+  margin-bottom: 10px;
+}
+
+.sec-head p {
+  font-size: 15px;
+  color: var(--text-2);
+}
+
+/* Three Chapters */
+.chapters {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 18px;
 }
 
-.sec-item {
-  padding: 26px;
-  border-radius: 18px;
+.chap {
+  padding: 30px 26px;
+  border-radius: 20px;
   background: var(--surface);
   border: 1px solid var(--border);
-  position: relative;
+  backdrop-filter: blur(20px);
+  transition: transform 0.26s ease, background-color 0.26s ease;
 }
 
-.sec-num {
-  font-size: 12px;
-  font-weight: 700;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--accent);
+.chap:hover { transform: translateY(-3px); background: var(--surface-strong); }
+.chap-num { font-family: Georgia, serif; font-size: 12px; color: var(--text-3); margin-bottom: 12px; letter-spacing: 0.1em; }
+.chap h3 { font-size: 17.5px; font-weight: 620; margin-bottom: 9px; }
+.chap p { font-size: 14px; color: var(--text-2); line-height: 1.78; }
+
+/* 13 Agents Grid */
+.agents-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(195px, 1fr));
+  gap: 12px;
+}
+
+.agent-card {
+  padding: 15px 17px;
+  border-radius: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(16px);
+  transition: background-color 0.2s ease, transform 0.2s ease;
+}
+
+.agent-card:hover { background: var(--surface-strong); transform: translateY(-2px); }
+.agent-card strong { display: block; font-size: 14.5px; font-weight: 600; margin-bottom: 3px; }
+.agent-card span { font-size: 11.5px; color: var(--text-3); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* Closing CTA */
+.closing-box {
+  padding: 56px 28px;
+  border-radius: 26px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(22px);
+  text-align: center;
+  box-shadow: var(--shadow);
+  margin-bottom: 72px;
+}
+
+.closing-box h2 {
+  font-family: "Songti SC", "Noto Serif SC", "STSong", "PingFang SC", Georgia, serif;
+  font-size: clamp(24px, 3.8vw, 40px);
+  font-weight: 600;
   margin-bottom: 12px;
 }
 
-.sec-item h3 {
-  font-size: 17px;
-  font-weight: 680;
-  margin-bottom: 8px;
-}
-
-.sec-item p {
-  font-size: 14px;
-  line-height: 1.68;
-  color: var(--text-secondary);
-}
-
-/* Monumental Final CTA */
-.final-cta {
-  padding: 88px 0 76px;
-  text-align: center;
-  position: relative;
-}
-
-.cta-card {
-  position: relative;
-  border-radius: 28px;
-  padding: 64px 32px;
-  background: var(--surface);
-  border: 1px solid var(--border-strong);
-  overflow: hidden;
-  box-shadow: var(--stage-shadow);
-}
-
-.cta-card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: var(--beam-top);
-  pointer-events: none;
-}
-
-.cta-card > * { position: relative; z-index: 1; }
-
-.cta-card h2 {
-  font-size: clamp(26px, 4vw, 44px);
-  font-weight: 760;
-  letter-spacing: -0.035em;
-  margin: 16px 0 12px;
-  background: var(--heading-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.cta-card p {
-  max-width: 520px;
+.closing-box p {
+  max-width: 500px;
   margin: 0 auto 28px;
   font-size: 15px;
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
-/* Footer */
-.site-footer {
+footer {
   border-top: 1px solid var(--border);
   padding: 28px 0 42px;
-  font-size: 13px;
-  color: var(--text-muted);
+  font-size: 12.5px;
+  color: var(--text-3);
 }
 
 .footer-row {
@@ -1091,7 +507,7 @@ button { font: inherit; color: inherit; }
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 14px;
+  gap: 12px;
 }
 
 .footer-links {
@@ -1102,561 +518,610 @@ button { font: inherit; color: inherit; }
 
 .footer-links a:hover { color: var(--text); }
 
-/* Scroll Reveal */
-.reveal {
-  opacity: 0;
-  transform: translateY(18px);
-  transition: opacity 0.65s cubic-bezier(0.16, 1, 0.3, 1), transform 0.65s cubic-bezier(0.16, 1, 0.3, 1);
+/* Tablet */
+@media (max-width: 860px) {
+  .chapters { grid-template-columns: 1fr; }
+  .metrics { grid-template-columns: repeat(2, 1fr); }
 }
 
-.reveal.in {
-  opacity: 1;
-  transform: translateY(0);
-}
+/* Mobile Optimization */
+@media (max-width: 640px) {
+  .wrap { padding: 0 16px; }
+  .nav { height: 54px; }
+  .nav-links, .nav-demo-top { display: none; }
+  .pill-btn { height: 32px; padding: 0 12px; font-size: 12.5px; }
+  .hero { min-height: auto; padding: 48px 0 34px; }
+  .seal-tag { font-size: 11.5px; padding: 5px 12px; margin-bottom: 20px; }
+  .hero-desc { margin-bottom: 24px; }
+  .cta-group { flex-direction: column; width: 100%; max-width: 340px; gap: 10px; }
+  .cta { width: 100%; height: 48px; }
+  .hero-meta { margin-top: 18px; font-size: 12px; }
 
-/* Theme icons */
-.icon-sun { display: block; }
-.icon-moon { display: none; }
-[data-theme="light"] .icon-sun { display: none; }
-[data-theme="light"] .icon-moon { display: block; }
+  .showcase { padding: 4px 0 52px; }
+  .frame { padding: 7px; border-radius: 16px; }
+  .frame-bar { padding: 2px 2px 8px; }
+  .frame-title span { display: none; }
+  .frame-img { border-radius: 10px; }
 
-/* Tablet Breakpoint */
-@media (max-width: 980px) {
-  .card, .card.span-7, .card.span-5 { grid-column: span 12; }
-  .sec-grid { grid-template-columns: 1fr; }
-  .metrics-grid { grid-template-columns: repeat(2, 1fr); }
-  .metric-cell:nth-child(2) { border-right: none; }
-  .metric-cell:nth-child(1), .metric-cell:nth-child(2) { border-bottom: 1px solid var(--border); }
-}
+  .metrics { gap: 10px; margin-bottom: 52px; }
+  .metric { padding: 18px 12px; border-radius: 14px; }
+  .sec { padding: 8px 0 54px; }
+  .sec-head { margin-bottom: 22px; }
+  .chap { padding: 22px 20px; border-radius: 16px; }
+  .agents-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .agent-card { padding: 13px 14px; border-radius: 12px; }
 
-/* Mobile Breakpoint */
-@media (max-width: 720px) {
-  .wrap, .stage-wrap { padding: 0 16px; }
-  .nav-bar { height: 56px; }
-  .nav-links, .nav-ver, .nav-demo { display: none; }
-  .nav-dl { height: 34px; padding: 0 14px; font-size: 12.5px; }
-  .hero { padding: 44px 0 28px; }
-  .emblem-wrap { padding: 6px; border-radius: 20px; margin-bottom: 18px; }
-  .emblem-wrap img { width: 56px; height: 56px; border-radius: 15px; }
-  .hero-pill { font-size: 11.5px; padding: 5px 12px; margin-bottom: 18px; }
-  .hero-sub { margin-bottom: 24px; }
-  .hero-cta { flex-direction: column; width: 100%; max-width: 360px; margin: 0 auto; gap: 10px; }
-  .hero-cta .btn { width: 100%; height: 48px; font-size: 15px; }
-  .hero-footnote { gap: 8px 12px; font-size: 12px; margin-top: 18px; }
-
-  .stage-section { padding: 10px 0 56px; }
-  .chassis-outer { padding: 5px; border-radius: 16px; }
-  .chassis-inner { border-radius: 12px; }
-  .win-bar { height: auto; padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
-  .win-dots { display: none; }
-  .win-title { font-size: 12px; }
-  .seg-btn { padding: 4px 10px; font-size: 11.5px; }
-  .win-demo-btn { height: 28px; padding: 0 10px; font-size: 11.5px; }
-  .stage-note { font-size: 12px; margin-top: 12px; }
-
-  .metric-cell { padding: 22px 12px; }
-  .section { padding: 56px 0; }
-  .section-header { margin-bottom: 28px; }
-  .bento { gap: 14px; }
-  .card { padding: 20px; border-radius: 16px; gap: 16px; }
-  .card h3 { font-size: 17px; }
-  .mini-ui { padding: 12px; }
-
-  .marquee-section { padding: 52px 0; }
-  .marquee-shell { margin-top: 22px; gap: 10px; }
-  .agent-chip { padding: 10px 14px; border-radius: 12px; gap: 8px; }
-  .agent-chip strong { font-size: 13px; }
-
-  .sec-grid { gap: 14px; }
-  .sec-item { padding: 20px; border-radius: 16px; }
-
-  .final-cta { padding: 56px 0 48px; }
-  .cta-card { padding: 40px 20px; border-radius: 22px; }
-
-  .site-footer { padding: 24px 0 36px; text-align: center; }
-  .footer-row { flex-direction: column; justify-content: center; }
+  .closing-box { padding: 38px 18px; border-radius: 20px; margin-bottom: 48px; }
+  .footer-row { flex-direction: column; text-align: center; }
   .footer-links { justify-content: center; gap: 14px; }
-}
-
-@media (max-width: 420px) {
-  .shield-split { grid-template-columns: 1fr; }
-  .win-title span { display: none; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .marquee-track, .marquee-track.reverse { animation: none; }
-  .reveal { opacity: 1; transform: none; transition: none; }
 }
 </style>
 </head>
 <body>
-<div class="studio-light" aria-hidden="true"></div>
-<div class="studio-grid" aria-hidden="true"></div>
+<canvas id="fluidCanvas" aria-hidden="true"></canvas>
 
-<header class="site-header">
-  <div class="wrap nav-bar">
-    <a class="brand" href="#">
-      <img src="./app-icon.png" alt="Agent会话管理">
-      <span class="brand-name">Agent会话管理</span>
-      <span class="nav-ver">v1.8.4</span>
-    </a>
+<div class="page">
+  <header>
+    <div class="wrap nav">
+      <a class="brand" href="#">
+        <img src="./app-icon.png" alt="Agent会话管理">
+        <span class="brand-text">Agent会话管理</span>
+      </a>
 
-    <nav class="nav-links" aria-label="主导航">
-      <a href="#preview">界面预览</a>
-      <a href="#engine">核心引擎</a>
-      <a href="#agents">13 种 Agent</a>
-      <a href="#security">安全架构</a>
-    </nav>
+      <nav class="nav-links" aria-label="主导航">
+        <a href="#preview">界面预览</a>
+        <a href="#features">核心特性</a>
+        <a href="#agents">支持工具</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
+      </nav>
 
-    <div class="nav-right">
-      <button class="icon-btn" id="themeToggle" type="button" title="切换暗色 / 亮色外观" aria-label="切换暗色 / 亮色外观">
-        <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-        <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-      </button>
-      <a class="icon-btn" href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer" title="GitHub 仓库" aria-label="GitHub 仓库">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2Z"/></svg>
-      </a>
-      <a class="nav-demo" href="./demo/" target="_blank" rel="noopener noreferrer">
-        <span>在线体验</span>
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
-      </a>
-      <a class="nav-dl" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
-        <span>下载</span>
-      </a>
+      <div class="nav-right">
+        <button class="pill-btn" id="modeBtn" type="button">玄墨夜</button>
+        <a class="pill-btn nav-demo-top" href="./demo/" target="_blank" rel="noopener noreferrer">在线体验 ↗</a>
+        <a class="pill-btn solid" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">下载</a>
+      </div>
     </div>
-  </div>
-</header>
+  </header>
 
-<main>
-  <!-- Hero -->
-  <section class="hero">
-    <div class="wrap">
-      <div>
-        <div class="emblem-wrap">
-          <img src="./app-icon.png" alt="Agent会话管理 铂金刀锋图标">
-        </div>
-      </div>
-
-      <a class="hero-pill" href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">
-        <span class="pill-dot"></span>
-        <span>v1.8.4 · 长代码折叠 · 零抖动多选 · FTS5 批量索引</span>
-      </a>
-
+  <main class="wrap">
+    <section class="hero">
+      <div class="seal-tag">v1.8.4 · 十三家本地编码 Agent 一纸收揽</div>
       <h1>
-        本地 AI 编码会话，<br>
-        <span>终有一座精密工作台。</span>
+        墨落成章，<br>
+        <em>每一段 AI 思考皆有回响。</em>
       </h1>
-
-      <p class="hero-sub">
-        原生只读解析 13 种主流本地编码 Agent 的历史记录。将散落的 JSONL、SQLite 与思考流，雕琢为结构化思维链、内联行号 Diff 与毫秒级全文知识库。
+      <p class="hero-desc">
+        原生只读解析 Codex、Claude Code、Gemini CLI 等 13 种本地编码 Agent 会话。将散落磁盘的 JSONL 与 SQLite，还原为安静、清晰、可毫秒检索的阅读案头。
       </p>
-
-      <div class="hero-cta">
-        <a class="btn btn-primary" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-          <span>下载 Windows / Linux 版</span>
-        </a>
-        <a class="btn btn-secondary" href="./demo/" target="_blank" rel="noopener noreferrer">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
-          <span>进入 1:1 在线体验</span>
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
-        </a>
+      <div class="cta-group">
+        <a class="cta cta-dark" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">下载桌面端安装包</a>
+        <a class="cta cta-glass" href="./demo/" target="_blank" rel="noopener noreferrer">进入 1:1 在线体验 ↗</a>
       </div>
-
-      <div class="hero-footnote">
-        <span>Rust + Tauri v2 原生架构</span>
+      <div class="hero-meta">
+        <span>Windows x64 &amp; Linux amd64</span>
         <span>·</span>
-        <span>~5.1 MB 轻量安装包</span>
+        <span>Rust + Tauri v2 原生驱动</span>
         <span>·</span>
         <span>100% 本地离线零上传</span>
         <span>·</span>
         <span>MIT 开源</span>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Retina Product Showcase (No Embedded Iframe; Direct Jump Button to /demo/) -->
-  <section class="stage-section" id="preview">
-    <div class="stage-glow" aria-hidden="true"></div>
-    <div class="stage-wrap">
-      <div class="chassis-outer">
-        <div class="chassis-inner">
-          <div class="win-bar">
-            <div class="win-left">
-              <div class="win-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-              <div class="win-title">
-                <img src="./app-icon.png" alt="">
-                <span>Agent会话管理 v1.8.4</span>
-              </div>
-            </div>
-
-            <div class="seg-control" role="tablist" aria-label="界面外观预览">
-              <button class="seg-btn active" id="shotDarkBtn" type="button" role="tab" aria-selected="true">暗色外观</button>
-              <button class="seg-btn" id="shotLightBtn" type="button" role="tab" aria-selected="false">亮色外观</button>
-            </div>
-
-            <a class="win-demo-btn" href="./demo/" target="_blank" rel="noopener noreferrer">
-              <span>在线体验</span>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
-            </a>
+    <section class="showcase" id="preview">
+      <div class="frame">
+        <div class="frame-bar">
+          <div class="frame-title">
+            <img src="./app-icon.png" alt="">
+            <span>Agent会话管理 v1.8.4</span>
           </div>
-
-          <div class="shot-frame">
-            <img id="shotImg" src="./main-window-dark.png" alt="Agent会话管理 v1.8.4 2880×1800 高清桌面端主界面">
+          <div class="frame-actions">
+            <div class="seg" role="tablist" aria-label="界面外观切换">
+              <button id="shotLightBtn" class="active" type="button" role="tab" aria-selected="true">浅色</button>
+              <button id="shotDarkBtn" type="button" role="tab" aria-selected="false">深色</button>
+            </div>
+            <a class="pill-btn" style="height:28px;padding:0 11px;font-size:12px" href="./demo/" target="_blank" rel="noopener noreferrer">在线体验 ↗</a>
           </div>
         </div>
+        <img class="frame-img" id="previewShot" src="./main-window-light.png" alt="Agent会话管理 v1.8.4 2880×1800 高清桌面端主界面">
+      </div>
+      <div class="frame-note">
+        <span>2880×1800 2x 高清桌面端主界面 · 轻划屏幕可触发实时流体水彩晕染</span>
+        <span>支持自由切换「素绢白 / 玄墨夜」双外观</span>
+      </div>
+    </section>
+
+    <section class="metrics" aria-label="核心规格">
+      <div class="metric"><div class="metric-v">13</div><div class="metric-l">原生纳管本地 Agent</div></div>
+      <div class="metric"><div class="metric-v">FTS5</div><div class="metric-l">本地 SQLite 全文索引</div></div>
+      <div class="metric"><div class="metric-v">~5.1 MB</div><div class="metric-l">轻量原生安装包</div></div>
+      <div class="metric"><div class="metric-v">0 B</div><div class="metric-l">云端上传与遥测</div></div>
+    </section>
+
+    <section class="sec" id="features">
+      <div class="sec-head">
+        <div class="sec-kicker">Core Capabilities</div>
+        <h2>化繁为简，只留真正值得细读的内容。</h2>
+        <p>面向长上下文与复杂工程代码定制，把混乱的工具日志沉淀为可检索、可导出的本地知识库。</p>
       </div>
 
-      <div class="stage-note">
-        <span>2880×1800 2x 高清桌面端界面预览 · 支持亮 / 暗双外观自由切换</span>
-        <span>想亲自点击操作？点击上方「在线体验」直接跳转至独立 1:1 交互版</span>
-      </div>
-    </div>
-  </section>
-
-  <!-- Metrics Ribbon -->
-  <section class="metrics-band">
-    <div class="wrap metrics-grid">
-      <div class="metric-cell">
-        <div class="metric-num">13</div>
-        <div class="metric-label">原生适配本地编码 Agent</div>
-      </div>
-      <div class="metric-cell">
-        <div class="metric-num">2 MB</div>
-        <div class="metric-label">单块推理链按需流式分页</div>
-      </div>
-      <div class="metric-cell">
-        <div class="metric-num">FTS5</div>
-        <div class="metric-label">SQLite 纯正文增量全文检索</div>
-      </div>
-      <div class="metric-cell">
-        <div class="metric-num">0 B</div>
-        <div class="metric-label">云端上传与遥测数据量</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Flagship Interactive Bento -->
-  <section class="section" id="engine">
-    <div class="wrap">
-      <div class="section-header reveal">
-        <div class="eyebrow">Reading &amp; Indexing Engine</div>
-        <h2>每一处细节，都为长上下文工程而生。</h2>
-        <p>不是把原始 JSONL 粗暴铺在屏幕上，而是用结构化阅读引擎把每一次推理、工具调用与代码修改还原成清晰可查的工程资产。</p>
-      </div>
-
-      <div class="bento">
-        <article class="card span-7 reveal">
-          <div>
-            <div class="card-kicker">Structured Reader</div>
-            <h3>两段式思维链 &amp; 三态视图全链路联动</h3>
-            <p>按各 Agent 原生风格呈现思考过程，默认单行摘要按需拉取全文；顶栏「全部 / 对话 / 改动」三态视图与搜索、复制、导出实时联动。</p>
-          </div>
-          <div class="mini-ui" id="miniReader">
-            <div class="mini-toolbar">
-              <div class="mini-tabs" role="tablist">
-                <button class="mini-tab active" data-view="all" type="button">全部</button>
-                <button class="mini-tab" data-view="dialog" type="button">对话</button>
-                <button class="mini-tab" data-view="changes" type="button">改动</button>
-              </div>
-              <span class="mini-badge" id="miniReaderStat">3 步过程 · 1 处改动</span>
-            </div>
-            <div class="mini-thought" id="miniThoughtRow">
-              <span>✻ 思考中 · 定位 JWKS 未知 kid 轮换未触发回源刷新…</span>
-              <span style="opacity:.7;flex:none">1.4s</span>
-            </div>
-            <div class="mini-diff" id="miniDiffRow">
-              <div class="diff-del">- if (!key) throw new UnauthorizedError('unknown kid');</div>
-              <div class="diff-add">+ if (!key) { await refreshJwks({ force: true }); key = jwksCache.get(kid); }</div>
-            </div>
-            <div class="mini-thought" id="miniDialogRow" style="display:none;margin-bottom:0">
-              <span>已为未知 kid 补充单飞强制回源刷新，消除 15 分钟轮换窗口期的偶发 401。</span>
-            </div>
-          </div>
+      <div class="chapters">
+        <article class="chap">
+          <div class="chap-num">壹 · READ</div>
+          <h3>两段式思维链与行号 Diff</h3>
+          <p>默认收敛冗长过程，一键展开完整推理链（单块按需分页最高 2 MB）与红绿行号 Diff；超过 28 行的长代码块自动折叠预览，三态视图（全部 / 对话 / 改动）全链路联动。</p>
         </article>
-
-        <article class="card span-5 reveal">
-          <div>
-            <div class="card-kicker">SQLite FTS5</div>
-            <h3>跨会话正文毫秒级检索</h3>
-            <p>后台批量事务增量索引纯正文，跳过系统注入块且不挤占阅读缓存；高亮摘录一键跳至对应轮次，关闭即彻底清理索引库。</p>
-          </div>
-          <div class="mini-ui">
-            <div class="mini-search-bar">
-              <span>kid-2026-11</span>
-              <span class="mini-badge">0.4 ms · 3 命中</span>
-            </div>
-            <div class="mini-hit">
-              <div class="mini-hit-title"><span>Claude Code · edge-gateway</span><span style="color:var(--text-muted)">第 2 轮</span></div>
-              <div class="mini-hit-body">当签发端轮换到新密钥 <span class="hl">kid-2026-11</span> 时触发单飞回源…</div>
-            </div>
-            <div class="mini-hit">
-              <div class="mini-hit-title"><span>DeepSeek · 子代理核验</span><span style="color:var(--text-muted)">第 1 轮</span></div>
-              <div class="mini-hit-body">并发请求未知 <span class="hl">kid-2026-11</span> 共享同一个刷新 Promise…</div>
-            </div>
-          </div>
+        <article class="chap">
+          <div class="chap-num">贰 · SEARCH</div>
+          <h3>SQLite FTS5 纯正文检索</h3>
+          <p>后台批量事务增量构建纯正文索引，自动跳过系统注入块且不挤占阅读缓存；高亮摘录直达目标轮次，关闭开关即彻底清理索引文件。</p>
         </article>
-
-        <article class="card span-4 reveal">
-          <div>
-            <div class="card-kicker">Code Ergonomics</div>
-            <h3>超长代码块智能折叠</h3>
-            <p>超过 28 行的代码块自动折叠预览前 18 行并展示行数角标，搜词时自动展开；全局复制统一提供 1.5s 绿色对勾微反馈。</p>
-          </div>
-          <div class="mini-ui">
-            <div class="mini-code">
-              <div>export async function refreshJwks(opts) {</div>
-              <div>&nbsp;&nbsp;if (!inflightRefresh) {</div>
-              <div>&nbsp;&nbsp;&nbsp;&nbsp;inflightRefresh = fetchOrigin();</div>
-              <div>&nbsp;&nbsp;}</div>
-              <div class="mini-code-fade">
-                <span style="color:var(--accent);font-weight:600">展开全部 38 行代码</span>
-                <span class="mini-badge">✓ 已复制</span>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="card span-4 reveal">
-          <div>
-            <div class="card-kicker">Native Bridge</div>
-            <h3>原生另存为 &amp; 路径直达</h3>
-            <p>Windows 独立 STA 线程拉起原生「另存为」导出 `.md`；正文路径自动识别为胶囊，一键复制或在资源管理器中精准定位。</p>
-          </div>
-          <div class="mini-ui">
-            <div class="chip-row">
-              <span class="path-pill">src/auth/jwt.ts:48</span>
-              <span class="path-pill">search_index.rs</span>
-              <span class="path-pill" style="color:var(--emerald)">导出 .md</span>
-            </div>
-          </div>
-        </article>
-
-        <article class="card span-4 reveal">
-          <div>
-            <div class="card-kicker">Safe Governance</div>
-            <h3>零抖动多选 &amp; 边界隔离</h3>
-            <p>底栏原地切换多选状态零跳动，支持一键定位当前会话、跨分页全选与父子代理级联清理，绝不触碰项目工作区。</p>
-          </div>
-          <div class="mini-ui">
-            <div class="shield-split">
-              <div class="shield-box">
-                <strong style="color:var(--emerald)">受控会话目录 ✓</strong>
-                <span>仅清理会话与边车记录</span>
-              </div>
-              <div class="shield-box">
-                <strong style="color:var(--text)">代码工作区 🔒</strong>
-                <span>只读隔离 · 永不修改</span>
-              </div>
-            </div>
-          </div>
+        <article class="chap">
+          <div class="chap-num">叁 · GUARD</div>
+          <h3>零抖动治理与安全边界</h3>
+          <p>底栏原地多选零跳动、一键定位当前会话、原生另存为 `.md` 与路径胶囊直达；Rust 底层严守受控会话目录与防符号链接越界，绝不触碰项目源代码。</p>
         </article>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- 13 Agents Infinite Dual-Row Marquee -->
-  <section class="marquee-section" id="agents">
-    <div class="wrap">
-      <div class="section-header reveal" style="margin-bottom:0">
-        <div class="eyebrow">13 Native Adapters</div>
-        <h2>开箱纳管十三种本地编码 Agent</h2>
-        <p>针对每种工具的原生存储结构定制解析器与清理策略，零侵入、零配置插件。</p>
+    <section class="sec" id="agents">
+      <div class="sec-head">
+        <div class="sec-kicker">13 Native Adapters</div>
+        <h2>覆盖主流本地编码 Agent 生态</h2>
+        <p>针对每种工具的原生存储结构定制只读解析与安全清理策略，零侵入、零插件配置。</p>
+      </div>
+
+      <div class="agents-grid">
+        <div class="agent-card"><strong>Claude Code</strong><span>Projects JSONL</span></div>
+        <div class="agent-card"><strong>Codex</strong><span>Rollout JSONL</span></div>
+        <div class="agent-card"><strong>Gemini CLI</strong><span>Chats &amp; Thought</span></div>
+        <div class="agent-card"><strong>GitHub Copilot</strong><span>Session Events</span></div>
+        <div class="agent-card"><strong>DeepSeek Harness</strong><span>Session v3 / v4</span></div>
+        <div class="agent-card"><strong>WorkBuddy</strong><span>JSONL · Sidecar</span></div>
+        <div class="agent-card"><strong>CodeBuddy</strong><span>DAG · Rollback</span></div>
+        <div class="agent-card"><strong>Kimi CLI</strong><span>Context &amp; Wire</span></div>
+        <div class="agent-card"><strong>OpenCode</strong><span>SQLite WAL</span></div>
+        <div class="agent-card"><strong>ZCode</strong><span>Dual SQLite</span></div>
+        <div class="agent-card"><strong>OpenClaw</strong><span>Multi-Agent</span></div>
+        <div class="agent-card"><strong>Pi</strong><span>Branch Tree</span></div>
+        <div class="agent-card"><strong>Grok Build</strong><span>JSONL · Zstd</span></div>
+      </div>
+    </section>
+
+    <section class="closing-box">
+      <h2>即刻拥有安静的本地阅读案头。</h2>
+      <p>免费开源，支持 Windows x64 安装程序与 Linux amd64 AppImage / deb 发行包。</p>
+      <div class="cta-group">
+        <a class="cta cta-dark" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">前往 GitHub Releases 下载</a>
+        <a class="cta cta-glass" href="./demo/" target="_blank" rel="noopener noreferrer">前往 1:1 在线体验 ↗</a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-row">
+      <div>© 2026 Agent会话管理 · MIT Open Source</div>
+      <div class="footer-links">
+        <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">全部版本</a>
+        <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
       </div>
     </div>
-
-    <div class="marquee-shell" aria-label="支持的 13 种本地编码 Agent">
-      <div class="marquee-track">
-        <div class="agent-chip"><strong>Claude Code</strong><span>Projects JSONL</span></div>
-        <div class="agent-chip"><strong>Codex</strong><span>Rollout JSONL</span></div>
-        <div class="agent-chip"><strong>Gemini CLI</strong><span>Chats &amp; Thought</span></div>
-        <div class="agent-chip"><strong>GitHub Copilot</strong><span>Session Events</span></div>
-        <div class="agent-chip"><strong>DeepSeek Harness</strong><span>Session v3 / v4</span></div>
-        <div class="agent-chip"><strong>WorkBuddy</strong><span>JSONL + Sidecar</span></div>
-        <div class="agent-chip"><strong>CodeBuddy</strong><span>DAG + Rollback</span></div>
-        <div class="agent-chip"><strong>Claude Code</strong><span>Projects JSONL</span></div>
-        <div class="agent-chip"><strong>Codex</strong><span>Rollout JSONL</span></div>
-        <div class="agent-chip"><strong>Gemini CLI</strong><span>Chats &amp; Thought</span></div>
-        <div class="agent-chip"><strong>GitHub Copilot</strong><span>Session Events</span></div>
-        <div class="agent-chip"><strong>DeepSeek Harness</strong><span>Session v3 / v4</span></div>
-        <div class="agent-chip"><strong>WorkBuddy</strong><span>JSONL + Sidecar</span></div>
-        <div class="agent-chip"><strong>CodeBuddy</strong><span>DAG + Rollback</span></div>
-      </div>
-
-      <div class="marquee-track reverse">
-        <div class="agent-chip"><strong>Kimi CLI</strong><span>Context &amp; Wire</span></div>
-        <div class="agent-chip"><strong>OpenCode</strong><span>SQLite WAL</span></div>
-        <div class="agent-chip"><strong>ZCode</strong><span>Dual SQLite Lineage</span></div>
-        <div class="agent-chip"><strong>OpenClaw</strong><span>Multi-Agent JSONL</span></div>
-        <div class="agent-chip"><strong>Pi</strong><span>Branch Tree JSONL</span></div>
-        <div class="agent-chip"><strong>Grok Build</strong><span>JSONL + Zstd Archive</span></div>
-        <div class="agent-chip"><strong>Kimi CLI</strong><span>Context &amp; Wire</span></div>
-        <div class="agent-chip"><strong>OpenCode</strong><span>SQLite WAL</span></div>
-        <div class="agent-chip"><strong>ZCode</strong><span>Dual SQLite Lineage</span></div>
-        <div class="agent-chip"><strong>OpenClaw</strong><span>Multi-Agent JSONL</span></div>
-        <div class="agent-chip"><strong>Pi</strong><span>Branch Tree JSONL</span></div>
-        <div class="agent-chip"><strong>Grok Build</strong><span>JSONL + Zstd Archive</span></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Security Architecture -->
-  <section class="section" id="security">
-    <div class="wrap">
-      <div class="section-header reveal">
-        <div class="eyebrow">Safety Architecture</div>
-        <h2>把防误删与隐私边界，写进 Rust 底层。</h2>
-        <p>所有文件操作与解析都在本机 Rust 核心内严格校验，完整安全承诺公开可审计。</p>
-      </div>
-
-      <div class="sec-grid">
-        <div class="sec-item reveal">
-          <div class="sec-num">01 / PATH BOUNDARY</div>
-          <h3>受控根路径与防符号链接越界</h3>
-          <p>删除前逐层校验规范路径、NTFS 重解析点与符号链接边界，任何指向项目仓库或系统目录的链接都会被直接拦截拒绝。</p>
-        </div>
-        <div class="sec-item reveal">
-          <div class="sec-num">02 / PROCESS GUARD</div>
-          <h3>进程守卫与先子后父级联清理</h3>
-          <p>检测正在写入会话的活跃 Agent 进程与锁文件，按「先子代理后父会话」顺序安全回收，50+ 条批量操作强制知情核对。</p>
-        </div>
-        <div class="sec-item reveal">
-          <div class="sec-num">03 / LOCAL FIRST</div>
-          <h3>100% 离线单机，零云端遥测</h3>
-          <p>无账号、无统计埋点、不上传任何对话或路径信息。所有索引、缓存与导出均在您的本机磁盘闭环完成。</p>
-        </div>
-      </div>
-
-      <div style="margin-top:24px">
-        <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px">
-          <span>审阅完整安全边界说明 (SAFETY.md)</span>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
-        </a>
-      </div>
-    </div>
-  </section>
-
-  <!-- Monumental CTA -->
-  <section class="final-cta">
-    <div class="wrap">
-      <div class="cta-card reveal">
-        <div class="emblem-wrap" style="margin-bottom:8px">
-          <img src="./app-icon.png" alt="" style="width:52px;height:52px;border-radius:14px">
-        </div>
-        <h2>让每一次 AI 协作，都有迹可循。</h2>
-        <p>下载 Agent会话管理 v1.8.4，支持 Windows x64 安装程序与 Linux amd64 AppImage / deb 发行包。</p>
-        <div class="hero-cta">
-          <a class="btn btn-primary" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-            <span>前往 GitHub Releases 下载</span>
-          </a>
-          <a class="btn btn-secondary" href="./demo/" target="_blank" rel="noopener noreferrer">
-            <span>前往 1:1 在线体验</span>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
-          </a>
-        </div>
-      </div>
-    </div>
-  </section>
-</main>
-
-<footer class="site-footer">
-  <div class="wrap footer-row">
-    <div>© 2026 Agent会话管理 · MIT Open Source</div>
-    <div class="footer-links">
-      <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">全部版本</a>
-      <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
-    </div>
-  </div>
-</footer>
+  </footer>
+</div>
 
 <script>
 (function () {
   var root = document.documentElement;
-  var themeToggle = document.getElementById("themeToggle");
-  var shotImg = document.getElementById("shotImg");
-  var shotDarkBtn = document.getElementById("shotDarkBtn");
+  var modeBtn = document.getElementById("modeBtn");
+  var shot = document.getElementById("previewShot");
   var shotLightBtn = document.getElementById("shotLightBtn");
+  var shotDarkBtn = document.getElementById("shotDarkBtn");
+  var isDark = root.getAttribute("data-mode") === "ink";
 
-  function getTheme() {
-    return root.getAttribute("data-theme") === "light" ? "light" : "dark";
-  }
-
-  function setPreviewVariant(variant) {
-    var isLight = variant === "light";
-    if (shotImg) {
-      shotImg.src = isLight ? "./main-window-light.png" : "./main-window-dark.png";
-    }
-    if (shotDarkBtn && shotLightBtn) {
-      shotDarkBtn.classList.toggle("active", !isLight);
-      shotDarkBtn.setAttribute("aria-selected", String(!isLight));
-      shotLightBtn.classList.toggle("active", isLight);
-      shotLightBtn.setAttribute("aria-selected", String(isLight));
+  function syncShotButtons(dark) {
+    if (shot) shot.src = dark ? "./main-window-dark.png" : "./main-window-light.png";
+    if (shotLightBtn && shotDarkBtn) {
+      shotLightBtn.classList.toggle("active", !dark);
+      shotLightBtn.setAttribute("aria-selected", String(!dark));
+      shotDarkBtn.classList.toggle("active", dark);
+      shotDarkBtn.setAttribute("aria-selected", String(dark));
     }
   }
 
-  function applyTheme(theme) {
-    root.setAttribute("data-theme", theme);
-    try { localStorage.setItem("asm-site-theme-v2", theme); } catch (e) {}
-    setPreviewVariant(theme);
+  function syncModeUI() {
+    root.setAttribute("data-mode", isDark ? "ink" : "paper");
+    if (modeBtn) modeBtn.textContent = isDark ? "素绢白" : "玄墨夜";
+    syncShotButtons(isDark);
+  }
+  syncModeUI();
+
+  if (shotLightBtn && shotDarkBtn) {
+    shotLightBtn.addEventListener("click", function () { syncShotButtons(false); });
+    shotDarkBtn.addEventListener("click", function () { syncShotButtons(true); });
   }
 
-  setPreviewVariant(getTheme());
+  // Respect prefers-reduced-motion
+  var reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var canvas = document.getElementById("fluidCanvas");
+  var params = { alpha: true, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false };
+  var gl = !reducedMotion && canvas ? (canvas.getContext("webgl2", params) || canvas.getContext("webgl", params) || canvas.getContext("experimental-webgl", params)) : null;
 
-  if (themeToggle) {
-    themeToggle.addEventListener("click", function () {
-      applyTheme(getTheme() === "dark" ? "light" : "dark");
-    });
+  if (!gl) {
+    if (modeBtn) {
+      modeBtn.addEventListener("click", function () {
+        isDark = !isDark;
+        try { localStorage.setItem("asm-fluid-mode", isDark ? "ink" : "paper"); } catch (e) {}
+        syncModeUI();
+      });
+    }
+    return;
   }
 
-  if (shotDarkBtn && shotLightBtn) {
-    shotDarkBtn.addEventListener("click", function () { setPreviewVariant("dark"); });
-    shotLightBtn.addEventListener("click", function () { setPreviewVariant("light"); });
+  var isWebGL2 = typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext;
+  var halfFloat, supportLinearFiltering;
+  if (isWebGL2) {
+    gl.getExtension("EXT_color_buffer_float");
+    supportLinearFiltering = !!gl.getExtension("OES_texture_float_linear");
+  } else {
+    halfFloat = gl.getExtension("OES_texture_half_float");
+    supportLinearFiltering = !!gl.getExtension("OES_texture_half_float_linear");
   }
 
-  // Interactive Bento Card 1: All / Dialog / Changes switcher
-  var miniTabs = document.querySelectorAll("#miniReader .mini-tab");
-  var thoughtRow = document.getElementById("miniThoughtRow");
-  var diffRow = document.getElementById("miniDiffRow");
-  var dialogRow = document.getElementById("miniDialogRow");
-  var readerStat = document.getElementById("miniReaderStat");
-  miniTabs.forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      var v = btn.getAttribute("data-view");
-      miniTabs.forEach(function (b) { b.classList.toggle("active", b === btn); });
-      if (v === "all") {
-        thoughtRow.style.display = "flex";
-        diffRow.style.display = "block";
-        dialogRow.style.display = "none";
-        readerStat.textContent = "3 步过程 · 1 处改动";
-      } else if (v === "dialog") {
-        thoughtRow.style.display = "none";
-        diffRow.style.display = "none";
-        dialogRow.style.display = "flex";
-        readerStat.textContent = "纯净问答视图";
-      } else {
-        thoughtRow.style.display = "none";
-        diffRow.style.display = "block";
-        dialogRow.style.display = "none";
-        readerStat.textContent = "仅展示代码补丁 (+1 / -1)";
+  var halfFloatTexType = isWebGL2 ? gl.HALF_FLOAT : (halfFloat ? halfFloat.HALF_FLOAT_OES : gl.UNSIGNED_BYTE);
+  var formatRGBA = isWebGL2 ? { internalFormat: gl.RGBA16F, format: gl.RGBA } : { internalFormat: gl.RGBA, format: gl.RGBA };
+  var formatRG = isWebGL2 ? { internalFormat: gl.RG16F, format: gl.RG } : { internalFormat: gl.RGBA, format: gl.RGBA };
+  var formatR = isWebGL2 ? { internalFormat: gl.R16F, format: gl.RED } : { internalFormat: gl.RGBA, format: gl.RGBA };
+  var texFilter = supportLinearFiltering ? gl.LINEAR : gl.NEAREST;
+
+  function compileShader(type, source) {
+    var shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    return shader;
+  }
+
+  function createProgram(vsSource, fsSource) {
+    var prog = gl.createProgram();
+    gl.attachShader(prog, compileShader(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, fsSource));
+    gl.linkProgram(prog);
+    var uniforms = {};
+    var count = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+    for (var i = 0; i < count; i++) {
+      var name = gl.getActiveUniform(prog, i).name;
+      uniforms[name] = gl.getUniformLocation(prog, name);
+    }
+    return { program: prog, uniforms: uniforms };
+  }
+
+  var baseVS = [
+    "precision highp float;",
+    "attribute vec2 aPosition;",
+    "varying vec2 vUv;",
+    "varying vec2 vL;",
+    "varying vec2 vR;",
+    "varying vec2 vT;",
+    "varying vec2 vB;",
+    "uniform vec2 texelSize;",
+    "void main () {",
+    "  vUv = aPosition * 0.5 + 0.5;",
+    "  vL = vUv - vec2(texelSize.x, 0.0);",
+    "  vR = vUv + vec2(texelSize.x, 0.0);",
+    "  vT = vUv + vec2(0.0, texelSize.y);",
+    "  vB = vUv - vec2(0.0, texelSize.y);",
+    "  gl_Position = vec4(aPosition, 0.0, 1.0);",
+    "}"
+  ].join("\n");
+
+  var clearShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;uniform sampler2D uTexture;uniform float value;void main(){gl_FragColor=value*texture2D(uTexture,vUv);}");
+  var splatShader = createProgram(baseVS, "precision highp float;varying vec2 vUv;uniform sampler2D uTarget;uniform float aspectRatio;uniform vec3 color;uniform vec2 point;uniform float radius;void main(){vec2 p=vUv-point.xy;p.x*=aspectRatio;vec3 splat=exp(-dot(p,p)/radius)*color;vec3 base=texture2D(uTarget,vUv).xyz;gl_FragColor=vec4(base+splat,1.0);}");
+  var advectionShader = createProgram(baseVS, "precision highp float;varying vec2 vUv;uniform sampler2D uVelocity;uniform sampler2D uSource;uniform vec2 texelSize;uniform float dt;uniform float dissipation;void main(){vec2 coord=vUv-dt*texture2D(uVelocity,vUv).xy*texelSize;vec4 result=texture2D(uSource,coord);float decay=1.0+dissipation*dt;gl_FragColor=result/decay;}");
+  var divergenceShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;varying highp vec2 vL;varying highp vec2 vR;varying highp vec2 vT;varying highp vec2 vB;uniform sampler2D uVelocity;void main(){float L=texture2D(uVelocity,vL).x;float R=texture2D(uVelocity,vR).x;float T=texture2D(uVelocity,vT).y;float B=texture2D(uVelocity,vB).y;vec2 C=texture2D(uVelocity,vUv).xy;if(vL.x<0.0){L=-C.x;}if(vR.x>1.0){R=-C.x;}if(vT.y>1.0){T=-C.y;}if(vB.y<0.0){B=-C.y;}float div=0.5*(R-L+T-B);gl_FragColor=vec4(div,0.0,0.0,1.0);}");
+  var curlShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;varying highp vec2 vL;varying highp vec2 vR;varying highp vec2 vT;varying highp vec2 vB;uniform sampler2D uVelocity;void main(){float L=texture2D(uVelocity,vL).y;float R=texture2D(uVelocity,vR).y;float T=texture2D(uVelocity,vT).x;float B=texture2D(uVelocity,vB).x;float vorticity=R-L-T+B;gl_FragColor=vec4(0.5*vorticity,0.0,0.0,1.0);}");
+  var vorticityShader = createProgram(baseVS, "precision highp float;varying vec2 vUv;varying vec2 vL;varying vec2 vR;varying vec2 vT;varying vec2 vB;uniform sampler2D uVelocity;uniform sampler2D uCurl;uniform float curl;uniform float dt;void main(){float L=texture2D(uCurl,vL).x;float R=texture2D(uCurl,vR).x;float T=texture2D(uCurl,vT).x;float B=texture2D(uCurl,vB).x;float C=texture2D(uCurl,vUv).x;vec2 force=0.5*vec2(abs(T)-abs(B),abs(R)-abs(L));force/=length(force)+0.0001;force*=curl*C;force.y*=-1.0;vec2 vel=texture2D(uVelocity,vUv).xy;gl_FragColor=vec4(vel+force*dt,0.0,1.0);}");
+  var pressureShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;varying highp vec2 vL;varying highp vec2 vR;varying highp vec2 vT;varying highp vec2 vB;uniform sampler2D uPressure;uniform sampler2D uDivergence;void main(){float L=texture2D(uPressure,vL).x;float R=texture2D(uPressure,vR).x;float T=texture2D(uPressure,vT).x;float B=texture2D(uPressure,vB).x;float div=texture2D(uDivergence,vUv).x;float p=(L+R+B+T-div)*0.25;gl_FragColor=vec4(p,0.0,0.0,1.0);}");
+  var gradientSubtractShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;varying highp vec2 vL;varying highp vec2 vR;varying highp vec2 vT;varying highp vec2 vB;uniform sampler2D uPressure;uniform sampler2D uVelocity;void main(){float L=texture2D(uPressure,vL).x;float R=texture2D(uPressure,vR).x;float T=texture2D(uPressure,vT).x;float B=texture2D(uPressure,vB).x;vec2 vel=texture2D(uVelocity,vUv).xy;vel.xy-=vec2(R-L,T-B);gl_FragColor=vec4(vel,0.0,1.0);}");
+
+  // Softer, low-glare display shader (calibrated to avoid brightness glare in both light & dark)
+  var displayShader = createProgram(baseVS, [
+    "precision highp float;",
+    "varying vec2 vUv;",
+    "varying vec2 vL;",
+    "varying vec2 vR;",
+    "varying vec2 vT;",
+    "varying vec2 vB;",
+    "uniform sampler2D uTexture;",
+    "uniform vec3 uBgColor;",
+    "uniform float uIsDark;",
+    "void main () {",
+    "  vec3 c = texture2D(uTexture, vUv).rgb;",
+    "  vec3 lc = texture2D(uTexture, vL).rgb;",
+    "  vec3 rc = texture2D(uTexture, vR).rgb;",
+    "  vec3 tc = texture2D(uTexture, vT).rgb;",
+    "  vec3 bc = texture2D(uTexture, vB).rgb;",
+    "  float dx = length(rc) - length(lc);",
+    "  float dy = length(tc) - length(bc);",
+    "  vec3 n = normalize(vec3(dx, dy, 0.1));",
+    "  float spec = clamp(dot(n, normalize(vec3(0.22, 0.35, 1.0))), 0.72, 1.0);",
+    "  float density = clamp(length(c) * 0.85, 0.0, 0.82);",
+    "  vec3 shaded = c * (0.86 + 0.22 * spec);",
+    "  if (uIsDark > 0.5) {",
+    "    vec3 col = uBgColor + shaded * 0.46;",
+    "    gl_FragColor = vec4(col, 1.0);",
+    "  } else {",
+    "    vec3 pigment = mix(uBgColor, uBgColor * (1.0 - clamp(shaded * 0.54, 0.0, 0.5)) + shaded * 0.16, density);",
+    "    gl_FragColor = vec4(pigment, 1.0);",
+    "  }",
+    "}"
+  ].join("\n"));
+
+  var quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, -1, 1, 1, 1, 1, -1]), gl.STATIC_DRAW);
+  var idxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+
+  function blit(target) {
+    if (!target) {
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    } else {
+      gl.viewport(0, 0, target.width, target.height);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    }
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  }
+
+  function createFBO(w, h, internalFormat, format, type, param) {
+    gl.activeTexture(gl.TEXTURE0);
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, param);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, param);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null);
+    var fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.viewport(0, 0, w, h);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    return {
+      texture: tex, fbo: fbo, width: w, height: h,
+      texelSizeX: 1 / w, texelSizeY: 1 / h,
+      attach: function (id) {
+        gl.activeTexture(gl.TEXTURE0 + id);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        return id;
       }
-    });
+    };
+  }
+
+  function createDoubleFBO(w, h, internalFormat, format, type, param) {
+    var f1 = createFBO(w, h, internalFormat, format, type, param);
+    var f2 = createFBO(w, h, internalFormat, format, type, param);
+    return {
+      width: w, height: h, texelSizeX: f1.texelSizeX, texelSizeY: f1.texelSizeY,
+      get read() { return f1; }, set read(v) { f1 = v; },
+      get write() { return f2; }, set write(v) { f2 = v; },
+      swap: function () { var t = f1; f1 = f2; f2 = t; }
+    };
+  }
+
+  var dye, velocity, divergence, curl, pressure;
+  function initFBOs() {
+    var isMobile = window.innerWidth < 720;
+    var baseSim = isMobile ? 96 : 128;
+    var baseDye = isMobile ? 320 : 512;
+    var aspect = window.innerWidth / Math.max(1, window.innerHeight);
+    var simW = aspect >= 1 ? Math.round(baseSim * aspect) : baseSim;
+    var simH = aspect >= 1 ? baseSim : Math.round(baseSim / aspect);
+    var dyeW = aspect >= 1 ? Math.round(baseDye * aspect) : baseDye;
+    var dyeH = aspect >= 1 ? baseDye : Math.round(baseDye / aspect);
+    dye = createDoubleFBO(dyeW, dyeH, formatRGBA.internalFormat, formatRGBA.format, halfFloatTexType, texFilter);
+    velocity = createDoubleFBO(simW, simH, formatRG.internalFormat, formatRG.format, halfFloatTexType, texFilter);
+    divergence = createFBO(simW, simH, formatR.internalFormat, formatR.format, halfFloatTexType, gl.NEAREST);
+    curl = createFBO(simW, simH, formatR.internalFormat, formatR.format, halfFloatTexType, gl.NEAREST);
+    pressure = createDoubleFBO(simW, simH, formatR.internalFormat, formatR.format, halfFloatTexType, gl.NEAREST);
+  }
+
+  function resizeCanvas() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+  }
+
+  resizeCanvas();
+  initFBOs();
+  var resizeTimer;
+  window.addEventListener("resize", function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      resizeCanvas();
+      initFBOs();
+    }, 150);
   });
 
-  if ("IntersectionObserver" in window) {
-    var io = new IntersectionObserver(function (entries) {
-      entries.forEach(function (entry) {
-        if (entry.isIntersecting) {
-          entry.target.classList.add("in");
-          io.unobserve(entry.target);
-        }
-      });
-    }, { threshold: 0.1 });
-    document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
-  } else {
-    document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
+  // Low-glare, serene Song-dynasty mineral pigments
+  var lightPigments = [
+    [0.16, 0.34, 0.56], // 沉石青
+    [0.14, 0.44, 0.44], // 苍竹青
+    [0.28, 0.30, 0.54], // 黛远山
+    [0.48, 0.32, 0.42], // 烟霞藕
+    [0.20, 0.40, 0.52]  // 暮云蓝
+  ];
+  var darkPigments = [
+    [0.13, 0.34, 0.68],
+    [0.10, 0.50, 0.54],
+    [0.32, 0.26, 0.68],
+    [0.46, 0.22, 0.54],
+    [0.15, 0.44, 0.70]
+  ];
+  var colorCursor = 0;
+
+  function pickColor() {
+    var pal = isDark ? darkPigments : lightPigments;
+    var base = pal[Math.floor(colorCursor) % pal.length];
+    var next = pal[(Math.floor(colorCursor) + 1) % pal.length];
+    var t = colorCursor % 1;
+    colorCursor += 0.08;
+    return [
+      base[0] + (next[0] - base[0]) * t,
+      base[1] + (next[1] - base[1]) * t,
+      base[2] + (next[2] - base[2]) * t
+    ];
+  }
+
+  function splat(x, y, dx, dy, color, radius) {
+    gl.useProgram(splatShader.program);
+    gl.uniform1i(splatShader.uniforms.uTarget, velocity.read.attach(0));
+    gl.uniform1f(splatShader.uniforms.aspectRatio, canvas.width / canvas.height);
+    gl.uniform2f(splatShader.uniforms.point, x, y);
+    gl.uniform3f(splatShader.uniforms.color, dx, dy, 0);
+    gl.uniform1f(splatShader.uniforms.radius, radius || 0.0026);
+    blit(velocity.write);
+    velocity.swap();
+
+    gl.uniform1i(splatShader.uniforms.uTarget, dye.read.attach(0));
+    gl.uniform3f(splatShader.uniforms.color, color[0], color[1], color[2]);
+    gl.uniform1f(splatShader.uniforms.radius, (radius || 0.0026) * 1.15);
+    blit(dye.write);
+    dye.swap();
+  }
+
+  function openingFlourish() {
+    var strokes = [
+      { x: 0.18, y: 0.65, dx: 220, dy: 80 },
+      { x: 0.82, y: 0.58, dx: -220, dy: 96 },
+      { x: 0.48, y: 0.34, dx: 150, dy: -110 }
+    ];
+    strokes.forEach(function (s, idx) {
+      setTimeout(function () {
+        splat(s.x, s.y, s.dx, s.dy, pickColor(), 0.0048);
+      }, idx * 140);
+    });
+  }
+  openingFlourish();
+
+  var lastX = null, lastY = null;
+  window.addEventListener("pointermove", function (e) {
+    var x = e.clientX / window.innerWidth;
+    var y = 1.0 - e.clientY / window.innerHeight;
+    if (lastX === null) { lastX = x; lastY = y; return; }
+    var dx = (x - lastX) * 4800;
+    var dy = (y - lastY) * 4800;
+    if (Math.hypot(dx, dy) > 12) {
+      splat(x, y, dx, dy, pickColor(), 0.0025);
+      lastX = x;
+      lastY = y;
+    }
+  }, { passive: true });
+
+  window.addEventListener("pointerdown", function (e) {
+    var x = e.clientX / window.innerWidth;
+    var y = 1.0 - e.clientY / window.innerHeight;
+    lastX = x;
+    lastY = y;
+    for (var i = 0; i < 4; i++) {
+      var a = (Math.PI * 2 * i) / 4 + Math.random() * 0.5;
+      splat(x, y, Math.cos(a) * 380, Math.sin(a) * 380, pickColor(), 0.0038);
+    }
+  }, { passive: true });
+
+  var lastTime = performance.now();
+  function step() {
+    var now = performance.now();
+    var dt = Math.min((now - lastTime) / 1000, 0.0166);
+    lastTime = now;
+
+    gl.useProgram(curlShader.program);
+    gl.uniform2f(curlShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(curlShader.uniforms.uVelocity, velocity.read.attach(0));
+    blit(curl);
+
+    gl.useProgram(vorticityShader.program);
+    gl.uniform2f(vorticityShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(vorticityShader.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(vorticityShader.uniforms.uCurl, curl.attach(1));
+    gl.uniform1f(vorticityShader.uniforms.curl, 26.0);
+    gl.uniform1f(vorticityShader.uniforms.dt, dt);
+    blit(velocity.write);
+    velocity.swap();
+
+    gl.useProgram(divergenceShader.program);
+    gl.uniform2f(divergenceShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(divergenceShader.uniforms.uVelocity, velocity.read.attach(0));
+    blit(divergence);
+
+    gl.useProgram(clearShader.program);
+    gl.uniform1i(clearShader.uniforms.uTexture, pressure.read.attach(0));
+    gl.uniform1f(clearShader.uniforms.value, 0.8);
+    blit(pressure.write);
+    pressure.swap();
+
+    gl.useProgram(pressureShader.program);
+    gl.uniform2f(pressureShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(pressureShader.uniforms.uDivergence, divergence.attach(0));
+    for (var i = 0; i < 14; i++) {
+      gl.uniform1i(pressureShader.uniforms.uPressure, pressure.read.attach(1));
+      blit(pressure.write);
+      pressure.swap();
+    }
+
+    gl.useProgram(gradientSubtractShader.program);
+    gl.uniform2f(gradientSubtractShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(gradientSubtractShader.uniforms.uPressure, pressure.read.attach(0));
+    gl.uniform1i(gradientSubtractShader.uniforms.uVelocity, velocity.read.attach(1));
+    blit(velocity.write);
+    velocity.swap();
+
+    gl.useProgram(advectionShader.program);
+    gl.uniform2f(advectionShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    var velId = velocity.read.attach(0);
+    gl.uniform1i(advectionShader.uniforms.uVelocity, velId);
+    gl.uniform1i(advectionShader.uniforms.uSource, velId);
+    gl.uniform1f(advectionShader.uniforms.dt, dt);
+    gl.uniform1f(advectionShader.uniforms.dissipation, 0.92);
+    blit(velocity.write);
+    velocity.swap();
+
+    gl.uniform2f(advectionShader.uniforms.texelSize, dye.texelSizeX, dye.texelSizeY);
+    gl.uniform1i(advectionShader.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(advectionShader.uniforms.uSource, dye.read.attach(1));
+    gl.uniform1f(advectionShader.uniforms.dissipation, 0.74);
+    blit(dye.write);
+    dye.swap();
+
+    gl.useProgram(displayShader.program);
+    gl.uniform2f(displayShader.uniforms.texelSize, 1.0 / canvas.width, 1.0 / canvas.height);
+    gl.uniform1i(displayShader.uniforms.uTexture, dye.read.attach(0));
+    if (isDark) {
+      // #090b10
+      gl.uniform3f(displayShader.uniforms.uBgColor, 0.035, 0.043, 0.063);
+      gl.uniform1f(displayShader.uniforms.uIsDark, 1.0);
+    } else {
+      // #eae7e0 soft warm silk paper
+      gl.uniform3f(displayShader.uniforms.uBgColor, 0.918, 0.906, 0.878);
+      gl.uniform1f(displayShader.uniforms.uIsDark, 0.0);
+    }
+    blit(null);
+
+    requestAnimationFrame(step);
+  }
+  step();
+
+  if (modeBtn) {
+    modeBtn.addEventListener("click", function () {
+      isDark = !isDark;
+      try { localStorage.setItem("asm-fluid-mode", isDark ? "ink" : "paper"); } catch (e) {}
+      syncModeUI();
+      openingFlourish();
+    });
   }
 })();
 </script>
