@@ -1342,34 +1342,64 @@ footer {
     return { color: neu[Math.floor(Math.random() * neu.length)], isAccent: false };
   }
 
-  function createShape(i, total) {
-    var isMobile = W < 720;
-    // Bold, generously sized Bauhaus shapes (24px ~ 56px on desktop, 18px ~ 36px on mobile)
-    var size = (isMobile ? 18 : 24) + Math.random() * (isMobile ? 16 : 26);
-    var p = pickColor(0.18);
-    var spread = (i + Math.random()) / total;
-    var x = spread * W;
-    // Dense bottom carpet flush to the very bottom edge, curving higher near left/right sides
-    var edgeBoost = Math.pow(Math.abs(spread - 0.5) * 2, 1.5);
-    var layerRand = Math.pow(Math.random(), 1.35);
-    var maxPile = (isMobile ? 120 : 185) + edgeBoost * (isMobile ? 35 : 75);
-    var floorOffset = 4 + layerRand * maxPile;
-    var restY = H - floorOffset;
-    return {
-      type: TYPES[Math.floor(Math.random() * TYPES.length)],
-      color: p.color,
-      isAccent: p.isAccent,
-      size: size,
-      x: x,
-      y: restY - Math.random() * 40,
-      restY: restY,
-      vx: (Math.random() - 0.5) * 0.6,
-      vy: 0,
-      angle: Math.random() * Math.PI * 2,
-      va: (Math.random() - 0.5) * 0.03,
-      mass: 0.65 + (size / 56) * 0.65,
-      settled: false
-    };
+  // Resolve pairwise collisions so shapes NEVER overlap and stack solidly on the bottom floor
+  function resolveCollisions(passes) {
+    var n = shapes.length;
+    for (var pass = 0; pass < passes; pass++) {
+      for (var i = 0; i < n; i++) {
+        var a = shapes[i];
+        for (var j = i + 1; j < n; j++) {
+          var b = shapes[j];
+          var dx = b.x - a.x;
+          var dy = b.y - a.y;
+          var minDist = a.r + b.r + 1.5;
+          var d2 = dx * dx + dy * dy;
+          if (d2 >= minDist * minDist) continue;
+
+          var d = Math.sqrt(d2);
+          if (d < 0.001) {
+            dx = (Math.random() - 0.5) * 0.2;
+            dy = -0.2;
+            d = Math.hypot(dx, dy);
+          }
+          var overlap = (minDist - d) * 0.5;
+          var nx = dx / d;
+          var ny = dy / d;
+
+          a.x -= nx * overlap;
+          a.y -= ny * overlap;
+          b.x += nx * overlap;
+          b.y += ny * overlap;
+
+          // Subtle damped impulse transfer along normal
+          var rvx = b.vx - a.vx;
+          var rvy = b.vy - a.vy;
+          var velAlongNormal = rvx * nx + rvy * ny;
+          if (velAlongNormal < 0) {
+            var jImp = -0.58 * velAlongNormal;
+            a.vx -= jImp * nx;
+            a.vy -= jImp * ny;
+            b.vx += jImp * nx;
+            b.vy += jImp * ny;
+          }
+        }
+      }
+
+      // Clamp to stage floor and side walls every pass
+      for (var k = 0; k < n; k++) {
+        var s = shapes[k];
+        if (s.x < s.r) { s.x = s.r; if (s.vx < 0) s.vx *= -0.25; }
+        else if (s.x > W - s.r) { s.x = W - s.r; if (s.vx > 0) s.vx *= -0.25; }
+        if (s.y < s.r) { s.y = s.r; if (s.vy < 0) s.vy *= -0.2; }
+        if (s.y > H - s.r) {
+          s.y = H - s.r;
+          if (s.vy > 0.6) s.vy *= -0.16;
+          else s.vy = 0;
+          s.vx *= 0.86;
+          s.va *= 0.82;
+        }
+      }
+    }
   }
 
   function initShapes() {
@@ -1381,13 +1411,46 @@ footer {
     canvas.height = Math.floor(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    var count = W < 720 ? 115 : Math.min(340, Math.max(240, Math.floor(W / 4.4)));
+    var isMobile = W < 720;
+    // Larger, chunky non-overlapping shapes: 36px ~ 64px on desktop, 26px ~ 44px on mobile
+    var count = isMobile ? 48 : Math.min(135, Math.max(88, Math.floor(W / 11)));
     shapes = [];
     for (var i = 0; i < count; i++) {
-      shapes.push(createShape(i, count));
+      var size = (isMobile ? 26 : 36) + Math.random() * (isMobile ? 18 : 28);
+      var r = size * 0.48;
+      var p = pickColor(0.2);
+      var colFrac = (i + 0.5 + (Math.random() - 0.5) * 0.6) / count;
+      var row = Math.floor(Math.random() * 4);
+      shapes.push({
+        type: TYPES[Math.floor(Math.random() * TYPES.length)],
+        color: p.color,
+        isAccent: p.isAccent,
+        size: size,
+        r: r,
+        x: r + colFrac * Math.max(40, W - r * 2),
+        y: H - r - row * (size * 0.92) - Math.random() * 20,
+        vx: 0,
+        vy: 0,
+        angle: Math.random() * Math.PI * 2,
+        va: 0
+      });
+    }
+
+    // Pre-settle pile offline so initial paint is already a clean, non-overlapping solid stack!
+    for (var step = 0; step < 36; step++) {
+      for (var m = 0; m < shapes.length; m++) {
+        shapes[m].vy += 0.45;
+        shapes[m].y += shapes[m].vy;
+        shapes[m].vy *= 0.9;
+      }
+      resolveCollisions(3);
+    }
+    for (var z = 0; z < shapes.length; z++) {
+      shapes[z].vx = 0;
+      shapes[z].vy = 0;
+      shapes[z].va = 0;
     }
     drawAll();
-    wake(2200);
   }
 
   function recolorShapes() {
@@ -1399,7 +1462,7 @@ footer {
   }
 
   function wake(ms) {
-    var target = performance.now() + (ms || 4200);
+    var target = performance.now() + (ms || 2400);
     if (target > activeUntil) activeUntil = target;
     if (!running) {
       running = true;
@@ -1407,47 +1470,40 @@ footer {
     }
   }
 
-  function applyInkForce(lx, ly, dx, dy, isBurst) {
-    var radius = isBurst ? (W < 720 ? 130 : 175) : (W < 720 ? 115 : 155);
-    var r2 = radius * radius;
-    var speed = Math.min(36, Math.hypot(dx, dy));
+  // Only the instantaneous cursor/ink head nudges shapes directly under it — subtle & weighty
+  function nudgeAtCursorHead(lx, ly, dx, dy) {
+    var headRadius = W < 720 ? 68 : 88;
+    var speed = Math.min(28, Math.hypot(dx, dy));
     var hitAny = false;
 
     for (var i = 0; i < shapes.length; i++) {
       var s = shapes[i];
       var rx = s.x - lx;
       var ry = s.y - ly;
+      var reach = headRadius + s.r;
       var d2 = rx * rx + ry * ry;
-      if (d2 > r2) continue;
+      if (d2 > reach * reach) continue;
 
       var d = Math.sqrt(d2) || 1;
-      var falloff = 1 - d / radius;
-      var f = (falloff * falloff) / s.mass;
+      var falloff = 1 - d / reach;
+      var f = falloff * falloff;
 
-      if (isBurst) {
-        var b = (W < 720 ? 4.2 : 5.6) * f;
-        s.vx += (rx / d) * b + (Math.random() - 0.5) * 1.4;
-        s.vy += (ry / d) * b - (W < 720 ? 4.0 : 5.4) * f;
-        s.va += (Math.random() - 0.5) * 0.14 * f;
-      } else {
-        // Gentle, silky buoyant ink lift
-        s.vx += (dx * 0.18 + (rx / d) * (0.6 + speed * 0.04)) * f;
-        s.vy += (dy * 0.12 - (1.9 + speed * 0.14)) * f;
-        s.va += (dx * 0.007 + (rx >= 0 ? 0.025 : -0.025)) * f;
-      }
+      // Subtle, restrained lift & nudge only at the cursor head
+      s.vx += (dx * 0.085 + (rx / d) * (0.35 + speed * 0.025)) * f;
+      s.vy += (dy * 0.055 - (0.85 + speed * 0.055)) * f;
+      s.va += (dx * 0.0035) * f;
 
-      s.vx = Math.max(-8.5, Math.min(8.5, s.vx));
-      s.vy = Math.max(-10.5, Math.min(7.5, s.vy));
-      s.settled = false;
+      s.vx = Math.max(-4.8, Math.min(4.8, s.vx));
+      s.vy = Math.max(-5.6, Math.min(4.2, s.vy));
       hitAny = true;
     }
-    if (hitAny) wake(3600);
+    if (hitAny) wake(2600);
   }
 
   var lastLx = null, lastLy = null;
   window.addEventListener("pointermove", function (e) {
     var rect = stage.getBoundingClientRect();
-    if (e.clientY < rect.top - 40 || e.clientY > rect.bottom + 40) {
+    if (e.clientY < rect.top || e.clientY > rect.bottom) {
       lastLx = null;
       lastLy = null;
       return;
@@ -1458,25 +1514,14 @@ footer {
     var dx = lx - lastLx;
     var dy = ly - lastLy;
     if (Math.hypot(dx, dy) > 1.5) {
-      applyInkForce(lx, ly, dx, dy, false);
+      nudgeAtCursorHead(lx, ly, dx, dy);
       lastLx = lx;
       lastLy = ly;
     }
   }, { passive: true });
 
-  window.addEventListener("pointerdown", function (e) {
-    var rect = stage.getBoundingClientRect();
-    if (e.clientY < rect.top || e.clientY > rect.bottom) return;
-    var lx = e.clientX - rect.left;
-    var ly = e.clientY - rect.top;
-    lastLx = lx;
-    lastLy = ly;
-    applyInkForce(lx, ly, 0, 0, true);
-  }, { passive: true });
-
   window.addEventListener("pointerleave", function () { lastLx = null; lastLy = null; });
   window.addEventListener("pointercancel", function () { lastLx = null; lastLy = null; });
-
 
   var lastW = window.innerWidth;
   var rTimer;
@@ -1491,7 +1536,7 @@ footer {
   mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-mode"] });
 
   function drawShape(s) {
-    var r = s.size * 0.5;
+    var r = s.r;
     ctx.save();
     ctx.translate(s.x, s.y);
     ctx.rotate(s.angle);
@@ -1501,39 +1546,39 @@ footer {
     switch (s.type) {
       case "circle":
         ctx.beginPath();
-        ctx.arc(0, 0, r * 0.85, 0, Math.PI * 2);
+        ctx.arc(0, 0, r * 0.92, 0, Math.PI * 2);
         ctx.fill();
         break;
       case "ring":
-        ctx.lineWidth = Math.max(4, r * 0.36);
+        ctx.lineWidth = Math.max(5, r * 0.36);
         ctx.beginPath();
         ctx.arc(0, 0, r * 0.72, 0, Math.PI * 2);
         ctx.stroke();
         break;
       case "triangle":
         ctx.beginPath();
-        ctx.moveTo(0, -r);
-        ctx.lineTo(r * 0.94, r * 0.82);
-        ctx.lineTo(-r * 0.94, r * 0.82);
+        ctx.moveTo(0, -r * 0.98);
+        ctx.lineTo(r * 0.92, r * 0.8);
+        ctx.lineTo(-r * 0.92, r * 0.8);
         ctx.closePath();
         ctx.fill();
         break;
       case "bowtie":
         ctx.beginPath();
-        ctx.moveTo(-r, -r * 0.78);
+        ctx.moveTo(-r * 0.95, -r * 0.74);
         ctx.lineTo(0, 0);
-        ctx.lineTo(-r, r * 0.78);
+        ctx.lineTo(-r * 0.95, r * 0.74);
         ctx.closePath();
-        ctx.moveTo(r, -r * 0.78);
+        ctx.moveTo(r * 0.95, -r * 0.74);
         ctx.lineTo(0, 0);
-        ctx.lineTo(r, r * 0.78);
+        ctx.lineTo(r * 0.95, r * 0.74);
         ctx.closePath();
         ctx.fill();
         break;
       case "star":
         ctx.beginPath();
         for (var k = 0; k < 10; k++) {
-          var rad = k % 2 === 0 ? r : r * 0.44;
+          var rad = k % 2 === 0 ? r * 0.98 : r * 0.44;
           var a = (k * Math.PI) / 5 - Math.PI / 2;
           if (k === 0) ctx.moveTo(Math.cos(a) * rad, Math.sin(a) * rad);
           else ctx.lineTo(Math.cos(a) * rad, Math.sin(a) * rad);
@@ -1542,19 +1587,19 @@ footer {
         ctx.fill();
         break;
       case "cross":
-        var w = r * 0.42;
+        var w = r * 0.4;
         ctx.beginPath();
         if (ctx.roundRect) {
-          ctx.roundRect(-r, -w, r * 2, w * 2, 3);
-          ctx.roundRect(-w, -r, w * 2, r * 2, 3);
+          ctx.roundRect(-r * 0.95, -w, r * 1.9, w * 2, 4);
+          ctx.roundRect(-w, -r * 0.95, w * 2, r * 1.9, 4);
         } else {
-          ctx.rect(-r, -w, r * 2, w * 2);
-          ctx.rect(-w, -r, w * 2, r * 2);
+          ctx.rect(-r * 0.95, -w, r * 1.9, w * 2);
+          ctx.rect(-w, -r * 0.95, w * 2, r * 1.9);
         }
         ctx.fill();
         break;
       case "pill":
-        var pw = r * 1.18, ph = r * 0.5;
+        var pw = r * 0.98, ph = r * 0.46;
         ctx.beginPath();
         if (ctx.roundRect) ctx.roundRect(-pw, -ph, pw * 2, ph * 2, ph);
         else ctx.rect(-pw, -ph, pw * 2, ph * 2);
@@ -1564,8 +1609,8 @@ footer {
         ctx.beginPath();
         for (var m = 0; m < 5; m++) {
           var ang = (m * Math.PI * 2) / 5 - Math.PI / 2;
-          if (m === 0) ctx.moveTo(Math.cos(ang) * r, Math.sin(ang) * r);
-          else ctx.lineTo(Math.cos(ang) * r, Math.sin(ang) * r);
+          if (m === 0) ctx.moveTo(Math.cos(ang) * r * 0.95, Math.sin(ang) * r * 0.95);
+          else ctx.lineTo(Math.cos(ang) * r * 0.95, Math.sin(ang) * r * 0.95);
         }
         ctx.closePath();
         ctx.fill();
@@ -1583,49 +1628,29 @@ footer {
 
   function tick() {
     var now = performance.now();
-    var anyMoving = false;
+    var totalEnergy = 0;
 
     for (var i = 0; i < shapes.length; i++) {
       var s = shapes[i];
-      if (s.settled) continue;
-
-      s.vy += 0.28 * s.mass;
-      s.vx *= 0.986;
-      s.vy *= 0.992;
-      s.va *= 0.978;
-
+      s.vy += 0.34;
+      s.vx *= 0.96;
+      s.vy *= 0.97;
+      s.va *= 0.94;
       s.x += s.vx;
       s.y += s.vy;
       s.angle += s.va;
+    }
 
-      var pad = s.size * 0.5;
-      if (s.x < pad) { s.x = pad; s.vx = Math.abs(s.vx) * 0.55; }
-      else if (s.x > W - pad) { s.x = W - pad; s.vx = -Math.abs(s.vx) * 0.55; }
-      if (s.y < pad) { s.y = pad; s.vy = Math.abs(s.vy) * 0.45; }
+    resolveCollisions(4);
 
-      if (s.y >= s.restY) {
-        s.y = s.restY;
-        if (Math.abs(s.vy) > 1.2) {
-          s.vy = -s.vy * 0.36;
-          s.vx *= 0.84;
-          s.va *= 0.8;
-        } else {
-          s.vy = 0;
-          s.vx *= 0.78;
-          s.va *= 0.75;
-          if (Math.abs(s.vx) < 0.06 && Math.abs(s.va) < 0.004) {
-            s.vx = 0;
-            s.va = 0;
-            s.settled = true;
-          }
-        }
-      }
-      if (!s.settled) anyMoving = true;
+    for (var j = 0; j < shapes.length; j++) {
+      var q = shapes[j];
+      totalEnergy += Math.abs(q.vx) + Math.abs(q.vy) + Math.abs(q.va) * 10;
     }
 
     drawAll();
 
-    if (!anyMoving && now > activeUntil) {
+    if (totalEnergy < 1.2 && now > activeUntil) {
       running = false;
       return;
     }
