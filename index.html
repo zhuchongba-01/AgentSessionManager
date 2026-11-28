@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Agent会话管理 v1.8.4 — 本地编码 Agent 会话阅读与治理工作台</title>
 <meta name="description" content="面向 13 种本地编码 Agent 的旗舰级桌面会话阅读、SQLite FTS5 全文检索、内联 Diff 与安全治理工具。Rust + Tauri v2 驱动，100% 本地离线。">
 <link rel="icon" type="image/png" href="./app-icon.png">
@@ -21,10 +21,9 @@
 :root {
   --bg: #05060a;
   --bg-elevated: #0b0d14;
-  --surface: rgba(16, 19, 28, 0.72);
+  --surface: rgba(16, 19, 28, 0.76);
   --surface-solid: #0f121b;
-  --surface-2: rgba(24, 29, 42, 0.65);
-  --nav-bg: rgba(5, 6, 10, 0.72);
+  --nav-bg: rgba(5, 6, 10, 0.76);
   --border: rgba(255, 255, 255, 0.08);
   --border-strong: rgba(255, 255, 255, 0.16);
   --specular: rgba(255, 255, 255, 0.22);
@@ -42,8 +41,8 @@
   --btn-primary-bg: linear-gradient(180deg, #ffffff 0%, #e4e9f2 100%);
   --btn-primary-text: #07090f;
   --btn-primary-shadow: 0 1px 0 rgba(255,255,255,0.9) inset, 0 12px 30px -10px rgba(255,255,255,0.35);
-  --btn-sec-bg: rgba(255, 255, 255, 0.05);
-  --btn-sec-hover: rgba(255, 255, 255, 0.1);
+  --btn-sec-bg: rgba(255, 255, 255, 0.055);
+  --btn-sec-hover: rgba(255, 255, 255, 0.11);
   --stage-bezel: linear-gradient(180deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0.03) 100%);
   --stage-shadow: 0 40px 120px -24px rgba(0, 0, 0, 0.88), 0 0 0 1px rgba(255, 255, 255, 0.09);
   --beam-top: radial-gradient(ellipse 68% 36% at 50% -8%, rgba(122, 162, 255, 0.18), transparent 72%);
@@ -55,10 +54,9 @@
 [data-theme="light"] {
   --bg: #f6f7fa;
   --bg-elevated: #ffffff;
-  --surface: rgba(255, 255, 255, 0.86);
+  --surface: rgba(255, 255, 255, 0.88);
   --surface-solid: #ffffff;
-  --surface-2: rgba(241, 244, 249, 0.85);
-  --nav-bg: rgba(246, 247, 250, 0.78);
+  --nav-bg: rgba(246, 247, 250, 0.82);
   --border: rgba(15, 23, 42, 0.08);
   --border-strong: rgba(15, 23, 42, 0.15);
   --specular: rgba(255, 255, 255, 0.95);
@@ -76,7 +74,7 @@
   --btn-primary-bg: linear-gradient(180deg, #1e293b 0%, #0b0f19 100%);
   --btn-primary-text: #ffffff;
   --btn-primary-shadow: 0 1px 0 rgba(255,255,255,0.22) inset, 0 14px 28px -10px rgba(15,23,42,0.45);
-  --btn-sec-bg: rgba(255, 255, 255, 0.88);
+  --btn-sec-bg: rgba(255, 255, 255, 0.9);
   --btn-sec-hover: #ffffff;
   --stage-bezel: linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(226,232,240,0.65) 100%);
   --stage-shadow: 0 38px 96px -28px rgba(15, 23, 42, 0.2), 0 0 0 1px rgba(15, 23, 42, 0.08);
@@ -86,13 +84,19 @@
   --mini-row: rgba(15, 23, 42, 0.035);
 }
 
-* { margin: 0; padding: 0; box-sizing: border-box; }
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
 
 html {
   scroll-behavior: smooth;
-  scroll-padding-top: 84px;
+  scroll-padding-top: 76px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  overflow-x: clip;
 }
 
 body {
@@ -100,14 +104,15 @@ body {
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   line-height: 1.6;
-  overflow-x: hidden;
+  overflow-x: clip;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 a { color: inherit; text-decoration: none; }
 button { font: inherit; color: inherit; }
 
-/* Atmospheric Studio Lighting & Subtle Grain */
+/* Atmospheric Studio Lighting */
 .studio-light {
   position: fixed;
   inset: 0;
@@ -141,7 +146,7 @@ button { font: inherit; color: inherit; }
 ::-webkit-scrollbar-thumb:hover { background-color: rgba(148, 163, 184, 0.5); }
 
 .wrap { max-width: 1140px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
-.stage-wrap { max-width: 1320px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+.stage-wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
 
 /* Floating Precision Navbar */
 .site-header {
@@ -159,7 +164,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
 }
 
 .brand {
@@ -169,13 +174,21 @@ button { font: inherit; color: inherit; }
   font-size: 15px;
   font-weight: 650;
   letter-spacing: -0.02em;
+  min-width: 0;
 }
 
 .brand img {
   width: 28px;
   height: 28px;
   border-radius: 8px;
+  flex: none;
   box-shadow: 0 0 0 1px var(--border-strong), 0 4px 12px rgba(0,0,0,0.22);
+}
+
+.brand-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .nav-ver {
@@ -187,6 +200,7 @@ button { font: inherit; color: inherit; }
   border: 1px solid var(--border);
   background: var(--btn-sec-bg);
   color: var(--text-secondary);
+  flex: none;
 }
 
 .nav-links {
@@ -213,6 +227,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: none;
 }
 
 .icon-btn {
@@ -235,6 +250,26 @@ button { font: inherit; color: inherit; }
   background: var(--btn-sec-hover);
 }
 
+.nav-demo {
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--btn-sec-bg);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+}
+
+.nav-demo:hover {
+  background: var(--btn-sec-hover);
+  border-color: var(--text-muted);
+}
+
 .nav-dl {
   height: 34px;
   padding: 0 15px;
@@ -254,7 +289,7 @@ button { font: inherit; color: inherit; }
 
 /* Sculpted Hero */
 .hero {
-  padding: 84px 0 48px;
+  padding: 80px 0 46px;
   text-align: center;
 }
 
@@ -266,7 +301,7 @@ button { font: inherit; color: inherit; }
   border-radius: 24px;
   background: var(--stage-bezel);
   box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-strong), 0 0 40px var(--accent-glow);
-  margin-bottom: 28px;
+  margin-bottom: 26px;
 }
 
 .emblem-wrap img {
@@ -288,7 +323,8 @@ button { font: inherit; color: inherit; }
   font-size: 12.5px;
   font-weight: 550;
   color: var(--text-secondary);
-  margin-bottom: 24px;
+  margin-bottom: 22px;
+  max-width: 100%;
   box-shadow: 0 1px 0 var(--specular) inset;
   transition: border-color 0.2s ease, transform 0.2s ease;
 }
@@ -302,17 +338,18 @@ button { font: inherit; color: inherit; }
   width: 6px;
   height: 6px;
   border-radius: 50%;
+  flex: none;
   background: var(--emerald);
   box-shadow: 0 0 10px var(--emerald);
 }
 
 .hero h1 {
-  font-size: clamp(38px, 5.8vw, 66px);
+  font-size: clamp(32px, 5.8vw, 66px);
   font-weight: 760;
-  line-height: 1.07;
+  line-height: 1.08;
   letter-spacing: -0.04em;
   max-width: 900px;
-  margin: 0 auto 20px;
+  margin: 0 auto 18px;
   background: var(--heading-grad);
   -webkit-background-clip: text;
   background-clip: text;
@@ -328,8 +365,8 @@ button { font: inherit; color: inherit; }
 
 .hero-sub {
   max-width: 620px;
-  margin: 0 auto 34px;
-  font-size: 17px;
+  margin: 0 auto 32px;
+  font-size: clamp(15px, 2vw, 17px);
   line-height: 1.72;
   color: var(--text-secondary);
   font-weight: 420;
@@ -351,6 +388,7 @@ button { font: inherit; color: inherit; }
   font-weight: 650;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 8px;
   cursor: pointer;
   transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
@@ -378,19 +416,19 @@ button { font: inherit; color: inherit; }
 }
 
 .hero-footnote {
-  margin-top: 24px;
+  margin-top: 22px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 16px;
+  gap: 12px;
   flex-wrap: wrap;
   font-size: 12.5px;
   color: var(--text-muted);
 }
 
-/* Cinema Product Stage */
+/* Cinema Product Showcase (Retina Static Preview + Direct Demo Jump) */
 .stage-section {
-  padding: 18px 0 96px;
+  padding: 16px 0 92px;
   position: relative;
 }
 
@@ -435,7 +473,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   background: var(--surface-solid);
   border-bottom: 1px solid var(--border);
 }
@@ -443,12 +481,14 @@ button { font: inherit; color: inherit; }
 .win-left {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
+  min-width: 0;
 }
 
 .win-dots {
   display: flex;
   gap: 7px;
+  flex: none;
 }
 
 .win-dots i {
@@ -466,6 +506,7 @@ button { font: inherit; color: inherit; }
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .win-title img { width: 16px; height: 16px; border-radius: 4px; }
@@ -482,12 +523,13 @@ button { font: inherit; color: inherit; }
 .seg-btn {
   border: 0;
   background: transparent;
-  padding: 4px 13px;
+  padding: 4px 12px;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
   cursor: pointer;
+  white-space: nowrap;
   transition: all 0.18s ease;
 }
 
@@ -497,41 +539,37 @@ button { font: inherit; color: inherit; }
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24), 0 0 0 1px var(--border);
 }
 
-.win-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.win-btn {
-  height: 28px;
-  padding: 0 11px;
+.win-demo-btn {
+  height: 30px;
+  padding: 0 12px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   background: var(--btn-sec-bg);
-  color: var(--text-secondary);
+  color: var(--text);
   font-size: 12px;
-  font-weight: 550;
+  font-weight: 600;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  cursor: pointer;
+  white-space: nowrap;
   transition: all 0.16s ease;
 }
 
-.win-btn:hover { color: var(--text); border-color: var(--border-strong); background: var(--btn-sec-hover); }
+.win-demo-btn:hover {
+  border-color: var(--accent);
+  background: var(--btn-sec-hover);
+}
 
-.demo-iframe {
-  width: 100%;
-  height: 760px;
-  border: 0;
-  display: block;
+.shot-frame {
+  position: relative;
   background: var(--bg-elevated);
 }
 
-.shot-pane { display: none; }
-.shot-pane.active { display: block; }
-.shot-pane img { width: 100%; height: auto; display: block; }
+.shot-frame img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
 
 .stage-note {
   margin-top: 16px;
@@ -559,7 +597,7 @@ button { font: inherit; color: inherit; }
 }
 
 .metric-cell {
-  padding: 32px 20px;
+  padding: 32px 16px;
   text-align: center;
   border-right: 1px solid var(--border);
 }
@@ -567,7 +605,7 @@ button { font: inherit; color: inherit; }
 .metric-cell:last-child { border-right: none; }
 
 .metric-num {
-  font-size: 32px;
+  font-size: clamp(24px, 3vw, 32px);
   font-weight: 760;
   letter-spacing: -0.035em;
   font-variant-numeric: tabular-nums;
@@ -579,20 +617,20 @@ button { font: inherit; color: inherit; }
 
 .metric-label {
   margin-top: 4px;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text-secondary);
 }
 
 /* Section Layout */
 .section {
-  padding: 96px 0;
+  padding: 92px 0;
   position: relative;
   z-index: 1;
 }
 
 .section-header {
   max-width: 660px;
-  margin-bottom: 48px;
+  margin-bottom: 44px;
 }
 
 .eyebrow {
@@ -604,15 +642,15 @@ button { font: inherit; color: inherit; }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent);
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
 .section-header h2 {
-  font-size: clamp(28px, 3.6vw, 42px);
+  font-size: clamp(24px, 3.6vw, 42px);
   font-weight: 750;
-  line-height: 1.14;
+  line-height: 1.15;
   letter-spacing: -0.035em;
-  margin-bottom: 14px;
+  margin-bottom: 12px;
   background: var(--heading-grad);
   -webkit-background-clip: text;
   background-clip: text;
@@ -620,7 +658,7 @@ button { font: inherit; color: inherit; }
 }
 
 .section-header p {
-  font-size: 16px;
+  font-size: clamp(14.5px, 1.8vw, 16px);
   line-height: 1.7;
   color: var(--text-secondary);
 }
@@ -638,12 +676,13 @@ button { font: inherit; color: inherit; }
   border-radius: 20px;
   background: var(--surface);
   border: 1px solid var(--border);
-  padding: 28px;
+  padding: 26px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  gap: 22px;
+  gap: 20px;
   overflow: hidden;
+  min-width: 0;
   backdrop-filter: blur(16px);
   transition: border-color 0.25s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -667,7 +706,6 @@ button { font: inherit; color: inherit; }
 
 .card.span-7 { grid-column: span 7; }
 .card.span-5 { grid-column: span 5; }
-.card.span-6 { grid-column: span 6; }
 
 .card-kicker {
   font-size: 11.5px;
@@ -679,7 +717,7 @@ button { font: inherit; color: inherit; }
 }
 
 .card h3 {
-  font-size: 19px;
+  font-size: 18.5px;
   font-weight: 700;
   letter-spacing: -0.025em;
   margin-bottom: 8px;
@@ -692,13 +730,14 @@ button { font: inherit; color: inherit; }
   color: var(--text-secondary);
 }
 
-/* Sculpted Mini UI Previews inside Bento Cards */
+/* Sculpted Mini UI Previews */
 .mini-ui {
   border-radius: 13px;
   background: var(--mini-bg);
   border: 1px solid var(--border);
   padding: 14px;
   font-size: 12px;
+  min-width: 0;
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
 }
 
@@ -706,6 +745,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -744,6 +784,7 @@ button { font: inherit; color: inherit; }
   background: var(--emerald-soft);
   color: var(--emerald);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .mini-thought {
@@ -756,6 +797,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
 }
 
 .mini-diff {
@@ -763,18 +805,19 @@ button { font: inherit; color: inherit; }
   font-size: 11.5px;
   line-height: 1.65;
   border-radius: 9px;
-  overflow: hidden;
+  overflow-x: auto;
   border: 1px solid var(--border);
 }
 
-.diff-del { background: var(--rose-soft); color: var(--rose); padding: 2px 10px; }
-.diff-add { background: var(--emerald-soft); color: var(--emerald); padding: 2px 10px; }
-.diff-ctx { padding: 2px 10px; color: var(--text-secondary); }
+.diff-del, .diff-add { white-space: nowrap; padding: 3px 10px; }
+.diff-del { background: var(--rose-soft); color: var(--rose); }
+.diff-add { background: var(--emerald-soft); color: var(--emerald); }
 
 .mini-search-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 8px 11px;
   border-radius: 9px;
   background: var(--mini-row);
@@ -800,6 +843,7 @@ button { font: inherit; color: inherit; }
   margin-bottom: 3px;
   display: flex;
   justify-content: space-between;
+  gap: 8px;
 }
 
 .mini-hit-body {
@@ -820,8 +864,10 @@ button { font: inherit; color: inherit; }
   font-size: 11px;
   line-height: 1.65;
   color: var(--text-secondary);
-  position: relative;
+  overflow-x: auto;
 }
+
+.mini-code > div { white-space: nowrap; }
 
 .mini-code-fade {
   margin-top: 8px;
@@ -830,6 +876,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
 }
 
 .chip-row {
@@ -877,24 +924,24 @@ button { font: inherit; color: inherit; }
 
 /* 13 Agents Infinite Dual-Track Marquee */
 .marquee-section {
-  padding: 84px 0;
+  padding: 80px 0;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   overflow: hidden;
 }
 
 .marquee-shell {
-  margin-top: 36px;
+  margin-top: 32px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
   mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
   -webkit-mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
 }
 
 .marquee-track {
   display: flex;
-  gap: 14px;
+  gap: 12px;
   width: max-content;
   animation: scroll-left 34s linear infinite;
 }
@@ -921,8 +968,8 @@ button { font: inherit; color: inherit; }
   flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 12px;
-  padding: 13px 20px;
+  gap: 10px;
+  padding: 12px 18px;
   border-radius: 14px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -936,7 +983,7 @@ button { font: inherit; color: inherit; }
 }
 
 .agent-chip strong {
-  font-size: 14.5px;
+  font-size: 14px;
   font-weight: 650;
   color: var(--text);
 }
@@ -959,7 +1006,7 @@ button { font: inherit; color: inherit; }
 }
 
 .sec-item {
-  padding: 28px;
+  padding: 26px;
   border-radius: 18px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -971,7 +1018,7 @@ button { font: inherit; color: inherit; }
   font-weight: 700;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--accent);
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 
 .sec-item h3 {
@@ -988,7 +1035,7 @@ button { font: inherit; color: inherit; }
 
 /* Monumental Final CTA */
 .final-cta {
-  padding: 96px 0 84px;
+  padding: 88px 0 76px;
   text-align: center;
   position: relative;
 }
@@ -996,7 +1043,7 @@ button { font: inherit; color: inherit; }
 .cta-card {
   position: relative;
   border-radius: 28px;
-  padding: 68px 32px;
+  padding: 64px 32px;
   background: var(--surface);
   border: 1px solid var(--border-strong);
   overflow: hidden;
@@ -1014,10 +1061,10 @@ button { font: inherit; color: inherit; }
 .cta-card > * { position: relative; z-index: 1; }
 
 .cta-card h2 {
-  font-size: clamp(28px, 4vw, 44px);
+  font-size: clamp(26px, 4vw, 44px);
   font-weight: 760;
   letter-spacing: -0.035em;
-  margin: 18px 0 12px;
+  margin: 16px 0 12px;
   background: var(--heading-grad);
   -webkit-background-clip: text;
   background-clip: text;
@@ -1026,15 +1073,15 @@ button { font: inherit; color: inherit; }
 
 .cta-card p {
   max-width: 520px;
-  margin: 0 auto 30px;
-  font-size: 15.5px;
+  margin: 0 auto 28px;
+  font-size: 15px;
   color: var(--text-secondary);
 }
 
 /* Footer */
 .site-footer {
   border-top: 1px solid var(--border);
-  padding: 32px 0 48px;
+  padding: 28px 0 42px;
   font-size: 13px;
   color: var(--text-muted);
 }
@@ -1044,12 +1091,13 @@ button { font: inherit; color: inherit; }
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 16px;
+  gap: 14px;
 }
 
 .footer-links {
   display: flex;
-  gap: 20px;
+  flex-wrap: wrap;
+  gap: 18px;
 }
 
 .footer-links a:hover { color: var(--text); }
@@ -1057,8 +1105,8 @@ button { font: inherit; color: inherit; }
 /* Scroll Reveal */
 .reveal {
   opacity: 0;
-  transform: translateY(20px);
-  transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translateY(18px);
+  transition: opacity 0.65s cubic-bezier(0.16, 1, 0.3, 1), transform 0.65s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .reveal.in {
@@ -1072,20 +1120,72 @@ button { font: inherit; color: inherit; }
 [data-theme="light"] .icon-sun { display: none; }
 [data-theme="light"] .icon-moon { display: block; }
 
+/* Tablet Breakpoint */
 @media (max-width: 980px) {
-  .card, .card.span-7, .card.span-5, .card.span-6 { grid-column: span 12; }
+  .card, .card.span-7, .card.span-5 { grid-column: span 12; }
   .sec-grid { grid-template-columns: 1fr; }
   .metrics-grid { grid-template-columns: repeat(2, 1fr); }
   .metric-cell:nth-child(2) { border-right: none; }
   .metric-cell:nth-child(1), .metric-cell:nth-child(2) { border-bottom: 1px solid var(--border); }
 }
 
+/* Mobile Breakpoint */
 @media (max-width: 720px) {
-  .nav-links { display: none; }
-  .hero { padding: 56px 0 36px; }
-  .win-bar { height: auto; padding: 10px 12px; flex-wrap: wrap; }
-  .demo-iframe { height: 600px; }
-  .cta-card { padding: 48px 20px; }
+  .wrap, .stage-wrap { padding: 0 16px; }
+  .nav-bar { height: 56px; }
+  .nav-links, .nav-ver, .nav-demo { display: none; }
+  .nav-dl { height: 34px; padding: 0 14px; font-size: 12.5px; }
+  .hero { padding: 44px 0 28px; }
+  .emblem-wrap { padding: 6px; border-radius: 20px; margin-bottom: 18px; }
+  .emblem-wrap img { width: 56px; height: 56px; border-radius: 15px; }
+  .hero-pill { font-size: 11.5px; padding: 5px 12px; margin-bottom: 18px; }
+  .hero-sub { margin-bottom: 24px; }
+  .hero-cta { flex-direction: column; width: 100%; max-width: 360px; margin: 0 auto; gap: 10px; }
+  .hero-cta .btn { width: 100%; height: 48px; font-size: 15px; }
+  .hero-footnote { gap: 8px 12px; font-size: 12px; margin-top: 18px; }
+
+  .stage-section { padding: 10px 0 56px; }
+  .chassis-outer { padding: 5px; border-radius: 16px; }
+  .chassis-inner { border-radius: 12px; }
+  .win-bar { height: auto; padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+  .win-dots { display: none; }
+  .win-title { font-size: 12px; }
+  .seg-btn { padding: 4px 10px; font-size: 11.5px; }
+  .win-demo-btn { height: 28px; padding: 0 10px; font-size: 11.5px; }
+  .stage-note { font-size: 12px; margin-top: 12px; }
+
+  .metric-cell { padding: 22px 12px; }
+  .section { padding: 56px 0; }
+  .section-header { margin-bottom: 28px; }
+  .bento { gap: 14px; }
+  .card { padding: 20px; border-radius: 16px; gap: 16px; }
+  .card h3 { font-size: 17px; }
+  .mini-ui { padding: 12px; }
+
+  .marquee-section { padding: 52px 0; }
+  .marquee-shell { margin-top: 22px; gap: 10px; }
+  .agent-chip { padding: 10px 14px; border-radius: 12px; gap: 8px; }
+  .agent-chip strong { font-size: 13px; }
+
+  .sec-grid { gap: 14px; }
+  .sec-item { padding: 20px; border-radius: 16px; }
+
+  .final-cta { padding: 56px 0 48px; }
+  .cta-card { padding: 40px 20px; border-radius: 22px; }
+
+  .site-footer { padding: 24px 0 36px; text-align: center; }
+  .footer-row { flex-direction: column; justify-content: center; }
+  .footer-links { justify-content: center; gap: 14px; }
+}
+
+@media (max-width: 420px) {
+  .shield-split { grid-template-columns: 1fr; }
+  .win-title span { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track, .marquee-track.reverse { animation: none; }
+  .reveal { opacity: 1; transform: none; transition: none; }
 }
 </style>
 </head>
@@ -1097,12 +1197,12 @@ button { font: inherit; color: inherit; }
   <div class="wrap nav-bar">
     <a class="brand" href="#">
       <img src="./app-icon.png" alt="Agent会话管理">
-      <span>Agent会话管理</span>
+      <span class="brand-name">Agent会话管理</span>
       <span class="nav-ver">v1.8.4</span>
     </a>
 
     <nav class="nav-links" aria-label="主导航">
-      <a href="#stage">在线体验</a>
+      <a href="#preview">界面预览</a>
       <a href="#engine">核心引擎</a>
       <a href="#agents">13 种 Agent</a>
       <a href="#security">安全架构</a>
@@ -1116,8 +1216,12 @@ button { font: inherit; color: inherit; }
       <a class="icon-btn" href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer" title="GitHub 仓库" aria-label="GitHub 仓库">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2Z"/></svg>
       </a>
+      <a class="nav-demo" href="./demo/" target="_blank" rel="noopener noreferrer">
+        <span>在线体验</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+      </a>
       <a class="nav-dl" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">
-        <span>下载桌面端</span>
+        <span>下载</span>
       </a>
     </div>
   </div>
@@ -1135,7 +1239,7 @@ button { font: inherit; color: inherit; }
 
       <a class="hero-pill" href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">
         <span class="pill-dot"></span>
-        <span>v1.8.4 · 长代码智能折叠 · 零抖动多选底栏 · FTS5 批量索引</span>
+        <span>v1.8.4 · 长代码折叠 · 零抖动多选 · FTS5 批量索引</span>
       </a>
 
       <h1>
@@ -1154,7 +1258,8 @@ button { font: inherit; color: inherit; }
         </a>
         <a class="btn btn-secondary" href="./demo/" target="_blank" rel="noopener noreferrer">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
-          <span>全屏 1:1 在线体验</span>
+          <span>进入 1:1 在线体验</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
         </a>
       </div>
 
@@ -1170,8 +1275,8 @@ button { font: inherit; color: inherit; }
     </div>
   </section>
 
-  <!-- Cinema Stage -->
-  <section class="stage-section" id="stage">
+  <!-- Retina Product Showcase (No Embedded Iframe; Direct Jump Button to /demo/) -->
+  <section class="stage-section" id="preview">
     <div class="stage-glow" aria-hidden="true"></div>
     <div class="stage-wrap">
       <div class="chassis-outer">
@@ -1185,39 +1290,26 @@ button { font: inherit; color: inherit; }
               </div>
             </div>
 
-            <div class="seg-control" role="tablist" aria-label="演示视图">
-              <button class="seg-btn active" id="modeInteractive" type="button" role="tab" aria-selected="true">1:1 实时交互</button>
-              <button class="seg-btn" id="modeScreenshot" type="button" role="tab" aria-selected="false">2880×1800 静态图</button>
+            <div class="seg-control" role="tablist" aria-label="界面外观预览">
+              <button class="seg-btn active" id="shotDarkBtn" type="button" role="tab" aria-selected="true">暗色外观</button>
+              <button class="seg-btn" id="shotLightBtn" type="button" role="tab" aria-selected="false">亮色外观</button>
             </div>
 
-            <div class="win-actions">
-              <button class="win-btn" id="resetDemoBtn" type="button">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-                <span>重置数据</span>
-              </button>
-              <a class="win-btn" href="./demo/" target="_blank" rel="noopener noreferrer">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
-                <span>全屏</span>
-              </a>
-            </div>
+            <a class="win-demo-btn" href="./demo/" target="_blank" rel="noopener noreferrer">
+              <span>在线体验</span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+            </a>
           </div>
 
-          <iframe
-            id="demoFrame"
-            class="demo-iframe"
-            src="./demo/?theme=dark"
-            title="Agent会话管理 v1.8.4 1:1 实时交互体验"
-          ></iframe>
-
-          <div id="shotPane" class="shot-pane">
-            <img id="shotImg" src="./main-window-dark.png" alt="Agent会话管理 2880×1800 高清界面预览">
+          <div class="shot-frame">
+            <img id="shotImg" src="./main-window-dark.png" alt="Agent会话管理 v1.8.4 2880×1800 高清桌面端主界面">
           </div>
         </div>
       </div>
 
       <div class="stage-note">
-        <span>上方即真实运行的 v1.8.4 前端应用，内置 13 种 Agent 演示会话，可直接操作思维链、长代码折叠、目录抽屉与批量清理。</span>
-        <span>模拟数据仅驻留内存 · 刷新即复原</span>
+        <span>2880×1800 2x 高清桌面端界面预览 · 支持亮 / 暗双外观自由切换</span>
+        <span>想亲自点击操作？点击上方「在线体验」直接跳转至独立 1:1 交互版</span>
       </div>
     </div>
   </section>
@@ -1254,7 +1346,6 @@ button { font: inherit; color: inherit; }
       </div>
 
       <div class="bento">
-        <!-- Card 1: Interactive Tri-Mode Reader -->
         <article class="card span-7 reveal">
           <div>
             <div class="card-kicker">Structured Reader</div>
@@ -1272,7 +1363,7 @@ button { font: inherit; color: inherit; }
             </div>
             <div class="mini-thought" id="miniThoughtRow">
               <span>✻ 思考中 · 定位 JWKS 未知 kid 轮换未触发回源刷新…</span>
-              <span style="opacity:.7">1.4s</span>
+              <span style="opacity:.7;flex:none">1.4s</span>
             </div>
             <div class="mini-diff" id="miniDiffRow">
               <div class="diff-del">- if (!key) throw new UnauthorizedError('unknown kid');</div>
@@ -1284,7 +1375,6 @@ button { font: inherit; color: inherit; }
           </div>
         </article>
 
-        <!-- Card 2: FTS5 Full-Text Search -->
         <article class="card span-5 reveal">
           <div>
             <div class="card-kicker">SQLite FTS5</div>
@@ -1307,7 +1397,6 @@ button { font: inherit; color: inherit; }
           </div>
         </article>
 
-        <!-- Card 3: Long Code Collapse -->
         <article class="card span-4 reveal">
           <div>
             <div class="card-kicker">Code Ergonomics</div>
@@ -1328,7 +1417,6 @@ button { font: inherit; color: inherit; }
           </div>
         </article>
 
-        <!-- Card 4: Native Export & Path Chips -->
         <article class="card span-4 reveal">
           <div>
             <div class="card-kicker">Native Bridge</div>
@@ -1344,7 +1432,6 @@ button { font: inherit; color: inherit; }
           </div>
         </article>
 
-        <!-- Card 5: Zero-Jump Multi-Select & Safety -->
         <article class="card span-4 reveal">
           <div>
             <div class="card-kicker">Safe Governance</div>
@@ -1387,7 +1474,6 @@ button { font: inherit; color: inherit; }
         <div class="agent-chip"><strong>DeepSeek Harness</strong><span>Session v3 / v4</span></div>
         <div class="agent-chip"><strong>WorkBuddy</strong><span>JSONL + Sidecar</span></div>
         <div class="agent-chip"><strong>CodeBuddy</strong><span>DAG + Rollback</span></div>
-        <!-- Duplicate for seamless loop -->
         <div class="agent-chip"><strong>Claude Code</strong><span>Projects JSONL</span></div>
         <div class="agent-chip"><strong>Codex</strong><span>Rollout JSONL</span></div>
         <div class="agent-chip"><strong>Gemini CLI</strong><span>Chats &amp; Thought</span></div>
@@ -1404,7 +1490,6 @@ button { font: inherit; color: inherit; }
         <div class="agent-chip"><strong>OpenClaw</strong><span>Multi-Agent JSONL</span></div>
         <div class="agent-chip"><strong>Pi</strong><span>Branch Tree JSONL</span></div>
         <div class="agent-chip"><strong>Grok Build</strong><span>JSONL + Zstd Archive</span></div>
-        <!-- Duplicate for seamless loop -->
         <div class="agent-chip"><strong>Kimi CLI</strong><span>Context &amp; Wire</span></div>
         <div class="agent-chip"><strong>OpenCode</strong><span>SQLite WAL</span></div>
         <div class="agent-chip"><strong>ZCode</strong><span>Dual SQLite Lineage</span></div>
@@ -1442,7 +1527,7 @@ button { font: inherit; color: inherit; }
         </div>
       </div>
 
-      <div style="margin-top:26px">
+      <div style="margin-top:24px">
         <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px">
           <span>审阅完整安全边界说明 (SAFETY.md)</span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
@@ -1466,7 +1551,8 @@ button { font: inherit; color: inherit; }
             <span>前往 GitHub Releases 下载</span>
           </a>
           <a class="btn btn-secondary" href="./demo/" target="_blank" rel="noopener noreferrer">
-            <span>独立全屏打开在线体验</span>
+            <span>前往 1:1 在线体验</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
           </a>
         </div>
       </div>
@@ -1490,65 +1576,45 @@ button { font: inherit; color: inherit; }
 (function () {
   var root = document.documentElement;
   var themeToggle = document.getElementById("themeToggle");
-  var demoFrame = document.getElementById("demoFrame");
-  var shotPane = document.getElementById("shotPane");
   var shotImg = document.getElementById("shotImg");
-  var modeInteractive = document.getElementById("modeInteractive");
-  var modeScreenshot = document.getElementById("modeScreenshot");
-  var resetDemoBtn = document.getElementById("resetDemoBtn");
+  var shotDarkBtn = document.getElementById("shotDarkBtn");
+  var shotLightBtn = document.getElementById("shotLightBtn");
 
   function getTheme() {
     return root.getAttribute("data-theme") === "light" ? "light" : "dark";
   }
 
-  function syncTheme(theme) {
+  function setPreviewVariant(variant) {
+    var isLight = variant === "light";
     if (shotImg) {
-      shotImg.src = theme === "light" ? "./main-window-light.png" : "./main-window-dark.png";
+      shotImg.src = isLight ? "./main-window-light.png" : "./main-window-dark.png";
     }
-    if (demoFrame && demoFrame.contentWindow) {
-      try {
-        demoFrame.contentWindow.postMessage(
-          { type: "asm-demo-theme", theme: theme },
-          window.location.origin
-        );
-      } catch (e) {}
+    if (shotDarkBtn && shotLightBtn) {
+      shotDarkBtn.classList.toggle("active", !isLight);
+      shotDarkBtn.setAttribute("aria-selected", String(!isLight));
+      shotLightBtn.classList.toggle("active", isLight);
+      shotLightBtn.setAttribute("aria-selected", String(isLight));
     }
   }
 
-  var initTheme = getTheme();
-  if (demoFrame) {
-    demoFrame.src = "./demo/?theme=" + initTheme;
-    demoFrame.addEventListener("load", function () {
-      syncTheme(getTheme());
-    });
+  function applyTheme(theme) {
+    root.setAttribute("data-theme", theme);
+    try { localStorage.setItem("asm-site-theme-v2", theme); } catch (e) {}
+    setPreviewVariant(theme);
   }
-  syncTheme(initTheme);
+
+  setPreviewVariant(getTheme());
 
   if (themeToggle) {
     themeToggle.addEventListener("click", function () {
-      var next = getTheme() === "dark" ? "light" : "dark";
-      root.setAttribute("data-theme", next);
-      try { localStorage.setItem("asm-site-theme-v2", next); } catch (e) {}
-      syncTheme(next);
+      applyTheme(getTheme() === "dark" ? "light" : "dark");
     });
   }
 
-  function setMode(mode) {
-    var live = mode === "live";
-    modeInteractive.classList.toggle("active", live);
-    modeInteractive.setAttribute("aria-selected", String(live));
-    modeScreenshot.classList.toggle("active", !live);
-    modeScreenshot.setAttribute("aria-selected", String(!live));
-    demoFrame.style.display = live ? "block" : "none";
-    shotPane.classList.toggle("active", !live);
-    resetDemoBtn.style.display = live ? "inline-flex" : "none";
+  if (shotDarkBtn && shotLightBtn) {
+    shotDarkBtn.addEventListener("click", function () { setPreviewVariant("dark"); });
+    shotLightBtn.addEventListener("click", function () { setPreviewVariant("light"); });
   }
-
-  modeInteractive.addEventListener("click", function () { setMode("live"); });
-  modeScreenshot.addEventListener("click", function () { setMode("shot"); });
-  resetDemoBtn.addEventListener("click", function () {
-    demoFrame.src = "./demo/?theme=" + getTheme() + "&reset=" + Date.now();
-  });
 
   // Interactive Bento Card 1: All / Dialog / Changes switcher
   var miniTabs = document.querySelectorAll("#miniReader .mini-tab");
@@ -1579,7 +1645,6 @@ button { font: inherit; color: inherit; }
     });
   });
 
-  // Smooth Scroll Reveal
   if ("IntersectionObserver" in window) {
     var io = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
@@ -1588,7 +1653,7 @@ button { font: inherit; color: inherit; }
           io.unobserve(entry.target);
         }
       });
-    }, { threshold: 0.12 });
+    }, { threshold: 0.1 });
     document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
   } else {
     document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
