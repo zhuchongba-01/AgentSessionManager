@@ -168,6 +168,28 @@ button { font: inherit; color: inherit; }
   color: var(--text-2);
 }
 
+.finale-footer-pill {
+  position: absolute;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 10px 22px;
+  border-radius: 999px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.16);
+  font-size: 12.5px;
+  color: var(--text-2);
+  max-width: calc(100vw - 32px);
+}
+.finale-footer-pill a:hover { color: var(--text); }
+.finale-footer-pill .sep { opacity: 0.4; }
 .finale-hint {
   margin-top: 22px;
   font-size: 12.5px;
@@ -776,21 +798,16 @@ footer {
         <a class="cta cta-dark" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">前往 GitHub Releases 下载</a>
         <a class="cta cta-glass" href="./demo/" target="_blank" rel="noopener noreferrer">前往 1:1 在线体验 ↗</a>
       </div>
-      <div class="finale-hint">✦ 划过底部散落的几何图形，感受墨流将其托起翻涌 ✦</div>
     </div>
+    <footer class="finale-footer-pill">
+      <span>© 2026 Agent会话管理 · MIT</span>
+      <span class="sep">·</span>
+      <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
+      <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">历史版本</a>
+      <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
+    </footer>
   </section>
-
-  <footer>
-    <div class="wrap footer-row">
-      <div>© 2026 Agent会话管理 · MIT Open Source</div>
-      <div class="footer-links">
-        <a href="./demo/" target="_blank" rel="noopener noreferrer">在线体验</a>
-        <a href="https://github.com/zhuchongba-01/AgentSessionManager" target="_blank" rel="noopener noreferrer">GitHub</a>
-        <a href="https://github.com/zhuchongba-01/AgentSessionManager/releases" target="_blank" rel="noopener noreferrer">全部版本</a>
-        <a href="https://github.com/zhuchongba-01/AgentSessionManager/blob/master/SAFETY.md" target="_blank" rel="noopener noreferrer">安全说明</a>
-      </div>
-    </div>
-  </footer>
 </div>
 
 <script>
@@ -1328,12 +1345,15 @@ footer {
   function createShape(i, total) {
     var isMobile = W < 720;
     // Bold, generously sized Bauhaus shapes (24px ~ 56px on desktop, 18px ~ 36px on mobile)
-    var size = (isMobile ? 18 : 24) + Math.random() * (isMobile ? 18 : 32);
-    var p = pickColor(0.24);
+    var size = (isMobile ? 18 : 24) + Math.random() * (isMobile ? 16 : 26);
+    var p = pickColor(0.18);
     var spread = (i + Math.random()) / total;
-    var x = 16 + spread * Math.max(100, W - 32);
-    var edgeBoost = Math.pow(Math.abs(spread - 0.5) * 2, 1.4);
-    var floorOffset = size * 0.55 + Math.random() * (isMobile ? 95 : 145) + edgeBoost * (isMobile ? 30 : 65);
+    var x = spread * W;
+    // Dense bottom carpet flush to the very bottom edge, curving higher near left/right sides
+    var edgeBoost = Math.pow(Math.abs(spread - 0.5) * 2, 1.5);
+    var layerRand = Math.pow(Math.random(), 1.35);
+    var maxPile = (isMobile ? 120 : 185) + edgeBoost * (isMobile ? 35 : 75);
+    var floorOffset = 4 + layerRand * maxPile;
     var restY = H - floorOffset;
     return {
       type: TYPES[Math.floor(Math.random() * TYPES.length)],
@@ -1361,7 +1381,7 @@ footer {
     canvas.height = Math.floor(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    var count = W < 720 ? 52 : Math.min(135, Math.max(96, Math.floor(W / 10.5)));
+    var count = W < 720 ? 115 : Math.min(340, Math.max(240, Math.floor(W / 4.4)));
     shapes = [];
     for (var i = 0; i < count; i++) {
       shapes.push(createShape(i, count));
@@ -1388,9 +1408,9 @@ footer {
   }
 
   function applyInkForce(lx, ly, dx, dy, isBurst) {
-    var radius = isBurst ? (W < 720 ? 190 : 280) : (W < 720 ? 165 : 240);
+    var radius = isBurst ? (W < 720 ? 130 : 175) : (W < 720 ? 115 : 155);
     var r2 = radius * radius;
-    var speed = Math.min(60, Math.hypot(dx, dy));
+    var speed = Math.min(36, Math.hypot(dx, dy));
     var hitAny = false;
 
     for (var i = 0; i < shapes.length; i++) {
@@ -1402,26 +1422,26 @@ footer {
 
       var d = Math.sqrt(d2) || 1;
       var falloff = 1 - d / radius;
-      var f = (0.35 + 0.65 * falloff) * falloff / s.mass;
+      var f = (falloff * falloff) / s.mass;
 
       if (isBurst) {
-        var b = (W < 720 ? 12 : 17) * f;
-        s.vx += (rx / d) * b + (Math.random() - 0.5) * 4;
-        s.vy += (ry / d) * b - (W < 720 ? 10 : 14) * f;
-        s.va += (Math.random() - 0.5) * 0.36 * f;
+        var b = (W < 720 ? 4.2 : 5.6) * f;
+        s.vx += (rx / d) * b + (Math.random() - 0.5) * 1.4;
+        s.vy += (ry / d) * b - (W < 720 ? 4.0 : 5.4) * f;
+        s.va += (Math.random() - 0.5) * 0.14 * f;
       } else {
-        // Strong visible ink-wave buoyancy lift + swirl
-        s.vx += (dx * 0.52 + (rx / d) * (2.2 + speed * 0.16)) * f;
-        s.vy += (dy * 0.35 - (5.8 + speed * 0.42)) * f;
-        s.va += (dx * 0.018 + (rx >= 0 ? 0.06 : -0.06)) * f;
+        // Gentle, silky buoyant ink lift
+        s.vx += (dx * 0.18 + (rx / d) * (0.6 + speed * 0.04)) * f;
+        s.vy += (dy * 0.12 - (1.9 + speed * 0.14)) * f;
+        s.va += (dx * 0.007 + (rx >= 0 ? 0.025 : -0.025)) * f;
       }
 
-      s.vx = Math.max(-24, Math.min(24, s.vx));
-      s.vy = Math.max(-26, Math.min(18, s.vy));
+      s.vx = Math.max(-8.5, Math.min(8.5, s.vx));
+      s.vy = Math.max(-10.5, Math.min(7.5, s.vy));
       s.settled = false;
       hitAny = true;
     }
-    if (hitAny) wake(4800);
+    if (hitAny) wake(3600);
   }
 
   var lastLx = null, lastLy = null;
@@ -1457,18 +1477,6 @@ footer {
   window.addEventListener("pointerleave", function () { lastLx = null; lastLy = null; });
   window.addEventListener("pointercancel", function () { lastLx = null; lastLy = null; });
 
-  // Gentle welcome ripple when scrolling into the bottom finale stage
-  if ("IntersectionObserver" in window) {
-    var greeted = false;
-    var io = new IntersectionObserver(function (entries) {
-      if (!greeted && entries[0] && entries[0].isIntersecting) {
-        greeted = true;
-        applyInkForce(W * 0.35, H - 80, 18, -12, true);
-        setTimeout(function () { applyInkForce(W * 0.65, H - 80, -18, -12, true); }, 220);
-      }
-    }, { threshold: 0.25 });
-    io.observe(stage);
-  }
 
   var lastW = window.innerWidth;
   var rTimer;
