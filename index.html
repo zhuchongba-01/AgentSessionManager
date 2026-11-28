@@ -824,7 +824,8 @@ footer {
   var pressureShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;varying highp vec2 vL;varying highp vec2 vR;varying highp vec2 vT;varying highp vec2 vB;uniform sampler2D uPressure;uniform sampler2D uDivergence;void main(){float L=texture2D(uPressure,vL).x;float R=texture2D(uPressure,vR).x;float T=texture2D(uPressure,vT).x;float B=texture2D(uPressure,vB).x;float div=texture2D(uDivergence,vUv).x;float p=(L+R+B+T-div)*0.25;gl_FragColor=vec4(p,0.0,0.0,1.0);}");
   var gradientSubtractShader = createProgram(baseVS, "precision mediump float;varying highp vec2 vUv;varying highp vec2 vL;varying highp vec2 vR;varying highp vec2 vT;varying highp vec2 vB;uniform sampler2D uPressure;uniform sampler2D uVelocity;void main(){float L=texture2D(uPressure,vL).x;float R=texture2D(uPressure,vR).x;float T=texture2D(uPressure,vT).x;float B=texture2D(uPressure,vB).x;vec2 vel=texture2D(uVelocity,vUv).xy;vel.xy-=vec2(R-L,T-B);gl_FragColor=vec4(vel,0.0,1.0);}");
 
-  // Softer, low-glare display shader (calibrated to avoid brightness glare in both light & dark)
+  // Beer-Lambert subtractive watercolor (light) & Reinhard-mapped silk ink (dark):
+  // Center of ink strokes deepens richly and NEVER blows out bright/white!
   var displayShader = createProgram(baseVS, [
     "precision highp float;",
     "varying vec2 vUv;",
@@ -843,16 +844,23 @@ footer {
     "  vec3 bc = texture2D(uTexture, vB).rgb;",
     "  float dx = length(rc) - length(lc);",
     "  float dy = length(tc) - length(bc);",
-    "  vec3 n = normalize(vec3(dx, dy, 0.08));",
-    "  float spec = clamp(dot(n, normalize(vec3(0.25, 0.4, 1.0))), 0.65, 1.0);",
-    "  float density = clamp(length(c) * 0.92, 0.0, 0.88);",
-    "  vec3 shaded = c * (0.85 + 0.3 * spec);",
+    "  vec3 n = normalize(vec3(dx, dy, 0.14));",
+    "  float spec = clamp(dot(n, normalize(vec3(0.2, 0.35, 1.0))), 0.75, 1.0);",
+    "  float mag = length(c);",
+    "  vec3 hue = mag > 0.0001 ? (c / mag) : vec3(0.0);",
     "  if (uIsDark > 0.5) {",
-    "    vec3 col = uBgColor + shaded * 0.72;",
+    "    // Filmic Reinhard tone-mapping: silky luminous core, never white-hot",
+    "    vec3 mapped = c / (vec3(1.0) + c * 1.65);",
+    "    vec3 col = uBgColor + mapped * (0.62 + 0.12 * spec);",
     "    gl_FragColor = vec4(col, 1.0);",
     "  } else {",
-    "    vec3 pigment = mix(uBgColor, uBgColor * (1.0 - clamp(shaded * 0.68, 0.0, 0.62)) + shaded * 0.28, density);",
-    "    gl_FragColor = vec4(pigment, 1.0);",
+    "    // Beer-Lambert subtractive watercolor absorption on warm xuan paper",
+    "    float ink = 1.0 - exp(-mag * 1.15);",
+    "    vec3 mineral = mix(vec3(0.36, 0.44, 0.54), hue * 0.76, 0.72);",
+    "    vec3 stained = uBgColor * mix(vec3(1.0), mineral, 0.52 + 0.34 * ink);",
+    "    vec3 col = mix(uBgColor, stained, ink * 0.9);",
+    "    col *= (0.96 + 0.04 * spec);",
+    "    gl_FragColor = vec4(min(uBgColor, col), 1.0);",
     "  }",
     "}"
   ].join("\n"));
@@ -1009,18 +1017,51 @@ footer {
   openingFlourish();
 
   var lastX = null, lastY = null;
+  var pendingSplats = [];
+
+  function clampVel(v) {
+    return Math.max(-420, Math.min(420, v));
+  }
+
   window.addEventListener("pointermove", function (e) {
     var x = e.clientX / window.innerWidth;
     var y = 1.0 - e.clientY / window.innerHeight;
-    if (lastX === null) { lastX = x; lastY = y; return; }
-    var dx = (x - lastX) * 4800;
-    var dy = (y - lastY) * 4800;
-    if (Math.hypot(dx, dy) > 12) {
-      splat(x, y, dx, dy, pickColor(), 0.0025);
+    if (lastX === null) {
       lastX = x;
       lastY = y;
+      return;
     }
+    var rawDx = x - lastX;
+    var rawDy = y - lastY;
+    var dist = Math.hypot(rawDx, rawDy);
+    if (dist < 0.0008) return;
+
+    // Continuous sub-step interpolation so ink stays glued 1:1 to cursor even on fast drags
+    var steps = Math.min(8, Math.max(1, Math.ceil(dist / 0.014)));
+    var vx = clampVel(rawDx * 1850);
+    var vy = clampVel(rawDy * 1850);
+    var col = pickColor();
+    var stepWeight = 1.0 / Math.sqrt(steps);
+    var weightedCol = [col[0] * stepWeight, col[1] * stepWeight, col[2] * stepWeight];
+
+    for (var s = 1; s <= steps; s++) {
+      var t = s / steps;
+      pendingSplats.push({
+        x: lastX + rawDx * t,
+        y: lastY + rawDy * t,
+        dx: vx,
+        dy: vy,
+        color: weightedCol,
+        radius: 0.0022
+      });
+    }
+    if (pendingSplats.length > 24) pendingSplats.splice(0, pendingSplats.length - 24);
+    lastX = x;
+    lastY = y;
   }, { passive: true });
+
+  window.addEventListener("pointerleave", function () { lastX = null; lastY = null; });
+  window.addEventListener("blur", function () { lastX = null; lastY = null; });
 
   window.addEventListener("pointerdown", function (e) {
     var x = e.clientX / window.innerWidth;
@@ -1029,7 +1070,14 @@ footer {
     lastY = y;
     for (var i = 0; i < 4; i++) {
       var a = (Math.PI * 2 * i) / 4 + Math.random() * 0.5;
-      splat(x, y, Math.cos(a) * 380, Math.sin(a) * 380, pickColor(), 0.0038);
+      pendingSplats.push({
+        x: x,
+        y: y,
+        dx: Math.cos(a) * 260,
+        dy: Math.sin(a) * 260,
+        color: pickColor(),
+        radius: 0.0034
+      });
     }
   }, { passive: true });
 
@@ -1038,6 +1086,15 @@ footer {
     var now = performance.now();
     var dt = Math.min((now - lastTime) / 1000, 0.0166);
     lastTime = now;
+
+    // Apply all queued interpolated cursor strokes right inside the frame loop
+    if (pendingSplats.length > 0) {
+      for (var p = 0; p < pendingSplats.length; p++) {
+        var sp = pendingSplats[p];
+        splat(sp.x, sp.y, sp.dx, sp.dy, sp.color, sp.radius);
+      }
+      pendingSplats.length = 0;
+    }
 
     gl.useProgram(curlShader.program);
     gl.uniform2f(curlShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
