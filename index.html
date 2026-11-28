@@ -528,7 +528,7 @@ footer {
   .hero-meta { margin-top: 18px; font-size: 12px; }
 
   .showcase { padding: 4px 0 52px; }
-  .frame { padding: 7px; border-radius: 16px; }
+  .frame { padding: 7px; border-radius: 16px; box-shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.14), 0 0 0 1px var(--border); }
   .frame-bar { padding: 2px 2px 8px; }
   .frame-title span { display: none; }
   .frame-img { border-radius: 10px; }
@@ -541,7 +541,7 @@ footer {
   .agents-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
   .agent-card { padding: 13px 14px; border-radius: 12px; }
 
-  .closing-box { padding: 38px 18px; border-radius: 20px; margin-bottom: 48px; }
+  .closing-box { padding: 38px 18px; border-radius: 20px; margin-bottom: 48px; box-shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.12), 0 0 0 1px var(--border); }
   .footer-row { flex-direction: column; text-align: center; }
   .footer-links { justify-content: center; gap: 14px; }
 }
@@ -910,8 +910,8 @@ footer {
   var dye, velocity, divergence, curl, pressure;
   function initFBOs() {
     var isMobile = window.innerWidth < 720;
-    var baseSim = isMobile ? 96 : 128;
-    var baseDye = isMobile ? 320 : 512;
+    var baseSim = isMobile ? 64 : 128;
+    var baseDye = isMobile ? 224 : 512;
     var aspect = window.innerWidth / Math.max(1, window.innerHeight);
     var simW = aspect >= 1 ? Math.round(baseSim * aspect) : baseSim;
     var simH = aspect >= 1 ? baseSim : Math.round(baseSim / aspect);
@@ -926,12 +926,12 @@ footer {
 
   var lastWindowWidth = window.innerWidth;
   function resizeCanvas() {
-    var dpr = 1;
+    var scale = window.innerWidth < 720 ? 0.72 : 1;
     var rect = canvas.getBoundingClientRect();
     var w = Math.max(window.innerWidth, Math.round(rect.width || 0));
     var h = Math.max(window.innerHeight, Math.round(rect.height || 0));
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
+    canvas.width = Math.floor(w * scale);
+    canvas.height = Math.floor(h * scale);
   }
 
   resizeCanvas();
@@ -1029,7 +1029,8 @@ footer {
     if (dist < 0.0006) return;
 
     // Lush continuous sub-step interpolation for silky oil-ink marbling
-    var steps = Math.min(4, Math.max(1, Math.ceil(dist / 0.022)));
+    var maxSteps = window.innerWidth < 720 ? 2 : 4;
+    var steps = Math.min(maxSteps, Math.max(1, Math.ceil(dist / 0.024)));
     var vx = clampVel(rawDx * 2600);
     var vy = clampVel(rawDy * 2600);
     var col = pickColor();
@@ -1050,6 +1051,7 @@ footer {
     if (pendingSplats.length > 10) pendingSplats.splice(0, pendingSplats.length - 10);
     lastX = x;
     lastY = y;
+    wakeFluid();
   }, { passive: true });
 
   window.addEventListener("pointerleave", function () { lastX = null; lastY = null; });
@@ -1075,9 +1077,20 @@ footer {
         radius: burstRadius
       });
     }
+    wakeFluid();
   }, { passive: true });
 
   var lastTime = performance.now();
+  var lastActivityAt = performance.now();
+  var loopRunning = false;
+  function wakeFluid() {
+    lastActivityAt = performance.now();
+    if (!loopRunning) {
+      loopRunning = true;
+      lastTime = performance.now();
+      requestAnimationFrame(step);
+    }
+  }
   function step() {
     var now = performance.now();
     var dt = Math.min((now - lastTime) / 1000, 0.033);
@@ -1120,7 +1133,8 @@ footer {
     gl.useProgram(pressureShader.program);
     gl.uniform2f(pressureShader.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(pressureShader.uniforms.uDivergence, divergence.attach(0));
-    for (var i = 0; i < 10; i++) {
+    var pIters = window.innerWidth < 720 ? 6 : 10;
+    for (var i = 0; i < pIters; i++) {
       gl.uniform1i(pressureShader.uniforms.uPressure, pressure.read.attach(1));
       blit(pressure.write);
       pressure.swap();
@@ -1164,9 +1178,13 @@ footer {
     }
     blit(null);
 
+    if (now - lastActivityAt > 5200 && pendingSplats.length === 0) {
+      loopRunning = false;
+      return;
+    }
     requestAnimationFrame(step);
   }
-  step();
+  wakeFluid();
 
   if (modeBtn) {
     modeBtn.addEventListener("click", function () {
@@ -1174,6 +1192,7 @@ footer {
       try { localStorage.setItem("asm-fluid-mode", isDark ? "ink" : "paper"); } catch (e) {}
       syncModeUI();
       openingFlourish();
+      wakeFluid();
     });
   }
 })();
