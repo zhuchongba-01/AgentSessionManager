@@ -1397,7 +1397,7 @@ footer {
         if (s.y < s.r) { s.y = s.r; if (s.vy < 0) s.vy *= -0.2; }
         if (s.y > H - s.pr) {
           s.y = H - s.pr;
-          if (s.vy > 0.6) s.vy *= -0.26;
+          if (s.vy > 0.6) s.vy *= -0.20;
           else s.vy = 0;
           s.vx *= 0.86;
           s.va *= 0.82;
@@ -1424,7 +1424,7 @@ footer {
       var type = TYPES[Math.floor(Math.random() * TYPES.length)];
       var r = size * 0.48;
       // Concave / angled shapes (star, cross, bowtie, triangle, gear, pill) use tighter packing radius so teeth & corners nestle together naturally
-      var nestFactor = (type === "circle" || type === "ring") ? 0.88 : (type === "pentagon" ? 0.82 : 0.72);
+      var nestFactor = (type === "circle" || type === "ring") ? 0.96 : (type === "pentagon" ? 0.92 : 0.86);
       var pr = r * nestFactor;
       var p = pickColor(0.2);
       var colFrac = (i + 0.5 + (Math.random() - 0.5) * 0.6) / count;
@@ -1481,8 +1481,8 @@ footer {
 
   // Only the instantaneous cursor/ink head nudges shapes directly under it — subtle & weighty
   function nudgeAtCursorHead(lx, ly, dx, dy) {
-    var headRadius = W < 720 ? 88 : 118;
-    var speed = Math.min(40, Math.hypot(dx, dy));
+    var headRadius = W < 720 ? 78 : 102;
+    var speed = Math.min(34, Math.hypot(dx, dy));
     var hitAny = false;
 
     for (var i = 0; i < shapes.length; i++) {
@@ -1495,15 +1495,15 @@ footer {
 
       var d = Math.sqrt(d2) || 1;
       var falloff = 1 - d / reach;
-      var f = (0.3 + 0.7 * falloff) * falloff;
+      var f = (0.25 + 0.75 * falloff) * falloff;
 
-      // Playful, buoyant cursor-head lift (crisp 120-220px arc, never chaotic)
-      s.vx += (dx * 0.22 + (rx / d) * (1.2 + speed * 0.08)) * f;
-      s.vy += (dy * 0.14 - (2.4 + speed * 0.16)) * f;
-      s.va += (dx * 0.011 + (rx >= 0 ? 0.028 : -0.028)) * f;
+      // Gentle, crisp cursor-head lift (exact midpoint: responsive yet calm)
+      s.vx += (dx * 0.14 + (rx / d) * (0.7 + speed * 0.05)) * f;
+      s.vy += (dy * 0.09 - (1.55 + speed * 0.10)) * f;
+      s.va += (dx * 0.007 + (rx >= 0 ? 0.018 : -0.018)) * f;
 
-      s.vx = Math.max(-11.5, Math.min(11.5, s.vx));
-      s.vy = Math.max(-13.5, Math.min(9.5, s.vy));
+      s.vx = Math.max(-7.8, Math.min(7.8, s.vx));
+      s.vy = Math.max(-8.8, Math.min(6.8, s.vy));
       hitAny = true;
     }
     if (hitAny) wake(3600);
