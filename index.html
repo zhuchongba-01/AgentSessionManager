@@ -94,13 +94,9 @@ button { font: inherit; color: inherit; }
 
 /* Sticky Translucent Header */
 header {
-  position: sticky;
-  top: 0;
+  position: relative;
   z-index: 30;
-  backdrop-filter: blur(20px) saturate(140%);
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  background: color-mix(in srgb, var(--bg) 72%, transparent);
-  border-bottom: 1px solid var(--border);
+  background: transparent;
 }
 
 .nav {
@@ -528,7 +524,7 @@ footer {
 @media (max-width: 640px) {
   .wrap { padding: 0 16px; }
   .nav { height: 54px; }
-  .nav-links, .nav-demo-top { display: none; }
+  .nav-links { display: none; }
   .pill-btn { height: 32px; padding: 0 12px; font-size: 12.5px; }
   .hero { min-height: auto; padding: 48px 0 34px; }
   .seal-tag { font-size: 11.5px; padding: 5px 12px; margin-bottom: 20px; }
@@ -577,7 +573,6 @@ footer {
 
       <div class="nav-right">
         <button class="pill-btn" id="modeBtn" type="button">玄墨夜</button>
-        <a class="pill-btn nav-demo-top" href="./demo/" target="_blank" rel="noopener noreferrer">在线体验 ↗</a>
         <a class="pill-btn solid" href="https://github.com/zhuchongba-01/AgentSessionManager/releases/latest" target="_blank" rel="noopener noreferrer">下载</a>
       </div>
     </div>
